@@ -172,9 +172,12 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
                 package=hit.name,
                 installed=hit.version,
                 target=fixed,
-                files=["package.json", hit.lockfile]
+                files=[
+                    hit.override_manifest or hit.manifest or "package.json",
+                    hit.lockfile,
+                ]
                 if hit.lockfile
-                else ["package.json"],
+                else [hit.override_manifest or hit.manifest or "package.json"],
                 manager=hit.manager,
                 description=f"Pin transitive dependency {hit.name} to {fixed} with a {hit.manager} override.",
             )
@@ -363,7 +366,7 @@ def _apply_node(root, plan, runner, which, edited, commands) -> dict:
         if any(
             path.endswith("lock.json")
             or path.endswith("lock.yaml")
-            or path == "yarn.lock"
+            or Path(path).name == "yarn.lock"
             for path in plan.files
         ):
             return _refresh_node_lock(
@@ -377,8 +380,18 @@ def _apply_node(root, plan, runner, which, edited, commands) -> dict:
             )
         return _applied(plan, edited, commands)
     if plan.strategy == "override":
+        manifest = next(
+            (
+                path
+                for path in plan.files
+                if Path(path).name in {"package.json", "pnpm-workspace.yaml"}
+            ),
+            "package.json",
+        )
         edited.append(
-            add_npm_override(root, plan.package, plan.target, plan.manager or "npm")
+            add_npm_override(
+                root, plan.package, plan.target, plan.manager or "npm", manifest
+            )
         )
         return _refresh_node_lock(
             root,
@@ -429,6 +442,18 @@ def _refresh_node_lock(
     root, plan, runner, which, edited, commands, *, fallback_status: str
 ) -> dict:
     """Refresh dependencies with manager-specific remediation commands."""
+    entry = next(
+        (
+            path
+            for path in plan.files
+            if Path(path).name in {"pnpm-lock.yaml", "yarn.lock", "package-lock.json"}
+        ),
+        plan.files[0] if plan.files else "package.json",
+    )
+    resolved = resolve_inside(root, entry)
+    if resolved is None:
+        raise ValueError(f"Refusing a lockfile refresh outside the repository: {entry}")
+    workdir = resolved.parent
     tool = resolve_tool(plan.manager or "npm", which)
     if not tool:
         return _failed(
@@ -437,7 +462,7 @@ def _refresh_node_lock(
             f"{plan.manager} is not on PATH, so the lockfile was not refreshed.",
             edited,
         )
-    if plan.manager == "yarn" and is_modern_yarn(root):
+    if plan.manager == "yarn" and is_modern_yarn(workdir):
         if plan.strategy == "lockfile_only":
             argv = [tool, "up", "-R", plan.package]
         else:
@@ -468,7 +493,8 @@ def _refresh_node_lock(
         argv = [tool, "install", "--lockfile-only", "--ignore-scripts"]
     else:
         argv = [tool, "upgrade", f"{plan.package}@{plan.target}", "--ignore-scripts"]
-    result = runner.run(argv, timeout=PACKAGE_TIMEOUT, check=False)
+    options = {"cwd": workdir} if workdir != root.resolve() else {}
+    result = runner.run(argv, timeout=PACKAGE_TIMEOUT, check=False, **options)
     commands.append(result.display())
     if result.exit_code != 0:
         detail = (result.stderr or result.stdout).strip()[:500]

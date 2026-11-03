@@ -293,7 +293,9 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     }
 
 
-def run_checks(root: Path, checks: dict, runner, which, timeout: int) -> list[dict]:
+def run_checks(
+    root: Path, checks: dict, runner, which, timeout: int, *, plan: dict | None = None
+) -> list[dict]:
     """Require positive, untruncated success evidence from every check.
 
     Smoke checks must terminate and exercise product behavior. License
@@ -302,6 +304,23 @@ def run_checks(root: Path, checks: dict, runner, which, timeout: int) -> list[di
     that prove actual checks ran rather than accepting empty test runs.
     Record expected execution errors per check; interrupts still propagate.
     """
+    workdir = root
+    if plan and plan.get("manager") in {"npm", "pnpm", "yarn"}:
+        entry = next(
+            (
+                path
+                for path in plan.get("files", [])
+                if Path(path).name
+                in {"pnpm-lock.yaml", "yarn.lock", "package-lock.json"}
+            ),
+            next(iter(plan.get("files", [])), "package.json"),
+        )
+        resolved = resolve_inside(root, entry)
+        if resolved is None:
+            raise ValueError(
+                "Qualification working directory must stay inside the repository"
+            )
+        workdir = resolved.parent
     rows = []
     for kind in CHECK_KINDS:
         check = checks[kind]
@@ -322,7 +341,10 @@ def run_checks(root: Path, checks: dict, runner, which, timeout: int) -> list[di
                 )
                 continue
             result = runner.run(
-                [tool, *check["argv"][1:]], timeout=timeout, check=False
+                [tool, *check["argv"][1:]],
+                timeout=timeout,
+                check=False,
+                **({"cwd": workdir} if workdir != root.resolve() else {}),
             )
         except (OSError, RuntimeError, SubprocessError) as exc:
             rows.append(

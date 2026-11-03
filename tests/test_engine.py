@@ -790,6 +790,62 @@ def test_advisory_verified_dependency_fix_across_stacks(
     assert all(tool_name(call[0]) != "git" for call in runner.calls)
 
 
+@pytest.mark.parametrize(
+    "package, installed, target, major",
+    [
+        ("minimatch", "11.0.0", "11.0.1", False),
+        ("glob", "14.0.1", "14.0.2", False),
+        ("minimatch", "10.2.6", "11.0.1", True),
+        ("glob", "10.5.0", "14.0.2", True),
+    ],
+)
+def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
+    tmp_path, package, installed, target, major
+):
+    # Arrange
+    from unittest.mock import Mock
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name":"frontend"}', encoding="utf-8")
+    (frontend / "pnpm-lock.yaml").write_text(
+        f"packages:\n  {package}@{installed}: {{}}\n", encoding="utf-8"
+    )
+    (tmp_path / "Backend.csproj").write_text("<Project />", encoding="utf-8")
+    finding = _finding(package, package, "CVE-TEST", installed)
+    finding["location"] = {"file": "frontend/pnpm-lock.yaml"}
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved",
+        affected=True,
+        lowest_fixed_version=target,
+        fixed_versions=[target],
+        summary="Verified fixed version",
+    )
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    verified = engine.verify_security_finding(package)
+    blocked = engine.apply_minimal_fix(package)
+
+    # Assert
+    advisory.lookup.assert_called_once_with(finding, "npm", package, installed)
+    if major:
+        assert verified["decision"] == "MANUAL_REVIEW"
+        assert "major upgrade" in verified["reason"]
+        assert "not resolved locally" not in verified["reason"]
+        return
+    assert verified["decision"] == "CHANGE_REQUIRED"
+    assert verified["proposed_fix"]["target"] == target
+    assert verified["proposed_fix"]["files"] == [
+        "frontend/package.json",
+        "frontend/pnpm-lock.yaml",
+    ]
+    assert blocked["status"] == "QUALIFICATION_REQUIRED"
+
+
 def test_unresolved_java_transitive_dependency_is_not_false_positive(tmp_path):
     # Arrange
     (tmp_path / "pom.xml").write_text("<project />", encoding="utf-8")

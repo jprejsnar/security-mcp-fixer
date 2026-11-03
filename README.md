@@ -266,6 +266,13 @@ top-level package manifests (using each component's package manager), and .NET
 checks run at solution directories or standalone project directories. A root
 Node workspace manifest owns its nested packages; define workspace-wide checks
 there. Arbitrary mixed monorepos are not automatically orchestrated.
+Package lookup reads nested npm, pnpm, and Yarn lockfiles and retains each
+component's manifest, manager, and scanner-reported installed version. Node
+remediation and qualification checks use the owning component's directory.
+For pnpm components with `pnpm-workspace.yaml`, transitive override plans edit
+that workspace configuration while preserving comments and unrelated pins;
+otherwise they use the component's `package.json`. Discovery does not waive
+advisory verification, major-version review, or package qualification.
 Node, .NET, Java, NGINX, and Docker
 are needed only for the validation paths that apply to that checkout. Platform
 support does not mean every toolchain or Python runtime has been certified.

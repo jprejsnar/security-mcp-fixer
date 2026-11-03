@@ -554,6 +554,7 @@ class Engine:
                 self.runner,
                 self.which,
                 self.validation_timeout,
+                plan=plan,
             )
             if any(row["status"] != "PASSED" for row in checks):
                 raise ValueError(
@@ -788,6 +789,7 @@ class Engine:
                     self.runner,
                     self.which,
                     self.validation_timeout,
+                    plan=receipt["plan"],
                 )
                 receipt["post_results"] = checks
                 outcome["results"].extend(checks)

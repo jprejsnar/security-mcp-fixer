@@ -70,6 +70,33 @@ def package_policy(tmp_path):
     return path, policy, plan
 
 
+def test_nested_node_qualification_checks_use_component_directory(
+    tmp_path, package_policy
+):
+    # Arrange
+    from unittest.mock import Mock
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    checks = package_policy[1]["checks"]["npm"]
+    runner = Mock()
+    runner.run.return_value = CommandResult([], 0, "CHECK_PASSED", "", 0, False, "", "")
+    plan = {
+        "manager": "npm",
+        "files": ["frontend/package.json", "frontend/package-lock.json"],
+    }
+
+    # Act
+    rows = run_checks(tmp_path, checks, runner, lambda name: name, 30, plan=plan)
+
+    # Assert
+    assert len(rows) == 4
+    assert all(row["status"] == "PASSED" for row in rows)
+    assert all(
+        call.kwargs["cwd"] == frontend.resolve() for call in runner.run.call_args_list
+    )
+
+
 @pytest.fixture
 def package_engine(tmp_path, package_policy):
     """Use real local edits with mocked product commands and advisory evidence."""

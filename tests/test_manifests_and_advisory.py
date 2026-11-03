@@ -35,6 +35,76 @@ OSV = {
 }
 
 
+@pytest.mark.parametrize(
+    "package, installed", [("minimatch", "11.0.0"), ("glob", "14.0.1")]
+)
+def test_nested_pnpm_dependency_retains_component_paths(tmp_path, package, installed):
+    # Arrange
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name":"frontend"}', encoding="utf-8")
+    (frontend / "pnpm-lock.yaml").write_text(
+        f"lockfileVersion: '9.0'\npackages:\n  {package}@1.0.0: {{}}\n  {package}@{installed}: {{}}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Backend.csproj").write_text("<Project />", encoding="utf-8")
+
+    # Act
+    hit, truncated = locate_package(tmp_path, package, installed)
+
+    # Assert
+    assert not truncated
+    assert hit is not None
+    assert hit.version == installed
+    assert hit.manager == "pnpm"
+    assert hit.manifest == "frontend/package.json"
+    assert hit.lockfile == "frontend/pnpm-lock.yaml"
+    assert hit.direct is False
+
+
+@pytest.mark.parametrize(
+    "package, installed, target",
+    [("minimatch", "11.0.0", "11.0.1"), ("glob", "14.0.1", "14.0.2")],
+)
+def test_nested_pnpm_plan_applies_only_in_frontend(
+    tmp_path, package, installed, target
+):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.remediate import apply_plan
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name":"frontend"}', encoding="utf-8")
+    (frontend / "pnpm-lock.yaml").write_text(
+        f"packages:\n  {package}@{installed}: {{}}\n", encoding="utf-8"
+    )
+    hit, _truncated = locate_package(tmp_path, package, installed)
+    plan, reason = plan_remediation(tmp_path, {}, hit, target)
+    assert plan is not None, reason
+    runner = Mock()
+    runner.run.return_value = CommandResult(["pnpm"], 0, "", "", 0, False, "", "")
+
+    # Act
+    result = apply_plan(tmp_path, plan, runner, lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED"
+    assert plan.files == ["frontend/package.json", "frontend/pnpm-lock.yaml"]
+    assert runner.run.call_args.kwargs["cwd"] == frontend.resolve()
+    assert runner.run.call_args.args[0] == [
+        "pnpm",
+        "install",
+        "--lockfile-only",
+        "--ignore-scripts",
+    ]
+    data = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
+    assert data["pnpm"]["overrides"][package] == target
+    assert not (tmp_path / "package.json").exists()
+
+
 @pytest.mark.parametrize("ecosystem", ["npm", "NuGet", "Maven"])
 def test_package_plans_require_version_specific_qualifiers(ecosystem):
     """Attach compatibility, approval, and test obligations to package fixes."""
@@ -53,6 +123,109 @@ def test_package_plans_require_version_specific_qualifiers(ecosystem):
     assert qualifiers["package"] == "example"
     assert qualifiers["target"] == "1.0.1"
     assert len(qualifiers["requirements"]) == 4
+
+
+@pytest.mark.parametrize(
+    "manager, lockfile, contents",
+    [
+        (
+            "npm",
+            "package-lock.json",
+            '{"packages":{"node_modules/example":{"version":"1.0.0"}}}',
+        ),
+        ("yarn", "yarn.lock", 'example@^1.0.0:\n  version "1.0.0"\n'),
+        ("pnpm", "pnpm-lock.yaml", "packages:\n  example@1.0.0: {}\n"),
+    ],
+)
+def test_nested_node_lockfile_uses_its_own_manager(
+    tmp_path, manager, lockfile, contents
+):
+    # Arrange
+    (tmp_path / "package.json").write_text(
+        '{"packageManager":"npm@10.0.0"}', encoding="utf-8"
+    )
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps({"packageManager": f"{manager}@10.0.0"}), encoding="utf-8"
+    )
+    (frontend / lockfile).write_text(contents, encoding="utf-8")
+
+    # Act
+    hit, _truncated = locate_package(tmp_path, "example", "1.0.0")
+
+    # Assert
+    assert hit is not None
+    assert hit.manager == manager
+    assert hit.version == "1.0.0"
+    assert hit.lockfile == f"frontend/{lockfile}"
+    assert hit.manifest == "frontend/package.json"
+
+
+def test_workspace_dependency_keeps_child_manifest_and_shared_lockfile(tmp_path):
+    # Arrange
+    (tmp_path / "package.json").write_text(
+        '{"workspaces":["frontend"]}', encoding="utf-8"
+    )
+    (tmp_path / "package-lock.json").write_text(
+        '{"packages":{"node_modules/example":{"version":"1.0.0"}}}', encoding="utf-8"
+    )
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        '{"dependencies":{"example":"^1.0.0"}}', encoding="utf-8"
+    )
+
+    # Act
+    hit, _truncated = locate_package(tmp_path, "example", "1.0.0")
+
+    # Assert
+    assert hit is not None
+    assert hit.direct is True
+    assert hit.manifest == "frontend/package.json"
+    assert hit.lockfile == "package-lock.json"
+    assert hit.version == "1.0.0"
+
+
+def test_nested_pnpm_workspace_override_preserves_existing_configuration(tmp_path):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.remediate import apply_plan
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    manifest = frontend / "package.json"
+    manifest.write_text('{"name":"frontend"}\n', encoding="utf-8")
+    original = manifest.read_bytes()
+    workspace = frontend / "pnpm-workspace.yaml"
+    workspace.write_text(
+        'packages:\n  - .\n\n# Corporate pins\noverrides:\n  minimatch: "11.0.0"\n  "glob@10>minimatch": 9.0.9\n',
+        encoding="utf-8",
+    )
+    (frontend / "pnpm-lock.yaml").write_text(
+        "packages:\n  minimatch@11.0.0: {}\n", encoding="utf-8"
+    )
+    hit, _truncated = locate_package(tmp_path, "minimatch", "11.0.0")
+    plan, reason = plan_remediation(tmp_path, {}, hit, "11.0.1")
+    assert plan is not None, reason
+    runner = Mock()
+    runner.run.return_value = CommandResult(["pnpm"], 0, "", "", 0, False, "", "")
+
+    # Act
+    result = apply_plan(tmp_path, plan, runner, lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED"
+    assert plan.files == ["frontend/pnpm-workspace.yaml", "frontend/pnpm-lock.yaml"]
+    text = workspace.read_text(encoding="utf-8")
+    assert "# Corporate pins" in text
+    assert 'minimatch: "11.0.1"' in text
+    assert '"glob@10>minimatch": 9.0.9' in text
+    assert manifest.read_bytes() == original
+    assert runner.run.call_args.kwargs["cwd"] == frontend.resolve()
 
 
 def test_unreadable_walk_cannot_prove_package_absence(tmp_path, monkeypatch):

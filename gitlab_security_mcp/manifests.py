@@ -7,7 +7,11 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
+
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
 from gitlab_security_mcp.versions import bump_npm_spec, parse_version, range_allows
@@ -51,6 +55,7 @@ class PackageHit:
     lockfile: str | None
     direct: bool | None
     search_truncated: bool = False
+    override_manifest: str | None = None
 
 
 @dataclass
@@ -267,10 +272,61 @@ def _prefer(versions: list[str], hinted: str | None) -> str | None:
 def locate_npm(
     root: Path, name: str, hinted: str | None, files: list[Path]
 ) -> PackageHit | None:
-    """Locate a Node dependency using manifests and the selected lockfile."""
+    """Locate Node dependencies within each manifest/lockfile component."""
+    components = sorted(
+        {
+            path.parent
+            for path in files
+            if path.name
+            in {"package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"}
+        }
+    )
+    hits = []
+    for component in components:
+        component_files = [path for path in files if path.parent == component]
+        hit = _locate_npm_component(component, name, hinted, component_files)
+        if hit is None:
+            continue
+        if hit.manifest:
+            hit.manifest = _rel(root, component / hit.manifest)
+        if hit.lockfile:
+            hit.lockfile = _rel(root, component / hit.lockfile)
+        if hit.override_manifest:
+            hit.override_manifest = _rel(root, component / hit.override_manifest)
+        hits.append(hit)
+    for hit in hits:
+        if not hit.direct or hit.lockfile or not hit.manifest:
+            continue
+        owners = [
+            candidate
+            for candidate in hits
+            if candidate.lockfile
+            and Path(hit.manifest).parent.is_relative_to(
+                Path(candidate.lockfile).parent
+            )
+        ]
+        if owners:
+            owner = max(
+                owners, key=lambda candidate: len(Path(candidate.lockfile).parts)
+            )
+            hit.lockfile = owner.lockfile
+            hit.version = owner.version
+            hit.manager = owner.manager
+            hit.override_manifest = owner.override_manifest
+    if hinted:
+        matched = [hit for hit in hits if hit.version == hinted]
+        if matched:
+            return next((hit for hit in matched if hit.direct), matched[0])
+    return next((hit for hit in hits if hit.direct), hits[0] if hits else None)
+
+
+def _locate_npm_component(
+    root: Path, name: str, hinted: str | None, files: list[Path]
+) -> PackageHit | None:
+    """Keep dependency specifications and lock evidence in one component."""
     manifests = [path for path in files if path.name == "package.json"]
     spec = None
-    manifest = None
+    manifest = "package.json" if manifests else None
     direct = False
     for path in manifests:
         data = _read_json(path)
@@ -284,7 +340,15 @@ def locate_npm(
             break
     lock_versions: list[str] = []
     lock_rel = None
-    manager = detect_stack(root, files).node_manager or "npm"
+    manager = detect_stack(root, files).node_manager
+    if manager is None:
+        manager = (
+            "pnpm"
+            if (root / "pnpm-lock.yaml").is_file()
+            else "yarn"
+            if (root / "yarn.lock").is_file()
+            else "npm"
+        )
     if manager == "pnpm":
         lock = root / "pnpm-lock.yaml"
         if lock.exists():
@@ -317,6 +381,9 @@ def locate_npm(
         manifest=manifest,
         lockfile=lock_rel,
         direct=direct,
+        override_manifest="pnpm-workspace.yaml"
+        if manager == "pnpm" and (root / "pnpm-workspace.yaml").is_file()
+        else None,
     )
 
 
@@ -668,14 +735,35 @@ def _json_layout(text: str) -> tuple[str | int, str]:
     return (indent if "\t" in indent else len(indent)), newline
 
 
-def add_npm_override(root: Path, package: str, version: str, manager: str) -> str:
+def add_npm_override(
+    root: Path, package: str, version: str, manager: str, manifest: str = "package.json"
+) -> str:
     """Pin a transitive package with npm overrides, pnpm overrides, or yarn resolutions.
 
     The file is rewritten as JSON, keeping its indent, line endings, and
     non-ASCII text, so the diff is the new override block.
     """
-    path = _destination(root, "package.json")
+    path = _destination(root, manifest)
     text = _read(path)
+    if manager == "pnpm" and path.name == "pnpm-workspace.yaml":
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        yaml.indent(mapping=2, sequence=4, offset=2)
+        yaml.line_break = "\r\n" if "\r\n" in text else "\n"
+        try:
+            data = yaml.load(text)
+            if not isinstance(data, dict):
+                raise ValueError("pnpm-workspace.yaml must contain a mapping")
+            overrides = data.setdefault("overrides", {})
+            if not isinstance(overrides, dict):
+                raise ValueError("pnpm workspace overrides must contain a mapping")
+            overrides[package] = version
+            stream = StringIO()
+            yaml.dump(data, stream)
+        except YAMLError as exc:
+            raise ValueError("Could not parse pnpm-workspace.yaml safely") from exc
+        _write(path, stream.getvalue())
+        return manifest
     data = _read_json(path)
     if manager == "pnpm":
         data.setdefault("pnpm", {}).setdefault("overrides", {})[package] = version
@@ -686,7 +774,7 @@ def add_npm_override(root: Path, package: str, version: str, manager: str) -> st
     indent, newline = _json_layout(text)
     rendered = json.dumps(data, indent=indent, ensure_ascii=False) + "\n"
     _write(path, rendered.replace("\n", newline))
-    return "package.json"
+    return manifest
 
 
 def update_csproj_version(
