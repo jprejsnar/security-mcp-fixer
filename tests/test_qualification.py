@@ -11,8 +11,10 @@ from gitlab_security_mcp.commands import CommandResult, assert_allowed
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.qualification import (
     load_policy,
+    review_major_upgrade,
     review_package,
     run_checks,
+    scan_package_callers,
     tree_snapshot,
     validate_edits,
 )
@@ -170,6 +172,304 @@ def package_review():
         ],
         "source_fixes": [],
     }
+
+
+def test_major_review_requires_hashed_callers_and_no_code_changes(
+    tmp_path, package_review
+):
+    # Arrange
+    import hashlib
+
+    source = tmp_path / "app.ts"
+    source.write_text('import example from "example";\nexample();\n', encoding="utf-8")
+    plan = {
+        "major_upgrade": True,
+        "ecosystem": "npm",
+        "package": "example",
+        "installed": "1.0.0",
+        "target": "2.0.0",
+        "strategy": "manifest_bump",
+        "files": ["package.json"],
+    }
+    plan["caller_scan"] = scan_package_callers(tmp_path, plan)
+    package_review["major_upgrade"] = {
+        "scan_id": plan["caller_scan"]["scan_id"],
+        "compatible_without_code_changes": True,
+        "caller_breakages_found": False,
+        "migration_sources": ["https://example.test/migration/2"],
+        "api_comparison": "The used default export is unchanged across versions",
+        "caller_assessment": "The app call uses the unchanged signature",
+        "dependency_assessment": "No transitive consumer uses this direct dependency",
+        "reviewed_files": [
+            {
+                "path": "app.ts",
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "assessment": "Unchanged call signature",
+            }
+        ],
+    }
+
+    # Act
+    accepted = review_major_upgrade(tmp_path, plan, package_review)
+
+    # Assert
+    assert accepted["scan"]["source_files_scanned"] == 1
+    assert accepted["scan"]["references"] == [{"path": "app.ts", "lines": [1, 2]}]
+    package_review["source_fixes"] = [{"path": "app.ts", "reason": "Adapt API"}]
+    with pytest.raises(ValueError, match="cannot adjust"):
+        review_major_upgrade(tmp_path, plan, package_review)
+    package_review["source_fixes"] = []
+    source.write_text("changed();", encoding="utf-8")
+    with pytest.raises(ValueError, match="scan changed"):
+        review_major_upgrade(tmp_path, plan, package_review)
+
+
+def test_caller_scan_does_not_confuse_glob_with_global(tmp_path):
+    # Arrange
+    (tmp_path / "app.ts").write_text(
+        'globalThis.name;\nconst globalValue = true;\nimport {glob} from "glob";\n',
+        encoding="utf-8",
+    )
+
+    # Act
+    scan = scan_package_callers(tmp_path, {"package": "glob", "target": "14.0.2"})
+
+    # Assert
+    assert scan["references"] == [{"path": "app.ts", "lines": [3]}]
+
+
+@pytest.fixture
+def major_package_update(tmp_path, package_engine, package_policy, package_review):
+    # Arrange
+    import hashlib
+
+    source = tmp_path / "app.ts"
+    source.write_text('import example from "example";\nexample();\n', encoding="utf-8")
+    package_engine.advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved",
+        affected=True,
+        lowest_fixed_version="2.0.0",
+        fixed_versions=["2.0.0"],
+    )
+    path, policy, _plan = package_policy
+    policy["approvals"][0]["target"] = "2.0.0"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    verified = package_engine.verify_security_finding("package")
+    package_review["target"] = "2.0.0"
+    package_review["major_upgrade"] = {
+        "scan_id": verified["proposed_fix"]["caller_scan"]["scan_id"],
+        "compatible_without_code_changes": True,
+        "caller_breakages_found": False,
+        "migration_sources": ["https://example.test/migration/2"],
+        "api_comparison": "Used default-export API is unchanged",
+        "caller_assessment": "Application call uses the unchanged signature",
+        "dependency_assessment": "Direct dependency; no additional callers",
+        "reviewed_files": [
+            {
+                "path": "app.ts",
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "assessment": "Used API remains supported",
+            }
+        ],
+    }
+    return package_engine, package_review, source
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "build", "unit_tests", "source_edit", "script_edit"]
+)
+def test_major_update_requires_passing_checks_without_code_adjustments(
+    major_package_update, failure
+):
+    # Arrange
+    engine, review, source = major_package_update
+    original = source.read_bytes()
+    qualified = engine.qualify_package_update("package", review)
+    assert qualified["status"] == "QUALIFIED", qualified
+
+    # Act
+    applied = engine.apply_minimal_fix("package")
+    assert applied["status"] == "APPLIED", applied
+    if failure == "source_edit":
+        source.write_text("adapted();\n", encoding="utf-8")
+    elif failure == "script_edit":
+        manifest = engine.repo_root / "package.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["scripts"]["test"] = "echo bypassed"
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+    elif failure:
+
+        def fail_check(argv, **kwargs):
+            """Simulate product failures after an otherwise passing baseline."""
+            failed = argv[1:] == (["run", "build"] if failure == "build" else ["test"])
+            return CommandResult(
+                argv, 1 if failed else 0, "CHECK_PASSED", "", 0, False, "", ""
+            )
+
+        engine.runner.run.side_effect = fail_check
+    result = engine.run_validation_matrix()
+
+    # Assert
+    if failure:
+        assert result["status"] == "VALIDATION_FAILED"
+        assert engine.state.changes[0]["qualification_status"] == "PENDING_VALIDATION"
+    else:
+        assert result["status"] == "VALIDATION_COMPLETE"
+        assert engine.state.changes[0]["qualification_status"] == "VALIDATED"
+    if failure != "source_edit":
+        assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("compatible_without_code_changes", False),
+        ("caller_breakages_found", True),
+        ("migration_sources", []),
+        ("reviewed_files", []),
+        ("api_comparison", ""),
+    ],
+)
+def test_major_update_refuses_missing_or_breaking_review(
+    major_package_update, field, value
+):
+    # Arrange
+    engine, review, _source = major_package_update
+    review["major_upgrade"][field] = value
+
+    # Act
+    result = engine.qualify_package_update("package", review)
+
+    # Assert
+    assert result["status"] == "QUALIFICATION_REQUIRED"
+    assert not engine.state.changes
+    assert (
+        engine.state.findings[0]["packageQualification"]["review"]["major_upgrade"][
+            field
+        ]
+        == value
+    )
+    engine.runner.run.assert_not_called()
+
+
+def test_transitive_major_update_requires_dependency_source_review(
+    major_package_update,
+):
+    # Arrange
+    engine, review, _source = major_package_update
+    plan = engine.state.findings[0]["proposedFix"]
+    plan["strategy"] = "override"
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="installed dependency caller"):
+        review_major_upgrade(engine.repo_root, plan, review)
+
+
+@pytest.mark.parametrize(
+    "package, installed, target",
+    [("minimatch", "10.2.6", "11.0.1"), ("glob", "10.5.0", "14.0.2")],
+)
+def test_nested_transitive_pnpm_major_update_preserves_callers(
+    tmp_path, package_policy, package_review, package, installed, target
+):
+    # Arrange
+    import hashlib
+    from unittest.mock import Mock
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps(
+            {
+                "packageManager": "pnpm@10.0.0",
+                "scripts": {"build": "build", "test": "test"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (frontend / "pnpm-workspace.yaml").write_text(
+        f"packages:\n  - .\noverrides:\n  {package}: {installed}\n", encoding="utf-8"
+    )
+    lock = frontend / "pnpm-lock.yaml"
+    lock.write_text(f"packages:\n  {package}@{installed}: {{}}\n", encoding="utf-8")
+    source = frontend / "app.ts"
+    source.write_text("export const app = true;\n", encoding="utf-8")
+    consumer = frontend / "node_modules" / "consumer" / "index.js"
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text(f'const api = require("{package}");\n', encoding="utf-8")
+    original = {path: path.read_bytes() for path in (source, consumer)}
+    policy_path, policy, _plan = package_policy
+    policy["approvals"][0].update(package=package, target=target)
+    for check in policy["checks"]["npm"].values():
+        check["argv"][0] = "pnpm"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    runner = Mock()
+
+    def run(argv, **kwargs):
+        """Simulate a locked resolution update and successful real-check markers."""
+        assert_allowed(argv, tmp_path)
+        if argv[1:] == ["install", "--lockfile-only", "--ignore-scripts"]:
+            assert kwargs["cwd"] == frontend.resolve()
+            lock.write_text(
+                f"packages:\n  {package}@{target}: {{}}\n", encoding="utf-8"
+            )
+        return CommandResult(argv, 0, "CHECK_PASSED", "", 0, False, "", "")
+
+    runner.run.side_effect = run
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved",
+        affected=True,
+        lowest_fixed_version=target,
+        fixed_versions=[target],
+    )
+    engine = Engine(
+        tmp_path,
+        runner=runner,
+        advisory=advisory,
+        gitlab=Mock(),
+        which=lambda name: name,
+    )
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [
+        {
+            "id": package,
+            "component": package,
+            "installedVersion": installed,
+            "category": "dependency_scanning",
+        }
+    ]
+    verified = engine.verify_security_finding(package)
+    package_review.update(package=package, target=target)
+    package_review["major_upgrade"] = {
+        "scan_id": verified["proposed_fix"]["caller_scan"]["scan_id"],
+        "compatible_without_code_changes": True,
+        "caller_breakages_found": False,
+        "migration_sources": ["https://example.test/target-api"],
+        "api_comparison": "Used dependency API is unchanged",
+        "caller_assessment": "No application adaptation required",
+        "dependency_assessment": "Installed consumer uses supported exports",
+        "reviewed_files": [
+            {
+                "path": path.relative_to(tmp_path).as_posix(),
+                "sha256": hashlib.sha256(contents).hexdigest(),
+                "assessment": "Used API remains supported",
+            }
+            for path, contents in original.items()
+        ],
+    }
+
+    # Act
+    qualified = engine.qualify_package_update(package, package_review)
+    applied = engine.apply_minimal_fix(package)
+    validated = engine.run_validation_matrix()
+
+    # Assert
+    assert qualified["status"] == "QUALIFIED", qualified
+    assert applied["status"] == "APPLIED", applied
+    assert validated["status"] == "VALIDATION_COMPLETE", validated
+    assert engine.state.changes[0]["qualification_status"] == "VALIDATED"
+    assert all(path.read_bytes() == contents for path, contents in original.items())
 
 
 @pytest.mark.parametrize(

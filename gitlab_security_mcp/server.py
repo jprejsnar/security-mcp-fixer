@@ -35,6 +35,13 @@ Local-only GitLab security remediation. Call the tools in this order:
     framework/BOM/runtime, weaken tests, or force incompatible peer resolution
     just to make a security package install. Unsupported/uncertain candidates
     require manual review, not a guessed compatibility claim.
+    Do not skip a package merely because its major version changes. Use the
+    proposed caller_scan as a starting point, read the old/target APIs and
+    migration guides, and inspect actual application and installed dependency
+    callers (including wrappers, dynamic calls, options and return values).
+    No direct imports does not establish transitive compatibility. Record
+    concrete caller breakages when found; distinguish incomplete evidence
+    from proven breakage. Never claim 100% runtime compatibility from a scan.
 7. qualify_package_update with the exact version-bound documentation review.
     Corporate approvers must provision PACKAGE_UPDATE_POLICY independently.
     Do not create, edit, or invent license approvals. Free commercial use,
@@ -45,6 +52,10 @@ Local-only GitLab security remediation. Call the tools in this order:
     declared surgical source fixes and meaningful AAA regression tests using
     the host's editor. At most 5 source/test files and 200 added/deleted lines;
     larger migrations require manual review. No broad product rewrite.
+    Major package candidates require major_upgrade review evidence and
+    source_fixes=[]. Do not adjust source, tests, frameworks, or test scripts
+    to make a major update pass. Skip incompatible callers for review with
+    their concrete API evidence, not just a version-number warning.
 9. generate_aaa_test for supported base-image changes; it does not invent
     arbitrary API tests. Dependency-only fixes retain the product unit suite.
 10. run_validation_matrix after each package update. Required baseline and
@@ -191,6 +202,13 @@ def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str,
     attestations are audited, not independent proof of documentation reading.
     Corporate approval comes only from the configured policy file. This tool
     runs the product baseline and all policy checks before permitting an edit.
+    For proposed major_upgrade=true also provide major_upgrade {scan_id from
+    proposed_fix.caller_scan, compatible_without_code_changes:true,
+    caller_breakages_found:false, migration_sources:[official HTTPS URLs],
+    api_comparison, caller_assessment, dependency_assessment,
+    reviewed_files:[{path, sha256, assessment}]}. Read every source reference
+    and relevant installed dependency callers. Major source_fixes must be [].
+    This is reviewed evidence, not a mathematical compatibility guarantee.
     """
     return _run("qualify_package_update", finding_id, review)
 

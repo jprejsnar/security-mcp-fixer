@@ -469,7 +469,7 @@ def _finding(fid, package, identifier, version="1.0.0"):
         ("package_mismatch", None, "4.17.21", "MANUAL_REVIEW"),
         ("lookup_failed", None, None, "MANUAL_REVIEW"),
         ("not_found", None, None, "MANUAL_REVIEW"),
-        ("resolved", True, "5.0.0", "MANUAL_REVIEW"),
+        ("resolved", True, "5.0.0", "CHANGE_REQUIRED"),
         ("resolved", True, "not-a-version", "NO_SAFE_FIX"),
     ],
 )
@@ -506,7 +506,7 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
     assert result["eligible_for_auto_fix"] is False
     assert result["qualification_required"] is (expected == "CHANGE_REQUIRED")
     if expected == "CHANGE_REQUIRED":
-        assert result["proposed_fix"]["target"] == "4.17.21"
+        assert result["proposed_fix"]["target"] == fixed
         assert result["proposed_fix"]["package"] == "lodash"
         assert result["proposed_fix"]["strategy"] == "manifest_bump"
     else:
@@ -832,12 +832,9 @@ def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
 
     # Assert
     advisory.lookup.assert_called_once_with(finding, "npm", package, installed)
-    if major:
-        assert verified["decision"] == "MANUAL_REVIEW"
-        assert "major upgrade" in verified["reason"]
-        assert "not resolved locally" not in verified["reason"]
-        return
     assert verified["decision"] == "CHANGE_REQUIRED"
+    if major:
+        assert any("Major-version candidate" in item for item in verified["evidence"])
     assert verified["proposed_fix"]["target"] == target
     assert verified["proposed_fix"]["files"] == [
         "frontend/package.json",
@@ -1340,7 +1337,7 @@ def test_incomplete_plan_is_refused(repo):
     assert applied["reason"] == "Proposed fix is incomplete."
 
 
-def test_major_version_fix_needs_a_person(repo):
+def test_major_version_fix_needs_caller_qualification(repo):
     # Arrange
     (repo / "package.json").write_text(
         json.dumps({"dependencies": {"minimist": "0.2.1"}}), encoding="utf-8"
@@ -1374,9 +1371,11 @@ def test_major_version_fix_needs_a_person(repo):
     decision = engine.verify_security_finding("major")
 
     # Assert
-    assert decision["decision"] == "MANUAL_REVIEW"
-    assert "major upgrade" in decision["reason"]
-    assert decision["user_prompt"]
+    assert decision["decision"] == "CHANGE_REQUIRED"
+    assert decision["qualification_required"]
+    assert decision["proposed_fix"]["major_upgrade"] is True
+    assert decision["proposed_fix"]["caller_scan"]["scan_id"]
+    assert not decision["eligible_for_auto_fix"]
 
 
 def test_generated_test_never_overwrites_an_existing_file(repo):

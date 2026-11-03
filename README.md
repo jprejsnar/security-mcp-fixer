@@ -203,7 +203,7 @@ A finding is auto-fixed only when all of these are true:
 - Local evidence shows the vulnerable package or image is present.
 - An online advisory confirms it and publishes a fixed version newer than what is installed.
 - The edit is a lockfile refresh, a manifest version bump, a package override, or an unpinned `FROM` tag bump.
-- The fix stays within the installed major version (or the same minor for `0.x`). A major jump is skipped and listed for you.
+- Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing baseline/post-update checks. Major image-tag changes still require manual review.
 - Package updates also pass the mandatory compatibility, corporate-approval, and before/after product-check qualifiers below. Same-major does not prove compatibility.
 
 An advisory that names the identifier but not the package found in the repo is listed for you to review. It is not reported as a false positive, because the cause may be a naming difference.
@@ -301,12 +301,30 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
    recognizing an SPDX string is insufficient. Unknown/unapproved terms block.
 
 An incompatible or uncertain target is skipped for review. If documented API
-changes need only small caller adaptations, the AI declares the source/test paths
+changes in a non-major package update need only small caller adaptations, the AI declares the source/test paths
 in its review, applies the package update, makes those adaptations and regression
 tests, then reruns validation. Source changes are limited to five supported
 source/test files and 200 added/deleted lines in total. Undeclared edits or larger
 migrations fail qualification. Do not weaken assertions, skip tests, or rewrite
 the product to obtain passing results.
+
+A major number alone is not evidence that a caller breaks. For major package
+candidates, verification returns a bounded lexical `caller_scan` with a
+fingerprint and source-reference locations. The host must read old/target
+official APIs and migration guides, inspect those sources and installed
+dependency consumers, and distinguish concrete incompatible calls from missing
+evidence. No direct imports does not prove transitive compatibility. Static
+scans, documentation attestations, builds, and tests cannot establish 100%
+compatibility for every execution path.
+
+Automatic major updates permit no source/test adaptations. `source_fixes` must
+be empty, reviewed caller files must have current SHA256 evidence, and all
+identified source references must be assessed. Transitive npm updates also
+require installed `node_modules` consumer source evidence. The server rejects
+stale scans and source/test changes, and records the reviewed evidence. A failed
+or skipped build/unit test never becomes a validated fix. Existing runtime,
+license, and corporate approval gates still apply; failed edits remain local
+and unresolved rather than being automatically rolled back.
 
 #### Package update sequence
 
@@ -454,8 +472,38 @@ actual review. This illustrative input is not evidence for a real package:
 Include every relevant framework/runtime/BOM and publisher source. For adaptations,
 replace `source_fixes: []` with declared `{path, reason}` entries for the small
 caller and regression-test changes. The host AI edits these files after package
-application, not arbitrary files or manifests. Existing major-upgrade refusals
-still apply; this tool does not bypass them or support guessed SAST rewrites.
+application, not arbitrary files or manifests. These adaptations are only for
+non-major package updates; major candidates require unchanged source/tests.
+Guessed SAST rewrites remain unsupported.
+
+For `proposed_fix.major_upgrade=true`, also include the following review object.
+Use the scan ID returned by verification and actual SHA256 hashes of the files
+read. These example values are placeholders, not compatibility evidence:
+
+```json
+{
+  "major_upgrade": {
+    "scan_id": "FROM_PROPOSED_FIX_CALLER_SCAN",
+    "compatible_without_code_changes": true,
+    "caller_breakages_found": false,
+    "migration_sources": ["https://publisher.example/migration-to-target"],
+    "api_comparison": "Reviewed changes from installed to target; APIs actually used remain supported",
+    "caller_assessment": "Actual arguments, options, callbacks and return-value usage reviewed",
+    "dependency_assessment": "Actual transitive consumers and their runtime requirements reviewed",
+    "reviewed_files": [{
+      "path": "frontend/src/actual-caller.ts",
+      "sha256": "ACTUAL_FILE_SHA256",
+      "assessment": "Concrete API compatibility findings for this caller"
+    }]
+  }
+}
+```
+
+For transitive packages, include the relevant installed dependency source files
+as well as repository references, not only an application file. Supply this
+object alongside the normal exact-target documentation/framework review and
+`source_fixes: []`. Evidence is checked again after baseline validation and
+before applying the plan; reverify if the checkout/callers change.
 
 `QUALIFICATION_REQUIRED` blocks an edit. `QUALIFIED` authorizes only the exact
 reviewed plan on the unchanged pruned source checkout and unchanged policy.

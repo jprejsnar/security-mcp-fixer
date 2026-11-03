@@ -29,8 +29,10 @@ from gitlab_security_mcp.manifests import (
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
     load_policy,
+    review_major_upgrade,
     review_package,
     run_checks,
+    scan_package_callers,
     tree_snapshot,
     validate_edits,
 )
@@ -542,6 +544,7 @@ class Engine:
                     "Documentation review must identify the exact ecosystem, package, and target"
                 )
             source_before = review_package(self.repo_root, review)
+            major_review = review_major_upgrade(self.repo_root, plan, review)
             policy = load_policy(self.repo_root, self.package_policy_path, plan)
             baseline = run_validation(
                 self.repo_root, self.runner, self.which, timeout=self.validation_timeout
@@ -560,10 +563,13 @@ class Engine:
                 raise ValueError(
                     "Baseline build, unit-test, runtime, or dependency-license evidence is failed/incomplete"
                 )
+            if major_review is not None:
+                major_review = review_major_upgrade(self.repo_root, plan, review)
             receipt = {
                 "status": "QUALIFIED",
                 "plan": deepcopy(plan),
                 "review": deepcopy(review),
+                "major_review": major_review,
                 **policy,
                 "source_before": source_before,
                 "tree": tree_snapshot(self.repo_root),
@@ -571,6 +577,10 @@ class Engine:
             }
         except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
             finding["packageQualification"] = {"status": "BLOCKED", "reason": str(exc)}
+            if plan.get("major_upgrade") and isinstance(review, dict):
+                finding["packageQualification"].update(
+                    plan=deepcopy(plan), review=deepcopy(review)
+                )
             self._remember()
             return {
                 "status": "QUALIFICATION_REQUIRED",
@@ -649,6 +659,7 @@ class Engine:
                     raise ValueError(
                         "Checkout or corporate policy changed; requalify the exact plan"
                     )
+                review_major_upgrade(self.repo_root, proposed, receipt["review"])
             except (
                 OSError,
                 ValueError,
@@ -1133,7 +1144,8 @@ class Engine:
                 )
             return "NO_SAFE_FIX", plan_reason, evidence, None, None
         evidence.append(f"Minimal fix score {plan.score}: {plan.description}")
-        if is_major_upgrade(plan.installed or installed, plan.target):
+        major_upgrade = is_major_upgrade(plan.installed or installed, plan.target)
+        if major_upgrade and plan.ecosystem not in PACKAGE_ECOSYSTEMS:
             reason = (
                 f"The lowest fixed version {plan.target} is a major upgrade from {plan.installed or installed}. "
                 "That can break callers, so it was not applied automatically."
@@ -1156,9 +1168,17 @@ class Engine:
             )
         if plan.ecosystem in PACKAGE_ECOSYSTEMS:
             evidence.append(
-                "Candidate only: same-major does not establish framework/API compatibility or commercial license approval. qualify_package_update and all before/after product checks are required."
+                "Candidate only: version numbering does not establish framework/API compatibility or commercial license approval. qualify_package_update and all before/after product checks are required."
             )
-        return "CHANGE_REQUIRED", plan.description, evidence, plan.as_dict(), None
+            if major_upgrade:
+                evidence.append(
+                    "Major-version candidate: review target APIs and actual callers before deciding compatibility. No source/test adjustments are permitted for an automatic major update."
+                )
+        proposed = plan.as_dict()
+        if major_upgrade and plan.ecosystem in PACKAGE_ECOSYSTEMS:
+            proposed["major_upgrade"] = True
+            proposed["caller_scan"] = scan_package_callers(self.repo_root, proposed)
+        return "CHANGE_REQUIRED", plan.description, evidence, proposed, None
 
     def _prompt(
         self, finding: dict, looked_up: AdvisoryLookup | None, reason: str

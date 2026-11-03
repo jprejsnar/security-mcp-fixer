@@ -157,6 +157,7 @@ def render(
                     "reason",
                     "plan",
                     "review",
+                    "major_review",
                     "approval",
                     "policy_sha256",
                     "baseline_results",
