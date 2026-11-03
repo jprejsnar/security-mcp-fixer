@@ -7,16 +7,25 @@ import logging
 import os
 import shutil
 import threading
+from collections.abc import Callable
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
-from typing import Callable
 
 from gitlab_security_mcp.aaa import generate_aaa_test
-from gitlab_security_mcp.advisory import PACKAGE_MISMATCH, AdvisoryClient, AdvisoryLookup
+from gitlab_security_mcp.advisory import (
+    PACKAGE_MISMATCH,
+    AdvisoryClient,
+    AdvisoryLookup,
+)
 from gitlab_security_mcp.commands import CommandRunner
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
 from gitlab_security_mcp.gitlab_client import GitLabClient
-from gitlab_security_mcp.manifests import iter_files, locate_package, manifests_were_parsed
+from gitlab_security_mcp.manifests import (
+    iter_files,
+    locate_package,
+    manifests_were_parsed,
+)
 from gitlab_security_mcp.remediate import Plan, apply_plan, plan_remediation
 from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.state import RunState
@@ -26,7 +35,7 @@ from gitlab_security_mcp.versions import is_major_upgrade, parse_version
 
 logger = logging.getLogger("gitlab_security_mcp")
 
-AFTER_BRANCH = {"BRANCH_CREATED", "FINDINGS_LISTED", "FIXES_IN_PROGRESS", "VALIDATION_COMPLETE", "VALIDATION_FAILED", "REPORT_GENERATED"}
+AFTER_BRANCH = {"BRANCH_CREATED", "FINDINGS_LISTED", "FIXES_IN_PROGRESS", "VALIDATION_COMPLETE", "VALIDATION_INCOMPLETE", "VALIDATION_FAILED", "REPORT_GENERATED"}
 
 
 def _serialized(method):
@@ -34,18 +43,28 @@ def _serialized(method):
 
     MCP may run sync tools on different threads. The lock is re-entrant
     so a tool can call another tool method without deadlocking.
+    Copy results before unlocking so callers cannot mutate active state.
     """
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
+        """Reject calls after close and detach results while holding the lock."""
         with self._lock:
-            return method(self, *args, **kwargs)
+            if self._closed:
+                return {"status": "ERROR", "reason": "Engine is closed"}
+            return deepcopy(method(self, *args, **kwargs))
 
     return wrapper
 
 
 class Engine:
-    """One remediation run. Public methods are safe to call from MCP threads."""
+    """Coordinate one local run through serialized public tool methods.
+
+    The state attribute holds active decisions, changes, and validation.
+    Call prechecks, branch creation, retrieval, verification, remediation,
+    validation, and reporting in phase order. Close ends the run and
+    releases owned HTTP clients, but never injected dependencies.
+    """
 
     def __init__(
         self,
@@ -63,32 +82,63 @@ class Engine:
         github_token: str | None = None,
         nvd_api_key: str | None = None,
     ):
+        """Initialize state and optionally create HTTP clients and a runner.
+
+        repo_root bounds all local operations. Callers retain ownership of
+        injected clients; close releases only clients created here.
+        which and today can replace environment-dependent lookup and time.
+        Initialization errors propagate after owned-client cleanup.
+        """
         self.repo_root = Path(repo_root).resolve()
         self._lock = threading.RLock()
-        self.runner = runner or CommandRunner(self.repo_root)
+        self.runner = runner if runner is not None else CommandRunner(self.repo_root)
         self.git = GitOps(self.repo_root, self.runner)
         self._owns_gitlab = gitlab is None
         self._owns_advisory = advisory is None
-        self.gitlab = gitlab or GitLabClient(gitlab_token, gitlab_api_url)
-        self.advisory = advisory or AdvisoryClient(github_token=github_token, nvd_api_key=nvd_api_key)
-        self.which = which or shutil.which
+        self.gitlab = gitlab if gitlab is not None else GitLabClient(gitlab_token, gitlab_api_url)
+        try:
+            self.advisory = advisory if advisory is not None else AdvisoryClient(github_token=github_token, nvd_api_key=nvd_api_key)
+        except BaseException:
+            if self._owns_gitlab:
+                try:
+                    self.gitlab.close()
+                except Exception:
+                    logger.exception("Could not close GitLab client after initialization failure")
+            raise
+        self.which = which if which is not None else shutil.which
         self.today = today or date.today()
         self.project_id = project_id
         self.validation_timeout = validation_timeout
         self.state = RunState()
         self._files: list[Path] | None = None
         self._files_truncated = False
+        self._closed = False
 
     def close(self) -> None:
-        """Close HTTP clients this engine created. Injected clients stay open."""
-        if self._owns_gitlab:
-            self.gitlab.close()
-        if self._owns_advisory:
-            self.advisory.close()
+        """Wait for active tools and close each owned HTTP client once.
+
+        Injected clients stay open. Cleanup failures propagate after both
+        owned clients are attempted; later tool calls return an error.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                if self._owns_gitlab:
+                    self.gitlab.close()
+            finally:
+                if self._owns_advisory:
+                    self.advisory.close()
 
     @classmethod
     def from_env(cls) -> Engine:
-        """Build an engine from the process environment."""
+        """Build an engine from repository, API, and credential settings.
+
+        REPO_ROOT defaults to the current directory. GitLab and advisory
+        credentials are optional until their services are needed.
+        VALIDATION_TIMEOUT_SEC defaults to 600 and must parse as an integer.
+        """
         root = Path(os.environ.get("REPO_ROOT") or os.getcwd()).resolve()
         timeout = int(os.environ.get("VALIDATION_TIMEOUT_SEC", "600"))
         return cls(
@@ -102,6 +152,7 @@ class Engine:
         )
 
     def _remember(self) -> None:
+        """Persist the current run snapshot; let storage failures propagate."""
         self.state.save(self.repo_root)
 
     def _snapshot(self) -> tuple[list[Path], bool]:
@@ -111,6 +162,7 @@ class Engine:
         return self._files, self._files_truncated
 
     def _drop_snapshot(self) -> None:
+        """Invalidate cached file discovery after local changes."""
         self._files = None
 
     @_serialized
@@ -244,7 +296,7 @@ class Engine:
             "project_path": fetched.project_path,
             "pipeline": fetched.pipeline,
             "findings": fetched.findings,
-            "note": "Read-only GraphQL from the latest successful pipeline on the default branch. Dismissed and resolved findings are excluded.",
+            "note": "Read-only GraphQL from the project vulnerability report. Filters: Needs triage or Confirmed; tracked branch main; Still detected. Pipeline provenance is recorded per finding.",
         }
 
     @_serialized
@@ -255,8 +307,13 @@ class Engine:
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
+        try:
+            decision, reason, evidence, proposed, prompt = self._decide(finding)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            reason = f"Finding evidence could not be read safely: {exc}"
+            decision, evidence, proposed = "MANUAL_REVIEW", [reason], None
+            prompt = self._prompt(finding, None, reason)
         self.state.forget(finding_id)
-        decision, reason, evidence, proposed, prompt = self._decide(finding)
         assessment = {"decision": decision, "reason": reason, "evidence": evidence}
         finding["remediationDecision"] = decision
         finding["assessment"] = assessment
@@ -380,7 +437,8 @@ class Engine:
             self.state.status = "VALIDATION_FAILED"
             self.state.stop_stage = "validation"
         else:
-            self.state.status = "VALIDATION_COMPLETE"
+            self.state.status = outcome["status"]
+            self.state.stop_stage = None
         self._remember()
         return outcome
 
@@ -421,6 +479,12 @@ class Engine:
         }
 
     def _decide(self, finding: dict) -> tuple[str, str, list[str], dict | None, str | None]:
+        """Combine local evidence and advisories without guessing safe edits.
+
+        Return a decision, reason, evidence, optional plan, and optional
+        review prompt. Unknown reachability never proves a false positive.
+        Major upgrades and unresolved transitive dependencies need review.
+        """
         evidence = [
             "Reachability of the vulnerable code path was not determined. Unknown reachability is not treated as a false positive."
         ]
@@ -462,6 +526,9 @@ class Engine:
         elif truncated:
             evidence.append("Manifest search hit the file cap, so absence is not evidence of a false positive.")
         elif category == "dependency_scanning" and component and manifests_were_parsed(self.repo_root, files):
+            if any(path.suffix.lower() in {".csproj", ".fsproj", ".vbproj"} or path.name in {"pom.xml", "build.gradle", "build.gradle.kts", "libs.versions.toml", "Directory.Packages.props"} for path in files):
+                reason = "The package was not resolved locally. Java and NuGet manifests do not enumerate every transitive dependency; manual dependency-tree review is required."
+                return "MANUAL_REVIEW", reason, [*evidence, reason], None, self._prompt(finding, None, reason)
             evidence.append(f"{component} was not found in the parsed manifests or lockfiles.")
             return "FALSE_POSITIVE", f"{component} is not present in the parsed dependency files.", evidence, None, None
 
@@ -518,6 +585,7 @@ class Engine:
         return "CHANGE_REQUIRED", plan.description, evidence, plan.as_dict(), None
 
     def _prompt(self, finding: dict, looked_up: AdvisoryLookup | None, reason: str) -> str:
+        """Explain why human review is needed without endorsing GitLab hints."""
         solution = finding.get("solution") or "none"
         mentioned = ", ".join(finding.get("fixedVersions") or []) or "none"
         return (
@@ -528,9 +596,11 @@ class Engine:
         )
 
     def _finding(self, finding_id: str) -> dict | None:
+        """Return the active finding matching an id, or None if absent."""
         return next((item for item in self.state.findings if item.get("id") == finding_id), None)
 
     def _stop(self, status: str, stage: str, payload: dict) -> dict:
+        """Record and persist the failed phase before returning its details."""
         self.state.status = status
         self.state.stop_stage = stage
         self._remember()

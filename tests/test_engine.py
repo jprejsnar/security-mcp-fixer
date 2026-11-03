@@ -1,22 +1,245 @@
+"""Verify local phase decisions, safe edits, reporting, and shutdown order."""
+
 import hashlib
 import json
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from gitlab_security_mcp.advisory import AdvisoryLookup
-from gitlab_security_mcp.commands import CommandResult, CommandRunner, assert_allowed, tool_name
+from gitlab_security_mcp.commands import (
+    CommandResult,
+    CommandRunner,
+    assert_allowed,
+    tool_name,
+)
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.git_ops import branch_name_for
+
+
+@pytest.mark.parametrize("manifest, contents", [
+    ("package.json", "not-json"),
+    ("package.json", "[]"),
+    ("package.json", '{"dependencies":[]}'),
+    ("package-lock.json", '{"packages":[]}'),
+    ("pom.xml", "<project>"),
+    ("libs.versions.toml", 'libraries = ["bad"]'),
+])
+def test_unreadable_manifest_requires_review(tmp_path, manifest, contents):
+    # Arrange
+    (tmp_path / manifest).write_text(contents, encoding="utf-8")
+    finding = _finding("finding", "org.example:lodash", "CVE-TEST")
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding("finding")
+
+    # Assert
+    assert result["decision"] == "MANUAL_REVIEW"
+    assert not result["eligible_for_auto_fix"]
+    assert engine.state.false_positives == []
+
+
+@pytest.mark.parametrize("failure", [OSError("Executable vanished"), RuntimeError("Output reader failed")])
+def test_validation_execution_failure_returns_failed_result(tmp_path, failure):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.validate import run_validation
+
+    (tmp_path / "package.json").write_text('{"scripts":{"test":"test"}}', encoding="utf-8")
+    runner = Mock()
+    runner.run.side_effect = failure
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: name, timeout=30)
+
+    # Assert
+    assert result["status"] == "VALIDATION_FAILED"
+    assert any(row["status"] == "FAILED" and row["required"] for row in result["results"])
+
+
+def test_engine_constructor_failure_closes_owned_client(tmp_path, monkeypatch):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import engine as module
+
+    gitlab = Mock()
+    monkeypatch.setattr(module, "GitLabClient", lambda *args: gitlab)
+
+    def fail_advisory(**kwargs):
+        """Fail construction after the engine has acquired its GitLab client."""
+        raise RuntimeError("Advisory initialization failed")
+
+    monkeypatch.setattr(module, "AdvisoryClient", fail_advisory)
+
+    # Act
+    with pytest.raises(RuntimeError, match="Advisory initialization failed"):
+        Engine(tmp_path)
+
+    # Assert
+    gitlab.close.assert_called_once_with()
+
+
+def test_engine_constructor_preserves_primary_error(tmp_path, monkeypatch):
+    # Arrange
+    from unittest.mock import Mock
+
+    import gitlab_security_mcp.engine as engine_module
+
+    gitlab = Mock()
+    gitlab.close.side_effect = OSError("Cleanup failed")
+    monkeypatch.setattr(engine_module, "GitLabClient", Mock(return_value=gitlab))
+    monkeypatch.setattr(engine_module, "AdvisoryClient", Mock(side_effect=RuntimeError("Initialization failed")))
+
+    # Act
+    with pytest.raises(RuntimeError, match="Initialization failed"):
+        Engine(tmp_path)
+
+    # Assert
+    gitlab.close.assert_called_once_with()
+
+
+def test_engine_close_attempts_all_owned_clients_once(tmp_path, monkeypatch):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import engine as module
+
+    gitlab = Mock()
+    advisory = Mock()
+    gitlab.close.side_effect = OSError("Close failed")
+    monkeypatch.setattr(module, "GitLabClient", lambda *args: gitlab)
+    monkeypatch.setattr(module, "AdvisoryClient", lambda **kwargs: advisory)
+    engine = Engine(tmp_path)
+
+    # Act
+    with pytest.raises(OSError, match="Close failed"):
+        engine.close()
+    engine.close()
+    status = engine.get_run_status()
+
+    # Assert
+    gitlab.close.assert_called_once_with()
+    advisory.close.assert_called_once_with()
+    assert status["status"] == "ERROR"
+    assert "closed" in status["reason"].lower()
+
+
+def test_engine_close_waits_for_active_tool(tmp_path):
+    # Arrange
+    import threading
+    from unittest.mock import Mock
+
+    gitlab = FakeGitLab([_finding("finding", "lodash", "CVE-TEST")])
+    engine = Engine(tmp_path, gitlab=gitlab, advisory=ScriptedAdvisory())
+    engine.state.status = "BRANCH_CREATED"
+    engine._owns_gitlab = True
+    gitlab.close = Mock()
+    real_fetch = gitlab.fetch
+    entered = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    close_done = threading.Event()
+    results = []
+
+    def fetch(*args, **kwargs):
+        """Hold the active tool until the test explicitly releases its lock."""
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("Test release timed out")
+        return real_fetch(*args, **kwargs)
+
+    def close():
+        """Signal attempted shutdown and completion from a competing thread."""
+        close_started.set()
+        engine.close()
+        close_done.set()
+
+    gitlab.fetch = fetch
+    worker = threading.Thread(target=lambda: results.append(engine.list_security_findings()))
+    closer = threading.Thread(target=close)
+
+    # Act
+    worker.start()
+    try:
+        assert entered.wait(5)
+        closer.start()
+        assert close_started.wait(5)
+        closed_early = close_done.wait(0.1)
+    finally:
+        release.set()
+        worker.join(timeout=5)
+        if closer.ident is not None:
+            closer.join(timeout=5)
+
+    # Assert
+    assert not closed_early
+    assert not worker.is_alive() and not closer.is_alive()
+    assert results[0]["findings"][0]["component"] == "lodash"
+    gitlab.close.assert_called_once_with()
+    assert engine.get_run_status()["status"] == "ERROR"
+
+
+def test_engine_results_are_detached_snapshots(tmp_path):
+    # Arrange
+    finding = _finding("finding", "lodash", "CVE-TEST")
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=ScriptedAdvisory())
+    engine.state.status = "BRANCH_CREATED"
+
+    # Act
+    result = engine.list_security_findings("group/project")
+    result["findings"][0]["component"] = "tampered"
+    result["findings"].clear()
+
+    # Assert
+    assert len(engine.state.findings) == 1
+    assert engine.state.findings[0]["component"] == "lodash"
+
+
+def test_falsey_engine_dependencies_are_preserved(tmp_path):
+    # Arrange
+    class FalseyDependency:
+        """Expose a falsey injected dependency whose ownership stays external."""
+
+        def __bool__(self):
+            """Force constructor logic to distinguish falsey values from None."""
+            return False
+
+        def close(self):
+            """Fail if the engine incorrectly closes an injected dependency."""
+            raise AssertionError("Injected dependencies must not be closed")
+
+        def __call__(self, name):
+            """Act as an injected executable lookup that finds no tool."""
+            return None
+
+    dependency = FalseyDependency()
+    arguments = dict.fromkeys(("gitlab", "advisory", "runner", "which"), dependency)
+
+    # Act
+    engine = Engine(tmp_path, **arguments)
+    engine.close()
+
+    # Assert
+    for name in arguments:
+        assert getattr(engine, name) is dependency
 
 
 class HybridRunner(CommandRunner):
     """Run real git commands and record every other allowlisted command."""
 
     def __init__(self, repo_root):
+        """Initialize real Git execution and a record of all routed commands."""
         super().__init__(repo_root)
         self.calls: list[list[str]] = []
 
     def run(self, argv, *, timeout, check=True, cwd=None):
+        """Override execution to simulate non-Git tools after allowlist checks."""
         assert_allowed(argv, self.repo_root)
         self.calls.append(list(argv))
         if tool_name(argv[0]) == "git":
@@ -35,10 +258,14 @@ class HybridRunner(CommandRunner):
 
 
 class FakeGitLab:
+    """Return scripted findings without contacting private GitLab services."""
+
     def __init__(self, findings):
+        """Retain the finding list used by retrieval and snapshot tests."""
         self.findings = findings
 
     def fetch(self, project_id):
+        """Return normalized retrieval metadata for the requested project."""
         from gitlab_security_mcp.gitlab_client import FetchResult
 
         return FetchResult(
@@ -51,7 +278,10 @@ class FakeGitLab:
 
 
 class ScriptedAdvisory:
+    """Provide deterministic affected, missing, and no-fix advisory outcomes."""
+
     def lookup(self, finding, ecosystem, package, version):
+        """Select the fixture outcome using its synthetic CVE identifier."""
         identifier = (finding.get("identifiers") or [""])[0]
         if identifier == "CVE-FP":
             return AdvisoryLookup(
@@ -80,6 +310,7 @@ class ScriptedAdvisory:
 
 
 def _finding(fid, package, identifier, version="1.0.0"):
+    """Build a normalized dependency finding for engine and report tests."""
     return {
         "id": fid,
         "title": f"issue in {package}",
@@ -105,6 +336,315 @@ def _finding(fid, package, identifier, version="1.0.0"):
         "remediationDecision": None,
         "proposedFix": None,
     }
+
+
+@pytest.mark.parametrize("outcome, affected, fixed, expected", [
+    ("resolved", True, "4.17.21", "CHANGE_REQUIRED"),
+    ("no_fix_published", True, None, "NO_SAFE_FIX"),
+    ("resolved", True, None, "NO_SAFE_FIX"),
+    ("resolved", None, "4.17.21", "MANUAL_REVIEW"),
+    ("resolved", False, "4.17.21", "FALSE_POSITIVE"),
+    ("package_mismatch", None, "4.17.21", "MANUAL_REVIEW"),
+    ("lookup_failed", None, None, "MANUAL_REVIEW"),
+    ("not_found", None, None, "MANUAL_REVIEW"),
+    ("resolved", True, "5.0.0", "MANUAL_REVIEW"),
+    ("resolved", True, "not-a-version", "NO_SAFE_FIX"),
+])
+def test_solution_requires_advisory_evidence_and_safe_plan(tmp_path, monkeypatch, outcome, affected, fixed, expected):
+    """Require matching, comparable advisory evidence before planning edits."""
+    manifest = tmp_path / "package.json"
+    original = json.dumps({"dependencies": {"lodash": "4.17.20"}})
+    manifest.write_text(original, encoding="utf-8")
+    finding = _finding("solution-check", "lodash", "CVE-2021-23337", "4.17.20")
+    finding["solution"] = "Upgrade to version 4.17.21."
+    finding["fixedVersions"] = ["4.17.21"]
+    lookup = AdvisoryLookup(
+        outcome=outcome,
+        affected=affected,
+        fixed_versions=[fixed] if fixed else [],
+        lowest_fixed_version=fixed,
+        summary="Test advisory evidence.",
+        sources=["osv:CVE-2021-23337"],
+    )
+    advisory = ScriptedAdvisory()
+    monkeypatch.setattr(advisory, "lookup", lambda *args: lookup)
+    runner = HybridRunner(tmp_path)
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=advisory, runner=runner)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    result = engine.verify_security_finding(finding["id"])
+
+    assert result["decision"] == expected
+    assert result["eligible_for_auto_fix"] is (expected == "CHANGE_REQUIRED")
+    if expected == "CHANGE_REQUIRED":
+        assert result["proposed_fix"]["target"] == "4.17.21"
+        assert result["proposed_fix"]["package"] == "lodash"
+        assert result["proposed_fix"]["strategy"] == "manifest_bump"
+    else:
+        assert result["proposed_fix"] is None
+    assert manifest.read_text(encoding="utf-8") == original
+    assert runner.calls == []
+
+
+def test_report_ends_with_unresolved_security_issues_table(tmp_path):
+    """Keep unresolved issues unique and place their table last in reports."""
+    from gitlab_security_mcp.report import write_report
+    from gitlab_security_mcp.state import RunState
+
+    findings = [_finding(name, "lodash", "CVE-2021-23337", "4.17.20") for name in [
+        "no-fix", "manual", "failed", "applied", "false-positive", "not-verified",
+    ]]
+    findings[0]["title"] = "Issue | with\na newline"
+    state = RunState(
+        findings=[*findings, findings[0].copy()],
+        decisions={
+            "no-fix": {"decision": "NO_SAFE_FIX", "reason": "No patch published."},
+            "manual": {"decision": "MANUAL_REVIEW", "reason": "Code update needs a reviewer."},
+            "failed": {"decision": "CHANGE_REQUIRED"},
+            "applied": {"decision": "CHANGE_REQUIRED"},
+            "false-positive": {"decision": "FALSE_POSITIVE"},
+        },
+        no_solution=[{"id": "no-fix", "reason": "No patch published."}, {"id": "applied", "reason": "Earlier failure."}],
+        skipped_user_prompt=[{"id": "manual", "reason": "Code update needs a reviewer."}],
+        changes=[
+            {"finding_id": "failed", "status": "FIX_FAILED_LOCKFILE", "detail": "Lockfile update failed."},
+            {"finding_id": "applied", "status": "APPLIED"},
+            {"finding_id": "applied", "status": "TEST_ADDED"},
+        ],
+    )
+
+    result = write_report(tmp_path, state, staged=[], diff_stat="", diff_files="")
+    markdown = Path(result["human_report"]).read_text(encoding="utf-8")
+    payload = json.loads(Path(result["json_report"]).read_text(encoding="utf-8"))
+
+    assert [item["id"] for item in result["unresolved_issues"]] == ["no-fix", "manual", "failed"]
+    assert payload["unresolved_issues"] == result["unresolved_issues"]
+    assert markdown.rstrip().endswith(result["unresolved_issues_table"])
+    assert markdown.index("## Unresolved Security Issues") > markdown.index("## What you do next")
+    assert "Issue \\| with a newline" in result["unresolved_issues_table"]
+    assert "Code update needs a reviewer." in result["unresolved_issues_table"]
+    assert "Lockfile update failed." in result["unresolved_issues_table"]
+    assert "Earlier failure." not in result["unresolved_issues_table"]
+
+
+def test_unresolved_table_does_not_claim_unverified_findings_are_resolved():
+    """Distinguish missing verification from confirmed issue resolution."""
+    from gitlab_security_mcp.report import render
+    from gitlab_security_mcp.state import RunState
+
+    state = RunState(findings=[_finding("unverified", "lodash", "CVE-2021-23337")])
+
+    payload, markdown = render(state, staged=[], diff_stat="", diff_files="")
+
+    assert payload["unresolved_issues"] == []
+    assert payload["unverified_findings"] == ["unverified"]
+    assert "Unverified findings, if any, are listed above." in payload["unresolved_issues_table"]
+    assert markdown.rstrip().endswith(payload["unresolved_issues_table"])
+
+
+@pytest.mark.parametrize("stack, runtime, expected", [
+    ("node", "v22.20.0", "VALIDATION_COMPLETE"),
+    ("dotnet", "10.0.100", "VALIDATION_COMPLETE"),
+    ("dotnet", "9.0.305", "VALIDATION_FAILED"),
+    ("java", 'openjdk version "17.0.16" 2025-07-15', "VALIDATION_COMPLETE"),
+    ("java", 'openjdk version "21.0.8" 2025-07-15', "VALIDATION_FAILED"),
+    ("java", "unreadable runtime version", "VALIDATION_FAILED"),
+])
+def test_supported_runtime_validation_matrix(tmp_path, stack, runtime, expected):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import assert_allowed
+    from gitlab_security_mcp.validate import run_validation
+
+    manifests = {
+        "node": ("package.json", '{"scripts":{"test":"node --test"}}'),
+        "dotnet": ("App.csproj", "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"),
+        "java": ("pom.xml", "<project><properties><maven.compiler.release>17</maven.compiler.release></properties></project>"),
+    }
+    filename, contents = manifests[stack]
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+    calls = []
+
+    def run(argv, **kwargs):
+        """Simulate runtime output while checking every emitted command."""
+        assert_allowed(argv, tmp_path)
+        calls.append(argv)
+        return CommandResult(argv, 0, runtime if argv[1] in {"--version", "-version"} else "success", "", 0, False, "", "")
+
+    runner = Mock()
+    runner.run.side_effect = run
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: name, timeout=30)
+
+    # Assert
+    assert result["status"] == expected
+    assert calls
+    if expected == "VALIDATION_FAILED":
+        assert any(row["status"] == "FAILED" and row["required"] for row in result["results"])
+
+
+@pytest.mark.parametrize("filename", ["App.slnx", "App.fsproj", "App.vbproj"])
+def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.validate import run_validation
+
+    contents = "<Solution />" if filename.endswith(".slnx") else "<Project><TargetFramework>net10.0</TargetFramework></Project>"
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+    runner = Mock()
+    runner.run.return_value = CommandResult(["dotnet", "--version"], 0, "10.0.100", "", 0, False, "", "")
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: name, timeout=30)
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE"
+    assert runner.run.call_args_list[0].args[0] == ["dotnet", "--version"]
+    assert ["dotnet", "restore"] in [call.args[0] for call in runner.run.call_args_list]
+    assert ["dotnet", "test", "--configuration", "Release", "--nologo"] in [call.args[0] for call in runner.run.call_args_list]
+
+
+@pytest.mark.parametrize("manager, filename, contents, package, installed, target", [
+    ("npm", "package.json", '{"dependencies":{"lodash":"4.17.20"}}', "lodash", "4.17.20", "4.17.21"),
+    ("nuget", "App.csproj", '<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.1" /></ItemGroup></Project>', "Newtonsoft.Json", "13.0.1", "13.0.3"),
+    ("nuget", "Directory.Packages.props", '<Project><ItemGroup><PackageVersion Include="Newtonsoft.Json" Version="13.0.1" /></ItemGroup></Project>', "Newtonsoft.Json", "13.0.1", "13.0.3"),
+    ("maven", "pom.xml", '<project><properties><commons.version>1.9</commons.version></properties><dependencies><dependency><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>${commons.version}</version></dependency></dependencies></project>', "org.apache.commons:commons-text", "1.9", "1.10.0"),
+    ("gradle", "build.gradle.kts", 'dependencies { implementation("org.apache.commons:commons-text:1.9") }', "org.apache.commons:commons-text", "1.9", "1.10.0"),
+])
+def test_advisory_verified_dependency_fix_across_stacks(tmp_path, monkeypatch, manager, filename, contents, package, installed, target):
+    # Arrange
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+    finding = _finding("cross-stack", package, "CVE-TEST", installed)
+    finding["location"] = {"file": filename}
+    advisory = ScriptedAdvisory()
+    monkeypatch.setattr(advisory, "lookup", lambda *args: AdvisoryLookup(outcome="resolved", affected=True, lowest_fixed_version=target, fixed_versions=[target], summary="Verified patched version"))
+    runner = HybridRunner(tmp_path)
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=advisory, runner=runner)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    verified = engine.verify_security_finding("cross-stack")
+    applied = engine.apply_minimal_fix("cross-stack")
+
+    # Assert
+    assert verified["decision"] == "CHANGE_REQUIRED"
+    assert verified["proposed_fix"]["manager"] == manager
+    assert applied["status"] == "APPLIED"
+    assert target in (tmp_path / filename).read_text(encoding="utf-8")
+    assert installed not in (tmp_path / filename).read_text(encoding="utf-8")
+    assert not runner.calls
+
+
+def test_unresolved_java_transitive_dependency_is_not_false_positive(tmp_path):
+    # Arrange
+    (tmp_path / "pom.xml").write_text("<project />", encoding="utf-8")
+    finding = _finding("transitive", "org.example:transitive", "CVE-TEST", "1.0.0")
+    finding["location"] = {"file": "pom.xml"}
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=ScriptedAdvisory())
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    verified = engine.verify_security_finding("transitive")
+
+    # Assert
+    assert verified["decision"] == "MANUAL_REVIEW"
+    assert not verified["eligible_for_auto_fix"]
+    assert not engine.state.false_positives
+
+
+def test_modern_yarn_validation_uses_supported_commands(tmp_path):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import assert_allowed
+    from gitlab_security_mcp.validate import run_validation
+
+    (tmp_path / "package.json").write_text('{"packageManager":"yarn@4.9.2","scripts":{"test":"node --test"}}', encoding="utf-8")
+    (tmp_path / "yarn.lock").write_text("__metadata:\n  version: 8\n", encoding="utf-8")
+    calls = []
+
+    def run(argv, **kwargs):
+        """Capture Berry validation commands after allowlist enforcement."""
+        assert_allowed(argv, tmp_path)
+        calls.append(argv)
+        return CommandResult(argv, 0, "v22.20.0", "", 0, False, "", "")
+
+    runner = Mock()
+    runner.run.side_effect = run
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: name, timeout=30)
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE"
+    assert ["yarn", "install", "--immutable"] in calls
+    assert ["yarn", "npm", "audit", "--json"] in calls
+    assert ["yarn", "install", "--frozen-lockfile"] not in calls
+
+
+@pytest.mark.parametrize("strategy, expected", [
+    ("override", ["yarn", "install", "--mode=update-lockfile"]),
+    ("lockfile_only", ["yarn", "up", "-R", "lodash"]),
+])
+def test_modern_yarn_lockfile_refresh(tmp_path, strategy, expected):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import assert_allowed
+    from gitlab_security_mcp.remediate import Plan, apply_plan
+
+    (tmp_path / "package.json").write_text('{"packageManager":"yarn@4.9.2"}', encoding="utf-8")
+    calls = []
+
+    def run(argv, **kwargs):
+        """Record the minimal Berry refresh without performing installs."""
+        assert_allowed(argv, tmp_path)
+        calls.append(argv)
+        return CommandResult(argv, 0, "success", "", 0, False, "", "")
+
+    runner = Mock()
+    runner.run.side_effect = run
+    plan = Plan(strategy, 3, "npm", "lodash", "4.17.20", "4.17.21", ["yarn.lock"], "yarn", "Refresh lodash")
+
+    # Act
+    result = apply_plan(tmp_path, plan, runner, lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED"
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("manifest, contents", [
+    ("package.json", '{"scripts":{"test":"node --test"}}'),
+    ("App.csproj", "<Project><TargetFramework>net10.0</TargetFramework></Project>"),
+    ("pom.xml", "<project />"),
+    ("build.gradle.kts", "plugins { java }"),
+])
+def test_missing_required_tool_keeps_validation_incomplete(tmp_path, manifest, contents):
+    # Arrange
+    from unittest.mock import Mock
+
+    (tmp_path / manifest).write_text(contents, encoding="utf-8")
+    runner = Mock()
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory(), runner=runner, which=lambda name: None)
+    engine.state.status = "BRANCH_CREATED"
+
+    # Act
+    result = engine.run_validation_matrix()
+    repeated = engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == "VALIDATION_INCOMPLETE"
+    assert repeated["status"] == "VALIDATION_INCOMPLETE"
+    assert engine.state.status == "VALIDATION_INCOMPLETE"
+    assert engine.state.validation_status == "VALIDATION_INCOMPLETE"
+    runner.run.assert_not_called()
 
 
 def test_prechecks_fail_closed(repo):
@@ -256,7 +796,10 @@ def test_image_bump_and_aaa_test(repo):
     }
 
     class ImageAdvisory:
+        """Offer a same-major patched image tag for generated-test coverage."""
+
         def lookup(self, finding, ecosystem, package, version):
+            """Return an affected image with a deterministic patched tag."""
             return AdvisoryLookup(
                 outcome="resolved",
                 affected=True,
@@ -357,7 +900,10 @@ def test_major_version_fix_needs_a_person(repo):
     finding = _finding("major", "minimist", "CVE-MAJOR", "0.2.1")
 
     class MajorAdvisory:
+        """Offer a breaking fixed version that must require human review."""
+
         def lookup(self, finding, ecosystem, package, version):
+            """Return a patched major version without authorizing auto-fixing."""
             return AdvisoryLookup(
                 outcome="resolved",
                 affected=True,

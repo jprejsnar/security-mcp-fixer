@@ -30,6 +30,7 @@ def branch_name_for(day: date) -> str:
 
 
 def _porcelain_paths(line: str) -> list[str]:
+    """Extract status paths, including both sides of a reported rename."""
     payload = line[3:] if len(line) >= 4 else line
     return [part.strip().strip('"') for part in payload.split(" -> ")]
 
@@ -58,6 +59,7 @@ class GitOps:
     """Read-mostly git helpers. Every call goes through the command allowlist."""
 
     def __init__(self, repo_root: Path, runner: CommandRunner):
+        """Bind Git operations to the repository and its allowlisted runner."""
         self.repo_root = repo_root
         self.runner = runner
 
@@ -66,6 +68,7 @@ class GitOps:
         return self._git(args, check=check, timeout=timeout)
 
     def _git(self, args: list[str], *, check: bool = True, timeout: int = 120) -> CommandResult:
+        """Route Git through the runner's allowlist and repository boundary."""
         return self.runner.run(["git", *args], timeout=timeout, check=check)
 
     def ensure_work_tree(self) -> None:

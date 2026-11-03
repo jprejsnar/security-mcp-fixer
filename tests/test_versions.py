@@ -1,3 +1,5 @@
+"""Check safe fixed-version selection and conservative range evaluation."""
+
 from gitlab_security_mcp.versions import (
     bump_npm_spec,
     lowest_fixed,

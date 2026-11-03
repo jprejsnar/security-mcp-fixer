@@ -41,6 +41,7 @@ atexit.register(engine.close)
 
 
 def _run(tool_name: str, func, *args, **kwargs) -> dict[str, Any]:
+    """Log tool exceptions and return errors without crashing MCP stdio."""
     try:
         return func(*args, **kwargs)
     except Exception as exc:  # surfaced to the client as a tool result, not a crashed server
@@ -68,7 +69,7 @@ def create_security_branch() -> dict[str, Any]:
 
 @mcp.tool(annotations=ToolAnnotations(title="List security findings", read_only_hint=True, open_world_hint=True))
 def list_security_findings(project_id: str | None = None) -> dict[str, Any]:
-    """Phase 3. Read GitLab findings from the latest successful default-branch pipeline."""
+    """Phase 3. Read the still-detected GitLab vulnerability report on main."""
     return _run("list_security_findings", engine.list_security_findings, project_id)
 
 
@@ -98,7 +99,11 @@ def run_validation_matrix() -> dict[str, Any]:
 
 @mcp.tool(annotations=ToolAnnotations(title="Generate local report", read_only_hint=False, destructive_hint=False, open_world_hint=False))
 def generate_local_report() -> dict[str, Any]:
-    """Phase 7. Write the human and JSON report, including false positives and skipped findings."""
+    """Phase 7. Write the human and JSON report, including false positives and skipped findings.
+
+    Display unresolved_issues_table at the end of the final response. It lists
+    issues not safely addressed by package or code updates and the reasons.
+    """
     return _run("generate_local_report", engine.generate_local_report)
 
 
@@ -109,7 +114,14 @@ def get_run_status() -> dict[str, Any]:
 
 
 def main() -> None:
-    mcp.run()
+    """Serve MCP tools over stdio until the client disconnects."""
+    try:
+        mcp.run()
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            logger.exception("Could not close the engine during server shutdown")
 
 
 if __name__ == "__main__":

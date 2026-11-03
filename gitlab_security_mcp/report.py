@@ -6,6 +6,49 @@ import json
 from pathlib import Path
 
 from gitlab_security_mcp.state import RunState
+from gitlab_security_mcp.util import atomic_write_text
+
+
+def _table_cell(value: object) -> str:
+    """Escape pipes and line breaks so evidence stays in one table cell."""
+    return " ".join(str(value if value is not None else "N/A").splitlines()).replace("|", "\\|")
+
+
+def _unresolved_issues(state: RunState) -> list[dict]:
+    """Collect unique unresolved findings using the latest fix outcomes."""
+    reasons = {item["id"]: item for item in [*state.no_solution, *state.skipped_user_prompt]}
+    outcomes = {}
+    for change in state.changes:
+        if change.get("status") != "TEST_ADDED":
+            outcomes[change.get("finding_id")] = change
+    unresolved = []
+    seen = set()
+    for finding in state.findings:
+        finding_id = finding.get("id")
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        assessment = state.decisions.get(finding_id) or finding.get("assessment") or {}
+        decision = assessment.get("decision") or finding.get("remediationDecision")
+        outcome = outcomes.get(finding_id) or {}
+        if decision == "FALSE_POSITIVE" or outcome.get("status") == "APPLIED":
+            continue
+        failed = outcome.get("status") in {"FIX_FAILED", "FIX_FAILED_LOCKFILE"}
+        if decision not in {"NO_SAFE_FIX", "MANUAL_REVIEW"} and finding_id not in reasons and not failed:
+            continue
+        detail = reasons.get(finding_id) or {}
+        unresolved.append({
+            "id": finding_id,
+            "severity": finding.get("severity") or "unknown",
+            "component": finding.get("component"),
+            "installed_version": finding.get("installedVersion"),
+            "title": finding.get("title") or finding_id,
+            "identifiers": finding.get("identifiers") or [],
+            "location": finding.get("location") or {},
+            "decision": outcome.get("status") if failed else decision,
+            "reason": (outcome.get("detail") if failed else None) or detail.get("reason") or assessment.get("reason") or "No safe package or code update was identified.",
+        })
+    return unresolved
 
 
 def render(state: RunState, *, staged: list[str] | None, diff_stat: str, diff_files: str) -> tuple[dict, str]:
@@ -25,6 +68,17 @@ def render(state: RunState, *, staged: list[str] | None, diff_stat: str, diff_fi
         for item in state.no_solution
     ] or ["No-solution issues: none."]
     skipped_bullets = [f"- {item['id']}: {item['reason']}" for item in state.skipped_user_prompt] or ["None."]
+    unresolved = _unresolved_issues(state)
+    unresolved_lines = [
+        "| Severity | Package | Version | Issue | Reason Not Addressed |",
+        "|---|---|---|---|---|",
+    ]
+    for item in unresolved:
+        identifiers = ", ".join(identifier for identifier in item["identifiers"] if identifier.upper().startswith(("CVE-", "GHSA-")))
+        issue = f"{identifiers}: {item['title']}" if identifiers else item["title"]
+        cells = [item["severity"], item["component"], item["installed_version"], issue, item["reason"]]
+        unresolved_lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")
+    unresolved_table = "\n".join(unresolved_lines) if unresolved else "No verified findings are currently recorded as unresolved. Unverified findings, if any, are listed above."
     payload = {
         "run_status": state.status,
         "stop_stage": state.stop_stage,
@@ -44,6 +98,8 @@ def render(state: RunState, *, staged: list[str] | None, diff_stat: str, diff_fi
         "no_solution_details": state.no_solution,
         "user_prompt_skipped": skipped_bullets,
         "user_prompt_details": state.skipped_user_prompt,
+        "unresolved_issues": unresolved,
+        "unresolved_issues_table": unresolved_table,
         "git_diff_cached_empty": cached_empty,
         "staged_paths": staged,
         "diff_stat": diff_stat,
@@ -112,6 +168,9 @@ def render(state: RunState, *, staged: list[str] | None, diff_stat: str, diff_fi
             "- Confirm validation.",
             "- Commit and push yourself if you are satisfied.",
             "",
+            "## Unresolved Security Issues",
+            unresolved_table,
+            "",
         ]
     )
     return payload, "\n".join(lines)
@@ -125,8 +184,8 @@ def write_report(root: Path, state: RunState, *, staged: list[str] | None, diff_
     stem = f"security-remediation-report-{state.branch_name or 'unbranched'}"
     json_path = directory / f"{stem}.json"
     human_path = directory / f"{stem}.md"
-    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    human_path.write_text(markdown, encoding="utf-8")
+    atomic_write_text(json_path, json.dumps(payload, indent=2, ensure_ascii=False))
+    atomic_write_text(human_path, markdown)
     return {
         "status": "REPORT_GENERATED",
         "human_report": str(human_path),
@@ -134,6 +193,8 @@ def write_report(root: Path, state: RunState, *, staged: list[str] | None, diff_
         "false_positives": payload["false_positives"],
         "no_solution": payload["no_solution_issues"],
         "user_prompt_skipped": payload["user_prompt_skipped"],
+        "unresolved_issues": payload["unresolved_issues"],
+        "unresolved_issues_table": payload["unresolved_issues_table"],
         "git_diff_cached_empty": payload["git_diff_cached_empty"],
         "note": "All changes remain uncommitted. Review the report, then commit manually if you are satisfied.",
     }

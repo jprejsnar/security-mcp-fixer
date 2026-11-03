@@ -1,3 +1,5 @@
+"""Verify command boundaries, child cleanup, pipe readers, and audit hashes."""
+
 import json
 from datetime import date
 
@@ -5,6 +7,102 @@ import pytest
 
 from gitlab_security_mcp.commands import CommandRunner, assert_allowed
 from gitlab_security_mcp.git_ops import branch_name_for, meaningful_status
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_start):
+    # Arrange
+    from gitlab_security_mcp import commands
+
+    processes = []
+    started_threads = []
+    real_popen = commands.subprocess.Popen
+    real_start = commands.threading.Thread.start
+    attempts = 0
+
+    def recording_popen(*args, **kwargs):
+        """Track the tested Git child separately from taskkill helpers."""
+        process = real_popen(*args, **kwargs)
+        if args[0][0] == "git":
+            processes.append(process)
+        return process
+
+    def failing_start(thread):
+        """Fail one reader start while tracking successfully started threads."""
+        nonlocal attempts
+        attempts += 1
+        if attempts == failed_start:
+            raise RuntimeError("Cannot start reader")
+        real_start(thread)
+        started_threads.append(thread)
+
+    monkeypatch.setattr(commands.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(commands.threading.Thread, "start", failing_start)
+    runner = CommandRunner(tmp_path)
+
+    # Act
+    with pytest.raises(RuntimeError, match="Cannot start reader"):
+        runner.run(["git", "rev-parse", "--is-inside-work-tree"], timeout=30)
+
+    # Assert
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+    assert processes[0].stdout.closed
+    assert processes[0].stderr.closed
+    assert all(not thread.is_alive() for thread in started_threads)
+
+
+def test_pipe_reader_stops_when_descendant_keeps_pipe_open():
+    # Arrange
+    import os
+    import threading
+
+    from gitlab_security_mcp.commands import _read_capped
+
+    read_descriptor, write_descriptor = os.pipe()
+    pipe = os.fdopen(read_descriptor, "r", encoding="utf-8")
+    os.write(write_descriptor, "output caf\u00e9".encode())
+    stop = threading.Event()
+    captured = []
+    errors = []
+
+    def read():
+        """Record reader results without losing thread exceptions."""
+        try:
+            captured.append(_read_capped(pipe, 100, stop))
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=read, daemon=True)
+
+    # Act
+    reader.start()
+    stop.set()
+    reader.join(timeout=2)
+    finished = not reader.is_alive()
+    try:
+        # Assert
+        assert finished
+        assert errors == []
+        assert captured == [("output caf\u00e9", False)]
+        assert pipe.closed
+    finally:
+        os.close(write_descriptor)
+        reader.join(timeout=2)
+        pipe.close()
+
+
+@pytest.mark.parametrize("argv", [["yarn", "up", "-R", "lodash"], ["yarn", "install", "--mode=update-lockfile"]])
+def test_modern_yarn_remediation_disables_scripts_and_allows_lock_changes(argv):
+    # Arrange
+    from gitlab_security_mcp.commands import _child_env
+
+    # Act
+    environment = _child_env(argv)
+
+    # Assert
+    assert environment["YARN_ENABLE_SCRIPTS"] == "false"
+    assert environment["YARN_ENABLE_IMMUTABLE_INSTALLS"] == "false"
 
 
 def test_server_notes_do_not_count_as_a_dirty_tree():
@@ -97,6 +195,7 @@ def test_children_get_an_empty_stdin_and_no_git_prompt(repo, monkeypatch):
     real_popen = subprocess.Popen
 
     def recording_popen(*args, **kwargs):
+        """Capture child-launch options while running a real Git probe."""
         seen.update(kwargs)
         return real_popen(*args, **kwargs)
 

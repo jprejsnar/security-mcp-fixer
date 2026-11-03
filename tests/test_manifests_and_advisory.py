@@ -1,3 +1,5 @@
+"""Check retrieval filters, advisory evidence, local edits, and HTTP ownership."""
+
 import json
 
 import httpx
@@ -14,7 +16,6 @@ from gitlab_security_mcp.manifests import (
     update_pom_version,
 )
 from gitlab_security_mcp.remediate import plan_remediation
-
 
 OSV = {
     "id": "GHSA-test",
@@ -60,34 +61,63 @@ def test_normalize_dependency_finding():
     assert finding["identifiers"] == ["CVE-2021-23337"]
 
 
+def _gitlab_transport(handler):
+    """Supply a tracked main branch before delegating vulnerability queries."""
+    def route(request: httpx.Request) -> httpx.Response:
+        """Route tracked-ref queries locally without counting finding requests."""
+        body = json.loads(request.content.decode())
+        if "securityTrackedRefs(" in body["query"]:
+            return httpx.Response(200, json={"data": {"project": {"securityTrackedRefs": {
+                "nodes": [{"id": "gid://gitlab/Security::ProjectTrackedContext/2", "name": "main", "refType": "BRANCH"}],
+                "pageInfo": {"hasNextPage": False},
+            }}}})
+        return handler(request)
+
+    return httpx.MockTransport(route)
+
+
+@pytest.mark.parametrize("client_type", [GitLabClient, AdvisoryClient])
+def test_falsey_injected_http_client_is_preserved(client_type):
+    # Arrange
+    class FalseyHTTPClient(httpx.Client):
+        """Retain normal HTTP behavior while testing falsey injection."""
+
+        def __bool__(self):
+            """Require ownership checks to use None rather than truthiness."""
+            return False
+
+    with FalseyHTTPClient() as http:
+        arguments = {"http": http}
+        if client_type is GitLabClient:
+            arguments["token"] = "test-token"
+
+        # Act
+        client = client_type(**arguments)
+        client.close()
+
+        # Assert
+        assert client.http is http
+        assert not http.is_closed
+
+
 def test_gitlab_graphql_is_read_only(tmp_path):
     # Arrange
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Reject mutation text and serve mixed active/dismissed findings."""
         body = json.loads(request.content.decode())
         calls.append(body)
         assert body["query"].lstrip().lower().startswith("query")
         assert "mutation" not in body["query"].lower()
-        if "rootRef" in body["query"]:
-            return httpx.Response(200, json={"data": {"project": {"repository": {"rootRef": "main"}}}})
         return httpx.Response(
             200,
             json={
                 "data": {
                     "project": {
-                        "pipelines": {
+                        "vulnerabilities": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
                             "nodes": [
-                                {
-                                    "id": "gid://gitlab/Ci::Pipeline/1",
-                                    "iid": "1",
-                                    "sha": "abc",
-                                    "ref": "main",
-                                    "status": "SUCCESS",
-                                    "createdAt": "2026-11-01T00:00:00Z",
-                                    "securityReportFindings": {
-                                        "pageInfo": {"hasNextPage": False, "endCursor": None},
-                                        "nodes": [
                                             {
                                                 "uuid": "keep",
                                                 "title": "issue in lodash",
@@ -116,9 +146,6 @@ def test_gitlab_graphql_is_read_only(tmp_path):
                                                 "links": [],
                                                 "location": {"file": "package.json"},
                                             },
-                                        ],
-                                    },
-                                }
                             ]
                         }
                     }
@@ -126,7 +153,7 @@ def test_gitlab_graphql_is_read_only(tmp_path):
             },
         )
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
         client = GitLabClient("glpat-test", http=http)
 
         # Act
@@ -136,56 +163,205 @@ def test_gitlab_graphql_is_read_only(tmp_path):
     assert fetched.ok is True
     assert [item["id"] for item in fetched.findings] == ["keep"]
     assert fetched.excluded == {"dismissed": 1}
+    assert len(calls) == 1
+
+
+def test_report_filters_match_patient_web_ui():
+    """Match UI status, tracked main, and still-detected activity filters."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Verify exact filters after returning main's tracked-ref id."""
+        body = json.loads(request.content.decode())
+        calls.append(body)
+        if "securityTrackedRefs(" in body["query"]:
+            return httpx.Response(200, json={"data": {"project": {"securityTrackedRefs": {
+                "nodes": [
+                    {"id": "gid://gitlab/Security::ProjectTrackedContext/1", "name": "dev", "refType": "BRANCH"},
+                    {"id": "gid://gitlab/Security::ProjectTrackedContext/2", "name": "main", "refType": "BRANCH"},
+                ],
+                "pageInfo": {"hasNextPage": False},
+            }}}})
+        assert "state: [DETECTED, CONFIRMED]" in body["query"]
+        assert "hasResolution: false" in body["query"]
+        assert "trackedRefIds: $trackedRefIds" in body["query"]
+        assert body["variables"]["trackedRefIds"] == ["gid://gitlab/Security::ProjectTrackedContext/2"]
+        return httpx.Response(200, json={"data": {"project": {"vulnerabilities": {
+            "nodes": [], "pageInfo": {"hasNextPage": False},
+        }}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
+    assert fetched.ok is True
     assert len(calls) == 2
 
 
-def _pipeline_page(pipeline_id: str, has_next: bool) -> dict:
+def test_project_report_findings_do_not_require_a_successful_pipeline():
+    """Retrieve persistent findings independently of successful pipelines."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve report findings while rejecting the obsolete pipeline path."""
+        body = json.loads(request.content.decode())
+        calls.append(body)
+        assert "vulnerabilities(" in body["query"]
+        assert "securityReportFindings" not in body["query"]
+        return httpx.Response(200, json={"data": {"project": {
+            "vulnerabilities": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{
+                    "id": "gid://gitlab/Vulnerability/123",
+                    "uuid": "report-finding",
+                    "title": "issue in lodash",
+                    "state": "CONFIRMED",
+                    "reportType": "DEPENDENCY_SCANNING",
+                    "location": {"file": "package-lock.json"},
+                }],
+            },
+        }}})
+
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
+    assert fetched.ok is True
+    assert [finding["id"] for finding in fetched.findings] == ["report-finding"]
+    assert fetched.pipeline is None
+    assert len(calls) == 1
+
+
+def _vulnerability_page(pipeline_id: str, has_next: bool) -> dict:
+    """Build one paginated finding with per-finding pipeline provenance."""
     return {
         "data": {
             "project": {
-                "pipelines": {
-                    "nodes": [
-                        {
-                            "id": pipeline_id,
-                            "sha": "abc",
-                            "ref": "main",
-                            "status": "SUCCESS",
-                            "securityReportFindings": {
-                                "pageInfo": {"hasNextPage": has_next, "endCursor": "next" if has_next else None},
-                                "nodes": [],
-                            },
-                        }
-                    ]
+                "vulnerabilities": {
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": "next" if has_next else None},
+                    "nodes": [{
+                        "uuid": pipeline_id,
+                        "state": "DETECTED",
+                        "latestDetectedPipeline": {
+                            "id": pipeline_id, "sha": "abc", "ref": "main", "status": "SUCCESS",
+                        },
+                    }],
                 }
             }
         }
     }
 
 
-def test_findings_from_two_pipelines_are_not_mixed():
+def test_report_pagination_preserves_each_findings_pipeline():
     # Arrange
-    pages = iter([_pipeline_page("gid://gitlab/Ci::Pipeline/1", True), _pipeline_page("gid://gitlab/Ci::Pipeline/2", False)])
+    pages = iter([_vulnerability_page("gid://gitlab/Ci::Pipeline/1", True), _vulnerability_page("gid://gitlab/Ci::Pipeline/2", False)])
+    cursors = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve successive pages and capture cursor/filter propagation."""
         body = json.loads(request.content.decode())
-        if "rootRef" in body["query"]:
-            return httpx.Response(200, json={"data": {"project": {"repository": {"rootRef": "main"}}}})
+        assert body["variables"]["trackedRefIds"] == ["gid://gitlab/Security::ProjectTrackedContext/2"]
+        assert "state: [DETECTED, CONFIRMED]" in body["query"]
+        assert "hasResolution: false" in body["query"]
+        cursors.append(body["variables"]["after"])
         return httpx.Response(200, json=next(pages))
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
         client = GitLabClient("glpat-test", http=http)
 
         # Act
         fetched = client.fetch("group/project")
 
     # Assert
+    assert fetched.ok is True
+    assert cursors == [None, "next"]
+    assert [finding["pipeline"]["id"] for finding in fetched.findings] == [
+        "gid://gitlab/Ci::Pipeline/1", "gid://gitlab/Ci::Pipeline/2",
+    ]
+    assert fetched.pipeline is None
+
+
+@pytest.mark.parametrize("connection, expected_ok", [
+    (None, False),
+    ({"nodes": [], "pageInfo": {"hasNextPage": False}}, True),
+    ({"nodes": [], "pageInfo": {"hasNextPage": True}}, False),
+])
+def test_report_empty_unreadable_or_invalid_pagination(connection, expected_ok):
+    """Separate a valid empty connection from unreadable report data."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Inject the parametrized report connection for shape validation."""
+        return httpx.Response(200, json={"data": {"project": {"vulnerabilities": connection}}})
+
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
+    assert fetched.ok is expected_ok
+    assert fetched.findings == []
+
+
+def test_report_findings_limit_marks_results_truncated():
+    """Expose truncation when the finding cap stops a multi-page report."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve a page indicating additional findings remain unfetched."""
+        return httpx.Response(200, json=_vulnerability_page("gid://gitlab/Ci::Pipeline/1", True))
+
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http, max_findings=1).fetch("group/project")
+
+    assert fetched.ok is True
+    assert len(fetched.findings) == 1
+    assert fetched.truncated is True
+
+
+@pytest.mark.parametrize("connection", [
+    None,
+    {"nodes": [], "pageInfo": {"hasNextPage": False}},
+    {"nodes": [{"id": "tag-main", "name": "main", "refType": "TAG"}], "pageInfo": {"hasNextPage": False}},
+    {"nodes": [], "pageInfo": {"hasNextPage": True}},
+])
+def test_main_tracked_ref_missing_or_unreadable_fails_closed(connection):
+    """Refuse unfiltered retrieval when tracked main cannot be resolved."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Inject invalid main metadata before any finding query is allowed."""
+        body = json.loads(request.content.decode())
+        assert "securityTrackedRefs(" in body["query"]
+        return httpx.Response(200, json={"data": {"project": {"securityTrackedRefs": connection}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
     assert fetched.ok is False
-    assert "newer pipeline" in fetched.error
+    assert fetched.findings == []
+
+
+def test_main_tracked_ref_lookup_paginates():
+    """Resolve main on a later page before querying filtered findings."""
+    cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return main only after an advancing tracked-ref cursor."""
+        body = json.loads(request.content.decode())
+        if "securityTrackedRefs(" in body["query"]:
+            after = body["variables"]["after"]
+            cursors.append(after)
+            return httpx.Response(200, json={"data": {"project": {"securityTrackedRefs": {
+                "nodes": [] if after is None else [{"id": "main-id", "name": "main", "refType": "BRANCH"}],
+                "pageInfo": {"hasNextPage": after is None, "endCursor": "next" if after is None else None},
+            }}}})
+        assert body["variables"]["trackedRefIds"] == ["main-id"]
+        return httpx.Response(200, json={"data": {"project": {"vulnerabilities": {
+            "nodes": [], "pageInfo": {"hasNextPage": False},
+        }}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
+    assert fetched.ok is True
+    assert cursors == [None, "next"]
 
 
 def test_osv_lookup_marks_version_affected():
     # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve matching OSV ranges for a known vulnerable fixture version."""
         if request.url.path.endswith("/CVE-2021-23337"):
             return httpx.Response(200, json=OSV)
         return httpx.Response(404)
@@ -311,6 +487,141 @@ def test_manifest_write_refuses_paths_outside_the_repo(tmp_path):
     # Act / Assert
     with pytest.raises(ValueError, match="outside the repository"):
         update_npm_spec(tmp_path, str(outside), "lodash", "1.2.3")
+
+
+@pytest.mark.parametrize("connection", [
+    {},
+    {"nodes": None, "pageInfo": {"hasNextPage": False}},
+    {"nodes": [], "pageInfo": None},
+    {"nodes": {}, "pageInfo": {"hasNextPage": False}},
+    {"nodes": [None], "pageInfo": {"hasNextPage": False}},
+    {"nodes": [{"state": 42}], "pageInfo": {"hasNextPage": False}},
+    {"nodes": [{"identifiers": [None]}], "pageInfo": {"hasNextPage": False}},
+])
+def test_malformed_gitlab_connection_fails_closed(connection):
+    # Arrange
+    def handler(request):
+        """Inject malformed node or page shapes without making HTTP requests."""
+        return httpx.Response(200, json={"data": {"project": {"vulnerabilities": connection}}})
+
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        client = GitLabClient("test-token", http=http)
+
+        # Act
+        result = client.fetch("group/project")
+
+    # Assert
+    assert not result.ok
+    assert result.findings == []
+    assert result.error
+
+
+@pytest.mark.parametrize("payload", [None, [], {"errors": [None]}, {"data": {"project": []}}])
+def test_malformed_gitlab_payload_returns_error(payload):
+    # Arrange
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))) as http:
+        client = GitLabClient("test-token", http=http)
+
+        # Act
+        result = client.fetch("group/project")
+
+    # Assert
+    assert not result.ok
+    assert result.error
+
+
+@pytest.mark.parametrize("content", [b"not-json", b"null", b"42", b"[null]", b'{"affected":[null],"id":"CVE-TEST"}'])
+def test_malformed_advisory_returns_lookup_failure(content):
+    # Arrange
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=content))) as http:
+        client = AdvisoryClient(http=http)
+
+        # Act
+        result = client.lookup({"identifiers": ["CVE-TEST"]}, "npm", "lodash", "1.0.0")
+
+    # Assert
+    assert result.outcome == "lookup_failed"
+    assert result.affected is None
+    assert result.lowest_fixed_version is None
+    assert result.errors
+
+
+@pytest.mark.parametrize("client_type", [GitLabClient, AdvisoryClient])
+def test_operation_after_close_returns_failure(client_type):
+    # Arrange
+    with httpx.Client() as http:
+        client = GitLabClient("test-token", http=http) if client_type is GitLabClient else AdvisoryClient(http=http)
+        client.close()
+
+        # Act
+        result = client.fetch("group/project") if client_type is GitLabClient else client.lookup({}, None, None, None)
+
+        # Assert
+        assert not result.ok if client_type is GitLabClient else result.outcome == "lookup_failed"
+        assert not http.is_closed
+
+
+@pytest.mark.parametrize("client_type", [GitLabClient, AdvisoryClient])
+def test_close_waits_for_active_client_operation(client_type, monkeypatch):
+    # Arrange
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    close_done = threading.Event()
+    results = []
+
+    def handler(request):
+        """Hold a mock response until the shutdown race is measured."""
+        entered.set()
+        assert release.wait(5)
+        if client_type is GitLabClient:
+            return httpx.Response(200, json={"data": {"project": {"vulnerabilities": {
+                "nodes": [], "pageInfo": {"hasNextPage": False},
+            }}}})
+        return httpx.Response(404)
+
+    transport = _gitlab_transport(handler) if client_type is GitLabClient else httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as http:
+        monkeypatch.setattr(httpx, "Client", lambda **kwargs: http)
+        client = GitLabClient("test-token") if client_type is GitLabClient else AdvisoryClient()
+
+        def operate():
+            """Keep the client operation active on its worker thread."""
+            result = client.fetch("group/project") if client_type is GitLabClient else client.lookup(
+                {"identifiers": ["CVE-TEST"]}, None, None, None,
+            )
+            results.append(result)
+
+        def close():
+            """Signal shutdown attempts and completion without busy waiting."""
+            close_started.set()
+            client.close()
+            close_done.set()
+
+        worker = threading.Thread(target=operate)
+        closer = threading.Thread(target=close)
+
+        # Act
+        worker.start()
+        try:
+            assert entered.wait(5)
+            closer.start()
+            assert close_started.wait(5)
+            closed_while_active = close_done.wait(0.1)
+        finally:
+            release.set()
+            worker.join(5)
+            if closer.ident is not None:
+                closer.join(5)
+
+        # Assert
+        assert not closed_while_active
+        assert not worker.is_alive() and not closer.is_alive()
+        assert close_done.is_set()
+        assert http.is_closed
+        assert len(results) == 1
 
 
 def test_owned_http_clients_close():

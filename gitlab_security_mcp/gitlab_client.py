@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlparse
 
@@ -12,80 +13,77 @@ from gitlab_security_mcp.util import redact
 from gitlab_security_mcp.versions import parse_fixed_versions
 
 FINDINGS_QUERY = """
-query SecurityFindings($fullPath: ID!, $ref: String!, $after: String) {
+query SecurityFindings($fullPath: ID!, $trackedRefIds: [SecurityProjectTrackedContextID!]!, $after: String) {
   project(fullPath: $fullPath) {
-    pipelines(first: 1, ref: $ref, status: SUCCESS) {
+    vulnerabilities(first: 100, after: $after, state: [DETECTED, CONFIRMED], trackedRefIds: $trackedRefIds, hasResolution: false) {
+            pageInfo { hasNextPage endCursor }
       nodes {
         id
-        iid
-        sha
-        ref
-        status
-        createdAt
-        securityReportFindings(first: 100, after: $after) {
-          pageInfo { hasNextPage endCursor }
-          nodes {
-            uuid
-            title
-            description
-            severity
-            state
-            reportType
-            solution
-            falsePositive
-            scanner { externalId name vendor }
-            identifiers { externalType externalId name url }
-            links { name url }
-            location {
-              ... on VulnerabilityLocationDependencyScanning {
-                file
-                blobPath
-                dependency { package { name } version }
-              }
-              ... on VulnerabilityLocationContainerScanning {
-                image
-                operatingSystem
-                dependency { package { name } version }
-              }
-              ... on VulnerabilityLocationSast {
-                file
-                startLine
-                endLine
-                vulnerableClass
-                vulnerableMethod
-                blobPath
-              }
-              ... on VulnerabilityLocationSecretDetection {
-                file
-                startLine
-                endLine
-                blobPath
-              }
-              ... on VulnerabilityLocationDast {
-                hostname
-                path
-                param
-                requestMethod
-              }
-            }
-          }
-        }
+                latestDetectedPipeline { id iid sha ref status createdAt }
+                uuid
+                title
+                description
+                severity
+                state
+                trackedRef { id name }
+                resolvedOnDefaultBranch
+                reportType
+                solution
+                falsePositive
+                scanner { externalId name vendor }
+                identifiers { externalType externalId name url }
+                links { name url }
+                location {
+                    ... on VulnerabilityLocationDependencyScanning {
+                        file
+                        blobPath
+                        dependency { package { name } version }
+                    }
+                    ... on VulnerabilityLocationContainerScanning {
+                        image
+                        operatingSystem
+                        dependency { package { name } version }
+                    }
+                    ... on VulnerabilityLocationSast {
+                        file
+                        startLine
+                        endLine
+                        vulnerableClass
+                        vulnerableMethod
+                        blobPath
+                    }
+                    ... on VulnerabilityLocationSecretDetection {
+                        file
+                        startLine
+                        endLine
+                        blobPath
+                    }
+                    ... on VulnerabilityLocationDast {
+                        hostname
+                        path
+                        param
+                        requestMethod
+                    }
+                }
       }
     }
   }
 }
 """.strip()
 
-ROOT_REF_QUERY = """
-query DefaultBranch($fullPath: ID!) {
-  project(fullPath: $fullPath) {
-    repository { rootRef }
-  }
+TRACKED_REFS_QUERY = """
+query SecurityTrackedRefs($fullPath: ID!, $after: String) {
+    project(fullPath: $fullPath) {
+        securityTrackedRefs(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes { id name refType }
+        }
+    }
 }
 """.strip()
 
 _TITLE_PACKAGE = re.compile(r"\bin\s+([A-Za-z0-9_@./+-]+)\s*$")
-KEEP_STATES = {"detected", "confirmed", ""}
+KEEP_STATES = {"detected", "confirmed"}
 
 
 MAX_PAGES = 20
@@ -93,7 +91,7 @@ MAX_PAGES = 20
 
 @dataclass
 class FetchResult:
-    """Findings from one pipeline, or the reason they could not be read."""
+    """Project vulnerability report findings, or the reason they could not be read."""
 
     ok: bool
     findings: list[dict] = field(default_factory=list)
@@ -120,43 +118,62 @@ class GitLabClient:
         http: httpx.Client | None = None,
         max_findings: int = 1000,
     ):
+        """Configure report retrieval and retain any caller-owned HTTP client."""
         self.token = token
         self.api_url = api_url.rstrip("/")
         self._owns_http = http is None
-        self.http = http or httpx.Client(timeout=30.0)
+        self.http = http if http is not None else httpx.Client(timeout=30.0)
         self.max_findings = max_findings
         self._closed = False
+        self._lock = threading.RLock()
 
     def close(self) -> None:
         """Close the owned HTTP client. Repeated calls do nothing."""
-        if self._closed or not self._owns_http:
-            self._closed = True
-            return
-        self.http.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                if self._owns_http:
+                    self.http.close()
+            finally:
+                self._closed = True
 
     def __enter__(self) -> GitLabClient:
+        """Return this GitLab client for use in a context manager."""
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        """Close only the HTTP client owned by this GitLab client."""
         self.close()
 
     def fetch(self, project_id: str) -> FetchResult:
-        """Return detected and confirmed findings from the latest successful pipeline."""
+        """Fetch still-detected needs-triage or confirmed findings on main.
+
+        project_id may be a numeric GitLab id or a namespace/project path.
+        Return FetchResult with normalized findings, exclusions, and a
+        truncation flag. Missing access, malformed data, and closed-client
+        calls return an error result; no GitLab mutation is performed.
+        """
+        with self._lock:
+            if self._closed:
+                return FetchResult(ok=False, error="GitLab client is closed")
+            return self._fetch(project_id)
+
+    def _fetch(self, project_id: str) -> FetchResult:
+        """Validate inputs and contain request or normalization failures."""
         if not self.token:
             return FetchResult(ok=False, error="GITLAB_TOKEN is required")
         if not project_id:
             return FetchResult(ok=False, error="GITLAB_PROJECT_ID is required")
-        if "mutation" in FINDINGS_QUERY.lower() or "mutation" in ROOT_REF_QUERY.lower():
+        if "mutation" in FINDINGS_QUERY.lower() or "mutation" in TRACKED_REFS_QUERY.lower():
             return FetchResult(ok=False, error="Refusing a GitLab query that is not read-only")
         try:
             full_path = self._full_path(project_id)
-            root_ref = self._root_ref(full_path)
-            pipeline, raw_nodes, truncated = self._findings(full_path, root_ref)
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            pipeline, raw_nodes, truncated = self._findings(full_path)
+            normalized = [normalize_finding(node, pipeline) for node in raw_nodes]
+            kept, excluded = split_states(normalized)
+        except (httpx.HTTPError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
             return FetchResult(ok=False, error=self._clean(str(exc)))
-        normalized = [normalize_finding(node, pipeline) for node in raw_nodes]
-        kept, excluded = split_states(normalized)
         if len(kept) > self.max_findings:
             kept = kept[: self.max_findings]
             truncated = True
@@ -170,6 +187,7 @@ class GitLabClient:
         )
 
     def _full_path(self, project_id: str) -> str:
+        """Resolve numeric project ids and normalize encoded project paths."""
         if project_id.isdigit():
             payload = self._request("GET", f"{self.api_url}/projects/{quote(project_id, safe='')}")
             path = payload.get("path_with_namespace")
@@ -178,43 +196,54 @@ class GitLabClient:
             return path
         return unquote(project_id).strip("/")
 
-    def _root_ref(self, full_path: str) -> str:
-        payload = self._graphql(ROOT_REF_QUERY, {"fullPath": full_path})
-        project = (payload.get("data") or {}).get("project")
-        if not project:
-            raise RuntimeError(f"GitLab project '{full_path}' was not found or is not readable")
-        ref = ((project.get("repository") or {}).get("rootRef")) or "main"
-        return ref
+    def _main_tracked_ref(self, full_path: str) -> str:
+        """Resolve tracked main with bounded, advancing pagination.
 
-    def _findings(self, full_path: str, ref: str) -> tuple[dict | None, list[dict], bool]:
+        Raise if main is unreadable or missing instead of dropping filters.
+        """
+        after = None
+        for _page in range(MAX_PAGES):
+            payload = self._graphql(TRACKED_REFS_QUERY, {"fullPath": full_path, "after": after})
+            project = (payload.get("data") or {}).get("project")
+            if not project:
+                raise RuntimeError(f"GitLab project '{full_path}' was not found or is not readable")
+            connection = _connection(project, "securityTrackedRefs")
+            for tracked_ref in connection["nodes"]:
+                if tracked_ref.get("name") == "main" and tracked_ref.get("refType") == "BRANCH" and tracked_ref.get("id"):
+                    return tracked_ref["id"]
+            page = connection["pageInfo"]
+            if not page.get("hasNextPage"):
+                raise RuntimeError("GitLab security tracked branch 'main' was not found; refusing to fetch unfiltered findings")
+            if not page.get("endCursor") or page["endCursor"] == after:
+                raise RuntimeError("GitLab tracked-ref pagination did not advance")
+            after = page["endCursor"]
+        raise RuntimeError("GitLab tracked-ref lookup exceeded the page limit")
+
+    def _findings(self, full_path: str) -> tuple[dict | None, list[dict], bool]:
+        """Page the persistent filtered report and flag incomplete results."""
+        tracked_ref_id = self._main_tracked_ref(full_path)
         after = None
         pipeline = None
         nodes: list[dict] = []
         for _page in range(MAX_PAGES):
-            payload = self._graphql(FINDINGS_QUERY, {"fullPath": full_path, "ref": ref, "after": after})
+            payload = self._graphql(FINDINGS_QUERY, {"fullPath": full_path, "trackedRefIds": [tracked_ref_id], "after": after})
             project = (payload.get("data") or {}).get("project")
             if not project:
                 raise RuntimeError(f"GitLab project '{full_path}' was not found or is not readable")
-            pipelines = ((project.get("pipelines") or {}).get("nodes")) or []
-            if not pipelines:
-                raise RuntimeError(f"No successful pipeline found on the default branch '{ref}'")
-            current = _pipeline_summary(pipelines[0])
-            # Each page asks for the newest pipeline again. If a newer one
-            # finished mid-read, the cursor belongs to a different pipeline.
-            if pipeline is not None and current.get("id") != pipeline.get("id"):
-                raise RuntimeError("A newer pipeline finished while findings were being read. List the findings again.")
-            pipeline = current
-            connection = pipelines[0].get("securityReportFindings") or {}
-            nodes.extend(connection.get("nodes") or [])
-            page = connection.get("pageInfo") or {}
-            if not page.get("hasNextPage") or not page.get("endCursor"):
+            connection = _connection(project, "vulnerabilities")
+            nodes.extend(connection["nodes"])
+            page = connection["pageInfo"]
+            if not page.get("hasNextPage"):
                 return pipeline, nodes, False
+            if not page.get("endCursor") or page["endCursor"] == after:
+                raise RuntimeError("GitLab vulnerability report pagination did not advance")
             after = page["endCursor"]
             if len(nodes) >= self.max_findings:
                 return pipeline, nodes, True
         return pipeline, nodes, True
 
     def _graphql(self, query: str, variables: dict) -> dict:
+        """Send only query operations to the GitLab GraphQL endpoint."""
         if not query.strip().lower().startswith("query"):
             raise RuntimeError("Only GitLab GraphQL queries are allowed")
         return self._request(
@@ -224,12 +253,14 @@ class GitLabClient:
         )
 
     def _graphql_url(self) -> str:
+        """Derive GraphQL routing from GitLab's configured REST base URL."""
         if self.api_url.endswith("/api/v4"):
             return self.api_url[: -len("/api/v4")] + "/api/graphql"
         parsed = urlparse(self.api_url)
         return f"{parsed.scheme}://{parsed.netloc}/api/graphql"
 
     def _request(self, method: str, url: str, json_body: dict | None = None) -> dict:
+        """Authenticate, close responses, and reject HTTP or GraphQL errors."""
         response = self.http.request(
             method,
             url,
@@ -246,15 +277,34 @@ class GitLabClient:
         if not isinstance(payload, dict):
             raise RuntimeError(f"GitLab {method} {url} did not return a JSON object")
         if payload.get("errors"):
-            message = "; ".join(error.get("message", "unknown GraphQL error") for error in payload["errors"])
+            errors = payload["errors"]
+            if not isinstance(errors, list) or any(not isinstance(error, dict) for error in errors):
+                raise ValueError("GitLab returned malformed GraphQL errors")
+            message = "; ".join(str(error.get("message") or "unknown GraphQL error") for error in errors)
             raise RuntimeError(self._clean(message))
         return payload
 
     def _clean(self, text: str) -> str:
+        """Remove the GitLab token from returned or logged request details."""
         return redact(text, [self.token])
 
 
+def _connection(project: dict, name: str) -> dict:
+    """Reject unreadable GraphQL nodes or pagination instead of emptying them."""
+    connection = project.get(name)
+    if not isinstance(connection, dict):
+        raise RuntimeError(f"GitLab {name} connection is not readable")
+    nodes = connection.get("nodes")
+    page = connection.get("pageInfo")
+    if not isinstance(nodes, list) or any(not isinstance(node, dict) for node in nodes):
+        raise ValueError(f"GitLab {name} nodes are malformed")
+    if not isinstance(page, dict) or not isinstance(page.get("hasNextPage"), bool):
+        raise ValueError(f"GitLab {name} pagination is malformed")
+    return connection
+
+
 def _pipeline_summary(node: dict) -> dict:
+    """Keep pipeline provenance fields used in normalized findings."""
     return {
         "id": node.get("id"),
         "iid": node.get("iid"),
@@ -266,6 +316,7 @@ def _pipeline_summary(node: dict) -> dict:
 
 
 def _identifier(item: dict) -> str | None:
+    """Prefer external identifiers and normalize missing CVE prefixes."""
     external_type = (item.get("externalType") or "").lower()
     external_id = (item.get("externalId") or "").strip()
     name = (item.get("name") or "").strip()
@@ -277,6 +328,7 @@ def _identifier(item: dict) -> str | None:
 
 
 def _component_from_title(title: str | None) -> str | None:
+    """Extract a package name only when the scanner title matches a pattern."""
     if not title:
         return None
     match = _TITLE_PACKAGE.search(title.strip())
@@ -285,6 +337,8 @@ def _component_from_title(title: str | None) -> str | None:
 
 def normalize_finding(node: dict, pipeline: dict | None) -> dict:
     """Convert one GraphQL finding into the shape the engine and report use."""
+    if node.get("latestDetectedPipeline"):
+        pipeline = _pipeline_summary(node["latestDetectedPipeline"])
     identifiers = []
     for item in node.get("identifiers") or []:
         identifier = _identifier(item)
@@ -298,7 +352,7 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
     solution = node.get("solution")
     file_path = location.get("file") or location.get("path")
     return {
-        "id": node.get("uuid") or node.get("title") or "unknown-finding",
+        "id": node.get("uuid") or node.get("id") or node.get("title") or "unknown-finding",
         "title": node.get("title"),
         "description": node.get("description"),
         "scanner": (node.get("scanner") or {}).get("name"),
@@ -322,6 +376,8 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
             "hostname": location.get("hostname"),
         },
         "status": (node.get("state") or "").lower(),
+        "trackedRef": node.get("trackedRef"),
+        "resolvedOnDefaultBranch": node.get("resolvedOnDefaultBranch"),
         "falsePositiveFlag": node.get("falsePositive"),
         "solution": solution,
         "links": [link.get("url") for link in (node.get("links") or []) if link.get("url")],

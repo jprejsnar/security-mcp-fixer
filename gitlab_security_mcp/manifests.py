@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-from gitlab_security_mcp.util import resolve_inside
+from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
 from gitlab_security_mcp.versions import bump_npm_spec, parse_version, range_allows
 
 SKIP_DIRS = {
@@ -33,6 +33,8 @@ DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies"
 
 @dataclass
 class PackageHit:
+    """Describe a located package and its manifest or lockfile evidence."""
+
     ecosystem: str
     manager: str
     name: str
@@ -46,6 +48,8 @@ class PackageHit:
 
 @dataclass
 class StackInfo:
+    """Describe detected build stacks, frameworks, and configuration files."""
+
     node: bool = False
     node_manager: str | None = None
     dotnet: bool = False
@@ -58,6 +62,7 @@ class StackInfo:
 
 
 def _rel(root: Path, path: Path) -> str:
+    """Return normalized relative paths after resolving repository files."""
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
@@ -97,9 +102,9 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
             info.lockfiles["yarn"] = rel
         elif name == "package-lock.json":
             info.lockfiles["npm"] = rel
-        elif name == "packages.lock.json" or name.endswith(".csproj") or name.endswith(".sln"):
+        elif name == "packages.lock.json" or name.endswith((".csproj", ".fsproj", ".vbproj", ".sln", ".slnx")):
             info.dotnet = True
-            if name.endswith(".csproj"):
+            if name.endswith((".csproj", ".fsproj", ".vbproj")):
                 info.target_frameworks.extend(_target_frameworks(path.read_text(encoding="utf-8", errors="replace")))
         elif name == "pom.xml":
             info.java = True
@@ -123,20 +128,42 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
     return info
 
 
+def is_modern_yarn(root: Path) -> bool:
+    """Distinguish Yarn Berry from Classic using declared or lockfile metadata."""
+    declared = (_read_json(root / "package.json") or {}).get("packageManager", "")
+    match = re.match(r"yarn@(\d+)(?:\.|$)", str(declared))
+    if match:
+        return int(match.group(1)) >= 2
+    lock = root / "yarn.lock"
+    return lock.exists() and bool(re.search(r"^__metadata:", lock.read_text(encoding="utf-8"), re.MULTILINE))
+
+
 def _target_frameworks(text: str) -> list[str]:
-    return re.findall(r"<TargetFrameworks?>([^<]+)</TargetFrameworks?>", text, flags=re.IGNORECASE)
+    """Split single or multitarget .NET framework declarations."""
+    values = re.findall(r"<TargetFrameworks?>([^<]+)</TargetFrameworks?>", text, flags=re.IGNORECASE)
+    return [framework.strip() for value in values for framework in value.split(";") if framework.strip()]
 
 
 def _read_json(path: Path) -> dict | None:
+    """Read object-shaped metadata, returning None only for absent files.
+
+    Validate known dependency and manager mappings. Read, decoding, and
+    shape errors propagate so callers cannot infer safe package absence.
+    """
     if not path.exists():
         return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None
+    data = json_object(path.read_text(encoding="utf-8"))
+    for key in (*DEPENDENCY_SECTIONS, "packages", "scripts", "pnpm", "overrides", "resolutions"):
+        if key in data and not isinstance(data[key], dict):
+            raise ValueError(f"{path}: {key} must be a JSON object")
+    pnpm = data.get("pnpm", {})
+    if "overrides" in pnpm and not isinstance(pnpm["overrides"], dict):
+        raise ValueError(f"{path}: pnpm overrides must be a JSON object")
+    return data
 
 
 def _package_json_spec(data: dict, name: str) -> tuple[str | None, bool]:
+    """Find a string dependency spec and report whether it is direct."""
     for section in DEPENDENCY_SECTIONS:
         specs = data.get(section) or {}
         if isinstance(specs, dict) and name in specs and isinstance(specs[name], str):
@@ -145,6 +172,7 @@ def _package_json_spec(data: dict, name: str) -> tuple[str | None, bool]:
 
 
 def _npm_lock_versions(data: dict, name: str) -> list[str]:
+    """Read resolved versions from current and legacy npm lock layouts."""
     versions: list[str] = []
     packages = data.get("packages") or {}
     needle = f"node_modules/{name}"
@@ -183,6 +211,7 @@ def _pnpm_versions(text: str, name: str) -> list[str]:
 
 
 def _prefer(versions: list[str], hinted: str | None) -> str | None:
+    """Prefer a matching scanner hint, otherwise the lowest parsed version."""
     if hinted and hinted in versions:
         return hinted
     parsed = [(parse_version(item), item) for item in versions]
@@ -194,6 +223,7 @@ def _prefer(versions: list[str], hinted: str | None) -> str | None:
 
 
 def locate_npm(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+    """Locate a Node dependency using manifests and the selected lockfile."""
     manifests = [path for path in files if path.name == "package.json"]
     spec = None
     manifest = None
@@ -242,14 +272,16 @@ def locate_npm(root: Path, name: str, hinted: str | None, files: list[Path]) -> 
 
 
 def _local(tag: str) -> str:
+    """Strip an XML namespace so Maven tags can be compared by local name."""
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
 def _pom_dependencies(path: Path) -> list[dict[str, str]]:
+    """Read Maven dependency fields; reject malformed XML as unreadable."""
     try:
         root = ET.parse(path).getroot()
-    except ET.ParseError:
-        return []
+    except ET.ParseError as exc:
+        raise ValueError(f"Could not parse {path}") from exc
     found: list[dict[str, str]] = []
     for node in root.iter():
         if _local(node.tag) != "dependency":
@@ -263,10 +295,11 @@ def _pom_dependencies(path: Path) -> list[dict[str, str]]:
 
 
 def _pom_properties(path: Path) -> dict[str, str]:
+    """Read local Maven properties used to resolve dependency versions."""
     try:
         root = ET.parse(path).getroot()
-    except ET.ParseError:
-        return {}
+    except ET.ParseError as exc:
+        raise ValueError(f"Could not parse {path}") from exc
     props: dict[str, str] = {}
     for node in root.iter():
         if _local(node.tag) != "properties":
@@ -277,6 +310,7 @@ def _pom_properties(path: Path) -> dict[str, str]:
 
 
 def locate_maven(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+    """Locate a Maven dependency, resolving version properties when available."""
     group, artifact = _split_maven_name(name)
     for path in files:
         if path.name != "pom.xml":
@@ -306,6 +340,7 @@ def locate_maven(root: Path, name: str, hinted: str | None, files: list[Path]) -
 
 
 def _split_maven_name(name: str) -> tuple[str | None, str | None]:
+    """Separate group and artifact when a full Maven coordinate is present."""
     if ":" in name:
         group, artifact = name.split(":", 1)
         return group, artifact
@@ -313,6 +348,7 @@ def _split_maven_name(name: str) -> tuple[str | None, str | None]:
 
 
 def locate_gradle(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+    """Locate a Gradle coordinate in build files or a version catalog."""
     group, artifact = _split_maven_name(name)
     coordinate = name if group else None
     patterns = []
@@ -355,16 +391,20 @@ def locate_gradle(root: Path, name: str, hinted: str | None, files: list[Path]) 
 
 
 def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None:
+    """Resolve supported inline or referenced Gradle catalog versions."""
     try:
         import tomllib
     except ModuleNotFoundError:
         return None
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return None
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"Could not parse {path}") from exc
     versions = data.get("versions") or {}
-    for _key, library in (data.get("libraries") or {}).items():
+    libraries = data.get("libraries") or {}
+    if not isinstance(versions, dict) or not isinstance(libraries, dict):
+        raise ValueError(f"{path}: versions and libraries must be TOML tables")
+    for _key, library in libraries.items():
         if not isinstance(library, dict):
             continue
         module = library.get("module")
@@ -379,9 +419,9 @@ def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None
 
 
 def _nested_nuget(name: str) -> str:
-    """Match ``<PackageReference Include="x"><Version>`` inside one element only.
+    r"""Match ``<PackageReference Include="x"><Version>`` inside one element only.
 
-    A plain lazy ``[\\s\\S]*?`` would run past ``</PackageReference>`` and
+    A plain lazy ``[\s\S]*?`` would run past ``</PackageReference>`` and
     pick up the next package's version.
     """
     return (
@@ -391,6 +431,7 @@ def _nested_nuget(name: str) -> str:
 
 
 def locate_nuget(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+    """Locate a NuGet reference in project or central package metadata."""
     pattern = re.compile(
         rf'<PackageReference\s+Include="{re.escape(name)}"\s+Version="([^"]+)"',
         re.IGNORECASE,
@@ -428,6 +469,7 @@ def locate_nuget(root: Path, name: str, hinted: str | None, files: list[Path]) -
 
 
 def locate_nuget_lock(root: Path, name: str, files: list[Path]) -> PackageHit | None:
+    """Locate a resolved NuGet dependency in a packages.lock.json file."""
     for path in files:
         if path.name != "packages.lock.json":
             continue
@@ -510,8 +552,7 @@ def _read(path: Path) -> str:
 
 def _write(path: Path, text: str) -> None:
     """Write text exactly as given. No newline translation."""
-    with path.open("w", encoding="utf-8", newline="") as stream:
-        stream.write(text)
+    atomic_write_text(path, text)
 
 
 def _replace_groups(match: re.Match[str], value: str) -> str:
@@ -527,7 +568,7 @@ def update_npm_spec(root: Path, manifest: str, package: str, new_spec: str) -> b
     """Replace one dependency spec without rewriting the rest of the file."""
     path = _destination(root, manifest)
     text = _read(path)
-    data = json.loads(text)
+    data = json_object(text)
     old = None
     for section in DEPENDENCY_SECTIONS:
         specs = data.get(section) or {}
@@ -562,7 +603,7 @@ def add_npm_override(root: Path, package: str, version: str, manager: str) -> st
     """
     path = _destination(root, "package.json")
     text = _read(path)
-    data = json.loads(text)
+    data = _read_json(path)
     if manager == "pnpm":
         data.setdefault("pnpm", {}).setdefault("overrides", {})[package] = version
     elif manager == "yarn":
@@ -671,6 +712,7 @@ def update_gradle_version(root: Path, manifest: str, package: str, version: str)
 
 
 def _update_toml_version(path: Path, coordinate: str, version: str) -> bool:
+    """Replace only a supported catalog entry or its version reference."""
     hit = _toml_library_version(path, coordinate)
     if hit is None:
         return False
@@ -690,6 +732,7 @@ def _update_toml_version(path: Path, coordinate: str, version: str) -> bool:
 
 
 def _is_dockerfile(path: Path) -> bool:
+    """Recognize Dockerfile names without treating arbitrary files as images."""
     name = path.name.lower()
     return name == "dockerfile" or name.endswith(".dockerfile")
 
@@ -724,6 +767,7 @@ def update_dockerfile_tag(root: Path, image: str, new_tag: str, files: list[Path
 
 
 def _image_name_tag(image: str) -> tuple[str | None, str | None]:
+    """Split an image tag and reject digest-pinned or untagged references."""
     if "@" in image:
         return None, None
     if ":" not in image:

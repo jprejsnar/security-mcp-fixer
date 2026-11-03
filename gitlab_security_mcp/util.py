@@ -1,9 +1,49 @@
-"""Shared helpers for redaction and repository path checks."""
+"""Validate metadata, redact secrets, bound paths, and publish local text."""
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
+
+
+def json_object(text: str) -> dict:
+    """Parse JSON metadata and reject null, array, and scalar roots."""
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object")
+    return data
+
+
+def atomic_write_text(path: Path, text: str, *, exclusive: bool = False) -> None:
+    """Publish UTF-8 text atomically without translating line endings.
+
+    The parent directory must exist. Normal writes preserve existing file
+    permissions; exclusive writes use a hard link and raise FileExistsError
+    rather than replacing a user's file. Temporary storage is cleaned up
+    on exit. Filesystem errors propagate; this is a per-file operation,
+    not a multi-file transaction or cross-process editing lock.
+    """
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-", suffix=".tmp")
+    try:
+        try:
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
+            stream.write(text)
+        if not exclusive and path.exists():
+            shutil.copymode(path, temporary)
+        if exclusive:
+            os.link(temporary, path)
+        else:
+            os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def redact(text: str, secrets: list[str | None]) -> str:

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from gitlab_security_mcp.commands import CommandRunner, resolve_tool
 from gitlab_security_mcp.manifests import (
@@ -16,6 +15,7 @@ from gitlab_security_mcp.manifests import (
     add_nuget_reference,
     bumped_spec,
     dockerfile_images,
+    is_modern_yarn,
     spec_already_allows,
     update_csproj_version,
     update_dockerfile_tag,
@@ -23,7 +23,7 @@ from gitlab_security_mcp.manifests import (
     update_npm_spec,
     update_pom_version,
 )
-from gitlab_security_mcp.util import resolve_inside
+from gitlab_security_mcp.util import json_object, resolve_inside
 from gitlab_security_mcp.versions import parse_version
 
 MAX_AUTO_SCORE = 3
@@ -107,6 +107,7 @@ def plan_remediation(
 
 
 def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
+    """Choose a supported dependency edit, preferring minimal changes."""
     if hit.ecosystem == "npm":
         if hit.direct and hit.spec and spec_already_allows(hit, fixed) and hit.lockfile:
             return Plan(
@@ -205,6 +206,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
 
 
 def _image_plan(root: Path, finding: dict, fixed: str, files: list[Path] | None) -> Plan | None:
+    """Plan a matching unpinned image-tag update, never a digest rewrite."""
     image = (finding.get("location") or {}).get("image")
     component = finding.get("component") or ""
     if image:
@@ -238,6 +240,7 @@ def _image_plan(root: Path, finding: dict, fixed: str, files: list[Path] | None)
 
 
 def _split_image(image: str) -> tuple[str | None, str | None]:
+    """Separate image repository and tag; reject digest-pinned references."""
     if "@" in image:
         return None, None
     if ":" not in image:
@@ -247,6 +250,7 @@ def _split_image(image: str) -> tuple[str | None, str | None]:
 
 
 def _same_image(component: str, name: str, image: str | None) -> bool:
+    """Match a scanner component to an image name or repository basename."""
     if not component:
         return True
     repo = name.rsplit("/", 1)[-1]
@@ -259,7 +263,13 @@ def apply_plan(
     runner: CommandRunner,
     which: Callable[[str], str | None],
 ) -> dict:
-    """Apply one plan to the working tree and refresh lockfiles when needed."""
+    """Apply one supported local plan and refresh relevant lockfiles.
+
+    root bounds edited paths; runner and which control allowed tools.
+    Return APPLIED or a structured failure with edited files and commands.
+    A failed refresh can leave a manifest change for manual review; this
+    function does not roll back, stage, commit, or publish changes.
+    """
     edited: list[str] = []
     commands: list[str] = []
     if not safe_version(plan.target):
@@ -287,12 +297,13 @@ def apply_plan(
             return _applied(plan, [manifest], commands)
         if plan.manager == "nuget":
             return _apply_nuget(root, plan, runner, which, edited, commands)
-    except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+    except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as exc:
         return _failed("FIX_FAILED", plan, str(exc), edited, commands)
     return _failed("FIX_FAILED", plan, "No applicator matched this plan.")
 
 
 def _apply_node(root, plan, runner, which, edited, commands) -> dict:
+    """Apply a Node edit and record any failed lockfile refresh separately."""
     if plan.strategy == "manifest_bump":
         manifest = next((path for path in plan.files if path.endswith("package.json")), None)
         if manifest is None:
@@ -315,10 +326,11 @@ def _apply_node(root, plan, runner, which, edited, commands) -> dict:
 
 
 def _node_spec(root: Path, manifest: str, plan: Plan) -> str | None:
+    """Derive a replacement spec from the current local dependency entry."""
     path = resolve_inside(root, manifest)
     if path is None:
         raise ValueError(f"Refusing to read outside the repository: {manifest}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json_object(path.read_text(encoding="utf-8"))
     for section in DEPENDENCY_SECTIONS:
         specs = data.get(section) or {}
         if isinstance(specs, dict) and isinstance(specs.get(plan.package), str):
@@ -337,10 +349,16 @@ def _node_spec(root: Path, manifest: str, plan: Plan) -> str | None:
 
 
 def _refresh_node_lock(root, plan, runner, which, edited, commands, *, fallback_status: str) -> dict:
+    """Refresh dependencies with manager-specific remediation commands."""
     tool = resolve_tool(plan.manager or "npm", which)
     if not tool:
         return _failed(fallback_status, plan, f"{plan.manager} is not on PATH, so the lockfile was not refreshed.", edited)
-    if plan.strategy == "lockfile_only" and plan.manager == "npm":
+    if plan.manager == "yarn" and is_modern_yarn(root):
+        if plan.strategy == "lockfile_only":
+            argv = [tool, "up", "-R", plan.package]
+        else:
+            argv = [tool, "install", "--mode=update-lockfile"]
+    elif plan.strategy == "lockfile_only" and plan.manager == "npm":
         argv = [tool, "update", plan.package, "--ignore-scripts", "--no-audit", "--no-fund"]
     elif plan.strategy == "lockfile_only" and plan.manager == "pnpm":
         argv = [tool, "update", plan.package, "--ignore-scripts"]
@@ -364,6 +382,7 @@ def _refresh_node_lock(root, plan, runner, which, edited, commands, *, fallback_
 
 
 def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
+    """Edit NuGet references and restore an existing dependency lockfile."""
     if plan.strategy == "manifest_bump" and plan.files:
         manifest = plan.files[0]
         if not update_csproj_version(root, manifest, plan.package, plan.target):
@@ -388,6 +407,7 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
 
 
 def _applied(plan: Plan, files: list[str], commands: list[str]) -> dict:
+    """Return successful edit metadata with duplicate paths removed."""
     unique = []
     for path in files:
         if path and path not in unique:
@@ -404,6 +424,7 @@ def _applied(plan: Plan, files: list[str], commands: list[str]) -> dict:
 
 
 def _failed(status: str, plan: Plan, detail: str, files: list[str] | None = None, commands: list[str] | None = None) -> dict:
+    """Preserve partial edit evidence alongside the failed plan's details."""
     return {
         "status": status,
         "files": files or [],

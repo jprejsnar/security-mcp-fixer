@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 
 import httpx
@@ -79,29 +80,57 @@ class AdvisoryClient:
         github_token: str | None = None,
         nvd_api_key: str | None = None,
     ):
+        """Configure advisory credentials and retain any caller-owned HTTP client."""
         self._owns_http = http is None
-        self.http = http or httpx.Client(timeout=30.0)
+        self.http = http if http is not None else httpx.Client(timeout=30.0)
         self.github_token = github_token
         self.nvd_api_key = nvd_api_key
         self._cache: dict[str, dict | list | None] = {}
         self._closed = False
+        self._lock = threading.RLock()
 
     def close(self) -> None:
         """Close the owned HTTP client. Repeated calls do nothing."""
-        if self._closed or not self._owns_http:
-            self._closed = True
-            return
-        self.http.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                if self._owns_http:
+                    self.http.close()
+            finally:
+                self._closed = True
 
     def __enter__(self) -> AdvisoryClient:
+        """Return this advisory client for use in a context manager."""
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        """Close only the HTTP client owned by this advisory client."""
         self.close()
 
     def lookup(self, finding: dict, ecosystem: str | None, package: str | None, version: str | None) -> AdvisoryLookup:
-        """Decide whether online data can identify a fixed version for this finding."""
+        """Match online advisory evidence to a package and installed version.
+
+        Prefer OSV, then GitHub Advisory Database, then NVD. Return an
+        AdvisoryLookup with affected status, candidate fixes, and sources.
+        Failed requests, malformed responses, and calls after close return
+        lookup_failed instead of authorizing an edit. Serialize cache and
+        client access with shutdown; never treat lookup failure as safety.
+        """
+        with self._lock:
+            try:
+                if self._closed:
+                    raise RuntimeError("Advisory client is closed")
+                return self._lookup(finding, ecosystem, package, version)
+            except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+                return AdvisoryLookup(
+                    outcome="lookup_failed",
+                    summary="Online advisory data could not be read safely.",
+                    errors=[self._clean(str(exc))],
+                )
+
+    def _lookup(self, finding: dict, ecosystem: str | None, package: str | None, version: str | None) -> AdvisoryLookup:
+        """Resolve identifiers through advisory sources in priority order."""
         identifiers = [item for item in finding.get("identifiers") or [] if _advisory_id(item)]
         errors: list[str] = []
         sources: list[str] = []
@@ -167,6 +196,7 @@ class AdvisoryClient:
         )
 
     def _github(self, identifiers: list[str], errors: list[str], sources: list[str]) -> dict | None:
+        """Look up CVE or GHSA ids while preserving request error evidence."""
         for ident in identifiers:
             params = {"ghsa_id": ident} if ident.upper().startswith("GHSA-") else None
             if ident.upper().startswith("CVE-"):
@@ -184,6 +214,7 @@ class AdvisoryClient:
         return None
 
     def _nvd(self, cve: str, errors: list[str], sources: list[str]) -> dict | None:
+        """Fetch the first matching NVD CVE record or record a lookup error."""
         headers = {"apiKey": self.nvd_api_key} if self.nvd_api_key else {}
         try:
             payload = self._get_json(NVD_CVE, params={"cveId": cve}, headers=headers)
@@ -197,12 +228,18 @@ class AdvisoryClient:
         return vulnerabilities[0]
 
     def _github_headers(self) -> dict[str, str]:
+        """Set API media/version headers and optional bearer authentication."""
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         if self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return headers
 
     def _get_json(self, url: str, *, params: dict | None = None, headers: dict | None = None) -> dict | list | None:
+        """Cache validated GET payloads and close every HTTP response.
+
+        Cache 404 as None. Other HTTP or JSON errors propagate to lookup's
+        failure boundary rather than entering the cache as clean evidence.
+        """
         key = url + "?" + "&".join(f"{name}={value}" for name, value in sorted((params or {}).items()))
         if key in self._cache:
             return self._cache[key]
@@ -213,27 +250,34 @@ class AdvisoryClient:
                 return None
             response.raise_for_status()
             payload = response.json()
+            if not isinstance(payload, (dict, list)):
+                raise ValueError("Advisory response must be a JSON object or array")
         finally:
             response.close()
         self._cache[key] = payload
         return payload
 
     def _post_json(self, url: str, body: dict) -> dict | None:
+        """Submit an advisory query and close its response after parsing."""
         response = self.http.post(url, json=body)
         try:
             if response.status_code == 404:
                 return None
             response.raise_for_status()
             payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Advisory query response must be a JSON object")
         finally:
             response.close()
-        return payload if isinstance(payload, dict) else None
+        return payload
 
     def _clean(self, text: str) -> str:
+        """Redact advisory credentials before returning request details."""
         return redact(text, [self.github_token, self.nvd_api_key])
 
 
 def _advisory_id(value: str) -> bool:
+    """Recognize vulnerability ids while excluding weakness-class CWE ids."""
     upper = value.upper()
     if upper.startswith("CWE-"):
         return False
@@ -241,6 +285,7 @@ def _advisory_id(value: str) -> bool:
 
 
 def _overlaps(record: dict, identifiers: list[str], finding: dict) -> bool:
+    """Match advisory aliases to finding identifiers or their title text."""
     aliases = {record.get("id"), *(record.get("aliases") or [])}
     aliases = {item for item in aliases if item}
     if aliases.intersection(identifiers):
@@ -250,6 +295,7 @@ def _overlaps(record: dict, identifiers: list[str], finding: dict) -> bool:
 
 
 def _records_match_package(records: list[dict], package: str) -> bool:
+    """Check whether OSV affected entries name the requested package."""
     target = package.lower()
     for record in records:
         for affected in record.get("affected") or []:
@@ -260,6 +306,7 @@ def _records_match_package(records: list[dict], package: str) -> bool:
 
 
 def _matching_affected(records: list[dict], package: str | None) -> list[dict]:
+    """Select package-specific OSV entries, or all entries without a name."""
     entries: list[dict] = []
     for record in records:
         for affected in record.get("affected") or []:
@@ -272,6 +319,7 @@ def _matching_affected(records: list[dict], package: str | None) -> list[dict]:
 
 
 def _references(records: list[dict]) -> list[str]:
+    """Keep at most five unique advisory reference URLs for reporting."""
     urls: list[str] = []
     for record in records:
         for ref in record.get("references") or []:
@@ -284,6 +332,7 @@ def _references(records: list[dict]) -> list[str]:
 
 
 def _from_osv(records: list[dict], package: str | None, version: str | None, sources: list[str], errors: list[str]) -> AdvisoryLookup:
+    """Combine OSV affected votes and choose a fix outside known ranges."""
     entries = _matching_affected(records, package)
     if package and not entries:
         return AdvisoryLookup(
@@ -337,6 +386,7 @@ def _from_github(
     sources: list[str],
     errors: list[str],
 ) -> AdvisoryLookup:
+    """Match GitHub package ranges and select a comparable patched floor."""
     github_eco = GITHUB_ECOSYSTEMS.get(ecosystem or "")
     vulns = record.get("vulnerabilities") or []
     matched = []
@@ -425,6 +475,7 @@ def _from_nvd(
     sources: list[str],
     errors: list[str],
 ) -> AdvisoryLookup:
+    """Use only matching NVD products to infer affected bounds and fixes."""
     cve = (record.get("cve") or {})
     fixed: list[str] = []
     ranges: list[str] = []

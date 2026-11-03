@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gitlab_security_mcp.util import safe_token
@@ -70,12 +71,14 @@ _CMD_CHARS = _SHELL_CHARS + '%^"!()'
 
 
 def _bad_argument(arg: str, *, batch: bool = False) -> bool:
+    """Reject empty arguments and shell or batch expansion characters."""
     if arg == "":
         return True
     return any(char in arg for char in (_CMD_CHARS if batch else _SHELL_CHARS))
 
 
 def _package_arg(value: str) -> bool:
+    """Require a safe token before adding a package to command arguments."""
     try:
         safe_token(value, label="package")
     except ValueError:
@@ -84,7 +87,7 @@ def _package_arg(value: str) -> bool:
 
 
 def _version_spec(value: str) -> bool:
-    """A package name, or name@version. Scoped names contain a leading @."""
+    """Validate a package name or name@version, including leading @ scopes."""
     if value.startswith("@") and value.count("@") == 1:
         return _package_arg(value)
     if "@" not in value:
@@ -94,10 +97,12 @@ def _version_spec(value: str) -> bool:
 
 
 def _security_branch(name: str) -> bool:
+    """Accept only the dated branch naming scheme owned by this server."""
     return bool(_SECURITY_BRANCH.fullmatch(name))
 
 
 def _git_ok(args: list[str]) -> bool:
+    """Allow exact Git operations without staging or publishing changes."""
     if not args or args[0] in FORBIDDEN_GIT:
         return False
     command, rest = args[0], args[1:]
@@ -132,10 +137,12 @@ def _git_ok(args: list[str]) -> bool:
 
 
 def _script_run(args: list[str]) -> bool:
+    """Allow only known project check scripts rather than arbitrary names."""
     return len(args) == 2 and args[0] == "run" and args[1] in ALLOWED_SCRIPTS
 
 
 def _npm_ok(args: list[str]) -> bool:
+    """Allow npm checks and bounded dependency refresh operations."""
     if args in (
         ["--version"],
         ["ci"],
@@ -152,6 +159,7 @@ def _npm_ok(args: list[str]) -> bool:
 
 
 def _pnpm_ok(args: list[str]) -> bool:
+    """Allow pnpm checks and script-free dependency refresh operations."""
     if args in (
         ["--version"],
         ["install", "--frozen-lockfile"],
@@ -168,22 +176,29 @@ def _pnpm_ok(args: list[str]) -> bool:
 
 
 def _yarn_ok(args: list[str]) -> bool:
+    """Allow supported Classic and Berry checks and dependency refreshes."""
     if args in (
         ["--version"],
         ["install", "--frozen-lockfile"],
+        ["install", "--immutable"],
+        ["install", "--mode=update-lockfile"],
         ["install", "--ignore-scripts"],
         ["test"],
         ["audit", "--json"],
+        ["npm", "audit", "--json"],
     ):
         return True
     if _script_run(args):
         return True
+    if len(args) == 3 and args[:2] == ["up", "-R"]:
+        return _package_arg(args[2])
     if len(args) == 3 and args[0] == "upgrade" and args[2] == "--ignore-scripts":
         return _version_spec(args[1])
     return False
 
 
 def _dotnet_ok(args: list[str]) -> bool:
+    """Allow SDK probes, restores, and Release build or test commands."""
     return args in (
         ["--version"],
         ["restore"],
@@ -194,6 +209,7 @@ def _dotnet_ok(args: list[str]) -> bool:
 
 
 def _maven_ok(args: list[str]) -> bool:
+    """Allow noninteractive Maven verification and dependency inspection."""
     return args in (
         ["--version"],
         ["--batch-mode", "clean", "verify"],
@@ -202,6 +218,7 @@ def _maven_ok(args: list[str]) -> bool:
 
 
 def _gradle_ok(args: list[str]) -> bool:
+    """Allow Gradle checks without leaving a build daemon running."""
     return args in (
         ["--version"],
         ["--no-daemon", "dependencies"],
@@ -211,10 +228,12 @@ def _gradle_ok(args: list[str]) -> bool:
 
 
 def _java_node_ok(args: list[str]) -> bool:
+    """Permit runtime version probes, not arbitrary source execution."""
     return args == ["-version"] or args == ["--version"]
 
 
 def _nginx_ok(args: list[str], repo_root: Path) -> bool:
+    """Restrict NGINX validation to configurations inside the repository."""
     if args == ["-v"]:
         return True
     if len(args) == 3 and args[0] == "-t" and args[1] == "-c":
@@ -223,6 +242,7 @@ def _nginx_ok(args: list[str], repo_root: Path) -> bool:
 
 
 def _docker_ok(args: list[str], repo_root: Path) -> bool:
+    """Restrict Docker operations to version and local build checks."""
     if args == ["version"]:
         return True
     if len(args) == 5 and args[:3] == ["build", "--check", "-f"] and args[4] == ".":
@@ -231,6 +251,7 @@ def _docker_ok(args: list[str], repo_root: Path) -> bool:
 
 
 def _inside_repo(raw: str, repo_root: Path) -> bool:
+    """Resolve a path and reject traversal or external symlink targets."""
     try:
         path = Path(raw)
         if not path.is_absolute():
@@ -311,6 +332,7 @@ class CommandRunner:
     """
 
     def __init__(self, repo_root: Path, *, max_output: int = 65536, audit_path: Path | None = None):
+        """Configure the repository boundary, output cap, and local audit path."""
         self.repo_root = repo_root
         self.max_output = max_output
         self.audit_path = audit_path or (repo_root / ".security-mcp" / "audit.jsonl")
@@ -335,6 +357,7 @@ class CommandRunner:
             return self._run_locked(argv, timeout=timeout, check=check, workdir=workdir)
 
     def _run_locked(self, argv: list[str], *, timeout: int, check: bool, workdir: Path) -> CommandResult:
+        """Own child cleanup, cancellable readers, and audit publication."""
         started = time.monotonic()
         # stdin is the MCP JSON-RPC stream. A child that inherits it could
         # consume protocol bytes, so it gets an empty stdin instead.
@@ -348,14 +371,16 @@ class CommandRunner:
             encoding="utf-8",
             errors="replace",
             shell=False,
-            env=_child_env(),
+            env=_child_env(argv),
             **_process_group_options(),
         )
         captured: dict[str, tuple[str, bool]] = {}
         errors: list[BaseException] = []
-        threads = self._start_readers(process, captured, errors)
+        threads: list[threading.Thread] = []
+        stop_readers = threading.Event()
         timed_out = False
         try:
+            self._start_readers(process, captured, errors, threads, stop_readers)
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -364,13 +389,13 @@ class CommandRunner:
         finally:
             if process.poll() is None:
                 _kill_tree(process)
+            stop_readers.set()
             for thread in threads:
                 thread.join(timeout=5)
-            # A grandchild can keep a pipe open after the child dies. Closing
-            # a pipe while its reader thread is blocked can deadlock, so only
-            # close pipes whose reader has finished.
             if not any(thread.is_alive() for thread in threads):
                 _close_pipes(process)
+        if any(thread.is_alive() for thread in threads):
+            raise RuntimeError("Command output readers did not stop")
         if errors:
             raise RuntimeError("Could not read command output") from errors[0]
         stdout, stdout_truncated = captured.get("stdout", ("", False))
@@ -392,14 +417,17 @@ class CommandRunner:
         process: subprocess.Popen[str],
         captured: dict[str, tuple[str, bool]],
         errors: list[BaseException],
-    ) -> list[threading.Thread]:
+        started: list[threading.Thread],
+        stop: threading.Event,
+    ) -> None:
         """Start one daemon thread per pipe so a full buffer cannot stall the child."""
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("Command pipes were not opened")
 
         def read_stream(name: str, pipe) -> None:
+            """Capture a capped stream or record its reader exception."""
             try:
-                captured[name] = _read_capped(pipe, self.max_output)
+                captured[name] = _read_capped(pipe, self.max_output, stop)
             except Exception as exc:
                 errors.append(exc)
 
@@ -409,7 +437,7 @@ class CommandRunner:
         ]
         for thread in threads:
             thread.start()
-        return threads
+            started.append(thread)
 
     def _finish(
         self,
@@ -420,6 +448,7 @@ class CommandRunner:
         duration_ms: int,
         truncated: bool,
     ) -> CommandResult:
+        """Cap retained output and hash exactly the text returned to callers."""
         kept_out = stdout[: self.max_output]
         kept_err = stderr[: self.max_output]
         return CommandResult(
@@ -434,9 +463,10 @@ class CommandRunner:
         )
 
     def _audit(self, result: CommandResult, cwd: Path) -> None:
+        """Append command metadata and hashes without storing raw output."""
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "argv": result.argv,
             "cwd": str(cwd),
             "exit_code": result.exit_code,
@@ -451,21 +481,35 @@ class CommandRunner:
             handle.write(json.dumps(record) + "\n")
 
 
-def _read_capped(pipe, limit: int) -> tuple[str, bool]:
-    """Read a pipe, keep at most ``limit`` characters, and always drain the rest.
+def _read_capped(pipe, limit: int, stop: threading.Event) -> tuple[str, bool]:
+    """Read a pipe while retaining at most ``limit`` characters.
 
-    Stopping early would fill the OS pipe buffer and stall the child.
+    Drain excess output while the child runs to avoid pipe-buffer deadlock.
+    After shutdown, retain ready data and stop without waiting for EOF from
+    descendants that inherited the pipe. Always close the reader's pipe.
     """
     chunks: list[str] = []
     kept = 0
     truncated = False
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         while True:
-            block = pipe.read(_READ_SIZE)
-            if not block:
+            available = _pipe_available(pipe)
+            if available is None:
                 break
+            if not available:
+                if stop.is_set():
+                    break
+                stop.wait(0.02)
+                continue
+            raw = os.read(pipe.fileno(), min(available, _READ_SIZE))
+            if not raw:
+                break
+            block = decoder.decode(raw)
             if kept >= limit:
                 truncated = True
+                if stop.is_set():
+                    break
                 continue
             room = limit - kept
             if len(block) <= room:
@@ -475,23 +519,55 @@ def _read_capped(pipe, limit: int) -> tuple[str, bool]:
                 chunks.append(block[:room])
                 kept += room
                 truncated = True
+        final = decoder.decode(b"", final=True)
+        if final:
+            chunks.append(final[:max(0, limit - kept)])
+            truncated = truncated or kept + len(final) > limit
     finally:
         pipe.close()
     return "".join(chunks), truncated
 
 
+def _pipe_available(pipe) -> int | None:
+    """Probe readable bytes without blocking; return None on Windows EOF."""
+    if os.name != "nt":
+        import select
+
+        ready, _, _ = select.select([pipe], [], [], 0)
+        return _READ_SIZE if ready else 0
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    peek = kernel.PeekNamedPipe
+    peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    peek.restype = wintypes.BOOL
+    available = wintypes.DWORD()
+    if not peek(msvcrt.get_osfhandle(pipe.fileno()), None, 0, None, ctypes.byref(available), None):
+        error = ctypes.get_last_error()
+        if error == 109:
+            return None
+        raise ctypes.WinError(error)
+    return available.value
+
+
 def _close_pipes(process: subprocess.Popen[str]) -> None:
+    """Close remaining process streams after their readers have stopped."""
     for pipe in (process.stdout, process.stderr, process.stdin):
         if pipe is not None and not pipe.closed:
             pipe.close()
 
 
-def _child_env() -> dict[str, str]:
+def _child_env(argv: list[str] | None = None) -> dict[str, str]:
     """Copy the environment and stop git or package managers from prompting."""
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
     env["CI"] = env.get("CI") or "1"
+    if argv and tool_name(argv[0]) == "yarn" and (argv[1:3] == ["up", "-R"] or "--mode=update-lockfile" in argv):
+        env["YARN_ENABLE_SCRIPTS"] = "false"
+        env["YARN_ENABLE_IMMUTABLE_INSTALLS"] = "false"
     return env
 
 

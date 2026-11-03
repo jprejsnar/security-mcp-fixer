@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from gitlab_security_mcp.commands import CommandResult, CommandRunner, resolve_tool
-from gitlab_security_mcp.manifests import StackInfo, detect_stack, iter_files
+from gitlab_security_mcp.manifests import (
+    StackInfo,
+    _read_json,
+    detect_stack,
+    is_modern_yarn,
+    iter_files,
+)
 
 
 def run_validation(
@@ -19,6 +24,19 @@ def run_validation(
     *,
     timeout: int,
 ) -> dict:
+    """Run detected stack checks and return required failures and skipped tools."""
+    try:
+        return _run_validation(root, runner, which, timeout=timeout)
+    except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+        return {
+            "status": "VALIDATION_FAILED",
+            "detected": {},
+            "results": [_row(None, "FAILED", True, f"Validation could not complete: {exc}")],
+        }
+
+
+def _run_validation(root: Path, runner: CommandRunner, which: Callable[[str], str | None], *, timeout: int) -> dict:
+    """Aggregate stack checks without hiding required failures or skips."""
     files, _truncated = iter_files(root)
     stack = detect_stack(root, files)
     results: list[dict] = []
@@ -43,8 +61,9 @@ def run_validation(
             }
         )
     failed = any(item["status"] == "FAILED" and item.get("required", True) for item in results)
+    incomplete = any(item["status"] == "SKIPPED" and item.get("required", True) for item in results)
     return {
-        "status": "VALIDATION_FAILED" if failed else "VALIDATION_COMPLETE",
+        "status": "VALIDATION_FAILED" if failed else "VALIDATION_INCOMPLETE" if incomplete else "VALIDATION_COMPLETE",
         "detected": {
             "node": stack.node_manager if stack.node else None,
             "dotnet": stack.target_frameworks or None,
@@ -57,6 +76,7 @@ def run_validation(
 
 
 def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
+    """Probe runtimes and enforce Java 17 and net10.0 SDK requirements."""
     probes = []
     if stack.node:
         probes.append(("node", ["--version"]))
@@ -68,28 +88,42 @@ def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
     for name, args in probes:
         tool = resolve_tool(name, which)
         if not tool:
-            found.append(_row(None, "SKIPPED", False, f"{name} is not on PATH."))
+            found.append(_row(None, "SKIPPED", True, f"{name} is not on PATH."))
             continue
         result = runner.run([tool, *args], timeout=min(timeout, 60), check=False)
         text = (result.stdout or result.stderr).strip()
         detail = text.splitlines()[0] if text else f"exit {result.exit_code}"
+        requires_net10 = name == "dotnet" and any(re.match(r"net10\.0(?:-|$)", item) for item in stack.target_frameworks or [])
+        compatible = True
         if name == "java" and not _java_major(text, 17):
+            compatible = False
             detail = f"{detail}. Expected Java 17 for this validation matrix."
+        if requires_net10:
+            sdk = re.match(r"(\d+)\.\d+\.\d+", text)
+            if sdk is None or int(sdk.group(1)) < 10:
+                compatible = False
+                detail = f"{detail}. A .NET SDK 10 or newer is required for net10.0 targets."
         if name == "dotnet" and stack.target_frameworks and not any("net10" in item for item in stack.target_frameworks):
             detail = f"{detail}. Project target frameworks: {', '.join(stack.target_frameworks)}."
-        found.append(_row(result, "PASSED" if result.exit_code == 0 else "FAILED", False, detail))
+        found.append(_row(result, "PASSED" if result.exit_code == 0 and compatible else "FAILED", name == "java" or requires_net10, detail))
     return found
 
 
 def _java_major(text: str, expected: int) -> bool:
+    """Require a readable Java version matching the requested major."""
     match = re.search(r'version "(?P<major>\d+)', text)
     if not match:
-        return True
+        return False
     return int(match.group("major")) == expected
 
 
 def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
+    """Install locked Node dependencies, then run declared project checks."""
     manager = stack.node_manager or "npm"
+    data = _read_json(root / "package.json") or {}
+    scripts = data.get("scripts", {})
+    if any(not isinstance(script, str) or not script.strip() for script in scripts.values()):
+        raise ValueError("package.json scripts must contain nonempty command strings")
     tool = resolve_tool(manager, which)
     if not tool:
         return [_row(None, "SKIPPED", True, f"{manager} is not on PATH.")]
@@ -100,19 +134,15 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
     elif manager == "pnpm":
         rows.append(_run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True))
         rows.append(_run(runner, [tool, "audit", "--json"], timeout, required=False, informational=True))
+    elif is_modern_yarn(root):
+        rows.append(_run(runner, [tool, "install", "--immutable"], timeout, required=True))
+        rows.append(_run(runner, [tool, "npm", "audit", "--json"], timeout, required=False, informational=True))
     else:
         rows.append(_run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True))
         rows.append(_run(runner, [tool, "audit", "--json"], timeout, required=False, informational=True))
     if rows[0]["status"] == "FAILED":
         rows.append(_row(None, "SKIPPED", False, "Skipped lint, build, and test because install failed."))
         return rows
-    package_json = root / "package.json"
-    scripts = {}
-    if package_json.exists():
-        try:
-            scripts = json.loads(package_json.read_text(encoding="utf-8")).get("scripts") or {}
-        except json.JSONDecodeError:
-            scripts = {}
     for script in ("lint", "build", "test"):
         if script not in scripts:
             rows.append(_row(None, "SKIPPED", False, f"package.json has no {script} script."))
@@ -125,6 +155,7 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
 
 
 def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[dict]:
+    """Restore NuGet dependencies and run Release build and test checks."""
     tool = resolve_tool("dotnet", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "dotnet is not on PATH.")]
@@ -141,6 +172,7 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
 
 
 def _java(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
+    """Prefer repository wrappers for Maven or Gradle validation."""
     if stack.java_build == "gradle":
         wrapper = _wrapper(root, "gradlew")
         tool = wrapper or resolve_tool("gradle", which)
@@ -163,6 +195,7 @@ def _java(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
 
 
 def _nginx(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
+    """Check detected NGINX configuration files when the tool is present."""
     tool = resolve_tool("nginx", which)
     if not tool:
         return [_row(None, "SKIPPED", False, "nginx is not on PATH. Config was not executed.")]
@@ -173,6 +206,7 @@ def _nginx(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[di
 
 
 def _docker(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
+    """Check FROM instructions and use Docker build checks when available."""
     rows = []
     for rel in stack.dockerfiles or []:
         text = (root / rel).read_text(encoding="utf-8", errors="replace")
@@ -195,6 +229,7 @@ def _docker(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[d
 
 
 def _wrapper(root: Path, name: str) -> str | None:
+    """Find a build wrapper, preferring Windows command-file extensions."""
     if os.name == "nt":
         candidate = root / f"{name}.cmd"
         if candidate.exists():
@@ -207,11 +242,13 @@ def _wrapper(root: Path, name: str) -> str | None:
 
 
 def _run(runner, argv: list[str], timeout: int, *, required: bool, informational: bool = False) -> dict:
+    """Run one allowlisted check and convert its exit code to a row."""
     result = runner.run(argv, timeout=timeout, check=False)
     return _run_result(result, required=required, informational=informational)
 
 
 def _run_result(result: CommandResult, *, required: bool, informational: bool = False) -> dict:
+    """Classify command output without making advisory audits fatal."""
     if result.exit_code == 0:
         status = "PASSED"
     elif informational:
@@ -225,6 +262,7 @@ def _run_result(result: CommandResult, *, required: bool, informational: bool = 
 
 
 def _row(result: CommandResult | None, status: str, required: bool, detail: str) -> dict:
+    """Build a JSON-safe check row with hashes and optional command data."""
     return {
         "command": result.display() if result else None,
         "exit_code": result.exit_code if result else None,

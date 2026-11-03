@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Callable
+from collections.abc import Callable
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
@@ -152,6 +152,7 @@ def bump_npm_spec(old_spec: str, fixed: str) -> str | None:
 
 
 def _event_value(event: dict, key: str) -> Version | None:
+    """Parse one OSV bound, treating an introduced zero as unbounded."""
     if key not in event:
         return None
     raw = str(event[key])

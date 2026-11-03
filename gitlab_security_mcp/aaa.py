@@ -7,7 +7,8 @@ import os
 import re
 from pathlib import Path
 
-from gitlab_security_mcp.manifests import iter_files
+from gitlab_security_mcp.manifests import _read_json, iter_files
+from gitlab_security_mcp.util import atomic_write_text
 
 DEPENDENCY_STRATEGIES = {"lockfile_only", "manifest_bump", "override", "dependency_update"}
 
@@ -18,6 +19,14 @@ def generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
     Pure dependency updates do not get a test. An existing file is never
     overwritten.
     """
+    try:
+        return _generate_aaa_test(root, finding, change)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return {"status": "NOT_GENERATED", "finding_id": finding.get("id"), "reason": f"Test could not be generated safely: {exc}"}
+
+
+def _generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
+    """Publish an oracle-backed test only for supported behavior changes."""
     finding_id = finding.get("id")
     if not change:
         return {"status": "NOT_REQUIRED", "finding_id": finding_id, "reason": "No applied change to cover."}
@@ -54,9 +63,7 @@ def generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
     path, contents = _render(root, project_dir, framework, slug, oracle, target)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # "x" fails if the file exists, so a user's test is never replaced.
-        with path.open("x", encoding="utf-8", newline="\n") as stream:
-            stream.write(contents)
+        atomic_write_text(path, contents, exclusive=True)
     except FileExistsError:
         return {
             "status": "NOT_GENERATED",
@@ -73,10 +80,12 @@ def generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
 
 
 def _rel(root: Path, path: Path) -> str:
+    """Return a normalized repository-relative path for result metadata."""
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
 def _is_dockerfile_name(value: str) -> bool:
+    """Recognize standard and suffixed Dockerfile names in changed paths."""
     name = Path(value).name.lower()
     return name == "dockerfile" or name.endswith(".dockerfile")
 
@@ -85,10 +94,7 @@ def _detect_framework(root: Path) -> tuple[str, Path] | None:
     """Return the test framework and the directory its tests run from."""
     package_json = root / "package.json"
     if package_json.exists():
-        try:
-            data = json.loads(package_json.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
+        data = _read_json(package_json)
         deps: dict = {}
         for key in ("dependencies", "devDependencies"):
             deps.update(data.get(key) or {})
@@ -124,6 +130,7 @@ def _render(
     oracle: str,
     dockerfile: str,
 ) -> tuple[Path, str]:
+    """Select the framework's test destination and escaped source template."""
     if framework in {"vitest", "jest", "mocha"}:
         return root / "test" / "security" / f"{slug}.test.js", _node_test(oracle, framework, dockerfile)
     if framework == "node:test":
@@ -141,6 +148,7 @@ def _render(
 
 
 def _node_test(oracle: str, framework: str, dockerfile: str) -> str:
+    """Render a base-image assertion for Vitest, Jest, or Mocha."""
     expected = json.dumps(oracle)
     source = json.dumps(dockerfile)
     if framework == "vitest":
@@ -170,6 +178,7 @@ describe("security fix", () => {{
 
 
 def _node_builtin(oracle: str, esm: bool, dockerfile: str) -> str:
+    """Render a node:test assertion using the project's module syntax."""
     expected = json.dumps(oracle)
     source = json.dumps(dockerfile)
     if esm:
@@ -199,10 +208,12 @@ test("uses the patched base image", () => {{
 
 
 def _java_literal(value: str) -> str:
+    """Escape backslashes and quotes for a generated Java string literal."""
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _junit(class_name: str, oracle: str, dockerfile: str) -> str:
+    """Render a JUnit 5 assertion for the recorded Dockerfile and image."""
     return f"""package security;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -226,10 +237,12 @@ public class {class_name} {{
 
 
 def _csharp_literal(value: str) -> str:
+    """Escape quotes for a generated C# verbatim string literal."""
     return '@"' + value.replace('"', '""') + '"'
 
 
 def _xunit(class_name: str, oracle: str, from_project: str) -> str:
+    """Render an xUnit assertion that locates its test project at runtime."""
     return f"""using System;
 using System.IO;
 using Xunit;
@@ -257,6 +270,7 @@ public class {class_name}Tests
 
 
 def _package_type(root: Path) -> str:
+    """Read Node module syntax, defaulting to CommonJS when unspecified."""
     path = root / "package.json"
     if not path.exists():
         return "commonjs"
@@ -267,11 +281,13 @@ def _package_type(root: Path) -> str:
 
 
 def _slug(value: str) -> str:
+    """Make a bounded filename slug from an externally supplied finding id."""
     cleaned = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     return cleaned[:60] or "finding"
 
 
 def _class_name(slug: str) -> str:
+    """Produce an identifier that cannot begin with a digit."""
     parts = [part.capitalize() for part in slug.split("-") if part]
     name = "".join(parts) or "SecurityFix"
     if name[0].isdigit():

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from gitlab_security_mcp.util import atomic_write_text
 
 
 @dataclass
@@ -40,14 +40,7 @@ class RunState:
         path = repo_root / ".security-mcp" / "run-state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(asdict(self), indent=2, ensure_ascii=False)
-        handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=".run-state-", suffix=".tmp")
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                stream.write(text)
-            os.replace(temp_name, path)
-        except BaseException:
-            Path(temp_name).unlink(missing_ok=True)
-            raise
+        atomic_write_text(path, text)
 
     def forget(self, finding_id: str) -> None:
         """Drop every earlier decision for one finding before it is verified again."""

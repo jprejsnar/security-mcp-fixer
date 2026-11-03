@@ -11,7 +11,7 @@ The server exposes one tool per phase. A Cursor agent should call them in this o
 1. `run_prechecks` — stop unless the repo is a clean checkout of `main`, with no merge, rebase, cherry-pick, revert, or bisect in progress.
 2. `pull_main_twice` — fast-forward `main` twice with `git pull --ff-only`. Either failure stops the run.
 3. `create_security_branch` — create `security-fixes-Month-dd-YYYY` (for example `security-fixes-November-01-2026`). If that name already exists locally or on `origin`, the run stops.
-4. `list_security_findings` — read findings from the latest successful pipeline on the default branch. This uses GitLab GraphQL. Dismissed and resolved findings are left out.
+4. `list_security_findings` — read findings from the project vulnerability report using GitLab GraphQL. Filters match the UI: Status = Needs triage or Confirmed, Tracked ref = `main`, Activity = Still detected. The client resolves the exact tracked branch ID, requests states `DETECTED`/`CONFIRMED`, and sets `hasResolution: false`. If tracked `main` is unavailable, the client stops instead of fetching unfiltered results. Pipeline provenance is recorded per finding when available.
 5. `verify_security_finding` — for every finding, compare the local manifest or lockfile with OSV, the GitHub Advisory Database, and NVD.
 6. `apply_minimal_fix` — edit only findings marked `CHANGE_REQUIRED`. Findings that online lookups cannot settle are skipped.
 7. `generate_aaa_test` — add an Arrange-Act-Assert test when the fix changes runtime behavior, such as a base-image tag. Dependency-only edits do not get a test.
@@ -37,13 +37,56 @@ Git commands are allowlisted. `git add`, `commit`, `push`, `merge`, `rebase`, `r
 
 Reports and the audit log live under `.security-mcp/` in the target repository. They are untracked. The clean-tree check ignores that directory so the server's own notes do not fail the precheck. Do not commit that directory unless you want the report in git.
 
+### Robustness
+
+Engine tools and HTTP client operations are serialized within one process.
+Shutdown waits for active operations, closes owned clients once, and rejects
+later calls. Tool results are detached snapshots rather than live state.
+Malformed advisory responses fail lookup; malformed local evidence requires
+manual review instead of being treated as package absence. Validation read or
+execution failures produce `VALIDATION_FAILED`.
+
+State, manifests, and individual report files are replaced atomically. Generated
+tests are published without replacing existing files. Command readers stop
+even when descendants retain inherited pipes. This does not guarantee cleanup
+of detached descendant processes, coordinate multiple MCP processes editing
+the same checkout, or make the Markdown/JSON report pair a single transaction.
+
+Run the offline AAA regression suite with leak and thread warnings fatal:
+
+```powershell
+.\.venv\Scripts\python.exe -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+```
+
 ## Requirements
+
+### Repository Compatibility
+
+| Repository | Automatic dependency fixes | Validation |
+|---|---|---|
+| Node.js | npm, pnpm, Yarn Classic and modern Yarn; direct version bumps, supported lock refreshes, overrides/resolutions | Install, advisory audit, declared lint/build/test scripts |
+| .NET 10 | NuGet project references and existing central `Directory.Packages.props` versions | SDK compatibility check, restore, Release build/test; `.sln`, `.slnx`, C#, F#, and VB project detection |
+| Java 17 | Maven direct versions/properties and Gradle coordinates/supported version-catalog entries | Java 17 check, Maven verify/dependency tree or Gradle dependencies/test/build; wrappers preferred |
+
+These are safe dependency-remediation paths, not a promise to fix every security
+finding. A matching advisory, a published compatible fix, and a supported local
+edit are required. Unresolved Java/NuGet transitive dependencies require review;
+SAST, DAST, secrets, unsupported dependency formats, and breaking upgrades are
+not patched by guessing.
+
+Point `REPO_ROOT` at the build/package-manager entry directory. Arbitrary mixed
+monorepo layouts are not automatically orchestrated. Required tools must be on
+the server process's PATH. A missing required tool produces
+`VALIDATION_INCOMPLETE`; an incompatible Java runtime or an SDK too old for
+`net10.0` produces `VALIDATION_FAILED`. Install/configure the required tools and
+rerun validation. A .NET SDK 10 or newer is needed for `net10.0`; Java validation
+requires a Java 17 toolchain, not merely any installed Java version.
 
 - Windows, macOS, or Linux
 - Python 3.11 or newer
 - Git
 - A GitLab personal access token with the `read_api` scope
-- The project path or numeric id, and the default branch must have a successful pipeline with security reports
+- The project path or numeric id, and access to the project's vulnerability report
 
 Node, .NET, Java, NGINX, and Docker are only needed when the target repo uses them and you want that part of the validation matrix to run.
 
@@ -119,6 +162,19 @@ Create or edit the project file `.cursor/mcp.json` in the repository you want to
 
 Reload MCP servers in Cursor (Settings → MCP, or the MCP refresh control) and enable `gitlab-security`. The process speaks MCP over stdin and stdout. It waits for Cursor. It does not open a port.
 
+### Reload code changes
+
+Use the source launcher shown above: the virtualenv's Python with the absolute
+path to `server.py`. It imports the adjacent `gitlab_security_mcp` source tree,
+not an older installed copy. After changing code, restart/reload the
+`gitlab-security` MCP server in Cursor to load the changes. No rebuild or package
+reinstallation is needed for source-only changes.
+
+This restarts the process, rather than updating an active run in place. Reload
+between remediation runs: in-memory state is reset, and a new run must pass
+prechecks again. Dependency changes still require installing the updated
+requirements into the configured virtual environment before restarting.
+
 ### Environment variables
 
 | Variable | Required | Purpose |
@@ -146,7 +202,8 @@ Keep the token in the MCP config, not in a committed file.
 Use the gitlab-security MCP tools in order. Run prechecks, pull main twice,
 create the security branch, list findings, verify each finding, apply only
 eligible fixes, generate AAA tests where behavior changed, run validation,
-and generate the local report. Stop if a gate fails. Do not commit or push.
+and generate the local report. Display unresolved_issues_table at the end
+of your final response. Stop if a gate fails. Do not commit or push.
 ```
 
 5. Read `.security-mcp/reports/security-remediation-report-*.md` in the target repo.
@@ -160,6 +217,14 @@ The report always includes three sections:
 
 Those skipped findings are also returned by `verify_security_finding` and `apply_minimal_fix` as `MANUAL_REVIEW` / `SKIPPED_USER_PROMPT`. Tell the agent how you want them handled. The server will not guess a version when OSV, GitHub Advisory, and NVD do not.
 
+The report ends with an **Unresolved Security Issues** table: severity, package,
+installed version, issue identifiers/title, and the reason no package or code
+update was applied. It includes no-safe-fix, manual-review, and failed-fix
+outcomes, but excludes false positives and successfully applied fixes. The MCP
+result returns `unresolved_issues` and `unresolved_issues_table` so the agent can
+display the same table at the end of its response. Unverified findings remain
+listed separately; they are not assumed to be resolved or unfixable.
+
 ### Run the tests
 
 ```powershell
@@ -167,6 +232,53 @@ Those skipped findings are also returned by `verify_security_finding` and `apply
 python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+#### Python documentation standards
+
+Maintained Python sources follow [PEP 8](https://peps.python.org/pep-0008/),
+[PEP 257](https://peps.python.org/pep-0257/), and the official
+[documentation-string guidance](https://docs.python.org/3/tutorial/controlflow.html#documentation-strings).
+Modules and classes have docstrings. Public APIs describe their purpose and,
+where relevant, ownership, side effects, failures, and limits. Private helpers
+and nested callbacks have docstrings or leading intent comments. Tests retain
+their Arrange-Act-Assert structure rather than adding comments to every line.
+Comments explain non-obvious intent, not obvious assignments or control flow.
+
+The standards suite checks Ruff conventions, Python 3.11 source syntax, and
+documentation on every named definition in maintained source and test files:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_python_standards.py -q
+```
+
+Generated package copies under `build/` are refreshed by building the wheel;
+they are not independently edited or used as the documentation source of truth.
+
+#### Patient-web live checks
+
+Live retrieval is an integration test, not an offline unit test. It is skipped
+unless `--patient-web-live` is supplied. Set `GITLAB_TOKEN` (or
+`GITLAB_PERSONAL_ACCESS_TOKEN`) securely in the test process environment using a
+token with `read_api` and access to the patient-web vulnerability report. Never
+commit credentials. The project path is fixed to
+`clario-clinical/NxT/ecoa-swift/patient-web/patient-web`.
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_patient_web_live.py::test_retrieve_patient_web_security_findings --patient-web-live -v -s
+
+$env:PATIENT_WEB_REPO_ROOT = 'C:\Users\James.Prejsnar\source\repos\patient-web'
+.\.venv\Scripts\python.exe -m pytest tests/test_patient_web_live.py --patient-web-live -v -s
+```
+
+The first command checks that all active findings are retrieved, without
+truncation. The second also checks each finding against the local checkout and
+public advisories. It prints each decision and fails if any finding requires
+manual review, has no safe fix, or proposes a target that advisories cannot
+confirm is unaffected. Evidence-backed false positives do not require a fix.
+This deliberately does not assume every vulnerability has a solution. An empty
+active report fails the retrieval check; update that expectation once the
+project is clean. These tests do not apply fixes, execute Git or package-manager
+commands, or write MCP state or reports into patient-web.
 
 ### Optional: MCP Inspector
 
@@ -205,5 +317,29 @@ Lockfile refreshes use the package manager already selected by the repo (`npm`, 
 A failed required command sets the run to `VALIDATION_FAILED` and leaves the edits uncommitted.
 
 ## Development layout
+
+### Python standards
+
+The minimum supported version remains Python 3.11. Development checks use
+[PEP 8](https://peps.python.org/pep-0008/),
+[PEP 257](https://peps.python.org/pep-0257/), and the current
+[Python porting guidance](https://docs.python.org/3/whatsnew/3.15.html#porting-to-python-3-15).
+Do not introduce newer-only syntax or APIs without changing the support policy.
+Text I/O uses explicit UTF-8 encodings, and injected clients remain caller-owned.
+
+Install development dependencies and run the local checks:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m ruff check gitlab_security_mcp server.py tests
+.\.venv\Scripts\python.exe -W error::DeprecationWarning -m pytest -q
+```
+
+AAA standards tests enforce lint rules and Python 3.11 source syntax alongside
+the behavioral regression suite. Ruff checks PEP 8 layout, imports, supported
+modernization, common correctness issues, and production PEP 257 docstrings.
+Line-length checks are excluded for existing queries and report strings; test
+docstrings are optional. Syntax checks do not replace runtime tests on each
+supported Python version. Live GitLab tests remain opt-in.
 
 `server.py` is the stdio entry point. The implementation is the `gitlab_security_mcp` package: Git allowlist and audit log, GitLab GraphQL client, advisory lookup, manifest editors, validation, AAA tests, and the report.
