@@ -650,10 +650,11 @@ def test_plan_picks_lockfile_when_range_already_allows(tmp_path):
     assert plan.score == 1
 
 
-def test_dependency_directories_are_not_scanned(tmp_path):
+@pytest.mark.parametrize("directory", ["node_modules", ".pnpm-store", ".angular"])
+def test_dependency_directories_are_not_scanned(tmp_path, directory):
     # Arrange
     (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
-    nested = tmp_path / "node_modules" / "left-pad"
+    nested = tmp_path / directory / "left-pad"
     nested.mkdir(parents=True)
     (nested / "package.json").write_text('{"name": "left-pad"}\n', encoding="utf-8")
 
@@ -662,7 +663,7 @@ def test_dependency_directories_are_not_scanned(tmp_path):
 
     # Assert
     assert truncated is False
-    assert all("node_modules" not in path.parts for path in files)
+    assert all(directory not in path.parts for path in files)
 
 
 def test_manifest_write_refuses_paths_outside_the_repo(tmp_path):

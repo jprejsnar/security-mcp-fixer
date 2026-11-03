@@ -160,14 +160,30 @@ class Engine:
                     self.advisory.close()
 
     @classmethod
-    def from_env(cls) -> Engine:
+    def from_env(cls, repo_root: str | None = None) -> Engine:
         """Build an engine from repository, API, and credential settings.
 
-        REPO_ROOT defaults to the current directory. GitLab and advisory
+        An explicit repository overrides REPO_ROOT, which defaults to cwd.
+        Unexpanded host placeholders and missing directories are rejected.
+        GitLab and advisory
         credentials are optional until their services are needed.
         VALIDATION_TIMEOUT_SEC defaults to 600 and must parse as an integer.
         """
-        root = Path(os.environ.get("REPO_ROOT") or os.getcwd()).resolve()
+        configured = repo_root if repo_root is not None else os.environ.get("REPO_ROOT")
+        configured = configured or os.getcwd()
+        if "${" in configured:
+            raise ValueError(
+                "REPO_ROOT contains an unresolved host placeholder. Set REPO_ROOT "
+                "to the absolute application checkout path, or call "
+                "run_prechecks(repo_root=<absolute checkout path>). Restart the MCP "
+                "server after changing its configuration."
+            )
+        root = Path(configured).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError(
+                f"Repository directory does not exist: {root}. Set REPO_ROOT or "
+                "call run_prechecks(repo_root=<absolute checkout path>)."
+            )
         timeout = int(os.environ.get("VALIDATION_TIMEOUT_SEC", "600"))
         return cls(
             root,
@@ -201,6 +217,22 @@ class Engine:
         """Fail closed unless the tree is on a clean main with no merge in progress."""
         try:
             self.git.ensure_work_tree()
+        except Exception as exc:
+            self.state.status = "PRECHECK_FAILED"
+            self.state.stop_stage = "precheck"
+            return {
+                "status": "PRECHECK_FAILED",
+                "error": str(exc),
+                "repo_root": str(self.repo_root),
+                "server_cwd": os.getcwd(),
+                "reason": "Git could not verify the configured application checkout. "
+                "Check that Git is installed and REPO_ROOT points to the Git checkout, "
+                "not the MCP installation or a literal ${workspaceFolder}.",
+                "action": "Call run_prechecks(repo_root=<absolute application checkout path>) "
+                "or update REPO_ROOT and restart the MCP server.",
+                "no_changes_attempted": True,
+            }
+        try:
             branch = self.git.current_branch()
             if branch != "main":
                 return self._stop(
@@ -249,7 +281,12 @@ class Engine:
         self.state.status = "PRECHECK_PASSED"
         self.state.stop_stage = None
         self._remember()
-        return {"status": "PRECHECK_PASSED", "branch": "main", "clean": True}
+        return {
+            "status": "PRECHECK_PASSED",
+            "repo_root": str(self.repo_root),
+            "branch": "main",
+            "clean": True,
+        }
 
     @_serialized
     def pull_main_twice(self) -> dict:

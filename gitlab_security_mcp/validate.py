@@ -50,9 +50,32 @@ def _run_validation(
     results: list[dict] = []
     results.extend(_versions(runner, which, stack, timeout))
     if stack.node:
-        results.extend(_node(root, stack, runner, which, timeout))
+        node_roots = sorted(
+            {path.parent for path in files if path.name == "package.json"}
+        )
+        for component in node_roots:
+            if any(parent in node_roots for parent in component.parents):
+                continue
+            component_files = [path for path in files if path.is_relative_to(component)]
+            component_stack = detect_stack(component, component_files)
+            results.extend(_node(component, component_stack, runner, which, timeout))
     if stack.dotnet:
-        results.extend(_dotnet(root, files, runner, which, timeout))
+        solutions = {
+            path.parent for path in files if path.suffix.lower() in {".sln", ".slnx"}
+        }
+        projects = {
+            path.parent
+            for path in files
+            if path.suffix.lower() in {".csproj", ".fsproj", ".vbproj"}
+        }
+        dotnet_roots = solutions | {
+            path
+            for path in projects
+            if not any(path.is_relative_to(solution) for solution in solutions)
+        }
+        for component in sorted(dotnet_roots):
+            component_files = [path for path in files if path.is_relative_to(component)]
+            results.extend(_dotnet(component, component_files, runner, which, timeout))
     if stack.java:
         results.extend(_java(root, stack, runner, which, timeout))
     if stack.nginx_configs:
@@ -164,7 +187,7 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
         return [_row(None, "SKIPPED", True, f"{manager} is not on PATH.")]
     rows = []
     if manager == "npm":
-        rows.append(_run(runner, [tool, "ci"], timeout, required=True))
+        rows.append(_run(runner, [tool, "ci"], timeout, required=True, cwd=root))
         rows.append(
             _run(
                 runner,
@@ -172,11 +195,18 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
                 timeout,
                 required=False,
                 informational=True,
+                cwd=root,
             )
         )
     elif manager == "pnpm":
         rows.append(
-            _run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True)
+            _run(
+                runner,
+                [tool, "install", "--frozen-lockfile"],
+                timeout,
+                required=True,
+                cwd=root,
+            )
         )
         rows.append(
             _run(
@@ -185,11 +215,18 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
                 timeout,
                 required=False,
                 informational=True,
+                cwd=root,
             )
         )
     elif is_modern_yarn(root):
         rows.append(
-            _run(runner, [tool, "install", "--immutable"], timeout, required=True)
+            _run(
+                runner,
+                [tool, "install", "--immutable"],
+                timeout,
+                required=True,
+                cwd=root,
+            )
         )
         rows.append(
             _run(
@@ -198,11 +235,18 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
                 timeout,
                 required=False,
                 informational=True,
+                cwd=root,
             )
         )
     else:
         rows.append(
-            _run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True)
+            _run(
+                runner,
+                [tool, "install", "--frozen-lockfile"],
+                timeout,
+                required=True,
+                cwd=root,
+            )
         )
         rows.append(
             _run(
@@ -211,6 +255,7 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
                 timeout,
                 required=False,
                 informational=True,
+                cwd=root,
             )
         )
     if rows[0]["status"] == "FAILED":
@@ -230,9 +275,11 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
             )
             continue
         if script == "test":
-            rows.append(_run(runner, [tool, "test"], timeout, required=True))
+            rows.append(_run(runner, [tool, "test"], timeout, required=True, cwd=root))
         else:
-            rows.append(_run(runner, [tool, "run", script], timeout, required=True))
+            rows.append(
+                _run(runner, [tool, "run", script], timeout, required=True, cwd=root)
+            )
     return rows
 
 
@@ -243,7 +290,7 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
         return [_row(None, "SKIPPED", True, "dotnet is not on PATH.")]
     locked = any(path.name == "packages.lock.json" for path in files)
     restore_args = [tool, "restore", "--locked-mode"] if locked else [tool, "restore"]
-    restore = _run(runner, restore_args, timeout, required=True)
+    restore = _run(runner, restore_args, timeout, required=True, cwd=root)
     rows = [restore]
     if restore["status"] == "FAILED":
         rows.append(
@@ -258,6 +305,7 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
             [tool, "build", "--configuration", "Release", "--nologo"],
             timeout,
             required=True,
+            cwd=root,
         )
     )
     rows.append(
@@ -266,6 +314,7 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
             [tool, "test", "--configuration", "Release", "--nologo"],
             timeout,
             required=True,
+            cwd=root,
         )
     )
     return rows
@@ -397,9 +446,11 @@ def _run(
     *,
     required: bool,
     informational: bool = False,
+    cwd: Path | None = None,
 ) -> dict:
     """Run one allowlisted check and convert its exit code to a row."""
-    result = runner.run(argv, timeout=timeout, check=False)
+    options = {"cwd": cwd} if cwd is not None else {}
+    result = runner.run(argv, timeout=timeout, check=False, **options)
     return _run_result(result, required=required, informational=informational)
 
 

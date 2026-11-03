@@ -137,15 +137,14 @@ def test_generated_test_publication_failure_leaves_no_partial_file(
 
 
 @pytest.mark.parametrize("failure", [None, RuntimeError("Server stopped")])
-def test_server_exit_closes_engine(monkeypatch, failure):
+@pytest.mark.parametrize("initialized", [False, True])
+def test_server_exit_closes_engine(monkeypatch, failure, initialized):
     # Arrange
     from unittest.mock import Mock
 
     from gitlab_security_mcp import server
 
-    owned = server.engine
-    owned.close()
-    engine = Mock()
+    engine = Mock() if initialized else None
     monkeypatch.setattr(server, "engine", engine)
     monkeypatch.setattr(server.mcp, "run", Mock(side_effect=failure))
 
@@ -157,7 +156,8 @@ def test_server_exit_closes_engine(monkeypatch, failure):
         server.main()
 
     # Assert
-    engine.close.assert_called_once_with()
+    if initialized:
+        engine.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,8 @@ SKIP_DIRS = {
     ".venv",
     "venv",
     "node_modules",
+    ".pnpm-store",
+    ".angular",
     "bin",
     "obj",
     "target",

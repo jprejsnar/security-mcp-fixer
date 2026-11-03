@@ -18,6 +18,70 @@ from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.git_ops import branch_name_for
 
 
+def test_repository_override_recovers_unresolved_host_placeholder(repo, monkeypatch):
+    # Arrange
+    monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="unresolved host placeholder"):
+        Engine.from_env()
+    engine = Engine.from_env(str(repo))
+    try:
+        assert engine.repo_root == repo.resolve()
+        assert engine.run_prechecks()["status"] == "PRECHECK_PASSED"
+    finally:
+        engine.close()
+
+
+def test_missing_repository_has_actionable_error(tmp_path, monkeypatch):
+    # Arrange
+    monkeypatch.setenv("REPO_ROOT", str(tmp_path / "missing"))
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="Repository directory does not exist"):
+        Engine.from_env()
+
+
+def test_server_recovers_configuration_error(repo, monkeypatch):
+    # Arrange
+    from gitlab_security_mcp import server
+
+    monkeypatch.setattr(server, "engine", None)
+    monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
+
+    # Act
+    failed = server.run_prechecks()
+    recovered = server.run_prechecks(repo_root=str(repo))
+    try:
+        # Assert
+        assert failed["status"] == "ERROR"
+        assert failed["stage"] == "configuration"
+        assert "unresolved host placeholder" in failed["error"]
+        assert "run_prechecks" in failed["action"]
+        assert recovered["status"] == "PRECHECK_PASSED"
+        assert recovered["repo_root"] == str(repo.resolve())
+        refused = server.run_prechecks(repo_root=str(repo.parent))
+        assert refused["status"] == "ERROR"
+        assert "active run" in refused["error"]
+    finally:
+        server._close_engine()
+
+
+def test_non_git_precheck_does_not_persist_run_state(tmp_path):
+    # Arrange
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
+
+    # Act
+    result = engine.run_prechecks()
+
+    # Assert
+    assert result["status"] == "PRECHECK_FAILED"
+    assert result["repo_root"] == str(tmp_path.resolve())
+    assert "REPO_ROOT" in result["reason"]
+    assert result["no_changes_attempted"]
+    assert not (tmp_path / ".security-mcp" / "run-state.json").exists()
+
+
 @pytest.mark.parametrize(
     "manifest, contents",
     [
@@ -860,6 +924,60 @@ def test_missing_required_tool_keeps_validation_incomplete(
     assert engine.state.status == "VALIDATION_INCOMPLETE"
     assert engine.state.validation_status == "VALIDATION_INCOMPLETE"
     runner.run.assert_not_called()
+
+
+def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.validate import run_validation
+
+    frontend = tmp_path / "frontend"
+    backend = tmp_path / "backend"
+    frontend.mkdir()
+    backend.mkdir()
+    (frontend / "package.json").write_text(
+        json.dumps(
+            {
+                "packageManager": "pnpm@10.0.0",
+                "scripts": {"build": "ng build", "test": "jest"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (backend / "app.slnx").write_text("<Solution />", encoding="utf-8")
+    (backend / "App.csproj").write_text(
+        "<Project><TargetFramework>net10.0</TargetFramework></Project>",
+        encoding="utf-8",
+    )
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        argv=["tool"],
+        exit_code=0,
+        stdout="10.0.100",
+        stderr="",
+        duration_ms=0,
+        truncated=False,
+        stdout_sha256="",
+        stderr_sha256="",
+    )
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: name, timeout=30)
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE"
+    calls = runner.run.call_args_list
+    install = next(
+        call for call in calls if call.args[0][1:] == ["install", "--frozen-lockfile"]
+    )
+    assert install.args[0][0] == "pnpm"
+    assert install.kwargs["cwd"] == frontend
+    for call in calls:
+        if call.args[0][0] == "pnpm":
+            assert call.kwargs["cwd"] == frontend
+        if call.args[0][0] == "dotnet" and call.args[0][1] != "--version":
+            assert call.kwargs["cwd"] == backend
 
 
 def test_prechecks_fail_closed(repo):

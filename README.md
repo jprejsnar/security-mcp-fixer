@@ -174,7 +174,7 @@ flowchart TD
 
 | Tool | Responsibility and gate |
 | --- | --- |
-| `run_prechecks()` | Require clean `main`; reject merge, rebase, cherry-pick, revert or bisect in progress. |
+| `run_prechecks(repo_root=None)` | Select the absolute application checkout; require clean `main`; reject merge, rebase, cherry-pick, revert or bisect in progress. |
 | `pull_main_twice()` | Require successful prechecks; perform two fast-forward-only pulls. |
 | `create_security_branch()` | Require successful pulls; create `security-fixes-Month-dd-YYYY`, for example `security-fixes-November-02-2026`. |
 | `list_security_findings(project_id=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
@@ -260,9 +260,13 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
 - Independently approved package policy and meaningful product-check scripts
   before attempting package updates.
 
-Point `REPO_ROOT` at the build/package-manager entry directory. It is the
-application to remediate, not necessarily this MCP project. Arbitrary mixed
-monorepos are not automatically orchestrated. Node, .NET, Java, NGINX, and Docker
+Point `REPO_ROOT` at the application Git checkout, not this MCP project.
+Validation supports split Node/.NET repositories: Node checks run at the
+top-level package manifests (using each component's package manager), and .NET
+checks run at solution directories or standalone project directories. A root
+Node workspace manifest owns its nested packages; define workspace-wide checks
+there. Arbitrary mixed monorepos are not automatically orchestrated.
+Node, .NET, Java, NGINX, and Docker
 are needed only for the validation paths that apply to that checkout. Platform
 support does not mean every toolchain or Python runtime has been certified.
 
@@ -695,6 +699,26 @@ or use an uncommitted user configuration according to corporate policy.
 Reload MCP servers using Cursor's MCP settings/refresh control and enable
 `gitlab-security`. Configuration formats differ between hosts: VS Code uses
 `servers`; Cursor uses `mcpServers`. Do not interchange the two examples.
+
+Use a literal absolute `REPO_ROOT` in user-level Cursor configuration. Do not
+assume `${workspaceFolder}` is expanded: a server launched outside the active
+project cannot infer that project's directory. For example, study-service uses
+`C:\Users\James.Prejsnar\source\repos\study-service`, not its `backend` or
+`frontend` subdirectory.
+
+Alternatively, have the agent call
+`run_prechecks(repo_root="C:\\Users\\James.Prejsnar\\source\\repos\\study-service")`.
+This overrides `REPO_ROOT` for the process's run, including an unresolved
+placeholder. Repository selection is locked after prechecks pass; restart the
+server to switch an active run to another checkout.
+
+Engine configuration is deferred until a tool is called, so invalid paths or
+settings do not prevent MCP initialization or tool discovery. Tool errors
+include the stage, repository (when available), server working directory, and
+corrective action. Git precheck errors include the attempted checkout and
+recovery instructions. Diagnostic logs go to stderr, never MCP stdout. If the
+Python executable or dependencies prevent startup altogether, consult Cursor's
+MCP server log and verify the configured interpreter and installed requirements.
 
 ### Reload code changes
 

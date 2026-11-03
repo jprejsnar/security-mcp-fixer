@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
+import threading
+from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
@@ -16,7 +19,9 @@ logger = logging.getLogger("gitlab_security_mcp")
 
 INSTRUCTIONS = """
 Local-only GitLab security remediation. Call the tools in this order:
-1. run_prechecks
+1. run_prechecks(repo_root=<absolute application checkout path>). Always pass
+    the active application's path when the host starts this server elsewhere.
+    Unresolved ${workspaceFolder} values are not repository paths.
 2. pull_main_twice
 3. create_security_branch
 4. list_security_findings
@@ -59,19 +64,53 @@ mcp = MCPServer(
     instructions=INSTRUCTIONS,
     version=__version__,
 )
-engine = Engine.from_env()
-atexit.register(engine.close)
+engine: Engine | None = None
+_engine_lock = threading.RLock()
 
 
-def _run(tool_name: str, func, *args, **kwargs) -> dict[str, Any]:
+def _close_engine() -> None:
+    """Release the engine if configuration succeeded and tools initialized it."""
+    with _engine_lock:
+        if engine is not None:
+            engine.close()
+
+
+atexit.register(_close_engine)
+
+
+def _run(
+    tool_name: str, *args, repo_root: str | None = None, **kwargs
+) -> dict[str, Any]:
     """Log tool exceptions and return errors without crashing MCP stdio."""
-    try:
-        return func(*args, **kwargs)
-    except (
-        Exception
-    ) as exc:  # surfaced to the client as a tool result, not a crashed server
-        logger.exception("%s failed", tool_name)
-        return {"status": "ERROR", "error": str(exc)}
+    global engine
+    with _engine_lock:
+        try:
+            if engine is not None and repo_root is not None:
+                requested = Path(repo_root).expanduser().resolve()
+                if requested != engine.repo_root:
+                    if engine.state.status not in {"NOT_STARTED", "PRECHECK_FAILED"}:
+                        raise ValueError(
+                            "Cannot change repositories during an active run. "
+                            "Restart the MCP server to select another checkout."
+                        )
+                    replacement = Engine.from_env(repo_root)
+                    engine.close()
+                    engine = replacement
+            if engine is None:
+                engine = Engine.from_env(repo_root)
+            return getattr(engine, tool_name)(*args, **kwargs)
+        except Exception as exc:
+            logger.exception("%s failed", tool_name)
+            return {
+                "status": "ERROR",
+                "stage": "configuration" if engine is None else tool_name,
+                "error": str(exc),
+                "repo_root": str(engine.repo_root) if engine is not None else None,
+                "server_cwd": os.getcwd(),
+                "action": "Call run_prechecks(repo_root=<absolute application checkout path>). "
+                "For persistent configuration, set REPO_ROOT to that absolute path "
+                "and restart the MCP server. Check server stderr for diagnostic details.",
+            }
 
 
 @mcp.tool(
@@ -79,9 +118,13 @@ def _run(tool_name: str, func, *args, **kwargs) -> dict[str, Any]:
         title="Run prechecks", read_only_hint=True, open_world_hint=False
     )
 )
-def run_prechecks() -> dict[str, Any]:
-    """Phase 0. Fail closed unless the repo is on main, clean, and not mid-merge."""
-    return _run("run_prechecks", engine.run_prechecks)
+def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
+    """Select the absolute application checkout; require clean main and no merge.
+
+    Pass the active workspace path explicitly when REPO_ROOT is unset or contains
+    an unresolved host placeholder. Selection is locked after prechecks pass.
+    """
+    return _run("run_prechecks", repo_root=repo_root)
 
 
 @mcp.tool(
@@ -94,7 +137,7 @@ def run_prechecks() -> dict[str, Any]:
 )
 def pull_main_twice() -> dict[str, Any]:
     """Phase 1. Fast-forward main twice. Any failure stops the run."""
-    return _run("pull_main_twice", engine.pull_main_twice)
+    return _run("pull_main_twice")
 
 
 @mcp.tool(
@@ -107,7 +150,7 @@ def pull_main_twice() -> dict[str, Any]:
 )
 def create_security_branch() -> dict[str, Any]:
     """Phase 2. Create security-fixes-Month-dd-YYYY. Stop if that name already exists."""
-    return _run("create_security_branch", engine.create_security_branch)
+    return _run("create_security_branch")
 
 
 @mcp.tool(
@@ -117,7 +160,7 @@ def create_security_branch() -> dict[str, Any]:
 )
 def list_security_findings(project_id: str | None = None) -> dict[str, Any]:
     """Phase 3. Read the still-detected GitLab vulnerability report on main."""
-    return _run("list_security_findings", engine.list_security_findings, project_id)
+    return _run("list_security_findings", project_id)
 
 
 @mcp.tool(
@@ -127,7 +170,7 @@ def list_security_findings(project_id: str | None = None) -> dict[str, Any]:
 )
 def verify_security_finding(finding_id: str) -> dict[str, Any]:
     """Phase 4. Verify one finding with local evidence and online advisories before any edit."""
-    return _run("verify_security_finding", engine.verify_security_finding, finding_id)
+    return _run("verify_security_finding", finding_id)
 
 
 @mcp.tool(
@@ -149,9 +192,7 @@ def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str,
     Corporate approval comes only from the configured policy file. This tool
     runs the product baseline and all policy checks before permitting an edit.
     """
-    return _run(
-        "qualify_package_update", engine.qualify_package_update, finding_id, review
-    )
+    return _run("qualify_package_update", finding_id, review)
 
 
 @mcp.tool(
@@ -164,7 +205,7 @@ def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str,
 )
 def apply_minimal_fix(finding_id: str) -> dict[str, Any]:
     """Apply only a fresh qualified package plan; resolution requires post-checks."""
-    return _run("apply_minimal_fix", engine.apply_minimal_fix, finding_id)
+    return _run("apply_minimal_fix", finding_id)
 
 
 @mcp.tool(
@@ -177,7 +218,7 @@ def apply_minimal_fix(finding_id: str) -> dict[str, Any]:
 )
 def generate_aaa_test(finding_id: str) -> dict[str, Any]:
     """Phase 5. Add an Arrange-Act-Assert test when the fix changes runtime behavior."""
-    return _run("generate_aaa_test", engine.generate_aaa_test, finding_id)
+    return _run("generate_aaa_test", finding_id)
 
 
 @mcp.tool(
@@ -190,7 +231,7 @@ def generate_aaa_test(finding_id: str) -> dict[str, Any]:
 )
 def run_validation_matrix() -> dict[str, Any]:
     """Phase 6. Run Node, .NET, Java 17, NGINX, and container checks that apply to this repo."""
-    return _run("run_validation_matrix", engine.run_validation_matrix)
+    return _run("run_validation_matrix")
 
 
 @mcp.tool(
@@ -207,7 +248,7 @@ def generate_local_report() -> dict[str, Any]:
     Display unresolved_issues_table at the end of the final response. It lists
     issues not safely addressed by package or code updates and the reasons.
     """
-    return _run("generate_local_report", engine.generate_local_report)
+    return _run("generate_local_report")
 
 
 @mcp.tool(
@@ -217,7 +258,7 @@ def generate_local_report() -> dict[str, Any]:
 )
 def get_run_status() -> dict[str, Any]:
     """Return the current phase, branch, and counts for this run."""
-    return _run("get_run_status", engine.get_run_status)
+    return _run("get_run_status")
 
 
 def main() -> None:
@@ -226,7 +267,7 @@ def main() -> None:
         mcp.run()
     finally:
         try:
-            engine.close()
+            _close_engine()
         except Exception:
             logger.exception("Could not close the engine during server shutdown")
 
