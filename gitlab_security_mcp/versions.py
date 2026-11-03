@@ -46,7 +46,11 @@ def lowest_fixed(installed: str | None, fixed_versions: list[str]) -> str | None
     if current is None:
         # Without a comparable installed version, the lowest parsed fix is the floor.
         parsed = [(parse_version(raw), raw) for raw in fixed_versions]
-        usable = [(parsed_version, raw) for parsed_version, raw in parsed if parsed_version is not None]
+        usable = [
+            (parsed_version, raw)
+            for parsed_version, raw in parsed
+            if parsed_version is not None
+        ]
         if not usable:
             return None
         usable.sort(key=lambda item: item[0])
@@ -94,14 +98,21 @@ def is_major_upgrade(installed: str | None, target: str | None) -> bool:
 def npm_to_specifier(spec: str) -> str | None:
     """Convert a common npm range into a PEP 440 specifier set, if it is one range."""
     text = spec.strip()
-    if not text or text.startswith(("workspace:", "file:", "link:", "catalog:", "npm:", "git", "http")):
+    if not text or text.startswith(
+        ("workspace:", "file:", "link:", "catalog:", "npm:", "git", "http")
+    ):
         return None
     if text.startswith("^"):
         base = parse_version(text[1:])
         if base is None:
             return None
         parts = text[1:].split(".")
-        if base.major == 0 and len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) != 0:
+        if (
+            base.major == 0
+            and len(parts) >= 2
+            and parts[1].isdigit()
+            and int(parts[1]) != 0
+        ):
             return f">={text[1:]},<{base.major}.{base.minor + 1}.0"
         if base.major == 0:
             return f">={text[1:]},<{base.major}.{base.minor}.{base.micro + 1}"
@@ -139,7 +150,9 @@ def range_allows(spec: str | None, version: str) -> bool:
 def bump_npm_spec(old_spec: str, fixed: str) -> str | None:
     """Raise the floor of an npm spec to the fixed version, preserving ^ or ~."""
     text = old_spec.strip()
-    if text.startswith(("workspace:", "file:", "link:", "catalog:", "npm:", "git", "http")):
+    if text.startswith(
+        ("workspace:", "file:", "link:", "catalog:", "npm:", "git", "http")
+    ):
         return None
     if text.startswith("^") or text.startswith("~"):
         return f"{text[0]}{fixed}"
@@ -173,7 +186,10 @@ def range_contains(version: str, events: list[dict]) -> bool | None:
         fixed = _event_value(event, "fixed")
         last_affected = _event_value(event, "last_affected")
         if "introduced" in event:
-            if introduced is None and str(event.get("introduced")) not in {"0", "0.0.0"}:
+            if introduced is None and str(event.get("introduced")) not in {
+                "0",
+                "0.0.0",
+            }:
                 return None
             saw_bound = True
             if introduced is not None and current >= introduced:
@@ -200,7 +216,9 @@ def osv_version_affected(version: str | None, affected_entry: dict) -> bool | No
     if not version:
         return None
     explicit = [str(item) for item in affected_entry.get("versions") or []]
-    if version in explicit or version.lstrip("v") in {item.lstrip("v") for item in explicit}:
+    if version in explicit or version.lstrip("v") in {
+        item.lstrip("v") for item in explicit
+    }:
         return True
     ranges = affected_entry.get("ranges") or []
     if not ranges and not explicit:

@@ -27,6 +27,7 @@ OSV_VULN = "https://api.osv.dev/v1/vulns/{ident}"
 OSV_QUERY = "https://api.osv.dev/v1/query"
 GITHUB_ADVISORIES = "https://api.github.com/advisories"
 NVD_CVE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+MAX_CACHE_ENTRIES = 256
 
 ECOSYSTEMS = {
     "npm": "npm",
@@ -67,7 +68,7 @@ class AdvisoryLookup:
 
 
 class AdvisoryClient:
-    """Query public advisory APIs and cache responses for this process.
+    """Query public advisory APIs with a bounded process-local cache.
 
     OSV is tried first because it does not need a token. The owned HTTP
     client is closed by ``close``. An injected client stays open.
@@ -90,7 +91,7 @@ class AdvisoryClient:
         self._lock = threading.RLock()
 
     def close(self) -> None:
-        """Close the owned HTTP client. Repeated calls do nothing."""
+        """Release cached payloads and owned HTTP resources exactly once."""
         with self._lock:
             if self._closed:
                 return
@@ -98,6 +99,7 @@ class AdvisoryClient:
                 if self._owns_http:
                     self.http.close()
             finally:
+                self._cache.clear()
                 self._closed = True
 
     def __enter__(self) -> AdvisoryClient:
@@ -108,7 +110,13 @@ class AdvisoryClient:
         """Close only the HTTP client owned by this advisory client."""
         self.close()
 
-    def lookup(self, finding: dict, ecosystem: str | None, package: str | None, version: str | None) -> AdvisoryLookup:
+    def lookup(
+        self,
+        finding: dict,
+        ecosystem: str | None,
+        package: str | None,
+        version: str | None,
+    ) -> AdvisoryLookup:
         """Match online advisory evidence to a package and installed version.
 
         Prefer OSV, then GitHub Advisory Database, then NVD. Return an
@@ -122,16 +130,30 @@ class AdvisoryClient:
                 if self._closed:
                     raise RuntimeError("Advisory client is closed")
                 return self._lookup(finding, ecosystem, package, version)
-            except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            except (
+                httpx.HTTPError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                RuntimeError,
+            ) as exc:
                 return AdvisoryLookup(
                     outcome="lookup_failed",
                     summary="Online advisory data could not be read safely.",
                     errors=[self._clean(str(exc))],
                 )
 
-    def _lookup(self, finding: dict, ecosystem: str | None, package: str | None, version: str | None) -> AdvisoryLookup:
+    def _lookup(
+        self,
+        finding: dict,
+        ecosystem: str | None,
+        package: str | None,
+        version: str | None,
+    ) -> AdvisoryLookup:
         """Resolve identifiers through advisory sources in priority order."""
-        identifiers = [item for item in finding.get("identifiers") or [] if _advisory_id(item)]
+        identifiers = [
+            item for item in finding.get("identifiers") or [] if _advisory_id(item)
+        ]
         errors: list[str] = []
         sources: list[str] = []
         osv_records: list[dict] = []
@@ -147,11 +169,19 @@ class AdvisoryClient:
                 sources.append(f"osv:{payload.get('id')}")
 
         osv_ecosystem = ECOSYSTEMS.get((ecosystem or "").lower())
-        if package and version and osv_ecosystem and not _records_match_package(osv_records, package):
+        if (
+            package
+            and version
+            and osv_ecosystem
+            and not _records_match_package(osv_records, package)
+        ):
             try:
                 queried = self._post_json(
                     OSV_QUERY,
-                    {"package": {"ecosystem": osv_ecosystem, "name": package}, "version": version},
+                    {
+                        "package": {"ecosystem": osv_ecosystem, "name": package},
+                        "version": version,
+                    },
                 )
             except httpx.HTTPError as exc:
                 errors.append(self._clean(f"osv-query:{package}: {exc}"))
@@ -164,7 +194,11 @@ class AdvisoryClient:
                 except httpx.HTTPError as exc:
                     errors.append(self._clean(f"osv:{summary.get('id')}: {exc}"))
                     continue
-                if full and full.get("id") and full.get("id") not in {item.get("id") for item in osv_records}:
+                if (
+                    full
+                    and full.get("id")
+                    and full.get("id") not in {item.get("id") for item in osv_records}
+                ):
                     osv_records.append(full)
                     sources.append(f"osv:{full.get('id')}")
 
@@ -173,9 +207,13 @@ class AdvisoryClient:
 
         github_record = self._github(identifiers, errors, sources)
         if github_record is not None:
-            return _from_github(github_record, package, osv_ecosystem, version, sources, errors)
+            return _from_github(
+                github_record, package, osv_ecosystem, version, sources, errors
+            )
 
-        cve = next((item for item in identifiers if item.upper().startswith("CVE-")), None)
+        cve = next(
+            (item for item in identifiers if item.upper().startswith("CVE-")), None
+        )
         if cve:
             nvd_record = self._nvd(cve, errors, sources)
             if nvd_record is not None:
@@ -195,7 +233,9 @@ class AdvisoryClient:
             errors=errors,
         )
 
-    def _github(self, identifiers: list[str], errors: list[str], sources: list[str]) -> dict | None:
+    def _github(
+        self, identifiers: list[str], errors: list[str], sources: list[str]
+    ) -> dict | None:
         """Look up CVE or GHSA ids while preserving request error evidence."""
         for ident in identifiers:
             params = {"ghsa_id": ident} if ident.upper().startswith("GHSA-") else None
@@ -204,7 +244,9 @@ class AdvisoryClient:
             if params is None:
                 continue
             try:
-                payload = self._get_json(GITHUB_ADVISORIES, params=params, headers=self._github_headers())
+                payload = self._get_json(
+                    GITHUB_ADVISORIES, params=params, headers=self._github_headers()
+                )
             except httpx.HTTPError as exc:
                 errors.append(self._clean(f"github:{ident}: {exc}"))
                 continue
@@ -229,32 +271,45 @@ class AdvisoryClient:
 
     def _github_headers(self) -> dict[str, str]:
         """Set API media/version headers and optional bearer authentication."""
-        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
         if self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return headers
 
-    def _get_json(self, url: str, *, params: dict | None = None, headers: dict | None = None) -> dict | list | None:
+    def _get_json(
+        self, url: str, *, params: dict | None = None, headers: dict | None = None
+    ) -> dict | list | None:
         """Cache validated GET payloads and close every HTTP response.
 
         Cache 404 as None. Other HTTP or JSON errors propagate to lookup's
         failure boundary rather than entering the cache as clean evidence.
         """
-        key = url + "?" + "&".join(f"{name}={value}" for name, value in sorted((params or {}).items()))
+        key = (
+            url
+            + "?"
+            + "&".join(
+                f"{name}={value}" for name, value in sorted((params or {}).items())
+            )
+        )
         if key in self._cache:
             return self._cache[key]
         response = self.http.get(url, params=params, headers=headers)
         try:
             if response.status_code == 404:
-                self._cache[key] = None
-                return None
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, (dict, list)):
-                raise ValueError("Advisory response must be a JSON object or array")
+                payload = None
+            else:
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, (dict, list)):
+                    raise ValueError("Advisory response must be a JSON object or array")
         finally:
             response.close()
         self._cache[key] = payload
+        if len(self._cache) > MAX_CACHE_ENTRIES:
+            self._cache.pop(next(iter(self._cache)))
         return payload
 
     def _post_json(self, url: str, body: dict) -> dict | None:
@@ -331,7 +386,13 @@ def _references(records: list[dict]) -> list[str]:
     return urls
 
 
-def _from_osv(records: list[dict], package: str | None, version: str | None, sources: list[str], errors: list[str]) -> AdvisoryLookup:
+def _from_osv(
+    records: list[dict],
+    package: str | None,
+    version: str | None,
+    sources: list[str],
+    errors: list[str],
+) -> AdvisoryLookup:
     """Combine OSV affected votes and choose a fix outside known ranges."""
     entries = _matching_affected(records, package)
     if package and not entries:
@@ -342,7 +403,9 @@ def _from_osv(records: list[dict], package: str | None, version: str | None, sou
             errors=errors,
             references=_references(records),
         )
-    affected_votes = [osv_version_affected(version, entry) for entry in entries] if version else []
+    affected_votes = (
+        [osv_version_affected(version, entry) for entry in entries] if version else []
+    )
     if any(vote is True for vote in affected_votes):
         affected: bool | None = True
     elif affected_votes and all(vote is False for vote in affected_votes):
@@ -356,14 +419,18 @@ def _from_osv(records: list[dict], package: str | None, version: str | None, sou
     floor = first_unaffected(
         version,
         fixed,
-        lambda candidate: any(osv_version_affected(candidate, entry) is True for entry in entries),
+        lambda candidate: any(
+            osv_version_affected(candidate, entry) is True for entry in entries
+        ),
     )
     if affected is False:
         summary = "Installed version is outside the OSV affected range."
     elif fixed:
         summary = f"OSV lists fixed version(s): {', '.join(fixed)}."
     else:
-        summary = "OSV lists this package as affected and does not publish a fixed version."
+        summary = (
+            "OSV lists this package as affected and does not publish a fixed version."
+        )
     outcome = "resolved" if fixed or affected is False else "no_fix_published"
     return AdvisoryLookup(
         outcome=outcome,
@@ -423,7 +490,9 @@ def _from_github(
     floor = first_unaffected(
         version,
         fixed,
-        lambda candidate: any(_github_range_contains(candidate, item) is True for item in ranges),
+        lambda candidate: any(
+            _github_range_contains(candidate, item) is True for item in ranges
+        ),
     )
     if not fixed and affected is not False:
         outcome = "no_fix_published"
@@ -476,7 +545,7 @@ def _from_nvd(
     errors: list[str],
 ) -> AdvisoryLookup:
     """Use only matching NVD products to infer affected bounds and fixes."""
-    cve = (record.get("cve") or {})
+    cve = record.get("cve") or {}
     fixed: list[str] = []
     ranges: list[str] = []
     affected: bool | None = None
@@ -498,8 +567,12 @@ def _from_nvd(
                 end_excluding = match.get("versionEndExcluding")
                 end_including = match.get("versionEndIncluding")
                 start_including = match.get("versionStartIncluding") or "0"
-                end_excluding_version = parse_version(end_excluding) if end_excluding else None
-                end_including_version = parse_version(end_including) if end_including else None
+                end_excluding_version = (
+                    parse_version(end_excluding) if end_excluding else None
+                )
+                end_including_version = (
+                    parse_version(end_including) if end_including else None
+                )
                 if end_excluding_version is not None:
                     fixed.append(end_excluding)
                     ranges.append(f">={start_including},<{end_excluding}")

@@ -165,14 +165,25 @@ class GitLabClient:
             return FetchResult(ok=False, error="GITLAB_TOKEN is required")
         if not project_id:
             return FetchResult(ok=False, error="GITLAB_PROJECT_ID is required")
-        if "mutation" in FINDINGS_QUERY.lower() or "mutation" in TRACKED_REFS_QUERY.lower():
-            return FetchResult(ok=False, error="Refusing a GitLab query that is not read-only")
+        if (
+            "mutation" in FINDINGS_QUERY.lower()
+            or "mutation" in TRACKED_REFS_QUERY.lower()
+        ):
+            return FetchResult(
+                ok=False, error="Refusing a GitLab query that is not read-only"
+            )
         try:
             full_path = self._full_path(project_id)
             pipeline, raw_nodes, truncated = self._findings(full_path)
             normalized = [normalize_finding(node, pipeline) for node in raw_nodes]
             kept, excluded = split_states(normalized)
-        except (httpx.HTTPError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        except (
+            httpx.HTTPError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as exc:
             return FetchResult(ok=False, error=self._clean(str(exc)))
         if len(kept) > self.max_findings:
             kept = kept[: self.max_findings]
@@ -189,10 +200,14 @@ class GitLabClient:
     def _full_path(self, project_id: str) -> str:
         """Resolve numeric project ids and normalize encoded project paths."""
         if project_id.isdigit():
-            payload = self._request("GET", f"{self.api_url}/projects/{quote(project_id, safe='')}")
+            payload = self._request(
+                "GET", f"{self.api_url}/projects/{quote(project_id, safe='')}"
+            )
             path = payload.get("path_with_namespace")
             if not path:
-                raise RuntimeError("GitLab project lookup did not return path_with_namespace")
+                raise RuntimeError(
+                    "GitLab project lookup did not return path_with_namespace"
+                )
             return path
         return unquote(project_id).strip("/")
 
@@ -203,17 +218,27 @@ class GitLabClient:
         """
         after = None
         for _page in range(MAX_PAGES):
-            payload = self._graphql(TRACKED_REFS_QUERY, {"fullPath": full_path, "after": after})
+            payload = self._graphql(
+                TRACKED_REFS_QUERY, {"fullPath": full_path, "after": after}
+            )
             project = (payload.get("data") or {}).get("project")
             if not project:
-                raise RuntimeError(f"GitLab project '{full_path}' was not found or is not readable")
+                raise RuntimeError(
+                    f"GitLab project '{full_path}' was not found or is not readable"
+                )
             connection = _connection(project, "securityTrackedRefs")
             for tracked_ref in connection["nodes"]:
-                if tracked_ref.get("name") == "main" and tracked_ref.get("refType") == "BRANCH" and tracked_ref.get("id"):
+                if (
+                    tracked_ref.get("name") == "main"
+                    and tracked_ref.get("refType") == "BRANCH"
+                    and tracked_ref.get("id")
+                ):
                     return tracked_ref["id"]
             page = connection["pageInfo"]
             if not page.get("hasNextPage"):
-                raise RuntimeError("GitLab security tracked branch 'main' was not found; refusing to fetch unfiltered findings")
+                raise RuntimeError(
+                    "GitLab security tracked branch 'main' was not found; refusing to fetch unfiltered findings"
+                )
             if not page.get("endCursor") or page["endCursor"] == after:
                 raise RuntimeError("GitLab tracked-ref pagination did not advance")
             after = page["endCursor"]
@@ -226,17 +251,28 @@ class GitLabClient:
         pipeline = None
         nodes: list[dict] = []
         for _page in range(MAX_PAGES):
-            payload = self._graphql(FINDINGS_QUERY, {"fullPath": full_path, "trackedRefIds": [tracked_ref_id], "after": after})
+            payload = self._graphql(
+                FINDINGS_QUERY,
+                {
+                    "fullPath": full_path,
+                    "trackedRefIds": [tracked_ref_id],
+                    "after": after,
+                },
+            )
             project = (payload.get("data") or {}).get("project")
             if not project:
-                raise RuntimeError(f"GitLab project '{full_path}' was not found or is not readable")
+                raise RuntimeError(
+                    f"GitLab project '{full_path}' was not found or is not readable"
+                )
             connection = _connection(project, "vulnerabilities")
             nodes.extend(connection["nodes"])
             page = connection["pageInfo"]
             if not page.get("hasNextPage"):
                 return pipeline, nodes, False
             if not page.get("endCursor") or page["endCursor"] == after:
-                raise RuntimeError("GitLab vulnerability report pagination did not advance")
+                raise RuntimeError(
+                    "GitLab vulnerability report pagination did not advance"
+                )
             after = page["endCursor"]
             if len(nodes) >= self.max_findings:
                 return pipeline, nodes, True
@@ -264,12 +300,17 @@ class GitLabClient:
         response = self.http.request(
             method,
             url,
-            headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+            },
             json=json_body,
         )
         try:
             if response.status_code >= 400:
-                detail = self._clean(f"GitLab {method} {url} returned {response.status_code}: {response.text[:500]}")
+                detail = self._clean(
+                    f"GitLab {method} {url} returned {response.status_code}: {response.text[:500]}"
+                )
                 raise RuntimeError(detail)
             payload = response.json()
         finally:
@@ -278,9 +319,13 @@ class GitLabClient:
             raise RuntimeError(f"GitLab {method} {url} did not return a JSON object")
         if payload.get("errors"):
             errors = payload["errors"]
-            if not isinstance(errors, list) or any(not isinstance(error, dict) for error in errors):
+            if not isinstance(errors, list) or any(
+                not isinstance(error, dict) for error in errors
+            ):
                 raise ValueError("GitLab returned malformed GraphQL errors")
-            message = "; ".join(str(error.get("message") or "unknown GraphQL error") for error in errors)
+            message = "; ".join(
+                str(error.get("message") or "unknown GraphQL error") for error in errors
+            )
             raise RuntimeError(self._clean(message))
         return payload
 
@@ -321,7 +366,11 @@ def _identifier(item: dict) -> str | None:
     external_id = (item.get("externalId") or "").strip()
     name = (item.get("name") or "").strip()
     if external_type == "cve" and external_id:
-        return external_id if external_id.upper().startswith("CVE-") else f"CVE-{external_id}"
+        return (
+            external_id
+            if external_id.upper().startswith("CVE-")
+            else f"CVE-{external_id}"
+        )
     if external_id:
         return external_id
     return name or None
@@ -352,7 +401,10 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
     solution = node.get("solution")
     file_path = location.get("file") or location.get("path")
     return {
-        "id": node.get("uuid") or node.get("id") or node.get("title") or "unknown-finding",
+        "id": node.get("uuid")
+        or node.get("id")
+        or node.get("title")
+        or "unknown-finding",
         "title": node.get("title"),
         "description": node.get("description"),
         "scanner": (node.get("scanner") or {}).get("name"),
@@ -380,7 +432,9 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
         "resolvedOnDefaultBranch": node.get("resolvedOnDefaultBranch"),
         "falsePositiveFlag": node.get("falsePositive"),
         "solution": solution,
-        "links": [link.get("url") for link in (node.get("links") or []) if link.get("url")],
+        "links": [
+            link.get("url") for link in (node.get("links") or []) if link.get("url")
+        ],
         "pipeline": pipeline,
         "evidence": [],
         "assessment": None,

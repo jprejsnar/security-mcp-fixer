@@ -44,7 +44,13 @@ class RunState:
 
     def forget(self, finding_id: str) -> None:
         """Drop every earlier decision for one finding before it is verified again."""
-        self.false_positives = [item for item in self.false_positives if item.get("id") != finding_id]
-        self.no_solution = [item for item in self.no_solution if item.get("id") != finding_id]
-        self.skipped_user_prompt = [item for item in self.skipped_user_prompt if item.get("id") != finding_id]
+        self.false_positives = [
+            item for item in self.false_positives if item.get("id") != finding_id
+        ]
+        self.no_solution = [
+            item for item in self.no_solution if item.get("id") != finding_id
+        ]
+        self.skipped_user_prompt = [
+            item for item in self.skipped_user_prompt if item.get("id") != finding_id
+        ]
         self.decisions.pop(finding_id, None)

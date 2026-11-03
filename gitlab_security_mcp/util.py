@@ -27,7 +27,9 @@ def atomic_write_text(path: Path, text: str, *, exclusive: bool = False) -> None
     on exit. Filesystem errors propagate; this is a per-file operation,
     not a multi-file transaction or cross-process editing lock.
     """
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-", suffix=".tmp")
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}-", suffix=".tmp"
+    )
     try:
         try:
             stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="")

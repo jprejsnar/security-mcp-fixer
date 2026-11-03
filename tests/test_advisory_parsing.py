@@ -13,20 +13,35 @@ from gitlab_security_mcp.versions import (
 FINDING = {"identifiers": ["CVE-2021-23337"], "title": "lodash"}
 
 
-@pytest.mark.parametrize("events, expected_fixed", [
-    ([{"introduced": "0"}, {"fixed": "4.17.21"}], "4.17.21"),
-    ([{"introduced": "0"}, {"fixed": "4.17.21"}, {"introduced": "4.17.21"}, {"fixed": "4.17.22"}], "4.17.22"),
-    ([{"introduced": "0"}], None),
-])
-def test_solution_version_is_verified_outside_all_affected_ranges(events, expected_fixed):
+@pytest.mark.parametrize(
+    "events, expected_fixed",
+    [
+        ([{"introduced": "0"}, {"fixed": "4.17.21"}], "4.17.21"),
+        (
+            [
+                {"introduced": "0"},
+                {"fixed": "4.17.21"},
+                {"introduced": "4.17.21"},
+                {"fixed": "4.17.22"},
+            ],
+            "4.17.22",
+        ),
+        ([{"introduced": "0"}], None),
+    ],
+)
+def test_solution_version_is_verified_outside_all_affected_ranges(
+    events, expected_fixed
+):
     """Reject solution hints that are still inside another affected range."""
     record = {
         "id": "GHSA-35jh-r3h4-6jhm",
         "aliases": ["CVE-2021-23337"],
-        "affected": [{
-            "package": {"ecosystem": "npm", "name": "lodash"},
-            "ranges": [{"type": "SEMVER", "events": events}],
-        }],
+        "affected": [
+            {
+                "package": {"ecosystem": "npm", "name": "lodash"},
+                "ranges": [{"type": "SEMVER", "events": events}],
+            }
+        ],
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -36,7 +51,11 @@ def test_solution_version_is_verified_outside_all_affected_ranges(events, expect
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         client = AdvisoryClient(http=http)
-        finding = {**FINDING, "solution": "Upgrade to version 4.17.21.", "fixedVersions": ["4.17.21"]}
+        finding = {
+            **FINDING,
+            "solution": "Upgrade to version 4.17.21.",
+            "fixedVersions": ["4.17.21"],
+        }
         vulnerable = client.lookup(finding, "npm", "lodash", "4.17.20")
 
         assert vulnerable.affected is True
@@ -47,6 +66,57 @@ def test_solution_version_is_verified_outside_all_affected_ranges(events, expect
             assert patched.affected is False
         else:
             assert vulnerable.outcome == "no_fix_published"
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_advisory_cache_is_bounded_and_cleared_on_close(monkeypatch, status):
+    """Evict old successful and missing records and release them on shutdown."""
+    # Arrange
+    from gitlab_security_mcp import advisory
+
+    monkeypatch.setattr(advisory, "MAX_CACHE_ENTRIES", 2)
+
+    def handler(request):
+        """Return disposable advisory payloads without network access."""
+        return httpx.Response(status, json={"id": request.url.path})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = AdvisoryClient(http=http)
+
+        # Act
+        for number in range(3):
+            client._get_json(f"https://example.test/{number}")
+
+        # Assert
+        assert len(client._cache) == 2
+        assert "https://example.test/0?" not in client._cache
+        client.close()
+        assert client._cache == {}
+        assert not http.is_closed
+
+
+def test_advisory_close_failure_still_releases_cached_payloads(monkeypatch):
+    """Release retained evidence even if the owned transport cannot close."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import advisory
+
+    http = Mock()
+    http.close.side_effect = OSError("Transport close failed")
+    monkeypatch.setattr(advisory.httpx, "Client", lambda **kwargs: http)
+    client = AdvisoryClient()
+    client._cache["fixture"] = {"evidence": "retained"}
+
+    # Act
+    with pytest.raises(OSError, match="Transport close failed"):
+        client.close()
+    client.close()
+
+    # Assert
+    assert client._cache == {}
+    assert client._closed
+    http.close.assert_called_once()
 
 
 def _client(handler) -> tuple[httpx.Client, AdvisoryClient]:
@@ -98,7 +168,12 @@ def test_osv_record_for_another_package_needs_a_person():
         "affected": [
             {
                 "package": {"ecosystem": "npm", "name": "lodash-es"},
-                "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "4.17.21"}]}],
+                "ranges": [
+                    {
+                        "type": "SEMVER",
+                        "events": [{"introduced": "0"}, {"fixed": "4.17.21"}],
+                    }
+                ],
             }
         ],
     }
@@ -177,13 +252,22 @@ def test_first_unaffected_skips_a_fix_inside_another_range():
         "ranges": [
             {
                 "type": "SEMVER",
-                "events": [{"introduced": "0"}, {"fixed": "1.5.0"}, {"introduced": "1.5.0"}, {"fixed": "1.6.0"}],
+                "events": [
+                    {"introduced": "0"},
+                    {"fixed": "1.5.0"},
+                    {"introduced": "1.5.0"},
+                    {"fixed": "1.6.0"},
+                ],
             }
         ]
     }
 
     # Act
-    chosen = first_unaffected("1.2.0", ["1.5.0", "1.6.0"], lambda value: osv_version_affected(value, entry) is True)
+    chosen = first_unaffected(
+        "1.2.0",
+        ["1.5.0", "1.6.0"],
+        lambda value: osv_version_affected(value, entry) is True,
+    )
 
     # Assert
     assert chosen == "1.6.0"
@@ -191,7 +275,12 @@ def test_first_unaffected_skips_a_fix_inside_another_range():
 
 def test_major_upgrade_detection():
     # Arrange
-    cases = [("4.17.20", "4.17.21"), ("1.9.0", "2.0.0"), ("0.2.3", "0.3.0"), ("0.2.3", "0.2.4")]
+    cases = [
+        ("4.17.20", "4.17.21"),
+        ("1.9.0", "2.0.0"),
+        ("0.2.3", "0.3.0"),
+        ("0.2.3", "0.2.4"),
+    ]
 
     # Act
     results = [is_major_upgrade(installed, target) for installed, target in cases]

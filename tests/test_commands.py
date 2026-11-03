@@ -52,6 +52,25 @@ def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_st
     assert all(not thread.is_alive() for thread in started_threads)
 
 
+def test_fixture_git_processes_have_timeouts(tmp_path, monkeypatch):
+    """Bound disposable Git setup processes as well as production commands."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from tests import conftest
+
+    run = Mock()
+    monkeypatch.setattr(conftest.subprocess, "run", run)
+
+    # Act
+    conftest.git(tmp_path, "status")
+    conftest.commit_all(tmp_path)
+
+    # Assert
+    assert run.call_count == 3
+    assert all(call.kwargs["timeout"] == 30 for call in run.call_args_list)
+
+
 def test_pipe_reader_stops_when_descendant_keeps_pipe_open():
     # Arrange
     import os
@@ -92,7 +111,10 @@ def test_pipe_reader_stops_when_descendant_keeps_pipe_open():
         pipe.close()
 
 
-@pytest.mark.parametrize("argv", [["yarn", "up", "-R", "lodash"], ["yarn", "install", "--mode=update-lockfile"]])
+@pytest.mark.parametrize(
+    "argv",
+    [["yarn", "up", "-R", "lodash"], ["yarn", "install", "--mode=update-lockfile"]],
+)
 def test_modern_yarn_remediation_disables_scripts_and_allows_lock_changes(argv):
     # Arrange
     from gitlab_security_mcp.commands import _child_env
@@ -146,7 +168,9 @@ def test_git_mutations_are_rejected(repo):
         runner.run(["git", "reset", "--hard"], timeout=30)
     with pytest.raises(PermissionError):
         runner.run(["git", "checkout", "-b", "feature"], timeout=30)
-    status = runner.run(["git", "status", "--porcelain=v1", "--untracked-files=all"], timeout=30)
+    status = runner.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], timeout=30
+    )
 
     # Assert
     assert "note.txt" in status.stdout
@@ -156,7 +180,14 @@ def test_git_mutations_are_rejected(repo):
 def test_security_branch_checkout_is_allowed(repo):
     # Arrange
     checkout = ["git", "checkout", "-b", "security-fixes-November-01-2026"]
-    refresh = ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+    refresh = [
+        "npm",
+        "install",
+        "--package-lock-only",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+    ]
 
     # Act
     assert_allowed(checkout, repo)
@@ -216,7 +247,11 @@ def test_timeout_kills_the_command_and_reports_124(repo):
     runner = CommandRunner(repo)
 
     # Act
-    result = runner.run(["git", "status", "--porcelain=v1", "--untracked-files=all"], timeout=0, check=False)
+    result = runner.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        timeout=0,
+        check=False,
+    )
 
     # Assert
     assert result.exit_code == 124

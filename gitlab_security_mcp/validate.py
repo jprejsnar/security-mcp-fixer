@@ -31,11 +31,19 @@ def run_validation(
         return {
             "status": "VALIDATION_FAILED",
             "detected": {},
-            "results": [_row(None, "FAILED", True, f"Validation could not complete: {exc}")],
+            "results": [
+                _row(None, "FAILED", True, f"Validation could not complete: {exc}")
+            ],
         }
 
 
-def _run_validation(root: Path, runner: CommandRunner, which: Callable[[str], str | None], *, timeout: int) -> dict:
+def _run_validation(
+    root: Path,
+    runner: CommandRunner,
+    which: Callable[[str], str | None],
+    *,
+    timeout: int,
+) -> dict:
     """Aggregate stack checks without hiding required failures or skips."""
     files, _truncated = iter_files(root)
     stack = detect_stack(root, files)
@@ -51,7 +59,9 @@ def _run_validation(root: Path, runner: CommandRunner, which: Callable[[str], st
         results.extend(_nginx(root, stack, runner, which, timeout))
     if stack.dockerfiles:
         results.extend(_docker(root, stack, runner, which, timeout))
-    if not any([stack.node, stack.dotnet, stack.java, stack.nginx_configs, stack.dockerfiles]):
+    if not any(
+        [stack.node, stack.dotnet, stack.java, stack.nginx_configs, stack.dockerfiles]
+    ):
         results.append(
             {
                 "command": None,
@@ -60,10 +70,18 @@ def _run_validation(root: Path, runner: CommandRunner, which: Callable[[str], st
                 "detail": "No Node, .NET, Java, NGINX, or container stack was detected. Manual validation is required.",
             }
         )
-    failed = any(item["status"] == "FAILED" and item.get("required", True) for item in results)
-    incomplete = any(item["status"] == "SKIPPED" and item.get("required", True) for item in results)
+    failed = any(
+        item["status"] == "FAILED" and item.get("required", True) for item in results
+    )
+    incomplete = any(
+        item["status"] == "SKIPPED" and item.get("required", True) for item in results
+    )
     return {
-        "status": "VALIDATION_FAILED" if failed else "VALIDATION_INCOMPLETE" if incomplete else "VALIDATION_COMPLETE",
+        "status": "VALIDATION_FAILED"
+        if failed
+        else "VALIDATION_INCOMPLETE"
+        if incomplete
+        else "VALIDATION_COMPLETE",
         "detected": {
             "node": stack.node_manager if stack.node else None,
             "dotnet": stack.target_frameworks or None,
@@ -93,7 +111,9 @@ def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
         result = runner.run([tool, *args], timeout=min(timeout, 60), check=False)
         text = (result.stdout or result.stderr).strip()
         detail = text.splitlines()[0] if text else f"exit {result.exit_code}"
-        requires_net10 = name == "dotnet" and any(re.match(r"net10\.0(?:-|$)", item) for item in stack.target_frameworks or [])
+        requires_net10 = name == "dotnet" and any(
+            re.match(r"net10\.0(?:-|$)", item) for item in stack.target_frameworks or []
+        )
         compatible = True
         if name == "java" and not _java_major(text, 17):
             compatible = False
@@ -102,10 +122,23 @@ def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
             sdk = re.match(r"(\d+)\.\d+\.\d+", text)
             if sdk is None or int(sdk.group(1)) < 10:
                 compatible = False
-                detail = f"{detail}. A .NET SDK 10 or newer is required for net10.0 targets."
-        if name == "dotnet" and stack.target_frameworks and not any("net10" in item for item in stack.target_frameworks):
+                detail = (
+                    f"{detail}. A .NET SDK 10 or newer is required for net10.0 targets."
+                )
+        if (
+            name == "dotnet"
+            and stack.target_frameworks
+            and not any("net10" in item for item in stack.target_frameworks)
+        ):
             detail = f"{detail}. Project target frameworks: {', '.join(stack.target_frameworks)}."
-        found.append(_row(result, "PASSED" if result.exit_code == 0 and compatible else "FAILED", name == "java" or requires_net10, detail))
+        found.append(
+            _row(
+                result,
+                "PASSED" if result.exit_code == 0 and compatible else "FAILED",
+                name == "java" or requires_net10,
+                detail,
+            )
+        )
     return found
 
 
@@ -122,7 +155,9 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
     manager = stack.node_manager or "npm"
     data = _read_json(root / "package.json") or {}
     scripts = data.get("scripts", {})
-    if any(not isinstance(script, str) or not script.strip() for script in scripts.values()):
+    if any(
+        not isinstance(script, str) or not script.strip() for script in scripts.values()
+    ):
         raise ValueError("package.json scripts must contain nonempty command strings")
     tool = resolve_tool(manager, which)
     if not tool:
@@ -130,22 +165,69 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
     rows = []
     if manager == "npm":
         rows.append(_run(runner, [tool, "ci"], timeout, required=True))
-        rows.append(_run(runner, [tool, "audit", "--json"], timeout, required=False, informational=True))
+        rows.append(
+            _run(
+                runner,
+                [tool, "audit", "--json"],
+                timeout,
+                required=False,
+                informational=True,
+            )
+        )
     elif manager == "pnpm":
-        rows.append(_run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True))
-        rows.append(_run(runner, [tool, "audit", "--json"], timeout, required=False, informational=True))
+        rows.append(
+            _run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True)
+        )
+        rows.append(
+            _run(
+                runner,
+                [tool, "audit", "--json"],
+                timeout,
+                required=False,
+                informational=True,
+            )
+        )
     elif is_modern_yarn(root):
-        rows.append(_run(runner, [tool, "install", "--immutable"], timeout, required=True))
-        rows.append(_run(runner, [tool, "npm", "audit", "--json"], timeout, required=False, informational=True))
+        rows.append(
+            _run(runner, [tool, "install", "--immutable"], timeout, required=True)
+        )
+        rows.append(
+            _run(
+                runner,
+                [tool, "npm", "audit", "--json"],
+                timeout,
+                required=False,
+                informational=True,
+            )
+        )
     else:
-        rows.append(_run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True))
-        rows.append(_run(runner, [tool, "audit", "--json"], timeout, required=False, informational=True))
+        rows.append(
+            _run(runner, [tool, "install", "--frozen-lockfile"], timeout, required=True)
+        )
+        rows.append(
+            _run(
+                runner,
+                [tool, "audit", "--json"],
+                timeout,
+                required=False,
+                informational=True,
+            )
+        )
     if rows[0]["status"] == "FAILED":
-        rows.append(_row(None, "SKIPPED", False, "Skipped lint, build, and test because install failed."))
+        rows.append(
+            _row(
+                None,
+                "SKIPPED",
+                False,
+                "Skipped lint, build, and test because install failed.",
+            )
+        )
         return rows
     for script in ("lint", "build", "test"):
         if script not in scripts:
-            rows.append(_row(None, "SKIPPED", False, f"package.json has no {script} script."))
+            rows.append(
+                _row(None, "SKIPPED", False, f"package.json has no {script} script.")
+            )
             continue
         if script == "test":
             rows.append(_run(runner, [tool, "test"], timeout, required=True))
@@ -164,10 +246,28 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
     restore = _run(runner, restore_args, timeout, required=True)
     rows = [restore]
     if restore["status"] == "FAILED":
-        rows.append(_row(None, "SKIPPED", False, "Skipped build and test because restore failed."))
+        rows.append(
+            _row(
+                None, "SKIPPED", False, "Skipped build and test because restore failed."
+            )
+        )
         return rows
-    rows.append(_run(runner, [tool, "build", "--configuration", "Release", "--nologo"], timeout, required=True))
-    rows.append(_run(runner, [tool, "test", "--configuration", "Release", "--nologo"], timeout, required=True))
+    rows.append(
+        _run(
+            runner,
+            [tool, "build", "--configuration", "Release", "--nologo"],
+            timeout,
+            required=True,
+        )
+    )
+    rows.append(
+        _run(
+            runner,
+            [tool, "test", "--configuration", "Release", "--nologo"],
+            timeout,
+            required=True,
+        )
+    )
     return rows
 
 
@@ -178,19 +278,34 @@ def _java(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
         tool = wrapper or resolve_tool("gradle", which)
         if not tool:
             return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
-        rows = [_run(runner, [tool, "--no-daemon", "dependencies"], timeout, required=True)]
+        rows = [
+            _run(runner, [tool, "--no-daemon", "dependencies"], timeout, required=True)
+        ]
         if rows[0]["status"] == "FAILED":
-            rows.append(_row(None, "SKIPPED", False, "Skipped Gradle test because dependencies failed."))
+            rows.append(
+                _row(
+                    None,
+                    "SKIPPED",
+                    False,
+                    "Skipped Gradle test because dependencies failed.",
+                )
+            )
             return rows
         rows.append(_run(runner, [tool, "--no-daemon", "test"], timeout, required=True))
-        rows.append(_run(runner, [tool, "--no-daemon", "build"], timeout, required=True))
+        rows.append(
+            _run(runner, [tool, "--no-daemon", "build"], timeout, required=True)
+        )
         return rows
     wrapper = _wrapper(root, "mvnw")
     tool = wrapper or resolve_tool("mvn", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "mvnw or mvn is not available.")]
-    rows = [_run(runner, [tool, "--batch-mode", "clean", "verify"], timeout, required=True)]
-    rows.append(_run(runner, [tool, "--batch-mode", "dependency:tree"], timeout, required=True))
+    rows = [
+        _run(runner, [tool, "--batch-mode", "clean", "verify"], timeout, required=True)
+    ]
+    rows.append(
+        _run(runner, [tool, "--batch-mode", "dependency:tree"], timeout, required=True)
+    )
     return rows
 
 
@@ -198,10 +313,21 @@ def _nginx(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[di
     """Check detected NGINX configuration files when the tool is present."""
     tool = resolve_tool("nginx", which)
     if not tool:
-        return [_row(None, "SKIPPED", False, "nginx is not on PATH. Config was not executed.")]
+        return [
+            _row(
+                None, "SKIPPED", False, "nginx is not on PATH. Config was not executed."
+            )
+        ]
     rows = []
     for rel in stack.nginx_configs or []:
-        rows.append(_run(runner, [tool, "-t", "-c", str((root / rel).resolve())], min(timeout, 60), required=True))
+        rows.append(
+            _run(
+                runner,
+                [tool, "-t", "-c", str((root / rel).resolve())],
+                min(timeout, 60),
+                required=True,
+            )
+        )
     return rows
 
 
@@ -216,13 +342,36 @@ def _docker(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[d
             rows.append(_row(None, "PASSED", True, f"{rel} has a FROM instruction."))
     tool = resolve_tool("docker", which)
     if not tool:
-        rows.append(_row(None, "SKIPPED", False, "docker is not on PATH. Image build check was not run."))
+        rows.append(
+            _row(
+                None,
+                "SKIPPED",
+                False,
+                "docker is not on PATH. Image build check was not run.",
+            )
+        )
         return rows
     dockerfile = stack.dockerfiles[0]
-    result = runner.run([tool, "build", "--check", "-f", dockerfile, "."], timeout=timeout, check=False, cwd=root)
+    result = runner.run(
+        [tool, "build", "--check", "-f", dockerfile, "."],
+        timeout=timeout,
+        check=False,
+        cwd=root,
+    )
     text = (result.stderr + result.stdout).lower()
-    if result.exit_code != 0 and any(token in text for token in ("unknown flag", "cannot connect", "docker daemon", "npipe", "permission denied")):
-        rows.append(_row(result, "SKIPPED", False, "Docker build check is unavailable."))
+    if result.exit_code != 0 and any(
+        token in text
+        for token in (
+            "unknown flag",
+            "cannot connect",
+            "docker daemon",
+            "npipe",
+            "permission denied",
+        )
+    ):
+        rows.append(
+            _row(result, "SKIPPED", False, "Docker build check is unavailable.")
+        )
     else:
         rows.append(_run_result(result, required=True))
     return rows
@@ -241,13 +390,22 @@ def _wrapper(root: Path, name: str) -> str | None:
     return str(candidate) if candidate.exists() else None
 
 
-def _run(runner, argv: list[str], timeout: int, *, required: bool, informational: bool = False) -> dict:
+def _run(
+    runner,
+    argv: list[str],
+    timeout: int,
+    *,
+    required: bool,
+    informational: bool = False,
+) -> dict:
     """Run one allowlisted check and convert its exit code to a row."""
     result = runner.run(argv, timeout=timeout, check=False)
     return _run_result(result, required=required, informational=informational)
 
 
-def _run_result(result: CommandResult, *, required: bool, informational: bool = False) -> dict:
+def _run_result(
+    result: CommandResult, *, required: bool, informational: bool = False
+) -> dict:
     """Classify command output without making advisory audits fatal."""
     if result.exit_code == 0:
         status = "PASSED"
@@ -257,11 +415,15 @@ def _run_result(result: CommandResult, *, required: bool, informational: bool = 
         status = "FAILED"
     detail = (result.stderr or result.stdout).strip()
     if result.truncated:
-        detail = (detail[:400] + " (output truncated)") if detail else "output truncated"
+        detail = (
+            (detail[:400] + " (output truncated)") if detail else "output truncated"
+        )
     return _row(result, status, required and not informational, detail[:500])
 
 
-def _row(result: CommandResult | None, status: str, required: bool, detail: str) -> dict:
+def _row(
+    result: CommandResult | None, status: str, required: bool, detail: str
+) -> dict:
     """Build a JSON-safe check row with hashes and optional command data."""
     return {
         "command": result.display() if result else None,

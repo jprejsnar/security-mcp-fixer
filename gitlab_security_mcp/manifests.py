@@ -28,7 +28,12 @@ SKIP_DIRS = {
     "__pycache__",
 }
 MAX_FILES = 5000
-DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
 
 
 @dataclass
@@ -71,9 +76,16 @@ def iter_files(root: Path) -> tuple[list[Path], bool]:
 
     ``os.walk`` is used so ``node_modules`` is not descended into. A recursive
     glob would still open every file under those trees before filtering.
+    Raise OSError on unreadable directories rather than proving absence
+    from an incomplete walk.
     """
+
+    def fail_walk(error: OSError) -> None:
+        """Propagate filesystem errors into the caller's evidence boundary."""
+        raise error
+
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=fail_walk):
         dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
         for filename in filenames:
             path = Path(dirpath) / filename
@@ -90,7 +102,9 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
     """Detect Node, .NET, Java, NGINX, and Docker files from one file list."""
     if files is None:
         files, _truncated = iter_files(root)
-    info = StackInfo(target_frameworks=[], nginx_configs=[], dockerfiles=[], lockfiles={})
+    info = StackInfo(
+        target_frameworks=[], nginx_configs=[], dockerfiles=[], lockfiles={}
+    )
     for path in files:
         name = path.name.lower()
         rel = _rel(root, path)
@@ -102,14 +116,22 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
             info.lockfiles["yarn"] = rel
         elif name == "package-lock.json":
             info.lockfiles["npm"] = rel
-        elif name == "packages.lock.json" or name.endswith((".csproj", ".fsproj", ".vbproj", ".sln", ".slnx")):
+        elif name == "packages.lock.json" or name.endswith(
+            (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx")
+        ):
             info.dotnet = True
             if name.endswith((".csproj", ".fsproj", ".vbproj")):
-                info.target_frameworks.extend(_target_frameworks(path.read_text(encoding="utf-8", errors="replace")))
+                info.target_frameworks.extend(
+                    _target_frameworks(
+                        path.read_text(encoding="utf-8", errors="replace")
+                    )
+                )
         elif name == "pom.xml":
             info.java = True
             info.java_build = info.java_build or "maven"
-        elif name in {"build.gradle", "build.gradle.kts"} or name == "libs.versions.toml":
+        elif (
+            name in {"build.gradle", "build.gradle.kts"} or name == "libs.versions.toml"
+        ):
             info.java = True
             info.java_build = "gradle"
         elif name == "nginx.conf" or name.endswith(".nginx"):
@@ -121,7 +143,9 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
         declared = str(package_json.get("packageManager") or "")
         if declared.startswith("pnpm") or "pnpm" in info.lockfiles:
             info.node_manager = "pnpm"
-        elif declared.startswith("yarn") or ("yarn" in info.lockfiles and "npm" not in info.lockfiles):
+        elif declared.startswith("yarn") or (
+            "yarn" in info.lockfiles and "npm" not in info.lockfiles
+        ):
             info.node_manager = "yarn"
         else:
             info.node_manager = "npm"
@@ -135,13 +159,22 @@ def is_modern_yarn(root: Path) -> bool:
     if match:
         return int(match.group(1)) >= 2
     lock = root / "yarn.lock"
-    return lock.exists() and bool(re.search(r"^__metadata:", lock.read_text(encoding="utf-8"), re.MULTILINE))
+    return lock.exists() and bool(
+        re.search(r"^__metadata:", lock.read_text(encoding="utf-8"), re.MULTILINE)
+    )
 
 
 def _target_frameworks(text: str) -> list[str]:
     """Split single or multitarget .NET framework declarations."""
-    values = re.findall(r"<TargetFrameworks?>([^<]+)</TargetFrameworks?>", text, flags=re.IGNORECASE)
-    return [framework.strip() for value in values for framework in value.split(";") if framework.strip()]
+    values = re.findall(
+        r"<TargetFrameworks?>([^<]+)</TargetFrameworks?>", text, flags=re.IGNORECASE
+    )
+    return [
+        framework.strip()
+        for value in values
+        for framework in value.split(";")
+        if framework.strip()
+    ]
 
 
 def _read_json(path: Path) -> dict | None:
@@ -153,7 +186,14 @@ def _read_json(path: Path) -> dict | None:
     if not path.exists():
         return None
     data = json_object(path.read_text(encoding="utf-8"))
-    for key in (*DEPENDENCY_SECTIONS, "packages", "scripts", "pnpm", "overrides", "resolutions"):
+    for key in (
+        *DEPENDENCY_SECTIONS,
+        "packages",
+        "scripts",
+        "pnpm",
+        "overrides",
+        "resolutions",
+    ):
         if key in data and not isinstance(data[key], dict):
             raise ValueError(f"{path}: {key} must be a JSON object")
     pnpm = data.get("pnpm", {})
@@ -222,7 +262,9 @@ def _prefer(versions: list[str], hinted: str | None) -> str | None:
     return usable[0][1]
 
 
-def locate_npm(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+def locate_npm(
+    root: Path, name: str, hinted: str | None, files: list[Path]
+) -> PackageHit | None:
     """Locate a Node dependency using manifests and the selected lockfile."""
     manifests = [path for path in files if path.name == "package.json"]
     spec = None
@@ -244,12 +286,16 @@ def locate_npm(root: Path, name: str, hinted: str | None, files: list[Path]) -> 
     if manager == "pnpm":
         lock = root / "pnpm-lock.yaml"
         if lock.exists():
-            lock_versions = _pnpm_versions(lock.read_text(encoding="utf-8", errors="replace"), name)
+            lock_versions = _pnpm_versions(
+                lock.read_text(encoding="utf-8", errors="replace"), name
+            )
             lock_rel = "pnpm-lock.yaml"
     elif manager == "yarn":
         lock = root / "yarn.lock"
         if lock.exists():
-            lock_versions = _yarn_versions(lock.read_text(encoding="utf-8", errors="replace"), name)
+            lock_versions = _yarn_versions(
+                lock.read_text(encoding="utf-8", errors="replace"), name
+            )
             lock_rel = "yarn.lock"
     else:
         lock = root / "package-lock.json"
@@ -263,7 +309,8 @@ def locate_npm(root: Path, name: str, hinted: str | None, files: list[Path]) -> 
         ecosystem="npm",
         manager=manager,
         name=name,
-        version=_prefer(lock_versions, hinted) or (spec if spec and parse_version(spec) else None),
+        version=_prefer(lock_versions, hinted)
+        or (spec if spec and parse_version(spec) else None),
         spec=spec,
         manifest=manifest,
         lockfile=lock_rel,
@@ -309,7 +356,9 @@ def _pom_properties(path: Path) -> dict[str, str]:
     return props
 
 
-def locate_maven(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+def locate_maven(
+    root: Path, name: str, hinted: str | None, files: list[Path]
+) -> PackageHit | None:
     """Locate a Maven dependency, resolving version properties when available."""
     group, artifact = _split_maven_name(name)
     for path in files:
@@ -347,13 +396,17 @@ def _split_maven_name(name: str) -> tuple[str | None, str | None]:
     return None, name
 
 
-def locate_gradle(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+def locate_gradle(
+    root: Path, name: str, hinted: str | None, files: list[Path]
+) -> PackageHit | None:
     """Locate a Gradle coordinate in build files or a version catalog."""
     group, artifact = _split_maven_name(name)
     coordinate = name if group else None
     patterns = []
     if coordinate:
-        patterns.append(re.compile(rf"""['\"]{re.escape(coordinate)}:([^'\"\s]+)['\"]"""))
+        patterns.append(
+            re.compile(rf"""['\"]{re.escape(coordinate)}:([^'\"\s]+)['\"]""")
+        )
     for path in files:
         if path.name not in {"build.gradle", "build.gradle.kts"}:
             continue
@@ -412,7 +465,11 @@ def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None
             continue
         if isinstance(library.get("version"), str):
             return library["version"], "inline"
-        ref = (library.get("version") or {}).get("ref") if isinstance(library.get("version"), dict) else None
+        ref = (
+            (library.get("version") or {}).get("ref")
+            if isinstance(library.get("version"), dict)
+            else None
+        )
         if ref and ref in versions:
             return str(versions[ref]), str(ref)
     return None
@@ -430,7 +487,9 @@ def _nested_nuget(name: str) -> str:
     )
 
 
-def locate_nuget(root: Path, name: str, hinted: str | None, files: list[Path]) -> PackageHit | None:
+def locate_nuget(
+    root: Path, name: str, hinted: str | None, files: list[Path]
+) -> PackageHit | None:
     """Locate a NuGet reference in project or central package metadata."""
     pattern = re.compile(
         rf'<PackageReference\s+Include="{re.escape(name)}"\s+Version="([^"]+)"',
@@ -442,7 +501,10 @@ def locate_nuget(root: Path, name: str, hinted: str | None, files: list[Path]) -
         re.IGNORECASE,
     )
     for path in files:
-        if path.suffix.lower() not in {".csproj", ".fsproj", ".vbproj"} and path.name != "Directory.Packages.props":
+        if (
+            path.suffix.lower() not in {".csproj", ".fsproj", ".vbproj"}
+            and path.name != "Directory.Packages.props"
+        ):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         nested_match = nested.search(text)
@@ -531,9 +593,16 @@ def manifests_were_parsed(root: Path, files: list[Path] | None = None) -> bool:
     if files is None:
         files, _truncated = iter_files(root)
     names = {path.name for path in files}
-    return bool(names & {"package.json", "pom.xml", "build.gradle", "build.gradle.kts", "Directory.Packages.props"}) or any(
-        path.suffix.lower() in {".csproj", ".fsproj"} for path in files
-    )
+    return bool(
+        names
+        & {
+            "package.json",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "Directory.Packages.props",
+        }
+    ) or any(path.suffix.lower() in {".csproj", ".fsproj"} for path in files)
 
 
 def _destination(root: Path, relative: str) -> Path:
@@ -578,7 +647,9 @@ def update_npm_spec(root: Path, manifest: str, package: str, new_spec: str) -> b
     if not isinstance(old, str):
         return False
     pattern = re.compile(rf'("{re.escape(package)}"\s*:\s*"){re.escape(old)}(")')
-    updated, count = pattern.subn(lambda match: _replace_groups(match, new_spec), text, count=1)
+    updated, count = pattern.subn(
+        lambda match: _replace_groups(match, new_spec), text, count=1
+    )
     if count != 1:
         return False
     _write(path, updated)
@@ -616,17 +687,27 @@ def add_npm_override(root: Path, package: str, version: str, manager: str) -> st
     return "package.json"
 
 
-def update_csproj_version(root: Path, manifest: str, package: str, version: str) -> bool:
+def update_csproj_version(
+    root: Path, manifest: str, package: str, version: str
+) -> bool:
     """Bump one PackageReference or PackageVersion attribute."""
     path = _destination(root, manifest)
     text = _read(path)
     patterns = [
-        re.compile(rf'(<PackageReference\s+Include="{re.escape(package)}"\s+Version=")[^"]+(")', re.IGNORECASE),
+        re.compile(
+            rf'(<PackageReference\s+Include="{re.escape(package)}"\s+Version=")[^"]+(")',
+            re.IGNORECASE,
+        ),
         re.compile(_nested_nuget(package), re.IGNORECASE),
-        re.compile(rf'(<PackageVersion\s+Include="{re.escape(package)}"\s+Version=")[^"]+(")', re.IGNORECASE),
+        re.compile(
+            rf'(<PackageVersion\s+Include="{re.escape(package)}"\s+Version=")[^"]+(")',
+            re.IGNORECASE,
+        ),
     ]
     for pattern in patterns:
-        updated, count = pattern.subn(lambda match: _replace_groups(match, version), text, count=1)
+        updated, count = pattern.subn(
+            lambda match: _replace_groups(match, version), text, count=1
+        )
         if count == 1:
             _write(path, updated)
             return True
@@ -636,11 +717,15 @@ def update_csproj_version(root: Path, manifest: str, package: str, version: str)
 _NUGET_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
 
 
-def add_nuget_reference(root: Path, package: str, version: str, files: list[Path] | None = None) -> str | None:
+def add_nuget_reference(
+    root: Path, package: str, version: str, files: list[Path] | None = None
+) -> str | None:
     """Add a direct PackageReference when the repo has exactly one project."""
     # Both values land inside an XML attribute, so they are checked rather
     # than escaped: a valid NuGet id or version never needs escaping.
-    if not _NUGET_ID.fullmatch(package) or not re.fullmatch(r"[0-9A-Za-z.+-]{1,64}", version):
+    if not _NUGET_ID.fullmatch(package) or not re.fullmatch(
+        r"[0-9A-Za-z.+-]{1,64}", version
+    ):
         return None
     if files is None:
         files, _truncated = iter_files(root)
@@ -653,7 +738,9 @@ def add_nuget_reference(root: Path, package: str, version: str, files: list[Path
     reference = f'<PackageReference Include="{package}" Version="{version}" />'
     updated, count = re.subn(
         r"^([ \t]*)</ItemGroup>",
-        lambda match: f"{match.group(1)}  {reference}{newline}{match.group(1)}</ItemGroup>",
+        lambda match: (
+            f"{match.group(1)}  {reference}{newline}{match.group(1)}</ItemGroup>"
+        ),
         text,
         count=1,
         flags=re.MULTILINE,
@@ -671,11 +758,19 @@ def update_pom_version(root: Path, manifest: str, package: str, version: str) ->
     group, artifact = _split_maven_name(package)
     if not artifact:
         return False
-    for match in re.finditer(r"<dependency>\s*.*?</dependency>", text, flags=re.IGNORECASE | re.DOTALL):
+    for match in re.finditer(
+        r"<dependency>\s*.*?</dependency>", text, flags=re.IGNORECASE | re.DOTALL
+    ):
         body = match.group(0)
-        if not re.search(rf"<artifactId>\s*{re.escape(artifact)}\s*</artifactId>", body, flags=re.IGNORECASE):
+        if not re.search(
+            rf"<artifactId>\s*{re.escape(artifact)}\s*</artifactId>",
+            body,
+            flags=re.IGNORECASE,
+        ):
             continue
-        if group and not re.search(rf"<groupId>\s*{re.escape(group)}\s*</groupId>", body, flags=re.IGNORECASE):
+        if group and not re.search(
+            rf"<groupId>\s*{re.escape(group)}\s*</groupId>", body, flags=re.IGNORECASE
+        ):
             continue
         prop = re.search(r"<version>\s*\$\{([^}]+)\}\s*</version>", body)
         if prop:
@@ -683,13 +778,17 @@ def update_pom_version(root: Path, manifest: str, package: str, version: str) ->
             prop_pattern = re.compile(
                 rf"(<(?:[A-Za-z0-9_.-]+:)?{re.escape(prop_name)}>\s*)[^<]+(\s*</(?:[A-Za-z0-9_.-]+:)?{re.escape(prop_name)}>)"
             )
-            updated, count = prop_pattern.subn(lambda found: _replace_groups(found, version), text, count=1)
+            updated, count = prop_pattern.subn(
+                lambda found: _replace_groups(found, version), text, count=1
+            )
             if count != 1:
                 return False
             _write(path, updated)
             return True
         version_pattern = re.compile(r"(<version>\s*)[^<$\s]+(\s*</version>)")
-        replaced, count = version_pattern.subn(lambda found: _replace_groups(found, version), body, count=1)
+        replaced, count = version_pattern.subn(
+            lambda found: _replace_groups(found, version), body, count=1
+        )
         if count != 1:
             return False
         _write(path, text[: match.start()] + replaced + text[match.end() :])
@@ -697,14 +796,18 @@ def update_pom_version(root: Path, manifest: str, package: str, version: str) ->
     return False
 
 
-def update_gradle_version(root: Path, manifest: str, package: str, version: str) -> bool:
+def update_gradle_version(
+    root: Path, manifest: str, package: str, version: str
+) -> bool:
     """Bump one Gradle coordinate or version-catalog entry."""
     path = _destination(root, manifest)
     if path.name == "libs.versions.toml":
         return _update_toml_version(path, package, version)
     text = _read(path)
     pattern = re.compile(rf"""(['\"]{re.escape(package)}:)[^'\"\s]+(['\"])""")
-    updated, count = pattern.subn(lambda match: _replace_groups(match, version), text, count=1)
+    updated, count = pattern.subn(
+        lambda match: _replace_groups(match, version), text, count=1
+    )
     if count != 1:
         return False
     _write(path, updated)
@@ -724,7 +827,9 @@ def _update_toml_version(path: Path, coordinate: str, version: str) -> bool:
         )
     else:
         pattern = re.compile(rf'(?m)^({re.escape(ref)}\s*=\s*")[^"]+(")')
-    updated, count = pattern.subn(lambda match: _replace_groups(match, version), text, count=1)
+    updated, count = pattern.subn(
+        lambda match: _replace_groups(match, version), text, count=1
+    )
     if count != 1:
         return False
     _write(path, updated)
@@ -737,7 +842,9 @@ def _is_dockerfile(path: Path) -> bool:
     return name == "dockerfile" or name.endswith(".dockerfile")
 
 
-def update_dockerfile_tag(root: Path, image: str, new_tag: str, files: list[Path] | None = None) -> list[str]:
+def update_dockerfile_tag(
+    root: Path, image: str, new_tag: str, files: list[Path] | None = None
+) -> list[str]:
     """Move every unpinned ``FROM name:current`` line to ``new_tag``.
 
     Every Dockerfile and every stage is updated, so a multi-stage build is
@@ -795,8 +902,11 @@ def dockerfile_images(root: Path, files: list[Path] | None = None) -> list[str]:
     if files is None:
         files, _truncated = iter_files(root)
     images: list[str] = []
-    pattern = re.compile(r"^FROM[ \t]+(?:--\S+[ \t]+)*(\S+)", re.IGNORECASE | re.MULTILINE)
+    pattern = re.compile(
+        r"^FROM[ \t]+(?:--\S+[ \t]+)*(\S+)", re.IGNORECASE | re.MULTILINE
+    )
     for path in (item for item in files if _is_dockerfile(item)):
-        images.extend(pattern.findall(path.read_text(encoding="utf-8", errors="replace")))
+        images.extend(
+            pattern.findall(path.read_text(encoding="utf-8", errors="replace"))
+        )
     return images
-

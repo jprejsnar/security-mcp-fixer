@@ -21,7 +21,14 @@ MONTHS = (
     "November",
     "December",
 )
-IN_PROGRESS = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
+IN_PROGRESS = (
+    "MERGE_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+)
 
 
 def branch_name_for(day: date) -> str:
@@ -63,11 +70,15 @@ class GitOps:
         self.repo_root = repo_root
         self.runner = runner
 
-    def run(self, args: list[str], *, check: bool = True, timeout: int = 120) -> CommandResult:
+    def run(
+        self, args: list[str], *, check: bool = True, timeout: int = 120
+    ) -> CommandResult:
         """Run one allowlisted git command in this repository."""
         return self._git(args, check=check, timeout=timeout)
 
-    def _git(self, args: list[str], *, check: bool = True, timeout: int = 120) -> CommandResult:
+    def _git(
+        self, args: list[str], *, check: bool = True, timeout: int = 120
+    ) -> CommandResult:
         """Route Git through the runner's allowlist and repository boundary."""
         return self.runner.run(["git", *args], timeout=timeout, check=check)
 
@@ -87,7 +98,9 @@ class GitOps:
 
     def dirty_lines(self) -> list[str]:
         """Return porcelain lines for changes outside ``.security-mcp``."""
-        porcelain = self._git(["status", "--porcelain=v1", "--untracked-files=all"]).stdout
+        porcelain = self._git(
+            ["status", "--porcelain=v1", "--untracked-files=all"]
+        ).stdout
         return meaningful_status(porcelain)
 
     def in_progress_operation(self) -> str | None:

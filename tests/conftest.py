@@ -27,18 +27,91 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
         check=check,
         capture_output=True,
         text=True,
+        timeout=30,
     )
+
+
+def approve_package_for_test(root: Path, plan: dict) -> dict:
+    """Write synthetic approval and review evidence only in fixture roots."""
+    import json
+
+    from gitlab_security_mcp.qualification import CHECK_KINDS, _check_args
+
+    manager = plan["manager"]
+    tool = {"nuget": "dotnet", "maven": "mvn"}.get(manager, manager)
+    approval = {key: plan[key] for key in ("ecosystem", "package", "target")}
+    approval.update(
+        license_expression="MIT",
+        approved_by="Fixture Legal",
+        approval_reference="TEST-ONLY-NOT-A-REAL-APPROVAL",
+        obligations="Fixture notices",
+        commercial_distribution_approved=True,
+        no_license_fees=True,
+        license_sources=["https://example.test/license"],
+    )
+    policy = {
+        "schema_version": 1,
+        "approvals": [approval],
+        "checks": {
+            plan["ecosystem"]: {
+                kind: {
+                    "argv": [tool, *_check_args(manager, kind)],
+                    "success_marker": "ok",
+                }
+                for kind in CHECK_KINDS
+            }
+        },
+    }
+    path = root / ".security-mcp" / "package-update-policy.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    return {
+        **{key: plan[key] for key in ("ecosystem", "package", "target")},
+        "documentation": {
+            "complete": True,
+            "sources": ["https://example.test/docs"],
+            "summary": "Fixture API review",
+        },
+        "compatible": True,
+        "api_changes": "Fixture has no API changes",
+        "frameworks": [
+            {
+                "name": "Fixture runtime",
+                "version": "1",
+                "source_url": "https://example.test/support",
+                "assessment": "Fixture compatibility",
+            }
+        ],
+        "source_fixes": [],
+    }
 
 
 def commit_all(repo: Path, message: str = "init") -> None:
     """Stage and commit fixture files using a local test-only identity."""
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True, text=True)
     subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", message],
+        ["git", "add", "-A"],
         cwd=repo,
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            message,
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
 
 

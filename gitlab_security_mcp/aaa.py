@@ -10,32 +10,46 @@ from pathlib import Path
 from gitlab_security_mcp.manifests import _read_json, iter_files
 from gitlab_security_mcp.util import atomic_write_text
 
-DEPENDENCY_STRATEGIES = {"lockfile_only", "manifest_bump", "override", "dependency_update"}
+DEPENDENCY_STRATEGIES = {
+    "lockfile_only",
+    "manifest_bump",
+    "override",
+    "dependency_update",
+}
 
 
 def generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
     """Write one Arrange-Act-Assert test that checks the applied change.
 
-    Pure dependency updates do not get a test. An existing file is never
-    overwritten.
+    Dependency updates rely on qualified product checks and host-authored
+    API regression tests, not a generic generated assertion. An existing
+    file is never overwritten.
     """
     try:
         return _generate_aaa_test(root, finding, change)
     except (OSError, ValueError, TypeError, AttributeError) as exc:
-        return {"status": "NOT_GENERATED", "finding_id": finding.get("id"), "reason": f"Test could not be generated safely: {exc}"}
+        return {
+            "status": "NOT_GENERATED",
+            "finding_id": finding.get("id"),
+            "reason": f"Test could not be generated safely: {exc}",
+        }
 
 
 def _generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
     """Publish an oracle-backed test only for supported behavior changes."""
     finding_id = finding.get("id")
     if not change:
-        return {"status": "NOT_REQUIRED", "finding_id": finding_id, "reason": "No applied change to cover."}
+        return {
+            "status": "NOT_REQUIRED",
+            "finding_id": finding_id,
+            "reason": "No applied change to cover.",
+        }
     strategy = change.get("strategy") or change.get("type")
     if strategy in DEPENDENCY_STRATEGIES:
         return {
             "status": "NOT_REQUIRED",
             "finding_id": finding_id,
-            "reason": "A pure dependency update does not change first-party behavior.",
+            "reason": "Dependency updates require product checks and any reviewed API regression tests; no generic assertion is generated.",
         }
     oracle = change.get("oracle")
     if not oracle:
@@ -52,7 +66,9 @@ def _generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
             "reason": "No test framework was detected with enough confidence to add a compiling test.",
         }
     framework, project_dir = detected
-    target = next((item for item in change.get("files") or [] if _is_dockerfile_name(item)), None)
+    target = next(
+        (item for item in change.get("files") or [] if _is_dockerfile_name(item)), None
+    )
     if target is None:
         return {
             "status": "NOT_GENERATED",
@@ -109,7 +125,9 @@ def _detect_framework(root: Path) -> tuple[str, Path] | None:
         if test_script:
             return "node:test", root
     pom = root / "pom.xml"
-    if pom.exists() and "junit-jupiter" in pom.read_text(encoding="utf-8", errors="replace"):
+    if pom.exists() and "junit-jupiter" in pom.read_text(
+        encoding="utf-8", errors="replace"
+    ):
         return "junit5", root
     files, _truncated = iter_files(root)
     for path in files:
@@ -132,7 +150,9 @@ def _render(
 ) -> tuple[Path, str]:
     """Select the framework's test destination and escaped source template."""
     if framework in {"vitest", "jest", "mocha"}:
-        return root / "test" / "security" / f"{slug}.test.js", _node_test(oracle, framework, dockerfile)
+        return root / "test" / "security" / f"{slug}.test.js", _node_test(
+            oracle, framework, dockerfile
+        )
     if framework == "node:test":
         esm = _package_type(root) == "module"
         path = root / "test" / "security" / f"{slug}.test.{'mjs' if esm else 'js'}"
@@ -144,7 +164,9 @@ def _render(
     # xUnit runs from bin/<config>/<tfm>, so the path is resolved against
     # the repository root, which is fixed when the test is written.
     from_project = Path(os.path.relpath(root / dockerfile, project_dir)).as_posix()
-    return project_dir / "Security" / f"{class_name}Tests.cs", _xunit(class_name, oracle, from_project)
+    return project_dir / "Security" / f"{class_name}Tests.cs", _xunit(
+        class_name, oracle, from_project
+    )
 
 
 def _node_test(oracle: str, framework: str, dockerfile: str) -> str:
@@ -153,15 +175,15 @@ def _node_test(oracle: str, framework: str, dockerfile: str) -> str:
     source = json.dumps(dockerfile)
     if framework == "vitest":
         header = 'import { describe, it, expect } from "vitest";\nimport { readFileSync } from "node:fs";\n'
-        read = f"readFileSync({source}, \"utf8\")"
+        read = f'readFileSync({source}, "utf8")'
         check = "expect(patched).toBe(true);"
     elif framework == "jest":
         header = 'const fs = require("node:fs");\n'
-        read = f"fs.readFileSync({source}, \"utf8\")"
+        read = f'fs.readFileSync({source}, "utf8")'
         check = "expect(patched).toBe(true);"
     else:
         header = 'const fs = require("node:fs");\nconst assert = require("node:assert/strict");\n'
-        read = f"fs.readFileSync({source}, \"utf8\")"
+        read = f'fs.readFileSync({source}, "utf8")'
         check = "assert.equal(patched, true);"
     return f"""{header}
 describe("security fix", () => {{
@@ -187,14 +209,14 @@ def _node_builtin(oracle: str, esm: bool, dockerfile: str) -> str:
             'import assert from "node:assert/strict";\n'
             'import { readFileSync } from "node:fs";\n'
         )
-        read = f"readFileSync({source}, \"utf8\")"
+        read = f'readFileSync({source}, "utf8")'
     else:
         header = (
             'const test = require("node:test");\n'
             'const assert = require("node:assert/strict");\n'
             'const fs = require("node:fs");\n'
         )
-        read = f"fs.readFileSync({source}, \"utf8\")"
+        read = f'fs.readFileSync({source}, "utf8")'
     return f"""{header}
 test("uses the patched base image", () => {{
   // Arrange

@@ -20,18 +20,31 @@ def patient_web_findings(request):
     run lacks its required token or returns unreadable/incomplete findings.
     """
     if not request.config.getoption("--patient-web-live"):
-        pytest.skip("Use --patient-web-live to enable private GitLab and public advisory requests")
-    token = os.environ.get("GITLAB_TOKEN") or os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN")
+        pytest.skip(
+            "Use --patient-web-live to enable private GitLab and public advisory requests"
+        )
+    token = os.environ.get("GITLAB_TOKEN") or os.environ.get(
+        "GITLAB_PERSONAL_ACCESS_TOKEN"
+    )
     if not token:
-        pytest.fail("Set GITLAB_TOKEN or GITLAB_PERSONAL_ACCESS_TOKEN in the test process environment", pytrace=False)
+        pytest.fail(
+            "Set GITLAB_TOKEN or GITLAB_PERSONAL_ACCESS_TOKEN in the test process environment",
+            pytrace=False,
+        )
 
-    with GitLabClient(token, os.environ.get("GITLAB_API_URL", "https://gitlab.com/api/v4")) as client:
+    with GitLabClient(
+        token, os.environ.get("GITLAB_API_URL", "https://gitlab.com/api/v4")
+    ) as client:
         fetched = client.fetch(PATIENT_WEB_PROJECT)
 
     assert fetched.ok, fetched.error
     assert fetched.project_path == PATIENT_WEB_PROJECT
-    assert not fetched.truncated, "The report was truncated; not all patient-web findings were retrieved"
-    assert fetched.findings, "Patient-web returned no detected or confirmed vulnerabilities"
+    assert not fetched.truncated, (
+        "The report was truncated; not all patient-web findings were retrieved"
+    )
+    assert fetched.findings, (
+        "Patient-web returned no detected or confirmed vulnerabilities"
+    )
     return fetched.findings
 
 
@@ -48,17 +61,25 @@ def test_retrieve_patient_web_security_findings(patient_web_findings):
     print(f"Retrieved {len(patient_web_findings)} active patient-web vulnerabilities")
 
 
-def test_patient_web_findings_have_verified_safe_solutions(patient_web_findings, monkeypatch):
+def test_patient_web_findings_have_verified_safe_solutions(
+    patient_web_findings, monkeypatch
+):
     """Verify live advisory plans without applying local or GitLab changes."""
     configured_root = os.environ.get("PATIENT_WEB_REPO_ROOT")
     if not configured_root:
-        pytest.fail("Set PATIENT_WEB_REPO_ROOT to the local patient-web checkout", pytrace=False)
+        pytest.fail(
+            "Set PATIENT_WEB_REPO_ROOT to the local patient-web checkout", pytrace=False
+        )
     root = Path(configured_root).resolve()
-    assert root.is_dir() and (root / "package.json").is_file(), "PATIENT_WEB_REPO_ROOT must contain patient-web's package.json"
+    assert root.is_dir() and (root / "package.json").is_file(), (
+        "PATIENT_WEB_REPO_ROOT must contain patient-web's package.json"
+    )
 
     def refuse_commands(*args, **kwargs):
         """Fail immediately if verification tries to execute a local command."""
-        pytest.fail("Solution verification must not execute Git or package-manager commands")
+        pytest.fail(
+            "Solution verification must not execute Git or package-manager commands"
+        )
 
     unresolved = []
     with AdvisoryClient(
@@ -74,17 +95,27 @@ def test_patient_web_findings_have_verified_safe_solutions(patient_web_findings,
             for finding in patient_web_findings:
                 result = engine.verify_security_finding(finding["id"])
                 decision = result["decision"]
-                print(f"{finding['id']} | {finding['title']} | {decision} | {result['reason']}")
+                print(
+                    f"{finding['id']} | {finding['title']} | {decision} | {result['reason']}"
+                )
                 if decision == "FALSE_POSITIVE":
                     continue
                 if decision != "CHANGE_REQUIRED":
-                    unresolved.append(f"{finding['id']}: {decision}: {result['reason']}")
+                    unresolved.append(
+                        f"{finding['id']}: {decision}: {result['reason']}"
+                    )
                     continue
                 plan = result["proposed_fix"]
-                patched = advisory.lookup(finding, plan["ecosystem"], plan["package"], plan["target"])
+                patched = advisory.lookup(
+                    finding, plan["ecosystem"], plan["package"], plan["target"]
+                )
                 if patched.affected is not False:
-                    unresolved.append(f"{finding['id']}: advisory did not verify target {plan['target']} as unaffected")
+                    unresolved.append(
+                        f"{finding['id']}: advisory did not verify target {plan['target']} as unaffected"
+                    )
         finally:
             engine.close()
 
-    assert not unresolved, "Findings without a verified safe solution:\n" + "\n".join(unresolved)
+    assert not unresolved, "Findings without a verified safe solution:\n" + "\n".join(
+        unresolved
+    )

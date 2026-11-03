@@ -61,7 +61,10 @@ def test_manifest_replace_failure_preserves_original(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("*.tmp"))
 
 
-@pytest.mark.parametrize("contents", ["null", "[]", '{"scripts":[]}', '{"scripts":{"test":null}}', "bad-json"])
+@pytest.mark.parametrize(
+    "contents",
+    ["null", "[]", '{"scripts":[]}', '{"scripts":{"test":null}}', "bad-json"],
+)
 def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
     # Arrange
     from unittest.mock import Mock
@@ -78,7 +81,9 @@ def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
 
     # Assert
     assert result["status"] == "VALIDATION_FAILED"
-    assert any(row["required"] and row["status"] == "FAILED" for row in result["results"])
+    assert any(
+        row["required"] and row["status"] == "FAILED" for row in result["results"]
+    )
 
 
 @pytest.mark.parametrize("contents", ["null", "[]", '{"scripts":[]}', "bad-json"])
@@ -89,20 +94,28 @@ def test_invalid_test_metadata_returns_not_generated(tmp_path, contents):
     (tmp_path / "package.json").write_text(contents, encoding="utf-8")
 
     # Act
-    result = generate_aaa_test(tmp_path, {"id": "finding"}, {"strategy": "image_tag", "oracle": "nginx:2", "files": ["Dockerfile"]})
+    result = generate_aaa_test(
+        tmp_path,
+        {"id": "finding"},
+        {"strategy": "image_tag", "oracle": "nginx:2", "files": ["Dockerfile"]},
+    )
 
     # Assert
     assert result["status"] == "NOT_GENERATED"
     assert not list(tmp_path.rglob("*.test.js"))
 
 
-def test_generated_test_publication_failure_leaves_no_partial_file(tmp_path, monkeypatch):
+def test_generated_test_publication_failure_leaves_no_partial_file(
+    tmp_path, monkeypatch
+):
     # Arrange
     import os
 
     from gitlab_security_mcp.aaa import generate_aaa_test
 
-    (tmp_path / "package.json").write_text('{"scripts":{"test":"node --test"}}', encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"test":"node --test"}}', encoding="utf-8"
+    )
 
     def fail_link(*args):
         """Simulate exclusive-publication failure after temporary writing."""
@@ -111,7 +124,11 @@ def test_generated_test_publication_failure_leaves_no_partial_file(tmp_path, mon
     monkeypatch.setattr(os, "link", fail_link)
 
     # Act
-    result = generate_aaa_test(tmp_path, {"id": "finding"}, {"strategy": "image_tag", "oracle": "nginx:2", "files": ["Dockerfile"]})
+    result = generate_aaa_test(
+        tmp_path,
+        {"id": "finding"},
+        {"strategy": "image_tag", "oracle": "nginx:2", "files": ["Dockerfile"]},
+    )
 
     # Assert
     assert result["status"] == "NOT_GENERATED"
@@ -143,7 +160,14 @@ def test_server_exit_closes_engine(monkeypatch, failure):
     engine.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize("contents, strategy", [("null", "manifest_bump"), ('{"overrides":null}', "override"), ('{"pnpm":[]}', "override")])
+@pytest.mark.parametrize(
+    "contents, strategy",
+    [
+        ("null", "manifest_bump"),
+        ('{"overrides":null}', "override"),
+        ('{"pnpm":[]}', "override"),
+    ],
+)
 def test_malformed_manifest_application_returns_failure(tmp_path, contents, strategy):
     # Arrange
     from unittest.mock import Mock
@@ -151,7 +175,17 @@ def test_malformed_manifest_application_returns_failure(tmp_path, contents, stra
     from gitlab_security_mcp.remediate import Plan, apply_plan
 
     (tmp_path / "package.json").write_text(contents, encoding="utf-8")
-    plan = Plan(strategy, 2, "npm", "lodash", "4.17.20", "4.17.21", ["package.json"], "pnpm", "Update lodash")
+    plan = Plan(
+        strategy,
+        2,
+        "npm",
+        "lodash",
+        "4.17.20",
+        "4.17.21",
+        ["package.json"],
+        "pnpm",
+        "Update lodash",
+    )
 
     # Act
     result = apply_plan(tmp_path, plan, Mock(), lambda name: None)
@@ -179,7 +213,11 @@ def test_failed_metadata_replace_preserves_previous_file(tmp_path, monkeypatch, 
             write_report(tmp_path, state, staged=[], diff_stat="", diff_files="")
 
     write()
-    previous = {path: path.read_bytes() for path in (tmp_path / ".security-mcp").rglob("*") if path.is_file()}
+    previous = {
+        path: path.read_bytes()
+        for path in (tmp_path / ".security-mcp").rglob("*")
+        if path.is_file()
+    }
     state.status = "CHANGED"
 
     def fail_replace(*args):
@@ -207,7 +245,9 @@ def test_npm_spec_edit_keeps_crlf_line_endings(tmp_path):
 
     # Assert
     assert updated is True
-    assert (tmp_path / "package.json").read_bytes().decode("utf-8") == original.replace("4.17.20", "4.17.21")
+    assert (tmp_path / "package.json").read_bytes().decode("utf-8") == original.replace(
+        "4.17.20", "4.17.21"
+    )
 
 
 def test_override_keeps_indent_and_non_ascii(tmp_path):
@@ -279,4 +319,7 @@ def test_dockerfile_tag_moves_every_stage_and_skips_digests(tmp_path):
 
     # Assert
     assert changed == ["Dockerfile"]
-    assert text == "FROM nginx:1.27.0 AS build\r\nRUN true\r\nFROM nginx:1.27.0\r\nFROM nginx:1.25.1@sha256:abc\r\n"
+    assert (
+        text
+        == "FROM nginx:1.27.0 AS build\r\nRUN true\r\nFROM nginx:1.27.0\r\nFROM nginx:1.25.1@sha256:abc\r\n"
+    )

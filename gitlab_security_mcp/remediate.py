@@ -36,7 +36,11 @@ _SAFE_PACKAGE = re.compile(r"^@?[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,213}$")
 
 def safe_version(value: str | None) -> bool:
     """Return whether a version string is safe to write into a manifest."""
-    return bool(value) and bool(_SAFE_VERSION.fullmatch(value)) and parse_version(value) is not None
+    return (
+        bool(value)
+        and bool(_SAFE_VERSION.fullmatch(value))
+        and parse_version(value) is not None
+    )
 
 
 @dataclass
@@ -67,6 +71,19 @@ class Plan:
             "manager": self.manager,
             "description": self.description,
             "oracle": self.oracle,
+            "qualifiers": {
+                "status": "REQUIRED",
+                "package": self.package,
+                "target": self.target,
+                "requirements": [
+                    "Review complete official package documentation and API changes.",
+                    "Preserve product frameworks, runtimes, builds, and unit tests.",
+                    "Obtain exact-version corporate approval for free commercial distribution.",
+                    "Pass baseline and post-update build, unit-test, and runtime smoke checks.",
+                ],
+            }
+            if self.ecosystem in {"npm", "NuGet", "Maven"}
+            else None,
         }
 
 
@@ -86,7 +103,10 @@ def plan_remediation(
     if not safe_version(fixed):
         return None, f"The advisory version {fixed!r} is not a plain version string."
     if hit is not None and not _SAFE_PACKAGE.fullmatch(hit.name):
-        return None, f"The package name {hit.name!r} is not safe to write into a manifest."
+        return (
+            None,
+            f"The package name {hit.name!r} is not safe to write into a manifest.",
+        )
     installed = (hit.version if hit else None) or finding.get("installedVersion")
     installed_version = parse_version(installed)
     if installed_version is not None and installed_version >= parse_version(fixed):
@@ -97,12 +117,18 @@ def plan_remediation(
     candidates = [item for item in (package_plan, image_plan) if item is not None]
     if not candidates:
         if hit is None:
-            return None, "No manifest, lockfile, or image tag can be updated for this finding."
+            return (
+                None,
+                "No manifest, lockfile, or image tag can be updated for this finding.",
+            )
         return None, "The package was found, but the manifest cannot be bumped safely."
     candidates.sort(key=lambda item: item.score)
     best = candidates[0]
     if best.score > MAX_AUTO_SCORE:
-        return None, f"The smallest candidate edit scores {best.score}, above the auto-fix limit of {MAX_AUTO_SCORE}."
+        return (
+            None,
+            f"The smallest candidate edit scores {best.score}, above the auto-fix limit of {MAX_AUTO_SCORE}.",
+        )
     return best, best.description
 
 
@@ -146,7 +172,9 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
                 package=hit.name,
                 installed=hit.version,
                 target=fixed,
-                files=["package.json", hit.lockfile] if hit.lockfile else ["package.json"],
+                files=["package.json", hit.lockfile]
+                if hit.lockfile
+                else ["package.json"],
                 manager=hit.manager,
                 description=f"Pin transitive dependency {hit.name} to {fixed} with a {hit.manager} override.",
             )
@@ -205,7 +233,9 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
     return None
 
 
-def _image_plan(root: Path, finding: dict, fixed: str, files: list[Path] | None) -> Plan | None:
+def _image_plan(
+    root: Path, finding: dict, fixed: str, files: list[Path] | None
+) -> Plan | None:
     """Plan a matching unpinned image-tag update, never a digest rewrite."""
     image = (finding.get("location") or {}).get("image")
     component = finding.get("component") or ""
@@ -273,15 +303,23 @@ def apply_plan(
     edited: list[str] = []
     commands: list[str] = []
     if not safe_version(plan.target):
-        return _failed("FIX_FAILED", plan, f"Refusing unsafe target version {plan.target!r}.")
+        return _failed(
+            "FIX_FAILED", plan, f"Refusing unsafe target version {plan.target!r}."
+        )
     if plan.manager in {"maven", "gradle"} and not plan.files:
-        return _failed("FIX_FAILED", plan, "The plan does not name a build file to edit.")
+        return _failed(
+            "FIX_FAILED", plan, "The plan does not name a build file to edit."
+        )
     try:
         if plan.strategy == "image_tag":
-            token = f"{plan.package}:{plan.installed}" if plan.installed else plan.package
+            token = (
+                f"{plan.package}:{plan.installed}" if plan.installed else plan.package
+            )
             paths = update_dockerfile_tag(root, token, plan.target)
             if not paths:
-                return _failed("FIX_FAILED", plan, "No matching unpinned FROM line was updated.")
+                return _failed(
+                    "FIX_FAILED", plan, "No matching unpinned FROM line was updated."
+                )
             return _applied(plan, paths, commands)
         if plan.manager in {"npm", "pnpm", "yarn"}:
             return _apply_node(root, plan, runner, which, edited, commands)
@@ -305,23 +343,62 @@ def apply_plan(
 def _apply_node(root, plan, runner, which, edited, commands) -> dict:
     """Apply a Node edit and record any failed lockfile refresh separately."""
     if plan.strategy == "manifest_bump":
-        manifest = next((path for path in plan.files if path.endswith("package.json")), None)
+        manifest = next(
+            (path for path in plan.files if path.endswith("package.json")), None
+        )
         if manifest is None:
-            return _failed("FIX_FAILED", plan, "The plan does not name a package.json to edit.")
+            return _failed(
+                "FIX_FAILED", plan, "The plan does not name a package.json to edit."
+            )
         new_spec = _node_spec(root, manifest, plan)
         if new_spec is None:
-            return _failed("FIX_FAILED", plan, "Could not derive a replacement npm spec.")
+            return _failed(
+                "FIX_FAILED", plan, "Could not derive a replacement npm spec."
+            )
         if not update_npm_spec(root, manifest, plan.package, new_spec):
-            return _failed("FIX_FAILED", plan, f"Could not update {plan.package} in {manifest}.")
+            return _failed(
+                "FIX_FAILED", plan, f"Could not update {plan.package} in {manifest}."
+            )
         edited.append(manifest)
-        if any(path.endswith("lock.json") or path.endswith("lock.yaml") or path == "yarn.lock" for path in plan.files):
-            return _refresh_node_lock(root, plan, runner, which, edited, commands, fallback_status="FIX_FAILED_LOCKFILE")
+        if any(
+            path.endswith("lock.json")
+            or path.endswith("lock.yaml")
+            or path == "yarn.lock"
+            for path in plan.files
+        ):
+            return _refresh_node_lock(
+                root,
+                plan,
+                runner,
+                which,
+                edited,
+                commands,
+                fallback_status="FIX_FAILED_LOCKFILE",
+            )
         return _applied(plan, edited, commands)
     if plan.strategy == "override":
-        edited.append(add_npm_override(root, plan.package, plan.target, plan.manager or "npm"))
-        return _refresh_node_lock(root, plan, runner, which, edited, commands, fallback_status="FIX_FAILED_LOCKFILE")
+        edited.append(
+            add_npm_override(root, plan.package, plan.target, plan.manager or "npm")
+        )
+        return _refresh_node_lock(
+            root,
+            plan,
+            runner,
+            which,
+            edited,
+            commands,
+            fallback_status="FIX_FAILED_LOCKFILE",
+        )
     if plan.strategy == "lockfile_only":
-        return _refresh_node_lock(root, plan, runner, which, edited, commands, fallback_status="FIX_FAILED_LOCKFILE")
+        return _refresh_node_lock(
+            root,
+            plan,
+            runner,
+            which,
+            edited,
+            commands,
+            fallback_status="FIX_FAILED_LOCKFILE",
+        )
     return _failed("FIX_FAILED", plan, "Unsupported node strategy.")
 
 
@@ -348,24 +425,45 @@ def _node_spec(root: Path, manifest: str, plan: Plan) -> str | None:
     return None
 
 
-def _refresh_node_lock(root, plan, runner, which, edited, commands, *, fallback_status: str) -> dict:
+def _refresh_node_lock(
+    root, plan, runner, which, edited, commands, *, fallback_status: str
+) -> dict:
     """Refresh dependencies with manager-specific remediation commands."""
     tool = resolve_tool(plan.manager or "npm", which)
     if not tool:
-        return _failed(fallback_status, plan, f"{plan.manager} is not on PATH, so the lockfile was not refreshed.", edited)
+        return _failed(
+            fallback_status,
+            plan,
+            f"{plan.manager} is not on PATH, so the lockfile was not refreshed.",
+            edited,
+        )
     if plan.manager == "yarn" and is_modern_yarn(root):
         if plan.strategy == "lockfile_only":
             argv = [tool, "up", "-R", plan.package]
         else:
             argv = [tool, "install", "--mode=update-lockfile"]
     elif plan.strategy == "lockfile_only" and plan.manager == "npm":
-        argv = [tool, "update", plan.package, "--ignore-scripts", "--no-audit", "--no-fund"]
+        argv = [
+            tool,
+            "update",
+            plan.package,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ]
     elif plan.strategy == "lockfile_only" and plan.manager == "pnpm":
         argv = [tool, "update", plan.package, "--ignore-scripts"]
     elif plan.strategy == "lockfile_only" and plan.manager == "yarn":
         argv = [tool, "upgrade", plan.package, "--ignore-scripts"]
     elif plan.manager == "npm":
-        argv = [tool, "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+        argv = [
+            tool,
+            "install",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ]
     elif plan.manager == "pnpm":
         argv = [tool, "install", "--lockfile-only", "--ignore-scripts"]
     else:
@@ -374,7 +472,13 @@ def _refresh_node_lock(root, plan, runner, which, edited, commands, *, fallback_
     commands.append(result.display())
     if result.exit_code != 0:
         detail = (result.stderr or result.stdout).strip()[:500]
-        return _failed(fallback_status, plan, f"Lockfile refresh failed: {detail}", edited, commands)
+        return _failed(
+            fallback_status,
+            plan,
+            f"Lockfile refresh failed: {detail}",
+            edited,
+            commands,
+        )
     for path in plan.files:
         if path not in edited:
             edited.append(path)
@@ -386,21 +490,38 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
     if plan.strategy == "manifest_bump" and plan.files:
         manifest = plan.files[0]
         if not update_csproj_version(root, manifest, plan.package, plan.target):
-            return _failed("FIX_FAILED", plan, f"Could not update {plan.package} in {manifest}.")
+            return _failed(
+                "FIX_FAILED", plan, f"Could not update {plan.package} in {manifest}."
+            )
         edited.append(manifest)
     else:
         manifest = add_nuget_reference(root, plan.package, plan.target)
         if not manifest:
-            return _failed("FIX_FAILED", plan, "Could not add a PackageReference. More than one project, or no ItemGroup.")
+            return _failed(
+                "FIX_FAILED",
+                plan,
+                "Could not add a PackageReference. More than one project, or no ItemGroup.",
+            )
         edited.append(manifest)
     if any(path.endswith("packages.lock.json") for path in plan.files):
         tool = resolve_tool("dotnet", which)
         if not tool:
-            return _failed("FIX_FAILED_LOCKFILE", plan, "dotnet is not on PATH, so packages.lock.json was not refreshed.", edited)
+            return _failed(
+                "FIX_FAILED_LOCKFILE",
+                plan,
+                "dotnet is not on PATH, so packages.lock.json was not refreshed.",
+                edited,
+            )
         result = runner.run([tool, "restore"], timeout=PACKAGE_TIMEOUT, check=False)
         commands.append(result.display())
         if result.exit_code != 0:
-            return _failed("FIX_FAILED_LOCKFILE", plan, (result.stderr or result.stdout)[:500], edited, commands)
+            return _failed(
+                "FIX_FAILED_LOCKFILE",
+                plan,
+                (result.stderr or result.stdout)[:500],
+                edited,
+                commands,
+            )
         lock = next(path for path in plan.files if path.endswith("packages.lock.json"))
         edited.append(lock)
     return _applied(plan, edited, commands)
@@ -423,7 +544,13 @@ def _applied(plan: Plan, files: list[str], commands: list[str]) -> dict:
     }
 
 
-def _failed(status: str, plan: Plan, detail: str, files: list[str] | None = None, commands: list[str] | None = None) -> dict:
+def _failed(
+    status: str,
+    plan: Plan,
+    detail: str,
+    files: list[str] | None = None,
+    commands: list[str] | None = None,
+) -> dict:
     """Preserve partial edit evidence alongside the failed plan's details."""
     return {
         "status": status,
@@ -435,4 +562,3 @@ def _failed(status: str, plan: Plan, detail: str, files: list[str] | None = None
         "target": plan.target,
         "detail": detail,
     }
-

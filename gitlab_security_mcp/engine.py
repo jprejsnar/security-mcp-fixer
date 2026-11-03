@@ -26,6 +26,14 @@ from gitlab_security_mcp.manifests import (
     locate_package,
     manifests_were_parsed,
 )
+from gitlab_security_mcp.qualification import (
+    PACKAGE_ECOSYSTEMS,
+    load_policy,
+    review_package,
+    run_checks,
+    tree_snapshot,
+    validate_edits,
+)
 from gitlab_security_mcp.remediate import Plan, apply_plan, plan_remediation
 from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.state import RunState
@@ -35,7 +43,15 @@ from gitlab_security_mcp.versions import is_major_upgrade, parse_version
 
 logger = logging.getLogger("gitlab_security_mcp")
 
-AFTER_BRANCH = {"BRANCH_CREATED", "FINDINGS_LISTED", "FIXES_IN_PROGRESS", "VALIDATION_COMPLETE", "VALIDATION_INCOMPLETE", "VALIDATION_FAILED", "REPORT_GENERATED"}
+AFTER_BRANCH = {
+    "BRANCH_CREATED",
+    "FINDINGS_LISTED",
+    "FIXES_IN_PROGRESS",
+    "VALIDATION_COMPLETE",
+    "VALIDATION_INCOMPLETE",
+    "VALIDATION_FAILED",
+    "REPORT_GENERATED",
+}
 
 
 def _serialized(method):
@@ -90,20 +106,32 @@ class Engine:
         Initialization errors propagate after owned-client cleanup.
         """
         self.repo_root = Path(repo_root).resolve()
+        self.package_policy_path = Path(
+            os.environ.get("PACKAGE_UPDATE_POLICY")
+            or self.repo_root / ".security-mcp" / "package-update-policy.json"
+        ).resolve()
         self._lock = threading.RLock()
         self.runner = runner if runner is not None else CommandRunner(self.repo_root)
         self.git = GitOps(self.repo_root, self.runner)
         self._owns_gitlab = gitlab is None
         self._owns_advisory = advisory is None
-        self.gitlab = gitlab if gitlab is not None else GitLabClient(gitlab_token, gitlab_api_url)
+        self.gitlab = (
+            gitlab if gitlab is not None else GitLabClient(gitlab_token, gitlab_api_url)
+        )
         try:
-            self.advisory = advisory if advisory is not None else AdvisoryClient(github_token=github_token, nvd_api_key=nvd_api_key)
+            self.advisory = (
+                advisory
+                if advisory is not None
+                else AdvisoryClient(github_token=github_token, nvd_api_key=nvd_api_key)
+            )
         except BaseException:
             if self._owns_gitlab:
                 try:
                     self.gitlab.close()
                 except Exception:
-                    logger.exception("Could not close GitLab client after initialization failure")
+                    logger.exception(
+                        "Could not close GitLab client after initialization failure"
+                    )
             raise
         self.which = which if which is not None else shutil.which
         self.today = today or date.today()
@@ -144,8 +172,11 @@ class Engine:
         return cls(
             root,
             project_id=os.environ.get("GITLAB_PROJECT_ID"),
-            gitlab_token=os.environ.get("GITLAB_TOKEN") or os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN"),
-            gitlab_api_url=os.environ.get("GITLAB_API_URL", "https://gitlab.com/api/v4"),
+            gitlab_token=os.environ.get("GITLAB_TOKEN")
+            or os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN"),
+            gitlab_api_url=os.environ.get(
+                "GITLAB_API_URL", "https://gitlab.com/api/v4"
+            ),
             github_token=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
             nvd_api_key=os.environ.get("NVD_API_KEY"),
             validation_timeout=timeout,
@@ -175,28 +206,45 @@ class Engine:
                 return self._stop(
                     "PRECHECK_FAILED",
                     "precheck",
-                    {"status": "PRECHECK_FAILED", "reason": f"Not on main (current: {branch or 'detached'}). Switch to main first.", "no_changes_attempted": True},
+                    {
+                        "status": "PRECHECK_FAILED",
+                        "reason": f"Not on main (current: {branch or 'detached'}). Switch to main first.",
+                        "no_changes_attempted": True,
+                    },
                 )
             in_progress = self.git.in_progress_operation()
             if in_progress:
                 return self._stop(
                     "PRECHECK_FAILED",
                     "precheck",
-                    {"status": "PRECHECK_FAILED", "reason": f"A git {in_progress} operation is in progress.", "no_changes_attempted": True},
+                    {
+                        "status": "PRECHECK_FAILED",
+                        "reason": f"A git {in_progress} operation is in progress.",
+                        "no_changes_attempted": True,
+                    },
                 )
             dirty = self.git.dirty_lines()
             if dirty:
                 return self._stop(
                     "PRECHECK_FAILED",
                     "precheck",
-                    {"status": "PRECHECK_FAILED", "reason": "Working tree not clean.", "dirty_paths": dirty, "no_changes_attempted": True},
+                    {
+                        "status": "PRECHECK_FAILED",
+                        "reason": "Working tree not clean.",
+                        "dirty_paths": dirty,
+                        "no_changes_attempted": True,
+                    },
                 )
         except Exception as exc:
             logger.exception("precheck failed")
             return self._stop(
                 "PRECHECK_FAILED",
                 "precheck",
-                {"status": "PRECHECK_FAILED", "error": str(exc), "no_changes_attempted": True},
+                {
+                    "status": "PRECHECK_FAILED",
+                    "error": str(exc),
+                    "no_changes_attempted": True,
+                },
             )
         self.state.status = "PRECHECK_PASSED"
         self.state.stop_stage = None
@@ -212,7 +260,14 @@ class Engine:
         for number in (1, 2):
             try:
                 if self.git.current_branch() != "main":
-                    return self._stop("PULL_FAILED", f"pull_{number}", {"status": "PULL_FAILED", "reason": "Branch changed away from main before the pull finished."})
+                    return self._stop(
+                        "PULL_FAILED",
+                        f"pull_{number}",
+                        {
+                            "status": "PULL_FAILED",
+                            "reason": "Branch changed away from main before the pull finished.",
+                        },
+                    )
                 start = self.git.head()
                 result = self.git.run(["pull", "--ff-only"], check=False)
                 end = self.git.head()
@@ -227,12 +282,38 @@ class Engine:
                     }
                 )
                 if result.exit_code != 0:
-                    return self._stop("PULL_FAILED", f"pull_{number}", {"status": "PULL_FAILED", "failed_pull": number, "results": results})
+                    return self._stop(
+                        "PULL_FAILED",
+                        f"pull_{number}",
+                        {
+                            "status": "PULL_FAILED",
+                            "failed_pull": number,
+                            "results": results,
+                        },
+                    )
             except Exception as exc:
-                return self._stop("PULL_FAILED", f"pull_{number}", {"status": "PULL_FAILED", "failed_pull": number, "error": str(exc), "results": results})
+                return self._stop(
+                    "PULL_FAILED",
+                    f"pull_{number}",
+                    {
+                        "status": "PULL_FAILED",
+                        "failed_pull": number,
+                        "error": str(exc),
+                        "results": results,
+                    },
+                )
         dirty = self.git.dirty_lines()
         if dirty:
-            return self._stop("PULL_FAILED", "pull_clean", {"status": "PULL_FAILED", "reason": "Working tree dirty after pulls.", "dirty_paths": dirty, "results": results})
+            return self._stop(
+                "PULL_FAILED",
+                "pull_clean",
+                {
+                    "status": "PULL_FAILED",
+                    "reason": "Working tree dirty after pulls.",
+                    "dirty_paths": dirty,
+                    "results": results,
+                },
+            )
         self.state.status = "PULLS_SUCCEEDED"
         self.state.pulls = results
         self._remember()
@@ -242,23 +323,39 @@ class Engine:
     def create_security_branch(self) -> dict:
         """Create the dated security branch only when that name is unused."""
         if self.state.status == "BRANCH_CREATED" and self.state.branch_name:
-            return {"status": "BRANCH_CREATED", "branch": self.state.branch_name, "note": "Branch was already created for this run."}
+            return {
+                "status": "BRANCH_CREATED",
+                "branch": self.state.branch_name,
+                "note": "Branch was already created for this run.",
+            }
         if self.state.status != "PULLS_SUCCEEDED":
             return {"status": "BRANCH_CREATION_FAILED", "reason": "Pulls not succeeded"}
         name = branch_name_for(self.today)
         try:
-            if self.git.branch_exists_locally(name) or self.git.branch_exists_on_origin(name):
+            if self.git.branch_exists_locally(name) or self.git.branch_exists_on_origin(
+                name
+            ):
                 return self._stop(
                     "BRANCH_CREATION_FAILED",
                     "branch",
-                    {"status": "BRANCH_CREATION_FAILED", "reason": f"Branch {name} already exists. Delete or rename it manually.", "branch": name},
+                    {
+                        "status": "BRANCH_CREATION_FAILED",
+                        "reason": f"Branch {name} already exists. Delete or rename it manually.",
+                        "branch": name,
+                    },
                 )
             self.git.run(["checkout", "-b", name])
             current = self.git.current_branch()
             if current != name:
-                raise RuntimeError(f"Checkout verification failed. Current branch is {current}.")
+                raise RuntimeError(
+                    f"Checkout verification failed. Current branch is {current}."
+                )
         except Exception as exc:
-            return self._stop("BRANCH_CREATION_FAILED", "branch", {"status": "BRANCH_CREATION_FAILED", "error": str(exc), "branch": name})
+            return self._stop(
+                "BRANCH_CREATION_FAILED",
+                "branch",
+                {"status": "BRANCH_CREATION_FAILED", "error": str(exc), "branch": name},
+            )
         self.state.branch_name = name
         self.state.status = "BRANCH_CREATED"
         self._remember()
@@ -307,6 +404,13 @@ class Engine:
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
+        if any(
+            change["finding_id"] == finding_id for change in self._package_changes()
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Retain the applied package's original evidence; run post-update validation instead",
+            }
         try:
             decision, reason, evidence, proposed, prompt = self._decide(finding)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
@@ -318,34 +422,147 @@ class Engine:
         finding["remediationDecision"] = decision
         finding["assessment"] = assessment
         finding["proposedFix"] = proposed
+        finding.pop("packageQualification", None)
         finding["evidence"] = evidence
         self.state.decisions[finding_id] = assessment
         component = finding.get("component")
         if decision == "FALSE_POSITIVE":
-            self.state.false_positives.append({"id": finding_id, "component": component, "reason": reason, "evidence": evidence})
+            self.state.false_positives.append(
+                {
+                    "id": finding_id,
+                    "component": component,
+                    "reason": reason,
+                    "evidence": evidence,
+                }
+            )
         elif decision == "NO_SAFE_FIX":
-            self.state.no_solution.append({"id": finding_id, "component": component, "reason": reason})
+            self.state.no_solution.append(
+                {"id": finding_id, "component": component, "reason": reason}
+            )
         elif decision == "MANUAL_REVIEW":
-            self.state.skipped_user_prompt.append({"id": finding_id, "component": component, "reason": reason, "prompt": prompt})
+            self.state.skipped_user_prompt.append(
+                {
+                    "id": finding_id,
+                    "component": component,
+                    "reason": reason,
+                    "prompt": prompt,
+                }
+            )
         self._remember()
         return {
             "finding_id": finding_id,
             "decision": decision,
             "reason": reason,
             "evidence": evidence,
-            "eligible_for_auto_fix": decision == "CHANGE_REQUIRED",
+            "eligible_for_auto_fix": decision == "CHANGE_REQUIRED"
+            and not (proposed and proposed.get("ecosystem") in PACKAGE_ECOSYSTEMS),
+            "qualification_required": bool(
+                proposed and proposed.get("ecosystem") in PACKAGE_ECOSYSTEMS
+            ),
             "proposed_fix": proposed,
             "user_prompt": prompt,
         }
 
     @_serialized
+    def qualify_package_update(self, finding_id: str, review: dict) -> dict:
+        """Require exact-version corporate approval and a passing baseline.
+
+        The hosting AI supplies its complete official-documentation review
+        and declared surgical adaptations. Corporate approval is read from
+        PACKAGE_UPDATE_POLICY, never granted by this tool or the AI.
+        Missing evidence blocks edits. Requalify after checkout changes.
+        """
+        finding = self._finding(finding_id)
+        if (
+            self.state.status not in AFTER_BRANCH
+            or finding is None
+            or finding.get("remediationDecision") != "CHANGE_REQUIRED"
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Verify a supported package finding before qualification",
+            }
+        plan = finding.get("proposedFix") or {}
+        if plan.get("ecosystem") not in PACKAGE_ECOSYSTEMS:
+            return {
+                "status": "ERROR",
+                "reason": "This plan is not a supported package update",
+            }
+        if any(
+            change.get("finding_id") == finding_id for change in self._package_changes()
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "An applied update must retain its original qualification; run post-update validation",
+            }
+        finding.pop("packageQualification", None)
+        try:
+            if not isinstance(review, dict) or any(
+                review.get(key) != plan.get(key)
+                for key in ("ecosystem", "package", "target")
+            ):
+                raise ValueError(
+                    "Documentation review must identify the exact ecosystem, package, and target"
+                )
+            source_before = review_package(self.repo_root, review)
+            policy = load_policy(self.repo_root, self.package_policy_path, plan)
+            baseline = run_validation(
+                self.repo_root, self.runner, self.which, timeout=self.validation_timeout
+            )
+            if baseline["status"] != "VALIDATION_COMPLETE":
+                raise ValueError("Product baseline validation is failed or incomplete")
+            checks = run_checks(
+                self.repo_root,
+                policy["checks"],
+                self.runner,
+                self.which,
+                self.validation_timeout,
+            )
+            if any(row["status"] != "PASSED" for row in checks):
+                raise ValueError(
+                    "Baseline build, unit-test, runtime, or dependency-license evidence is failed/incomplete"
+                )
+            receipt = {
+                "status": "QUALIFIED",
+                "plan": deepcopy(plan),
+                "review": deepcopy(review),
+                **policy,
+                "source_before": source_before,
+                "tree": tree_snapshot(self.repo_root),
+                "baseline_results": baseline["results"] + checks,
+            }
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            finding["packageQualification"] = {"status": "BLOCKED", "reason": str(exc)}
+            self._remember()
+            return {
+                "status": "QUALIFICATION_REQUIRED",
+                "finding_id": finding_id,
+                "reason": str(exc),
+                "eligible_for_auto_fix": False,
+            }
+        finding["packageQualification"] = receipt
+        self._remember()
+        return {
+            "status": "QUALIFIED",
+            "finding_id": finding_id,
+            "eligible_for_auto_fix": True,
+            "approval": policy["approval"],
+            "baseline_results": receipt["baseline_results"],
+            "note": "Apply the exact reviewed plan, make only declared surgical fixes, then validate again.",
+        }
+
+    @_serialized
     def apply_minimal_fix(self, finding_id: str) -> dict:
-        """Apply one already-verified plan. Incomplete plans are refused."""
+        """Apply a verified plan only after package qualification passes."""
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
         if any(item["id"] == finding_id for item in self.state.skipped_user_prompt):
-            prompt = next(item["prompt"] for item in self.state.skipped_user_prompt if item["id"] == finding_id)
+            prompt = next(
+                item["prompt"]
+                for item in self.state.skipped_user_prompt
+                if item["id"] == finding_id
+            )
             return {
                 "status": "SKIPPED_USER_PROMPT",
                 "finding_id": finding_id,
@@ -353,11 +570,59 @@ class Engine:
                 "user_prompt": prompt,
             }
         if finding.get("remediationDecision") != "CHANGE_REQUIRED":
-            return {"status": "SKIPPED", "reason": "Not eligible for automated fix", "finding_id": finding_id}
+            return {
+                "status": "SKIPPED",
+                "reason": "Not eligible for automated fix",
+                "finding_id": finding_id,
+            }
         proposed = finding.get("proposedFix") or {}
         required = ("strategy", "score", "ecosystem", "package", "target")
         if any(key not in proposed for key in required):
-            return {"status": "ERROR", "reason": "Proposed fix is incomplete.", "finding_id": finding_id}
+            return {
+                "status": "ERROR",
+                "reason": "Proposed fix is incomplete.",
+                "finding_id": finding_id,
+            }
+        package_update = proposed["ecosystem"] in PACKAGE_ECOSYSTEMS
+        if package_update:
+            self._refresh_package_validation()
+            if any(
+                change.get("qualification_status") != "VALIDATED"
+                for change in self._package_changes()
+            ):
+                return {
+                    "status": "VALIDATION_REQUIRED",
+                    "reason": "Validate the previous package update before another edit",
+                    "finding_id": finding_id,
+                }
+            receipt = finding.get("packageQualification") or {}
+            try:
+                if (
+                    receipt.get("status") != "QUALIFIED"
+                    or receipt.get("plan") != proposed
+                ):
+                    raise ValueError(
+                        "Call qualify_package_update with documentation and corporate approval before this edit"
+                    )
+                policy = load_policy(self.repo_root, self.package_policy_path, proposed)
+                if receipt["policy_sha256"] != policy["policy_sha256"] or receipt[
+                    "tree"
+                ] != tree_snapshot(self.repo_root):
+                    raise ValueError(
+                        "Checkout or corporate policy changed; requalify the exact plan"
+                    )
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                RuntimeError,
+            ) as exc:
+                return {
+                    "status": "QUALIFICATION_REQUIRED",
+                    "finding_id": finding_id,
+                    "reason": str(exc),
+                }
         plan = Plan(
             strategy=proposed["strategy"],
             score=proposed["score"],
@@ -381,17 +646,31 @@ class Engine:
             "commands": outcome.get("commands") or [],
             "oracle": plan.oracle,
             "detail": outcome.get("detail"),
+            "package_update": package_update,
+            "ecosystem": plan.ecosystem,
+            "package": plan.package,
+            "target": plan.target,
+            "qualification_status": "PENDING_VALIDATION" if package_update else None,
         }
         self.state.changes.append(change)
         self._drop_snapshot()
         if outcome["status"] == "APPLIED":
             self.state.status = "FIXES_IN_PROGRESS"
+            self.state.validation_status = None
+            if package_update:
+                finding["packageQualification"]["status"] = "PENDING_VALIDATION"
+                for applied in self._package_changes():
+                    applied["qualification_status"] = "PENDING_VALIDATION"
+                    self._finding(applied["finding_id"])["packageQualification"][
+                        "status"
+                    ] = "PENDING_VALIDATION"
         elif outcome["status"] in {"FIX_FAILED", "FIX_FAILED_LOCKFILE"}:
             self.state.no_solution.append(
                 {
                     "id": finding_id,
                     "component": finding.get("component"),
-                    "reason": outcome.get("detail") or "The planned fix could not be applied.",
+                    "reason": outcome.get("detail")
+                    or "The planned fix could not be applied.",
                 }
             )
         self._remember()
@@ -399,7 +678,7 @@ class Engine:
             "status": outcome["status"],
             "finding_id": finding_id,
             "change": change,
-            "note": "Local uncommitted change only. Review the diff before committing.",
+            "note": "Local uncommitted change only; not a resolved package fix until post-update build, unit tests, runtime, and license checks pass. Make only declared surgical API fixes; never rewrite the product.",
         }
 
     @_serialized
@@ -408,7 +687,15 @@ class Engine:
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
-        change = next((item for item in reversed(self.state.changes) if item.get("finding_id") == finding_id and item.get("status") == "APPLIED"), None)
+        change = next(
+            (
+                item
+                for item in reversed(self.state.changes)
+                if item.get("finding_id") == finding_id
+                and item.get("status") == "APPLIED"
+            ),
+            None,
+        )
         result = generate_aaa_test(self.repo_root, finding, change)
         self._drop_snapshot()
         if result.get("status") == "GENERATED":
@@ -429,8 +716,81 @@ class Engine:
     def run_validation_matrix(self) -> dict:
         """Run the detected stack's checks. A missing branch blocks this."""
         if self.state.status not in AFTER_BRANCH:
-            return {"status": "ERROR", "reason": "Create the security branch before validation."}
-        outcome = run_validation(self.repo_root, self.runner, self.which, timeout=self.validation_timeout)
+            return {
+                "status": "ERROR",
+                "reason": "Create the security branch before validation.",
+            }
+        outcome = run_validation(
+            self.repo_root, self.runner, self.which, timeout=self.validation_timeout
+        )
+        package_changes = self._package_changes()
+        allowed_files = [
+            path for change in self.state.changes for path in change.get("files") or []
+        ]
+        for change in package_changes:
+            finding = self._finding(change["finding_id"])
+            receipt = (finding or {}).get("packageQualification") or {}
+            allowed_files.extend(receipt.get("source_before") or [])
+        for change in package_changes:
+            finding = self._finding(change["finding_id"])
+            receipt = (finding or {}).get("packageQualification") or {}
+            try:
+                if not receipt.get("plan"):
+                    raise ValueError("Package qualification is missing")
+                policy = load_policy(
+                    self.repo_root, self.package_policy_path, receipt["plan"]
+                )
+                if policy["policy_sha256"] != receipt["policy_sha256"]:
+                    raise ValueError(
+                        "Corporate approval policy changed after application; manual re-review required"
+                    )
+                validate_edits(self.repo_root, receipt, allowed_files)
+                checks = run_checks(
+                    self.repo_root,
+                    policy["checks"],
+                    self.runner,
+                    self.which,
+                    self.validation_timeout,
+                )
+                receipt["post_results"] = checks
+                outcome["results"].extend(checks)
+                if any(row["status"] != "PASSED" for row in checks):
+                    raise ValueError(
+                        "Post-update build, unit-test, runtime, or resolved-graph license check did not pass"
+                    )
+                receipt["validated_tree"] = validate_edits(
+                    self.repo_root, receipt, allowed_files
+                )
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                RuntimeError,
+            ) as exc:
+                change["detail"] = str(exc)
+                outcome["status"] = "VALIDATION_FAILED"
+                outcome["results"].append(
+                    {
+                        "status": "FAILED",
+                        "required": True,
+                        "kind": "package_qualification",
+                        "detail": str(exc),
+                        "finding_id": change["finding_id"],
+                    }
+                )
+        for change in package_changes:
+            receipt = self._finding(change["finding_id"])["packageQualification"]
+            status = (
+                "VALIDATED"
+                if outcome["status"] == "VALIDATION_COMPLETE"
+                else "PENDING_VALIDATION"
+            )
+            change["qualification_status"] = receipt["status"] = status
+            if status == "VALIDATED":
+                change["detail"] = (
+                    "Reviewed compatibility and corporate approval; all required before/after checks passed"
+                )
         self.state.validation_results = outcome["results"]
         self.state.validation_status = outcome["status"]
         if outcome["status"] == "VALIDATION_FAILED":
@@ -445,6 +805,7 @@ class Engine:
     @_serialized
     def generate_local_report(self) -> dict:
         """Write the markdown and JSON reports under .security-mcp/reports."""
+        self._refresh_package_validation()
         staged: list[str] | None = None
         diff_stat = ""
         diff_files = ""
@@ -456,7 +817,13 @@ class Engine:
             diff_files = summary["files"]
         except (OSError, RuntimeError, PermissionError) as exc:
             diff_stat = f"Could not read git diff: {exc}"
-        written = write_report(self.repo_root, self.state, staged=staged, diff_stat=diff_stat, diff_files=diff_files)
+        written = write_report(
+            self.repo_root,
+            self.state,
+            staged=staged,
+            diff_stat=diff_stat,
+            diff_files=diff_files,
+        )
         self.state.report_path = written["human_report"]
         self.state.json_report_path = written["json_report"]
         self.state.status = "REPORT_GENERATED"
@@ -465,7 +832,8 @@ class Engine:
 
     @_serialized
     def get_run_status(self) -> dict:
-        """Return counts for the current run without changing it."""
+        """Return current counts and retract stale package-validation results."""
+        self._refresh_package_validation()
         return {
             "status": self.state.status,
             "stop_stage": self.state.stop_stage,
@@ -476,9 +844,69 @@ class Engine:
             "no_solution_count": len(self.state.no_solution),
             "skipped_user_prompt_count": len(self.state.skipped_user_prompt),
             "report_path": self.state.report_path,
+            "package_updates": [
+                {
+                    "finding_id": change["finding_id"],
+                    "package": change["package"],
+                    "target": change["target"],
+                    "qualification_status": change["qualification_status"],
+                }
+                for change in self._package_changes()
+            ],
         }
 
-    def _decide(self, finding: dict) -> tuple[str, str, list[str], dict | None, str | None]:
+    def _package_changes(self) -> list[dict]:
+        """Return applied package changes whose product guarantees need checks."""
+        return [
+            change
+            for change in self.state.changes
+            if change.get("package_update") and change.get("status") == "APPLIED"
+        ]
+
+    def _refresh_package_validation(self) -> None:
+        """Invalidate green evidence when the checkout or approval policy moves."""
+        snapshot = None
+        snapshot_checked = False
+        for change in self._package_changes():
+            if change.get("qualification_status") != "VALIDATED":
+                continue
+            receipt = (self._finding(change["finding_id"]) or {}).get(
+                "packageQualification"
+            ) or {}
+            try:
+                if not snapshot_checked:
+                    snapshot_checked = True
+                    snapshot = tree_snapshot(self.repo_root)
+                policy = load_policy(
+                    self.repo_root, self.package_policy_path, receipt.get("plan") or {}
+                )
+                valid = (
+                    snapshot is not None
+                    and receipt.get("validated_tree") == snapshot
+                    and receipt.get("policy_sha256") == policy["policy_sha256"]
+                )
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                RuntimeError,
+                KeyError,
+            ):
+                valid = False
+            if not valid:
+                change["qualification_status"] = receipt["status"] = (
+                    "PENDING_VALIDATION"
+                )
+                change["detail"] = (
+                    "Checkout or approval changed after validation; rerun/review required"
+                )
+                self.state.validation_status = "VALIDATION_INCOMPLETE"
+                self.state.status = "VALIDATION_INCOMPLETE"
+
+    def _decide(
+        self, finding: dict
+    ) -> tuple[str, str, list[str], dict | None, str | None]:
         """Combine local evidence and advisories without guessing safe edits.
 
         Return a decision, reason, evidence, optional plan, and optional
@@ -491,21 +919,41 @@ class Engine:
         category = finding.get("category") or ""
         component = finding.get("component")
         if finding.get("falsePositiveFlag") is True:
-            evidence.append("GitLab marked falsePositive=true. That flag alone is not sufficient; local evidence is required.")
+            evidence.append(
+                "GitLab marked falsePositive=true. That flag alone is not sufficient; local evidence is required."
+            )
         location_file = (finding.get("location") or {}).get("file")
         if location_file and category in {"sast", "secret_detection"}:
             resolved = resolve_inside(self.repo_root, location_file)
             if resolved is None:
                 reason = f"{location_file} is outside the repository, so it was not treated as a false positive."
                 evidence.append(reason)
-                return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, None, reason)
+                return (
+                    "MANUAL_REVIEW",
+                    reason,
+                    evidence,
+                    None,
+                    self._prompt(finding, None, reason),
+                )
             if not resolved.is_file():
                 evidence.append(f"{location_file} is not in the working tree.")
-                return "FALSE_POSITIVE", f"{location_file} is not present in the repository.", evidence, None, None
+                return (
+                    "FALSE_POSITIVE",
+                    f"{location_file} is not present in the repository.",
+                    evidence,
+                    None,
+                    None,
+                )
 
         if category in {"secret_detection", "dast"}:
             reason = "Secret and DAST findings are not safe to rewrite automatically. Rotate the credential or fix the request with a reviewer."
-            return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, None, reason)
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                evidence,
+                None,
+                self._prompt(finding, None, reason),
+            )
 
         files, files_truncated = self._snapshot()
         hit, truncated = locate_package(
@@ -524,18 +972,54 @@ class Engine:
                 finding["installedVersion"] = hit.version
             finding["dependencyPath"] = ["direct" if hit.direct else "transitive"]
         elif truncated:
-            evidence.append("Manifest search hit the file cap, so absence is not evidence of a false positive.")
-        elif category == "dependency_scanning" and component and manifests_were_parsed(self.repo_root, files):
-            if any(path.suffix.lower() in {".csproj", ".fsproj", ".vbproj"} or path.name in {"pom.xml", "build.gradle", "build.gradle.kts", "libs.versions.toml", "Directory.Packages.props"} for path in files):
+            evidence.append(
+                "Manifest search hit the file cap, so absence is not evidence of a false positive."
+            )
+        elif (
+            category == "dependency_scanning"
+            and component
+            and manifests_were_parsed(self.repo_root, files)
+        ):
+            if any(
+                path.suffix.lower() in {".csproj", ".fsproj", ".vbproj"}
+                or path.name
+                in {
+                    "pom.xml",
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "libs.versions.toml",
+                    "Directory.Packages.props",
+                }
+                for path in files
+            ):
                 reason = "The package was not resolved locally. Java and NuGet manifests do not enumerate every transitive dependency; manual dependency-tree review is required."
-                return "MANUAL_REVIEW", reason, [*evidence, reason], None, self._prompt(finding, None, reason)
-            evidence.append(f"{component} was not found in the parsed manifests or lockfiles.")
-            return "FALSE_POSITIVE", f"{component} is not present in the parsed dependency files.", evidence, None, None
+                return (
+                    "MANUAL_REVIEW",
+                    reason,
+                    [*evidence, reason],
+                    None,
+                    self._prompt(finding, None, reason),
+                )
+            evidence.append(
+                f"{component} was not found in the parsed manifests or lockfiles."
+            )
+            return (
+                "FALSE_POSITIVE",
+                f"{component} is not present in the parsed dependency files.",
+                evidence,
+                None,
+                None,
+            )
 
         installed = (hit.version if hit else None) or finding.get("installedVersion")
         ecosystem = hit.ecosystem if hit else None
         package_name = hit.name if hit else component
-        looked_up = self.advisory.lookup(finding, ecosystem or (hit.manager if hit else None), package_name, installed)
+        looked_up = self.advisory.lookup(
+            finding,
+            ecosystem or (hit.manager if hit else None),
+            package_name,
+            installed,
+        )
         evidence.append(looked_up.summary or "No advisory summary.")
         if looked_up.ranges:
             finding["affectedRange"] = ", ".join(looked_up.ranges)
@@ -547,30 +1031,67 @@ class Engine:
 
         if looked_up.outcome in {"lookup_failed", "not_found", PACKAGE_MISMATCH}:
             reason = looked_up.summary
-            return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, looked_up, reason)
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                evidence,
+                None,
+                self._prompt(finding, looked_up, reason),
+            )
         if looked_up.affected is False:
             return "FALSE_POSITIVE", looked_up.summary, evidence, None, None
-        if looked_up.outcome == "no_fix_published" or not looked_up.lowest_fixed_version:
-            reason = looked_up.summary if looked_up.outcome == "no_fix_published" else "No fixed version is newer than the installed version."
+        if (
+            looked_up.outcome == "no_fix_published"
+            or not looked_up.lowest_fixed_version
+        ):
+            reason = (
+                looked_up.summary
+                if looked_up.outcome == "no_fix_published"
+                else "No fixed version is newer than the installed version."
+            )
             if looked_up.affected is None and looked_up.fixed_versions:
                 reason = "Online records were found, but the installed version could not be compared to the affected range."
-                return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, looked_up, reason)
+                return (
+                    "MANUAL_REVIEW",
+                    reason,
+                    evidence,
+                    None,
+                    self._prompt(finding, looked_up, reason),
+                )
             return "NO_SAFE_FIX", reason, evidence, None, None
         if looked_up.affected is None:
             reason = "Online records were found, but the installed version could not be compared to the affected range."
-            return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, looked_up, reason)
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                evidence,
+                None,
+                self._prompt(finding, looked_up, reason),
+            )
 
         image_only = category == "container_scanning" and hit is None
         fixed = looked_up.lowest_fixed_version
-        plan, plan_reason = plan_remediation(self.repo_root, finding, None if image_only else hit, fixed, files)
+        plan, plan_reason = plan_remediation(
+            self.repo_root, finding, None if image_only else hit, fixed, files
+        )
         if plan is None and category == "container_scanning":
-            plan, plan_reason = plan_remediation(self.repo_root, finding, None, fixed, files)
+            plan, plan_reason = plan_remediation(
+                self.repo_root, finding, None, fixed, files
+            )
         if plan is None and "already at or above" in plan_reason:
             return "FALSE_POSITIVE", plan_reason, evidence, None, None
         if plan is None:
             if category == "sast":
-                reason = "SAST findings do not get a guessed source edit. " + plan_reason
-                return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, looked_up, reason)
+                reason = (
+                    "SAST findings do not get a guessed source edit. " + plan_reason
+                )
+                return (
+                    "MANUAL_REVIEW",
+                    reason,
+                    evidence,
+                    None,
+                    self._prompt(finding, looked_up, reason),
+                )
             return "NO_SAFE_FIX", plan_reason, evidence, None, None
         evidence.append(f"Minimal fix score {plan.score}: {plan.description}")
         if is_major_upgrade(plan.installed or installed, plan.target):
@@ -578,13 +1099,31 @@ class Engine:
                 f"The lowest fixed version {plan.target} is a major upgrade from {plan.installed or installed}. "
                 "That can break callers, so it was not applied automatically."
             )
-            return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, looked_up, reason)
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                evidence,
+                None,
+                self._prompt(finding, looked_up, reason),
+            )
         if parse_version(installed) is None and plan.strategy != "image_tag":
             reason = "The installed version could not be parsed, so the fix was not applied automatically."
-            return "MANUAL_REVIEW", reason, evidence, None, self._prompt(finding, looked_up, reason)
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                evidence,
+                None,
+                self._prompt(finding, looked_up, reason),
+            )
+        if plan.ecosystem in PACKAGE_ECOSYSTEMS:
+            evidence.append(
+                "Candidate only: same-major does not establish framework/API compatibility or commercial license approval. qualify_package_update and all before/after product checks are required."
+            )
         return "CHANGE_REQUIRED", plan.description, evidence, plan.as_dict(), None
 
-    def _prompt(self, finding: dict, looked_up: AdvisoryLookup | None, reason: str) -> str:
+    def _prompt(
+        self, finding: dict, looked_up: AdvisoryLookup | None, reason: str
+    ) -> str:
         """Explain why human review is needed without endorsing GitLab hints."""
         solution = finding.get("solution") or "none"
         mentioned = ", ".join(finding.get("fixedVersions") or []) or "none"
@@ -597,7 +1136,9 @@ class Engine:
 
     def _finding(self, finding_id: str) -> dict | None:
         """Return the active finding matching an id, or None if absent."""
-        return next((item for item in self.state.findings if item.get("id") == finding_id), None)
+        return next(
+            (item for item in self.state.findings if item.get("id") == finding_id), None
+        )
 
     def _stop(self, status: str, stage: str, payload: dict) -> dict:
         """Record and persist the failed phase before returning its details."""

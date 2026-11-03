@@ -50,7 +50,16 @@ PATH_TOOLS = {
     "docker",
 }
 REPO_WRAPPERS = {"mvnw", "gradlew"}
-ALLOWED_SCRIPTS = {"lint", "build", "test", "test:unit", "test:ci", "check"}
+ALLOWED_SCRIPTS = {
+    "lint",
+    "build",
+    "test",
+    "test:unit",
+    "test:ci",
+    "check",
+    "security:smoke",
+    "security:licenses",
+}
 _SECURITY_BRANCH = re.compile(r"^security-fixes-[A-Z][a-z]+-\d{2}-\d{4}$")
 _READ_SIZE = 8192
 
@@ -132,7 +141,12 @@ def _git_ok(args: list[str]) -> bool:
     if command == "checkout":
         return len(rest) == 2 and rest[0] == "-b" and _security_branch(rest[1])
     if command == "ls-remote":
-        return len(rest) == 3 and rest[0] == "--heads" and rest[1] == "origin" and _security_branch(rest[2])
+        return (
+            len(rest) == 3
+            and rest[0] == "--heads"
+            and rest[1] == "origin"
+            and _security_branch(rest[2])
+        )
     return False
 
 
@@ -148,12 +162,22 @@ def _npm_ok(args: list[str]) -> bool:
         ["ci"],
         ["test"],
         ["audit", "--json"],
-        ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
+        [
+            "install",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ],
     ):
         return True
     if _script_run(args):
         return True
-    if len(args) == 5 and args[0] == "update" and args[2:] == ["--ignore-scripts", "--no-audit", "--no-fund"]:
+    if (
+        len(args) == 5
+        and args[0] == "update"
+        and args[2:] == ["--ignore-scripts", "--no-audit", "--no-fund"]
+    ):
         return _package_arg(args[1])
     return False
 
@@ -199,6 +223,18 @@ def _yarn_ok(args: list[str]) -> bool:
 
 def _dotnet_ok(args: list[str]) -> bool:
     """Allow SDK probes, restores, and Release build or test commands."""
+    prefix = ["test", "--configuration", "Release", "--nologo"]
+    if args[: len(prefix)] == prefix and args[len(prefix) :] in [
+        [flag, value]
+        for category in ("SecurityRuntimeSmoke", "LicenseCompliance")
+        for flag, value in (
+            ("--filter", f"Category={category}"),
+            ("--filter", f"TestCategory={category}"),
+            ("--filter-trait", f"Category={category}"),
+            ("--treenode-filter", f"/*/*/*/*[Category={category}]"),
+        )
+    ]:
+        return True
     return args in (
         ["--version"],
         ["restore"],
@@ -214,6 +250,9 @@ def _maven_ok(args: list[str]) -> bool:
         ["--version"],
         ["--batch-mode", "clean", "verify"],
         ["--batch-mode", "dependency:tree"],
+        ["--batch-mode", "test"],
+        ["--batch-mode", "-Psecurity-smoke", "verify"],
+        ["--batch-mode", "-Psecurity-licenses", "verify"],
     )
 
 
@@ -224,6 +263,8 @@ def _gradle_ok(args: list[str]) -> bool:
         ["--no-daemon", "dependencies"],
         ["--no-daemon", "test"],
         ["--no-daemon", "build"],
+        ["--no-daemon", "securitySmoke"],
+        ["--no-daemon", "securityLicenses"],
     )
 
 
@@ -284,8 +325,12 @@ def assert_allowed(argv: list[str], repo_root: Path) -> None:
     if len(argv) < 2:
         raise PermissionError("Refusing to run an empty command")
     batch = Path(argv[0]).suffix.lower() in {".cmd", ".bat"}
-    if any(_bad_argument(arg) for arg in argv[:1]) or any(_bad_argument(arg, batch=batch) for arg in argv[1:]):
-        raise PermissionError("Refusing command arguments that contain shell metacharacters")
+    if any(_bad_argument(arg) for arg in argv[:1]) or any(
+        _bad_argument(arg, batch=batch) for arg in argv[1:]
+    ):
+        raise PermissionError(
+            "Refusing command arguments that contain shell metacharacters"
+        )
     name = tool_name(argv[0])
     path = Path(argv[0])
     if not path.is_absolute() and name not in REPO_WRAPPERS and len(path.parts) > 1:
@@ -331,7 +376,13 @@ class CommandRunner:
     stream is capped so a noisy build cannot fill memory.
     """
 
-    def __init__(self, repo_root: Path, *, max_output: int = 65536, audit_path: Path | None = None):
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        max_output: int = 65536,
+        audit_path: Path | None = None,
+    ):
         """Configure the repository boundary, output cap, and local audit path."""
         self.repo_root = repo_root
         self.max_output = max_output
@@ -351,12 +402,16 @@ class CommandRunner:
         try:
             workdir.relative_to(self.repo_root.resolve())
         except ValueError as exc:
-            raise PermissionError(f"Refusing to run outside the repository: {workdir}") from exc
+            raise PermissionError(
+                f"Refusing to run outside the repository: {workdir}"
+            ) from exc
         assert_allowed(argv, self.repo_root)
         with self._lock:
             return self._run_locked(argv, timeout=timeout, check=check, workdir=workdir)
 
-    def _run_locked(self, argv: list[str], *, timeout: int, check: bool, workdir: Path) -> CommandResult:
+    def _run_locked(
+        self, argv: list[str], *, timeout: int, check: bool, workdir: Path
+    ) -> CommandResult:
         """Own child cleanup, cancellable readers, and audit publication."""
         started = time.monotonic()
         # stdin is the MCP JSON-RPC stream. A child that inherits it could
@@ -409,7 +464,9 @@ class CommandRunner:
         self._audit(result, workdir)
         if check and result.exit_code != 0:
             detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"{result.display()} failed ({result.exit_code}): {detail[:500]}")
+            raise RuntimeError(
+                f"{result.display()} failed ({result.exit_code}): {detail[:500]}"
+            )
         return result
 
     def _start_readers(
@@ -432,8 +489,12 @@ class CommandRunner:
                 errors.append(exc)
 
         threads = [
-            threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
-            threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+            threading.Thread(
+                target=read_stream, args=("stdout", process.stdout), daemon=True
+            ),
+            threading.Thread(
+                target=read_stream, args=("stderr", process.stderr), daemon=True
+            ),
         ]
         for thread in threads:
             thread.start()
@@ -457,9 +518,15 @@ class CommandRunner:
             stdout=kept_out,
             stderr=kept_err,
             duration_ms=duration_ms,
-            truncated=truncated or len(stdout) > self.max_output or len(stderr) > self.max_output,
-            stdout_sha256=hashlib.sha256(kept_out.encode("utf-8", errors="replace")).hexdigest(),
-            stderr_sha256=hashlib.sha256(kept_err.encode("utf-8", errors="replace")).hexdigest(),
+            truncated=truncated
+            or len(stdout) > self.max_output
+            or len(stderr) > self.max_output,
+            stdout_sha256=hashlib.sha256(
+                kept_out.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            stderr_sha256=hashlib.sha256(
+                kept_err.encode("utf-8", errors="replace")
+            ).hexdigest(),
         )
 
     def _audit(self, result: CommandResult, cwd: Path) -> None:
@@ -521,7 +588,7 @@ def _read_capped(pipe, limit: int, stop: threading.Event) -> tuple[str, bool]:
                 truncated = True
         final = decoder.decode(b"", final=True)
         if final:
-            chunks.append(final[:max(0, limit - kept)])
+            chunks.append(final[: max(0, limit - kept)])
             truncated = truncated or kept + len(final) > limit
     finally:
         pipe.close()
@@ -541,10 +608,24 @@ def _pipe_available(pipe) -> int | None:
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     peek = kernel.PeekNamedPipe
-    peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    peek.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
     peek.restype = wintypes.BOOL
     available = wintypes.DWORD()
-    if not peek(msvcrt.get_osfhandle(pipe.fileno()), None, 0, None, ctypes.byref(available), None):
+    if not peek(
+        msvcrt.get_osfhandle(pipe.fileno()),
+        None,
+        0,
+        None,
+        ctypes.byref(available),
+        None,
+    ):
         error = ctypes.get_last_error()
         if error == 109:
             return None
@@ -565,7 +646,11 @@ def _child_env(argv: list[str] | None = None) -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
     env["CI"] = env.get("CI") or "1"
-    if argv and tool_name(argv[0]) == "yarn" and (argv[1:3] == ["up", "-R"] or "--mode=update-lockfile" in argv):
+    if (
+        argv
+        and tool_name(argv[0]) == "yarn"
+        and (argv[1:3] == ["up", "-R"] or "--mode=update-lockfile" in argv)
+    ):
         env["YARN_ENABLE_SCRIPTS"] = "false"
         env["YARN_ENABLE_IMMUTABLE_INSTALLS"] = "false"
     return env
