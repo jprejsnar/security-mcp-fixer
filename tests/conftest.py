@@ -38,6 +38,25 @@ def approve_package_for_test(root: Path, plan: dict) -> dict:
     from gitlab_security_mcp.qualification import CHECK_KINDS, _check_args
 
     manager = plan["manager"]
+    if manager in {"npm", "pnpm", "yarn"}:
+        entry = next(
+            (
+                path
+                for path in plan.get("files", [])
+                if Path(path).name == "package.json"
+            ),
+            "package.json",
+        )
+        manifest = root / entry
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        for kind in ("lint", "build", "test"):
+            data.setdefault("scripts", {}).setdefault(kind, "fixture")
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+    if manager == "nuget" and not list(root.glob("*.csproj")):
+        (root / "Fixture.csproj").write_text(
+            "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>",
+            encoding="utf-8",
+        )
     tool = {"nuget": "dotnet", "maven": "mvn"}.get(manager, manager)
     approval = {key: plan[key] for key in ("ecosystem", "package", "target")}
     approval.update(
@@ -73,6 +92,7 @@ def approve_package_for_test(root: Path, plan: dict) -> dict:
             "summary": "Fixture API review",
         },
         "compatible": True,
+        "compatible_without_code_changes": True,
         "api_changes": "Fixture has no API changes",
         "frameworks": [
             {

@@ -77,9 +77,9 @@ class Plan:
                 "target": self.target,
                 "requirements": [
                     "Review complete official package documentation and API changes.",
-                    "Preserve product frameworks, runtimes, builds, and unit tests.",
-                    "Obtain exact-version corporate approval for free commercial distribution.",
-                    "Pass baseline and post-update build, unit-test, and runtime smoke checks.",
+                    "Require no production/unit-test API adaptations or check-script changes for any version increment.",
+                    "Review target-version license terms; obey configured corporate policy when present.",
+                    "Record baseline/post lint diagnostics; require no lint errors, successful production builds and executed passing unit tests, plus all configured policy checks.",
                 ],
             }
             if self.ecosystem in {"npm", "NuGet", "Maven"}

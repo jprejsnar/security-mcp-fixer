@@ -18,6 +18,109 @@ from gitlab_security_mcp.qualification import (
     tree_snapshot,
     validate_edits,
 )
+from gitlab_security_mcp.validate import _lint_result, _product_result
+
+
+@pytest.mark.parametrize("truncated,code", [(False, 0), (False, 1), (True, 0)])
+def test_lint_records_warnings_information_and_unknowns(truncated, code):
+    # Arrange
+    result = CommandResult(
+        ["npm", "run", "lint"],
+        code,
+        "warning: existing issue\ninfo: rule disabled\nunrecognized diagnostic\n",
+        "",
+        0,
+        truncated,
+        "out",
+        "err",
+    )
+
+    # Act
+    row = _lint_result(result)
+
+    # Assert
+    assert row["status"] == ("PASSED" if not truncated and code == 0 else "FAILED")
+    assert row["diagnostics"] == {
+        "errors": [],
+        "warnings": ["warning: existing issue"],
+        "info": ["info: rule disabled"],
+        "unknown": ["unrecognized diagnostic"],
+    }
+    assert row["stdout"] == result.stdout
+
+
+def test_lint_json_errors_fail_even_with_exit_zero():
+    # Arrange
+    result = CommandResult(
+        ["npm", "run", "lint"],
+        0,
+        json.dumps(
+            [
+                {
+                    "filePath": "app.ts",
+                    "messages": [{"severity": 2, "message": "API error"}],
+                }
+            ]
+        ),
+        "",
+        0,
+        False,
+        "out",
+        "err",
+    )
+
+    # Act
+    row = _lint_result(result)
+
+    # Assert
+    assert row["status"] == "FAILED"
+    assert len(row["diagnostics"]["errors"]) == 1
+
+
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("0 errors, 2 warnings", "PASSED"),
+        ("/src/error.ts\n1:2 warning unused import", "PASSED"),
+        ("2 errors, 0 warnings", "FAILED"),
+    ],
+)
+def test_lint_summaries_do_not_confuse_zero_errors_or_source_filenames(
+    output, expected
+):
+    # Arrange
+    result = CommandResult(
+        ["npm", "run", "lint"], 0, output, "", 0, False, "out", "err"
+    )
+
+    # Act
+    row = _lint_result(result)
+
+    # Assert
+    assert row["status"] == expected
+    assert row["stdout"] == output
+
+
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("No tests found, exiting with code 0", "FAILED"),
+        ("Tests run: 0", "FAILED"),
+        ("> Task :test NO-SOURCE", "FAILED"),
+        ("Tests run: 0\nTests run: 5, Failures: 0", "PASSED"),
+    ],
+)
+def test_unit_test_checks_require_executed_tests_without_rejecting_empty_modules(
+    output, expected
+):
+    # Arrange
+    result = CommandResult(["npm", "test"], 0, output, "", 0, False, "out", "err")
+
+    # Act
+    row = _product_result(result, "unit_tests")
+
+    # Assert
+    assert row["status"] == expected
 
 
 @pytest.fixture
@@ -110,7 +213,13 @@ def package_engine(tmp_path, package_policy):
                 "dependencies": {"example": "1.0.0"},
                 "scripts": {
                     name: "fixture"
-                    for name in ("build", "test", "security:smoke", "security:licenses")
+                    for name in (
+                        "lint",
+                        "build",
+                        "test",
+                        "security:smoke",
+                        "security:licenses",
+                    )
                 },
             }
         ),
@@ -161,6 +270,7 @@ def package_review():
             "summary": "Reviewed API and release notes",
         },
         "compatible": True,
+        "compatible_without_code_changes": True,
         "api_changes": "No caller changes required",
         "frameworks": [
             {
@@ -172,6 +282,303 @@ def package_review():
         ],
         "source_fixes": [],
     }
+
+
+@pytest.mark.parametrize("target", ["2.0.0", "1.1.0", "1.0.1", "1.0.0.1"])
+@pytest.mark.parametrize("source_path", ["app.ts", "app.test.ts"])
+def test_every_package_increment_rejects_code_adaptations(
+    tmp_path, package_review, target, source_path
+):
+    # Arrange
+    package_review["target"] = target
+    package_review["source_fixes"] = [
+        {"path": source_path, "reason": "Adapt changed API"}
+    ]
+
+    # Act / Assert
+    with pytest.raises(
+        ValueError, match="cannot require production or unit-test code changes"
+    ):
+        review_package(tmp_path, package_review)
+
+
+@pytest.mark.parametrize("missing_script", [None, "lint", "build", "test"])
+def test_missing_default_policy_uses_documented_license_review(
+    package_engine, package_review, missing_script
+):
+    # Arrange
+    from gitlab_security_mcp.report import render
+
+    package_engine.package_policy_path.unlink()
+    package_review["license"] = {
+        "expression": "MIT",
+        "sources": ["https://example.test/license/1.0.1"],
+        "commercial_use_permitted": True,
+        "no_license_fees": True,
+        "obligations": "Retain copyright and license notices",
+        "assessment": "Reviewed target-version terms; no license fee required",
+    }
+    if missing_script:
+        path = package_engine.repo_root / "package.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["scripts"].pop(missing_script)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    if missing_script:
+        assert result["status"] == "QUALIFICATION_REQUIRED"
+        assert "existing build and test scripts" in result["reason"]
+        package_engine.runner.run.assert_not_called()
+        return
+    assert result["status"] == "QUALIFIED", result
+    receipt = package_engine.state.findings[0]["packageQualification"]
+    assert receipt["policy_mode"] == "documentation_review"
+    assert receipt["approval"] is None
+    assert not package_engine.package_policy_path.exists()
+    applied = package_engine.apply_minimal_fix("package")
+    validated = package_engine.run_validation_matrix()
+    refreshed = package_engine.get_run_status()
+    assert applied["status"] == "APPLIED", applied
+    assert validated["status"] == "VALIDATION_COMPLETE", validated
+    assert package_engine.state.changes[0]["qualification_status"] == "VALIDATED"
+    assert refreshed["package_updates"][0]["qualification_status"] == "VALIDATED"
+    assert package_engine.state.validation_status == "VALIDATION_COMPLETE"
+    assert not package_engine.package_policy_path.exists()
+    payload, markdown = render(
+        package_engine.state, staged=[], diff_stat="", diff_files=""
+    )
+    qualification = payload["package_qualifications"]["package"]
+    assert qualification["policy_mode"] == "documentation_review"
+    assert qualification["approval"] is None
+    assert "documented license review, not corporate approval" in markdown
+
+
+def test_lint_diagnostics_are_retained_before_and_after_update(
+    package_engine, package_review
+):
+    # Arrange
+    def run(argv, **kwargs):
+        """Return nonblocking lint messages and passing product-check evidence."""
+        output = (
+            "warning: existing issue\ninfo: checked rules\nunknown diagnostic\n"
+            if argv[1:] == ["run", "lint"]
+            else "CHECK_PASSED"
+        )
+        return CommandResult(argv, 0, output, "", 0, False, "out", "err")
+
+    package_engine.runner.run.side_effect = run
+
+    # Act
+    qualified = package_engine.qualify_package_update("package", package_review)
+    applied = package_engine.apply_minimal_fix("package")
+    validated = package_engine.run_validation_matrix()
+
+    # Assert
+    assert qualified["status"] == "QUALIFIED", qualified
+    assert applied["status"] == "APPLIED", applied
+    assert validated["status"] == "VALIDATION_COMPLETE", validated
+    receipt = package_engine.state.findings[0]["packageQualification"]
+    for phase in ("baseline_results", "post_results"):
+        lint = next(row for row in receipt[phase] if row.get("kind") == "lint")
+        assert lint["status"] == "PASSED"
+        assert lint["diagnostics"]["warnings"]
+        assert lint["diagnostics"]["info"]
+        assert lint["diagnostics"]["unknown"]
+
+
+def test_lint_baseline_is_retained_when_build_cannot_start(
+    package_engine, package_review
+):
+    # Arrange
+    def run(argv, **kwargs):
+        """Emit lint evidence then fail starting the build command."""
+        if argv[1:] == ["run", "build"]:
+            raise OSError("Build executable unavailable")
+        return CommandResult(
+            argv,
+            0,
+            "warning: existing issue\n"
+            if argv[1:] == ["run", "lint"]
+            else "CHECK_PASSED",
+            "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    package_engine.runner.run.side_effect = run
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    assert result["status"] == "QUALIFICATION_REQUIRED"
+    assert "build" in result["reason"]
+    lint = next(row for row in result["baseline_results"] if row.get("kind") == "lint")
+    assert lint["diagnostics"]["warnings"] == ["warning: existing issue"]
+
+
+@pytest.mark.parametrize("stage", ["lint", "build", "test"])
+def test_failed_baseline_records_check_and_does_not_apply(
+    package_engine, package_review, stage
+):
+    # Arrange
+    before = (package_engine.repo_root / "package.json").read_bytes()
+
+    def run(argv, **kwargs):
+        """Fail only the selected product check."""
+        failed = argv[1:] == (["test"] if stage == "test" else ["run", stage])
+        return CommandResult(
+            argv,
+            1 if failed else 0,
+            "CHECK_PASSED",
+            "error: fixture failure" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    package_engine.runner.run.side_effect = run
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    assert result["status"] == "QUALIFICATION_REQUIRED"
+    assert ("unit_tests" if stage == "test" else stage) in result["reason"]
+    assert any(row["status"] == "FAILED" for row in result["baseline_results"])
+    assert (
+        package_engine.state.findings[0]["packageQualification"]["baseline_results"]
+        == result["baseline_results"]
+    )
+    assert (package_engine.repo_root / "package.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("confirmation", [None, False, "true"])
+def test_api_changes_or_uncertain_no_code_compatibility_blocks_qualification(
+    package_engine, package_review, confirmation
+):
+    # Arrange
+    package_review["compatible_without_code_changes"] = confirmation
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    assert result["status"] == "QUALIFICATION_REQUIRED"
+    assert (
+        "neither production nor unit-test callers need API changes" in result["reason"]
+    )
+    package_engine.runner.run.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["lint", "build", "test", "source", "scripts"])
+def test_failed_post_checks_reject_and_restore_only_dependency_edits(
+    package_engine, package_review, stage
+):
+    # Arrange
+    manifest = package_engine.repo_root / "package.json"
+    before = manifest.read_bytes()
+    assert (
+        package_engine.qualify_package_update("package", package_review)["status"]
+        == "QUALIFIED"
+    )
+    assert package_engine.apply_minimal_fix("package")["status"] == "APPLIED"
+    source = package_engine.repo_root / "app.test.ts"
+    if stage == "source":
+        source.write_text("adaptedApi();\n", encoding="utf-8")
+    if stage == "scripts":
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["scripts"]["test"] = "echo bypass tests"
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    def run(argv, **kwargs):
+        """Fail the selected post-update check without modifying files."""
+        failed = argv[1:] == (["test"] if stage == "test" else ["run", stage])
+        return CommandResult(
+            argv,
+            1 if failed else 0,
+            "CHECK_PASSED",
+            "error: fixture failure" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    package_engine.runner.run.side_effect = run
+
+    # Act
+    result = package_engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == "VALIDATION_FAILED", result
+    assert "not accepted" in result["reason"]
+    change = package_engine.state.changes[0]
+    assert change["qualification_status"] == "REJECTED"
+    assert "Package update rejected" in change["detail"]
+    if stage == "scripts":
+        assert result["rollbacks"][0]["status"] == "MANUAL_REVIEW_REQUIRED"
+        assert (
+            json.loads(manifest.read_text(encoding="utf-8"))["scripts"]["test"]
+            == "echo bypass tests"
+        )
+    else:
+        assert result["rollbacks"][0]["status"] == "ROLLED_BACK"
+        assert manifest.read_bytes() == before
+    if stage == "source":
+        assert source.read_text(encoding="utf-8") == "adaptedApi();\n"
+
+
+def test_missing_explicit_policy_does_not_fall_back(
+    tmp_path, monkeypatch, package_review
+):
+    # Arrange
+    from unittest.mock import Mock
+
+    missing = tmp_path / "corporate-policy.json"
+    monkeypatch.setenv("PACKAGE_UPDATE_POLICY", str(missing))
+    engine = Engine(tmp_path, gitlab=Mock(), advisory=Mock())
+    plan = {"ecosystem": "npm", "package": "example", "target": "1.0.1"}
+
+    # Act / Assert
+    with pytest.raises(FileNotFoundError):
+        engine._package_policy(plan, package_review)
+    assert not missing.exists()
+
+
+def test_missing_default_policy_does_not_fabricate_license_review(
+    package_engine, package_review
+):
+    # Arrange
+    package_engine.package_policy_path.unlink()
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    assert result["status"] == "QUALIFICATION_REQUIRED"
+    assert "review.license" in result["reason"]
+    assert "No corporate approval file is required" in result["reason"]
+    package_engine.runner.run.assert_not_called()
+
+
+def test_existing_invalid_policy_does_not_fall_back(package_engine, package_review):
+    # Arrange
+    package_engine.package_policy_path.write_text("{}", encoding="utf-8")
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    assert result["status"] == "QUALIFICATION_REQUIRED"
+    assert "schema_version" in result["reason"]
+    package_engine.runner.run.assert_not_called()
 
 
 def test_major_review_requires_hashed_callers_and_no_code_changes(
@@ -312,7 +719,7 @@ def test_major_update_requires_passing_checks_without_code_adjustments(
     # Assert
     if failure:
         assert result["status"] == "VALIDATION_FAILED"
-        assert engine.state.changes[0]["qualification_status"] == "PENDING_VALIDATION"
+        assert engine.state.changes[0]["qualification_status"] == "REJECTED"
     else:
         assert result["status"] == "VALIDATION_COMPLETE"
         assert engine.state.changes[0]["qualification_status"] == "VALIDATED"
@@ -369,8 +776,15 @@ def test_transitive_major_update_requires_dependency_source_review(
     "package, installed, target",
     [("minimatch", "10.2.6", "11.0.1"), ("glob", "10.5.0", "14.0.2")],
 )
+@pytest.mark.parametrize("corporate_policy", [False, True])
 def test_nested_transitive_pnpm_major_update_preserves_callers(
-    tmp_path, package_policy, package_review, package, installed, target
+    tmp_path,
+    package_policy,
+    package_review,
+    package,
+    installed,
+    target,
+    corporate_policy,
 ):
     # Arrange
     import hashlib
@@ -382,7 +796,7 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
         json.dumps(
             {
                 "packageManager": "pnpm@10.0.0",
-                "scripts": {"build": "build", "test": "test"},
+                "scripts": {"lint": "lint", "build": "build", "test": "test"},
             }
         ),
         encoding="utf-8",
@@ -403,6 +817,8 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
     for check in policy["checks"]["npm"].values():
         check["argv"][0] = "pnpm"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    if not corporate_policy:
+        policy_path.unlink()
     runner = Mock()
 
     def run(argv, **kwargs):
@@ -441,6 +857,14 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
     ]
     verified = engine.verify_security_finding(package)
     package_review.update(package=package, target=target)
+    package_review["license"] = {
+        "expression": "MIT",
+        "sources": ["https://example.test/target-license"],
+        "commercial_use_permitted": True,
+        "no_license_fees": True,
+        "obligations": "Retain notices",
+        "assessment": "Test-only reviewed license terms",
+    }
     package_review["major_upgrade"] = {
         "scan_id": verified["proposed_fix"]["caller_scan"]["scan_id"],
         "compatible_without_code_changes": True,
@@ -470,6 +894,13 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
     assert validated["status"] == "VALIDATION_COMPLETE", validated
     assert engine.state.changes[0]["qualification_status"] == "VALIDATED"
     assert all(path.read_bytes() == contents for path, contents in original.items())
+    assert policy_path.exists() is corporate_policy
+    receipt = engine.state.findings[0]["packageQualification"]
+    assert receipt["policy_mode"] == (
+        "corporate_policy" if corporate_policy else "documentation_review"
+    )
+    if not corporate_policy:
+        assert receipt["approval"] is None
 
 
 @pytest.mark.parametrize(
@@ -737,7 +1168,7 @@ def test_post_update_checks_control_resolution(
         "VALIDATION_COMPLETE" if failed_kind is None else "VALIDATION_FAILED"
     )
     assert package_engine.state.changes[0]["qualification_status"] == (
-        "VALIDATED" if failed_kind is None else "PENDING_VALIDATION"
+        "VALIDATED" if failed_kind is None else "REJECTED"
     )
     if failed_kind is not None:
         assert payload["unresolved_issues"][0]["id"] == "package"
@@ -921,25 +1352,15 @@ def test_checks_require_positive_untruncated_success(
 
 
 @pytest.mark.parametrize(
-    "mode", ["small", "rewrite", "rewrite_increments", "undeclared", "escape"]
+    "mode", ["small", "rewrite", "rewrite_increments", "undeclared", "delete"]
 )
-def test_only_declared_surgical_source_fixes_are_accepted(
+def test_source_changes_are_rejected_even_when_listed_as_allowed(
     tmp_path, package_review, mode
 ):
-    """Permit bounded API adaptations but refuse rewrites and scope expansion."""
+    """Reject every source adaptation, including small edits and deletions."""
     # Arrange
     source = tmp_path / "app.ts"
     source.write_text("oldApi();\n", encoding="utf-8")
-    package_review["source_fixes"] = [
-        {
-            "path": "../outside.ts" if mode == "escape" else "app.ts",
-            "reason": "Adapt renamed API",
-        }
-    ]
-    if mode == "escape":
-        with pytest.raises(ValueError):
-            review_package(tmp_path, package_review)
-        return
     receipt = {
         "source_before": review_package(tmp_path, package_review),
         "tree": tree_snapshot(tmp_path),
@@ -950,13 +1371,12 @@ def test_only_declared_surgical_source_fixes_are_accepted(
     )
     if mode == "undeclared":
         (tmp_path / "other.ts").write_text("unreviewed();", encoding="utf-8")
+    if mode == "delete":
+        source.unlink()
 
     # Act / Assert
-    if mode == "small":
-        assert validate_edits(tmp_path, receipt, []) != receipt["tree"]
-    else:
-        with pytest.raises(ValueError):
-            validate_edits(tmp_path, receipt, [])
+    with pytest.raises(ValueError, match="production or unit-test code changed"):
+        validate_edits(tmp_path, receipt, ["app.ts", "other.ts"])
 
 
 @pytest.mark.parametrize(

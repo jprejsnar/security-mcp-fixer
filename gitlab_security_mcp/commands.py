@@ -239,6 +239,7 @@ def _dotnet_ok(args: list[str]) -> bool:
         ["--version"],
         ["restore"],
         ["restore", "--locked-mode"],
+        ["format", "--verify-no-changes", "--no-restore"],
         ["build", "--configuration", "Release", "--nologo"],
         ["test", "--configuration", "Release", "--nologo"],
     )
@@ -250,6 +251,11 @@ def _maven_ok(args: list[str]) -> bool:
         ["--version"],
         ["--batch-mode", "clean", "verify"],
         ["--batch-mode", "dependency:tree"],
+        [
+            "--batch-mode",
+            "checkstyle:check",
+            "-Dcheckstyle.includeTestSourceDirectory=true",
+        ],
         ["--batch-mode", "test"],
         ["--batch-mode", "-Psecurity-smoke", "verify"],
         ["--batch-mode", "-Psecurity-licenses", "verify"],
@@ -261,6 +267,7 @@ def _gradle_ok(args: list[str]) -> bool:
     return args in (
         ["--version"],
         ["--no-daemon", "dependencies"],
+        ["--no-daemon", "checkstyleMain", "checkstyleTest"],
         ["--no-daemon", "test"],
         ["--no-daemon", "build"],
         ["--no-daemon", "securitySmoke"],

@@ -28,9 +28,14 @@ from gitlab_security_mcp.manifests import (
 )
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
+    backup_dependency_files,
+    dependency_file_hashes,
     load_policy,
+    package_script_hashes,
     review_major_upgrade,
     review_package,
+    reviewed_license_policy,
+    rollback_dependency_files,
     run_checks,
     scan_package_callers,
     tree_snapshot,
@@ -108,6 +113,7 @@ class Engine:
         Initialization errors propagate after owned-client cleanup.
         """
         self.repo_root = Path(repo_root).resolve()
+        self._package_policy_required = bool(os.environ.get("PACKAGE_UPDATE_POLICY"))
         self.package_policy_path = Path(
             os.environ.get("PACKAGE_UPDATE_POLICY")
             or self.repo_root / ".security-mcp" / "package-update-policy.json"
@@ -504,12 +510,12 @@ class Engine:
 
     @_serialized
     def qualify_package_update(self, finding_id: str, review: dict) -> dict:
-        """Require exact-version corporate approval and a passing baseline.
+        """Require reviewed APIs/license terms and a passing product baseline.
 
         The hosting AI supplies its complete official-documentation review
-        and declared surgical adaptations. Corporate approval is read from
-        PACKAGE_UPDATE_POLICY, never granted by this tool or the AI.
-        Missing evidence blocks edits. Requalify after checkout changes.
+        without production or unit-test adaptations. Configured/existing corporate
+        policies remain mandatory; otherwise documented license review is
+        used without inventing corporate approval. Requalify after changes.
         """
         finding = self._finding(finding_id)
         if (
@@ -535,6 +541,8 @@ class Engine:
                 "reason": "An applied update must retain its original qualification; run post-update validation",
             }
         finding.pop("packageQualification", None)
+        baseline = {"results": []}
+        checks = []
         try:
             if not isinstance(review, dict) or any(
                 review.get(key) != plan.get(key)
@@ -545,12 +553,25 @@ class Engine:
                 )
             source_before = review_package(self.repo_root, review)
             major_review = review_major_upgrade(self.repo_root, plan, review)
-            policy = load_policy(self.repo_root, self.package_policy_path, plan)
+            policy = self._package_policy(plan, review)
+            tree = tree_snapshot(self.repo_root)
+            scripts = package_script_hashes(self.repo_root, tree)
             baseline = run_validation(
-                self.repo_root, self.runner, self.which, timeout=self.validation_timeout
+                self.repo_root,
+                self.runner,
+                self.which,
+                timeout=self.validation_timeout,
+                package_checks=True,
             )
             if baseline["status"] != "VALIDATION_COMPLETE":
-                raise ValueError("Product baseline validation is failed or incomplete")
+                raise ValueError(
+                    "Package update not applied: baseline checks failed or are incomplete. "
+                    + "; ".join(
+                        f"{row.get('kind') or row.get('command') or 'validation'}: {row.get('detail', row['status'])}"
+                        for row in baseline["results"]
+                        if row.get("required") and row["status"] != "PASSED"
+                    )
+                )
             checks = run_checks(
                 self.repo_root,
                 policy["checks"],
@@ -561,22 +582,33 @@ class Engine:
             )
             if any(row["status"] != "PASSED" for row in checks):
                 raise ValueError(
-                    "Baseline build, unit-test, runtime, or dependency-license evidence is failed/incomplete"
+                    "Configured baseline product-check evidence is failed/incomplete"
                 )
             if major_review is not None:
                 major_review = review_major_upgrade(self.repo_root, plan, review)
+            validate_edits(
+                self.repo_root,
+                {"tree": tree, "source_before": {}, "package_script_hashes": scripts},
+                [],
+            )
             receipt = {
+                "check_contract": "lint-build-unit-no-code-v1",
                 "status": "QUALIFIED",
                 "plan": deepcopy(plan),
                 "review": deepcopy(review),
                 "major_review": major_review,
                 **policy,
                 "source_before": source_before,
-                "tree": tree_snapshot(self.repo_root),
+                "tree": tree,
+                "package_script_hashes": scripts,
                 "baseline_results": baseline["results"] + checks,
             }
         except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
-            finding["packageQualification"] = {"status": "BLOCKED", "reason": str(exc)}
+            finding["packageQualification"] = {
+                "status": "BLOCKED",
+                "reason": str(exc),
+                "baseline_results": baseline["results"] + checks,
+            }
             if plan.get("major_upgrade") and isinstance(review, dict):
                 finding["packageQualification"].update(
                     plan=deepcopy(plan), review=deepcopy(review)
@@ -587,6 +619,7 @@ class Engine:
                 "finding_id": finding_id,
                 "reason": str(exc),
                 "eligible_for_auto_fix": False,
+                "baseline_results": baseline["results"] + checks,
             }
         finding["packageQualification"] = receipt
         self._remember()
@@ -595,8 +628,9 @@ class Engine:
             "finding_id": finding_id,
             "eligible_for_auto_fix": True,
             "approval": policy["approval"],
+            "policy_mode": policy["policy_mode"],
             "baseline_results": receipt["baseline_results"],
-            "note": "Apply the exact reviewed plan, make only declared surgical fixes, then validate again.",
+            "note": "Apply only the reviewed dependency version edits. Do not change production code, unit tests, or check scripts. Lint, builds and unit tests must pass again before acceptance.",
         }
 
     @_serialized
@@ -648,18 +682,22 @@ class Engine:
                 if (
                     receipt.get("status") != "QUALIFIED"
                     or receipt.get("plan") != proposed
+                    or receipt.get("check_contract") != "lint-build-unit-no-code-v1"
                 ):
                     raise ValueError(
-                        "Call qualify_package_update with documentation and corporate approval before this edit"
+                        "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
                     )
-                policy = load_policy(self.repo_root, self.package_policy_path, proposed)
+                policy = self._package_policy(proposed, receipt["review"])
                 if receipt["policy_sha256"] != policy["policy_sha256"] or receipt[
                     "tree"
                 ] != tree_snapshot(self.repo_root):
                     raise ValueError(
-                        "Checkout or corporate policy changed; requalify the exact plan"
+                        "Checkout or qualification policy changed; requalify the exact plan"
                     )
                 review_major_upgrade(self.repo_root, proposed, receipt["review"])
+                receipt["dependency_before"] = backup_dependency_files(
+                    self.repo_root, proposed
+                )
             except (
                 OSError,
                 ValueError,
@@ -685,6 +723,10 @@ class Engine:
             oracle=proposed.get("oracle"),
         )
         outcome = apply_plan(self.repo_root, plan, self.runner, self.which)
+        if package_update:
+            receipt["applied_dependency_hashes"] = dependency_file_hashes(
+                self.repo_root, receipt["dependency_before"]
+            )
         change = {
             "finding_id": finding_id,
             "status": outcome["status"],
@@ -727,7 +769,7 @@ class Engine:
             "status": outcome["status"],
             "finding_id": finding_id,
             "change": change,
-            "note": "Local uncommitted change only; not a resolved package fix until post-update build, unit tests, runtime, and license checks pass. Make only declared surgical API fixes; never rewrite the product.",
+            "note": "Not accepted until post-update lint has no errors, production builds and unit tests pass, and configured policy checks pass. Production/unit-test code and check scripts must remain unchanged for every version increment.",
         }
 
     @_serialized
@@ -736,6 +778,12 @@ class Engine:
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
+        if (finding.get("proposedFix") or {}).get("ecosystem") in PACKAGE_ECOSYSTEMS:
+            return {
+                "status": "NOT_REQUIRED",
+                "finding_id": finding_id,
+                "reason": "Package version updates cannot add or modify production code or unit tests, including generated AAA tests.",
+            }
         change = next(
             (
                 item
@@ -769,13 +817,27 @@ class Engine:
                 "status": "ERROR",
                 "reason": "Create the security branch before validation.",
             }
-        outcome = run_validation(
-            self.repo_root, self.runner, self.which, timeout=self.validation_timeout
-        )
         package_changes = self._package_changes()
+        outcome = run_validation(
+            self.repo_root,
+            self.runner,
+            self.which,
+            timeout=self.validation_timeout,
+            package_checks=bool(package_changes),
+        )
         allowed_files = [
             path for change in self.state.changes for path in change.get("files") or []
         ]
+        expected_dependencies = {
+            path: digest
+            for change in package_changes
+            for path, digest in (
+                (self._finding(change["finding_id"]) or {}).get("packageQualification")
+                or {}
+            )
+            .get("applied_dependency_hashes", {})
+            .items()
+        }
         for change in package_changes:
             finding = self._finding(change["finding_id"])
             receipt = (finding or {}).get("packageQualification") or {}
@@ -786,14 +848,22 @@ class Engine:
             try:
                 if not receipt.get("plan"):
                     raise ValueError("Package qualification is missing")
-                policy = load_policy(
-                    self.repo_root, self.package_policy_path, receipt["plan"]
-                )
+                if receipt.get("check_contract") != "lint-build-unit-no-code-v1":
+                    raise ValueError(
+                        "Package qualification predates mandatory lint/no-code checks; requalification is required"
+                    )
+                receipt["post_results"] = deepcopy(outcome["results"])
+                policy = self._package_policy(receipt["plan"], receipt["review"])
                 if policy["policy_sha256"] != receipt["policy_sha256"]:
                     raise ValueError(
-                        "Corporate approval policy changed after application; manual re-review required"
+                        "Qualification policy changed after application; re-review required"
                     )
-                validate_edits(self.repo_root, receipt, allowed_files)
+                validate_edits(
+                    self.repo_root,
+                    receipt,
+                    allowed_files,
+                    expected_dependencies=expected_dependencies,
+                )
                 checks = run_checks(
                     self.repo_root,
                     policy["checks"],
@@ -802,15 +872,20 @@ class Engine:
                     self.validation_timeout,
                     plan=receipt["plan"],
                 )
-                receipt["post_results"] = checks
+                receipt["post_results"].extend(checks)
                 outcome["results"].extend(checks)
                 if any(row["status"] != "PASSED" for row in checks):
                     raise ValueError(
-                        "Post-update build, unit-test, runtime, or resolved-graph license check did not pass"
+                        "Post-update configured product checks did not pass"
                     )
-                receipt["validated_tree"] = validate_edits(
-                    self.repo_root, receipt, allowed_files
+                validated_tree = validate_edits(
+                    self.repo_root,
+                    receipt,
+                    allowed_files,
+                    expected_dependencies=expected_dependencies,
                 )
+                if outcome["status"] == "VALIDATION_COMPLETE":
+                    receipt["validated_tree"] = validated_tree
             except (
                 OSError,
                 ValueError,
@@ -839,9 +914,37 @@ class Engine:
             change["qualification_status"] = receipt["status"] = status
             if status == "VALIDATED":
                 change["detail"] = (
-                    "Reviewed compatibility and corporate approval; all required before/after checks passed"
+                    "Accepted: no production/unit-test API changes, no lint errors, production build and unit tests passed; all configured policy checks passed"
+                )
+            else:
+                failures = [
+                    row
+                    for row in outcome["results"]
+                    if row.get("required") and row["status"] != "PASSED"
+                ]
+                change["detail"] = "Package update rejected: " + "; ".join(
+                    f"{row.get('kind') or row.get('command') or 'validation'}: {row.get('detail', row['status'])}"
+                    for row in failures
                 )
         self.state.validation_results = outcome["results"]
+        if package_changes and outcome["status"] != "VALIDATION_COMPLETE":
+            outcome["reason"] = (
+                "Package updates are not accepted: lint errors, missing/incomplete checks, build or unit-test failures, or prohibited code changes require rejecting the update, not adapting production or unit tests. See results for each failed check."
+            )
+            outcome["rollbacks"] = []
+            for change in reversed(package_changes):
+                receipt = self._finding(change["finding_id"])["packageQualification"]
+                if receipt.get("validated_tree") is not None:
+                    continue
+                rollback = rollback_dependency_files(self.repo_root, receipt)
+                receipt["rollback"] = change["rollback"] = rollback
+                receipt["status"] = change["qualification_status"] = "REJECTED"
+                if rollback["status"] == "ROLLED_BACK":
+                    change["status"] = "ROLLED_BACK"
+                change["detail"] += " " + rollback["detail"]
+                outcome["rollbacks"].append(
+                    {"finding_id": change["finding_id"], **rollback}
+                )
         self.state.validation_status = outcome["status"]
         if outcome["status"] == "VALIDATION_FAILED":
             self.state.status = "VALIDATION_FAILED"
@@ -913,6 +1016,12 @@ class Engine:
             if change.get("package_update") and change.get("status") == "APPLIED"
         ]
 
+    def _package_policy(self, plan: dict, review: dict) -> dict:
+        """Enforce configured/existing policy, otherwise require license review."""
+        if self._package_policy_required or self.package_policy_path.exists():
+            return load_policy(self.repo_root, self.package_policy_path, plan)
+        return reviewed_license_policy(self.repo_root, plan, review)
+
     def _refresh_package_validation(self) -> None:
         """Invalidate green evidence when the checkout or approval policy moves."""
         snapshot = None
@@ -927,11 +1036,12 @@ class Engine:
                 if not snapshot_checked:
                     snapshot_checked = True
                     snapshot = tree_snapshot(self.repo_root)
-                policy = load_policy(
-                    self.repo_root, self.package_policy_path, receipt.get("plan") or {}
+                policy = self._package_policy(
+                    receipt.get("plan") or {}, receipt.get("review") or {}
                 )
                 valid = (
                     snapshot is not None
+                    and receipt.get("check_contract") == "lint-build-unit-no-code-v1"
                     and receipt.get("validated_tree") == snapshot
                     and receipt.get("policy_sha256") == policy["policy_sha256"]
                 )
@@ -1168,7 +1278,7 @@ class Engine:
             )
         if plan.ecosystem in PACKAGE_ECOSYSTEMS:
             evidence.append(
-                "Candidate only: version numbering does not establish framework/API compatibility or commercial license approval. qualify_package_update and all before/after product checks are required."
+                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy, and passing before/after checks."
             )
             if major_upgrade:
                 evidence.append(

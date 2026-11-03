@@ -1,8 +1,9 @@
-"""Enforce reviewed compatibility and corporate approval for package updates.
+"""Enforce reviewed compatibility, license evidence, and configured policies.
 
 The hosting AI reads official documentation; this module validates its
-attestation and executes repository-owned checks. Only the corporation can
-approve license terms. An SPDX identifier alone is not legal approval.
+attestation and executes repository-owned checks. Documented license review
+is not corporate approval; configured corporate policies remain mandatory.
+An SPDX identifier alone is not legal approval.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from urllib.parse import urlparse
 
 from gitlab_security_mcp.commands import assert_allowed, resolve_tool, tool_name
 from gitlab_security_mcp.manifests import iter_files
-from gitlab_security_mcp.util import json_object, resolve_inside
+from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
 from gitlab_security_mcp.validate import _run_result, _wrapper
 
 PACKAGE_ECOSYSTEMS = {"npm", "NuGet", "Maven"}
@@ -88,12 +89,7 @@ def _sources(value: object, label: str) -> list[str]:
 
 
 def review_package(root: Path, review: dict) -> dict[str, str | None]:
-    """Validate a documentation attestation and declared surgical edits.
-
-    Retain pre-edit text only for declared files to bound later migrations.
-    This is not independent proof that an AI read every documentation page;
-    the audit retains its explicit attestation and source references.
-    """
+    """Require compatibility evidence without production or test adaptations."""
     if not isinstance(review, dict):
         raise ValueError("Package review must be an object")
     documentation = review.get("documentation")
@@ -108,6 +104,10 @@ def review_package(root: Path, review: dict) -> dict[str, str | None]:
             "Unsupported or uncertain framework/runtime compatibility requires manual review"
         )
     _text(review.get("api_changes"), "API-change analysis")
+    if review.get("compatible_without_code_changes") is not True:
+        raise ValueError(
+            "Package update requires explicit confirmation that neither production nor unit-test callers need API changes"
+        )
     frameworks = review.get("frameworks")
     if not isinstance(frameworks, list) or not frameworks:
         raise ValueError(
@@ -120,40 +120,11 @@ def review_package(root: Path, review: dict) -> dict[str, str | None]:
             _text(framework.get(key), f"Framework {key}")
         _sources([framework.get("source_url")], "Framework compatibility")
     fixes = review.get("source_fixes")
-    if not isinstance(fixes, list) or len(fixes) > MAX_SOURCE_FILES:
+    if fixes != []:
         raise ValueError(
-            f"Declare at most {MAX_SOURCE_FILES} surgical source fixes; use [] if none"
+            "Package version updates cannot require production or unit-test code changes; source_fixes must be []"
         )
-    before = {}
-    for fix in fixes:
-        if not isinstance(fix, dict):
-            raise ValueError("Source fixes must name a path and rationale")
-        relative = _text(fix.get("path"), "Source-fix path")
-        _text(fix.get("reason"), "Source-fix rationale")
-        path = resolve_inside(root, relative)
-        if path is None or path.suffix.lower() not in {
-            ".js",
-            ".jsx",
-            ".ts",
-            ".tsx",
-            ".cs",
-            ".fs",
-            ".vb",
-            ".java",
-            ".kt",
-        }:
-            raise ValueError(
-                "Surgical fixes must be supported source/test files inside the repository"
-            )
-        relative = path.relative_to(root.resolve()).as_posix()
-        if relative in before:
-            raise ValueError("Source-fix paths must be unique")
-        before[relative] = (
-            _read_bounded(path, MAX_SOURCE_BYTES).decode("utf-8")
-            if path.exists()
-            else None
-        )
-    return before
+    return {}
 
 
 def _package_reference(package: str) -> re.Pattern[str]:
@@ -169,14 +140,19 @@ def _package_scripts_hash(path: Path) -> str:
     ).hexdigest()
 
 
-def scan_package_callers(root: Path, plan: dict) -> dict:
-    """Record bounded lexical caller hints, not a proof of runtime reachability."""
-    snapshot = tree_snapshot(root)
-    script_hashes = {
+def package_script_hashes(root: Path, snapshot: dict[str, str]) -> dict[str, str]:
+    """Protect every existing build/test script from package-update adaptations."""
+    return {
         relative: _package_scripts_hash(root / relative)
         for relative in snapshot
         if Path(relative).name == "package.json"
     }
+
+
+def scan_package_callers(root: Path, plan: dict) -> dict:
+    """Record bounded lexical caller hints, not a proof of runtime reachability."""
+    snapshot = tree_snapshot(root)
+    script_hashes = package_script_hashes(root, snapshot)
     sources = {
         path: digest
         for path, digest in snapshot.items()
@@ -351,6 +327,76 @@ def _check_variants(manager: str, kind: str) -> list[list[str]]:
     ]
 
 
+def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
+    """Use documented license terms without inventing corporate approval."""
+    license_review = review.get("license")
+    if not isinstance(license_review, dict):
+        raise ValueError(
+            "No corporate policy is configured. Provide review.license with expression, "
+            "official sources, commercial_use_permitted=true, no_license_fees=true, "
+            "obligations, and assessment. No corporate approval file is required."
+        )
+    for key in ("expression", "obligations", "assessment"):
+        _text(license_review.get(key), f"License {key}")
+    if license_review["expression"].strip().upper() in {
+        "UNLICENSED",
+        "UNKNOWN",
+        "NOASSERTION",
+        "NONE",
+    }:
+        raise ValueError("Unknown or unlicensed terms cannot qualify a package update")
+    _sources(license_review.get("sources"), "Official target-version license terms")
+    if (
+        license_review.get("commercial_use_permitted") is not True
+        or license_review.get("no_license_fees") is not True
+    ):
+        raise ValueError(
+            "Reviewed license terms must permit commercial use without license fees"
+        )
+    if plan.get("manager") in {"npm", "pnpm", "yarn"}:
+        entry = next(
+            (
+                path
+                for path in plan.get("files", [])
+                if Path(path).name
+                in {"pnpm-lock.yaml", "yarn.lock", "package-lock.json"}
+            ),
+            next(iter(plan.get("files", [])), "package.json"),
+        )
+        resolved = resolve_inside(root, entry)
+        if resolved is None:
+            raise ValueError("Package checks must stay inside the checkout")
+        manifest = resolve_inside(root, resolved.parent / "package.json")
+        if manifest is None:
+            raise ValueError("Package manifest must stay inside the checkout")
+        scripts = json_object(
+            _read_bounded(manifest, MAX_SOURCE_BYTES).decode("utf-8")
+        ).get("scripts", {})
+        if not isinstance(scripts, dict) or any(
+            not isinstance(scripts.get(kind), str) or not scripts[kind].strip()
+            for kind in ("lint", "build", "test")
+        ):
+            raise ValueError(
+                "Package updates require existing build and test scripts and a lint script; missing checks cannot count as passing"
+            )
+    fingerprint = {
+        "mode": "documentation_review",
+        "license": license_review,
+        "package": plan.get("package"),
+        "target": plan.get("target"),
+        "ecosystem": plan.get("ecosystem"),
+    }
+    return {
+        "approval": None,
+        "policy_mode": "documentation_review",
+        "license_review": license_review,
+        "checks": {},
+        "policy_sha256": hashlib.sha256(
+            json.dumps(fingerprint, sort_keys=True).encode()
+        ).hexdigest(),
+    }
+
+
 def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     """Require exact-version corporate approval and all product checks.
 
@@ -437,6 +483,7 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         assert_allowed(argv, root)
     return {
         "approval": approval,
+        "policy_mode": "corporate_policy",
         "checks": checks,
         "policy_sha256": hashlib.sha256(raw).hexdigest(),
     }
@@ -472,6 +519,8 @@ def run_checks(
         workdir = resolved.parent
     rows = []
     for kind in CHECK_KINDS:
+        if kind not in checks:
+            continue
         check = checks[kind]
         executable = check["argv"][0]
         try:
@@ -544,31 +593,152 @@ def tree_snapshot(root: Path) -> dict[str, str]:
     return hashes
 
 
+def backup_dependency_files(root: Path, plan: dict) -> dict[str, str | None]:
+    """Retain bounded original dependency text, including possibly new lockfiles."""
+    paths = set(plan.get("files") or [])
+    manager = plan.get("manager")
+    if manager in {"npm", "pnpm", "yarn"}:
+        entry = next(
+            (
+                path
+                for path in sorted(paths)
+                if Path(path).name
+                in {"pnpm-lock.yaml", "package-lock.json", "yarn.lock"}
+            ),
+            next(iter(sorted(paths)), "package.json"),
+        )
+        parent = Path(entry).parent
+        paths.add((parent / "package.json").as_posix())
+        paths.add(
+            (
+                parent
+                / {
+                    "npm": "package-lock.json",
+                    "pnpm": "pnpm-lock.yaml",
+                    "yarn": "yarn.lock",
+                }[manager]
+            ).as_posix()
+        )
+    originals = {}
+    total = 0
+    for relative in sorted(paths):
+        path = resolve_inside(root, relative)
+        if path is None or path.suffix.lower() in SOURCE_SUFFIXES:
+            raise ValueError(
+                "Package rollback backups must contain dependency files inside the repository, not production/unit-test code"
+            )
+        raw = _read_bounded(path, MAX_TREE_BYTES) if path.exists() else None
+        total += len(raw) if raw is not None else 0
+        if total > MAX_TREE_BYTES:
+            raise ValueError(
+                "Dependency rollback backup exceeds the qualification size limit"
+            )
+        originals[relative] = raw.decode("utf-8") if raw is not None else None
+    return originals
+
+
+def dependency_file_hashes(root: Path, paths: dict) -> dict[str, str | None]:
+    """Fingerprint updater-owned files so rollback never overwrites later edits."""
+    hashes = {}
+    for relative in paths:
+        path = resolve_inside(root, relative)
+        if path is None:
+            raise ValueError("Dependency file moved outside the repository")
+        hashes[relative] = (
+            hashlib.sha256(_read_bounded(path, MAX_TREE_BYTES)).hexdigest()
+            if path.exists()
+            else None
+        )
+    return hashes
+
+
+def rollback_dependency_files(root: Path, receipt: dict) -> dict:
+    """Restore only updater-owned dependency edits that still match their hashes."""
+    restored, preserved = [], []
+    originals = receipt.get("dependency_before")
+    expected = receipt.get("applied_dependency_hashes")
+    if not isinstance(originals, dict) or not isinstance(expected, dict):
+        return {
+            "status": "MANUAL_REVIEW_REQUIRED",
+            "detail": "Rollback evidence is missing; dependency files were left untouched for manual review.",
+        }
+    for relative, original in originals.items():
+        try:
+            current = dependency_file_hashes(root, {relative: None})[relative]
+            if relative not in expected or current != expected[relative]:
+                preserved.append(relative)
+                continue
+            previous = (
+                hashlib.sha256(original.encode("utf-8")).hexdigest()
+                if original is not None
+                else None
+            )
+            if current == previous:
+                continue
+            path = resolve_inside(root, relative)
+            if path is None:
+                raise ValueError("Dependency path moved outside the repository")
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, original)
+            restored.append(relative)
+        except (OSError, ValueError, TypeError):
+            preserved.append(relative)
+    return {
+        "status": "MANUAL_REVIEW_REQUIRED" if preserved else "ROLLED_BACK",
+        "restored_files": restored,
+        "preserved_files": preserved,
+        "detail": "Package update rejected. Restored unchanged updater-owned dependency edits; production/unit-test and unrelated edits were not touched."
+        + (
+            " Later dependency edits were preserved; manual cleanup is required."
+            if preserved
+            else ""
+        ),
+    }
+
+
 def validate_edits(
-    root: Path, receipt: dict, allowed_files: list[str]
+    root: Path,
+    receipt: dict,
+    allowed_files: list[str],
+    *,
+    expected_dependencies: dict | None = None,
 ) -> dict[str, str]:
     """Reject undeclared, oversized, or computationally costly migrations."""
     after = tree_snapshot(root)
     before = receipt["tree"]
-    if receipt.get("plan", {}).get("major_upgrade"):
-        for relative, expected in receipt["plan"]["caller_scan"][
-            "package_script_hashes"
-        ].items():
-            path = resolve_inside(root, relative)
-            if path is None or _package_scripts_hash(path) != expected:
-                raise ValueError(
-                    "Automatic major updates cannot change package build/test scripts"
-                )
+    script_hashes = receipt.get(
+        "package_script_hashes",
+        receipt.get("plan", {}).get("caller_scan", {}).get("package_script_hashes", {}),
+    )
+    if package_script_hashes(root, after) != script_hashes and (
+        script_hashes or any(Path(path).name == "package.json" for path in after)
+    ):
+        raise ValueError(
+            "Package version updates cannot change package build/test scripts; requalification is required"
+        )
+    if receipt.get("source_before"):
+        raise ValueError(
+            "Package version updates cannot authorize production or unit-test code adaptations; requalify without source fixes"
+        )
     changed = {
         path
         for path in before.keys() | after.keys()
         if before.get(path) != after.get(path)
     }
-    if receipt.get("plan", {}).get("major_upgrade") and any(
-        Path(path).suffix.lower() in SOURCE_SUFFIXES for path in changed
-    ):
+    if any(Path(path).suffix.lower() in SOURCE_SUFFIXES for path in changed):
         raise ValueError(
-            "Automatic major update validation forbids source or test code changes"
+            "Package version update rejected: production or unit-test code changed; API adaptations are not permitted for any version increment"
+        )
+    expected = (
+        receipt.get("applied_dependency_hashes", {})
+        if expected_dependencies is None
+        else expected_dependencies
+    )
+    if expected and dependency_file_hashes(root, expected) != expected:
+        raise ValueError(
+            "Dependency files changed beyond the applied version edit; production/test settings cannot be adapted to support an update"
         )
     allowed = set(allowed_files) | set(receipt["source_before"])
     if changed - allowed:

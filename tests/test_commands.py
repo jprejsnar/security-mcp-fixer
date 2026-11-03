@@ -9,6 +9,26 @@ from gitlab_security_mcp.commands import CommandRunner, assert_allowed
 from gitlab_security_mcp.git_ops import branch_name_for, meaningful_status
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["dotnet", "format", "--verify-no-changes", "--no-restore"],
+        [
+            "mvn",
+            "--batch-mode",
+            "checkstyle:check",
+            "-Dcheckstyle.includeTestSourceDirectory=true",
+        ],
+        ["gradle", "--no-daemon", "checkstyleMain", "checkstyleTest"],
+    ],
+)
+def test_read_only_package_lint_commands_are_allowlisted(tmp_path, argv):
+    # Arrange / Act / Assert
+    assert_allowed(argv, tmp_path)
+    with pytest.raises(PermissionError):
+        assert_allowed([*argv, "--fix"], tmp_path)
+
+
 @pytest.mark.parametrize("failed_start", [1, 2])
 def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_start):
     # Arrange

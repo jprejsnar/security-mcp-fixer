@@ -70,7 +70,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 "reason": (outcome.get("detail") if failed or pending else None)
                 or qualification.get("reason")
                 or (
-                    "Package update requires passing compatibility, corporate approval, and before/after product checks."
+                    "Package update requires reviewed compatibility, license terms or configured policy, and before/after product checks."
                     if pending or required
                     else None
                 )
@@ -159,9 +159,13 @@ def render(
                     "review",
                     "major_review",
                     "approval",
+                    "policy_mode",
+                    "license_review",
                     "policy_sha256",
                     "baseline_results",
                     "post_results",
+                    "check_contract",
+                    "rollback",
                 )
             }
             for finding in state.findings
@@ -233,11 +237,17 @@ def render(
         for finding_id, qualification in payload["package_qualifications"].items():
             approval = qualification.get("approval") or {}
             plan = qualification.get("plan") or {}
+            license_review = qualification.get("license_review") or {}
+            if qualification.get("policy_mode") == "documentation_review":
+                lines.append(
+                    f"- {finding_id}: {plan.get('package')} -> {plan.get('target')}; {qualification['status']}; license {license_review.get('expression') or 'unknown'}; documented license review, not corporate approval."
+                )
+            else:
+                lines.append(
+                    f"- {finding_id}: {plan.get('package') or 'unknown'} -> {plan.get('target') or 'unknown'}; {qualification['status']}; license {approval.get('license_expression') or 'unapproved'}; approval {approval.get('approval_reference') or 'missing'} by {approval.get('approved_by') or 'unknown'}."
+                )
             lines.append(
-                f"- {finding_id}: {plan.get('package') or 'unknown'} -> {plan.get('target') or 'unknown'}; {qualification['status']}; license {approval.get('license_expression') or 'unapproved'}; approval {approval.get('approval_reference') or 'missing'} by {approval.get('approved_by') or 'unknown'}."
-            )
-            lines.append(
-                f"  Obligations: {approval.get('obligations') or 'not approved'}."
+                f"  Obligations: {approval.get('obligations') or license_review.get('obligations') or 'not recorded'}."
             )
             documentation = (qualification.get("review") or {}).get(
                 "documentation"

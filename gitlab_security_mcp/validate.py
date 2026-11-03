@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from subprocess import SubprocessError
 
 from gitlab_security_mcp.commands import CommandResult, CommandRunner, resolve_tool
 from gitlab_security_mcp.manifests import (
@@ -23,10 +25,13 @@ def run_validation(
     which: Callable[[str], str | None],
     *,
     timeout: int,
+    package_checks: bool = False,
 ) -> dict:
     """Run detected stack checks and return required failures and skipped tools."""
     try:
-        return _run_validation(root, runner, which, timeout=timeout)
+        return _run_validation(
+            root, runner, which, timeout=timeout, package_checks=package_checks
+        )
     except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
         return {
             "status": "VALIDATION_FAILED",
@@ -43,6 +48,7 @@ def _run_validation(
     which: Callable[[str], str | None],
     *,
     timeout: int,
+    package_checks: bool = False,
 ) -> dict:
     """Aggregate stack checks without hiding required failures or skips."""
     files, _truncated = iter_files(root)
@@ -58,7 +64,16 @@ def _run_validation(
                 continue
             component_files = [path for path in files if path.is_relative_to(component)]
             component_stack = detect_stack(component, component_files)
-            results.extend(_node(component, component_stack, runner, which, timeout))
+            results.extend(
+                _node(
+                    component,
+                    component_stack,
+                    runner,
+                    which,
+                    timeout,
+                    package_checks=package_checks,
+                )
+            )
     if stack.dotnet:
         solutions = {
             path.parent for path in files if path.suffix.lower() in {".sln", ".slnx"}
@@ -75,9 +90,20 @@ def _run_validation(
         }
         for component in sorted(dotnet_roots):
             component_files = [path for path in files if path.is_relative_to(component)]
-            results.extend(_dotnet(component, component_files, runner, which, timeout))
+            results.extend(
+                _dotnet(
+                    component,
+                    component_files,
+                    runner,
+                    which,
+                    timeout,
+                    package_checks=package_checks,
+                )
+            )
     if stack.java:
-        results.extend(_java(root, stack, runner, which, timeout))
+        results.extend(
+            _java(root, stack, runner, which, timeout, package_checks=package_checks)
+        )
     if stack.nginx_configs:
         results.extend(_nginx(root, stack, runner, which, timeout))
     if stack.dockerfiles:
@@ -93,6 +119,20 @@ def _run_validation(
                 "detail": "No Node, .NET, Java, NGINX, or container stack was detected. Manual validation is required.",
             }
         )
+    if package_checks:
+        present = {row.get("kind") for row in results}
+        if "build_and_unit_tests" in present:
+            present.update({"build", "unit_tests"})
+        for kind in ("lint", "build", "unit_tests"):
+            if kind not in present:
+                row = _row(
+                    None,
+                    "SKIPPED",
+                    True,
+                    f"Required {kind} check was not detected or did not run; package update cannot be accepted.",
+                )
+                row["kind"] = kind
+                results.append(row)
     failed = any(
         item["status"] == "FAILED" and item.get("required", True) for item in results
     )
@@ -173,7 +213,15 @@ def _java_major(text: str, expected: int) -> bool:
     return int(match.group("major")) == expected
 
 
-def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
+def _node(
+    root: Path,
+    stack: StackInfo,
+    runner,
+    which,
+    timeout: int,
+    *,
+    package_checks: bool = False,
+) -> list[dict]:
     """Install locked Node dependencies, then run declared project checks."""
     manager = stack.node_manager or "npm"
     data = _read_json(root / "package.json") or {}
@@ -269,21 +317,33 @@ def _node(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
         )
         return rows
     for script in ("lint", "build", "test"):
+        kind = "unit_tests" if script == "test" else script
         if script not in scripts:
-            rows.append(
-                _row(None, "SKIPPED", False, f"package.json has no {script} script.")
+            row = _row(
+                None,
+                "SKIPPED",
+                package_checks,
+                f"{root / 'package.json'} has no {script} script; configure this check before qualifying a package update.",
             )
+            row["kind"] = kind
+            rows.append(row)
             continue
-        if script == "test":
-            rows.append(_run(runner, [tool, "test"], timeout, required=True, cwd=root))
-        else:
-            rows.append(
-                _run(runner, [tool, "run", script], timeout, required=True, cwd=root)
-            )
+        argv = [tool, "test"] if script == "test" else [tool, "run", script]
+        row = _execute_product_check(runner, argv, timeout, root, kind)
+        row["cwd"] = str(root)
+        rows.append(row)
     return rows
 
 
-def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[dict]:
+def _dotnet(
+    root: Path,
+    files: list[Path],
+    runner,
+    which,
+    timeout: int,
+    *,
+    package_checks: bool = False,
+) -> list[dict]:
     """Restore NuGet dependencies and run Release build and test checks."""
     tool = resolve_tool("dotnet", which)
     if not tool:
@@ -299,6 +359,16 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
             )
         )
         return rows
+    if package_checks:
+        rows.append(
+            _execute_product_check(
+                runner,
+                [tool, "format", "--verify-no-changes", "--no-restore"],
+                timeout,
+                root,
+                "lint",
+            )
+        )
     rows.append(
         _run(
             runner,
@@ -320,7 +390,15 @@ def _dotnet(root: Path, files: list[Path], runner, which, timeout: int) -> list[
     return rows
 
 
-def _java(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
+def _java(
+    root: Path,
+    stack: StackInfo,
+    runner,
+    which,
+    timeout: int,
+    *,
+    package_checks: bool = False,
+) -> list[dict]:
     """Prefer repository wrappers for Maven or Gradle validation."""
     if stack.java_build == "gradle":
         wrapper = _wrapper(root, "gradlew")
@@ -340,6 +418,16 @@ def _java(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
                 )
             )
             return rows
+        if package_checks:
+            rows.append(
+                _execute_product_check(
+                    runner,
+                    [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
+                    timeout,
+                    root,
+                    "lint",
+                )
+            )
         rows.append(_run(runner, [tool, "--no-daemon", "test"], timeout, required=True))
         rows.append(
             _run(runner, [tool, "--no-daemon", "build"], timeout, required=True)
@@ -349,13 +437,29 @@ def _java(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dic
     tool = wrapper or resolve_tool("mvn", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "mvnw or mvn is not available.")]
+    lint = []
+    if package_checks:
+        lint.append(
+            _execute_product_check(
+                runner,
+                [
+                    tool,
+                    "--batch-mode",
+                    "checkstyle:check",
+                    "-Dcheckstyle.includeTestSourceDirectory=true",
+                ],
+                timeout,
+                root,
+                "lint",
+            )
+        )
     rows = [
         _run(runner, [tool, "--batch-mode", "clean", "verify"], timeout, required=True)
     ]
     rows.append(
         _run(runner, [tool, "--batch-mode", "dependency:tree"], timeout, required=True)
     )
-    return rows
+    return lint + rows
 
 
 def _nginx(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[dict]:
@@ -449,9 +553,40 @@ def _run(
     cwd: Path | None = None,
 ) -> dict:
     """Run one allowlisted check and convert its exit code to a row."""
+    if required and "test" in argv:
+        return _execute_product_check(runner, argv, timeout, cwd, "unit_tests")
+    if required and "build" in argv:
+        return _execute_product_check(runner, argv, timeout, cwd, "build")
+    if required and "verify" in argv:
+        return _execute_product_check(
+            runner, argv, timeout, cwd, "build_and_unit_tests"
+        )
     options = {"cwd": cwd} if cwd is not None else {}
-    result = runner.run(argv, timeout=timeout, check=False, **options)
+    try:
+        result = runner.run(argv, timeout=timeout, check=False, **options)
+    except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
+        row = _row(None, "FAILED", required, f"Check could not execute: {exc}")
+        row["command"] = argv
+        return row
     return _run_result(result, required=required, informational=informational)
+
+
+def _execute_product_check(
+    runner, argv: list[str], timeout: int, cwd: Path | None, kind: str
+) -> dict:
+    """Keep earlier diagnostics when an individual product command cannot start."""
+    try:
+        result = runner.run(
+            argv,
+            timeout=timeout,
+            check=False,
+            **({"cwd": cwd} if cwd is not None else {}),
+        )
+    except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
+        row = _row(None, "FAILED", True, f"{kind} check could not execute: {exc}")
+        row.update(command=argv, kind=kind, output_complete=False)
+        return row
+    return _lint_result(result) if kind == "lint" else _product_result(result, kind)
 
 
 def _run_result(
@@ -470,6 +605,101 @@ def _run_result(
             (detail[:400] + " (output truncated)") if detail else "output truncated"
         )
     return _row(result, status, required and not informational, detail[:500])
+
+
+def _lint_result(result: CommandResult) -> dict:
+    """Retain all emitted lint diagnostics; incomplete evidence cannot pass."""
+    row = _product_result(result, "lint")
+    diagnostics = {kind: [] for kind in ("errors", "warnings", "info", "unknown")}
+    for stream in (result.stdout, result.stderr):
+        try:
+            reports = json.loads(stream)
+        except (ValueError, TypeError):
+            reports = None
+        if isinstance(reports, list) and all(
+            isinstance(report, dict) and isinstance(report.get("messages"), list)
+            for report in reports
+        ):
+            for report in reports:
+                for message in report["messages"]:
+                    severity = (
+                        message.get("severity") if isinstance(message, dict) else None
+                    )
+                    kind = (
+                        {2: "errors", 1: "warnings", 0: "info"}.get(severity, "unknown")
+                        if isinstance(severity, (int, str))
+                        else "unknown"
+                    )
+                    diagnostics[kind].append(
+                        {"file": report.get("filePath"), "message": message}
+                    )
+        else:
+            for line in stream.splitlines():
+                if not line.strip():
+                    continue
+                classified = re.sub(
+                    r"\b0\s+(?:errors?|warnings?)\b", "", line, flags=re.IGNORECASE
+                )
+                match = re.search(
+                    r"(?<![\w./\\-])(errors?|warnings?|warn|info|information)(?![\w./\\-])",
+                    classified,
+                    re.IGNORECASE,
+                )
+                kind = (
+                    {
+                        "error": "errors",
+                        "errors": "errors",
+                        "warning": "warnings",
+                        "warnings": "warnings",
+                        "warn": "warnings",
+                        "info": "info",
+                        "information": "info",
+                    }.get(match.group(1).lower(), "unknown")
+                    if match
+                    else "unknown"
+                )
+                diagnostics[kind].append(line)
+    row["diagnostics"] = diagnostics
+    if diagnostics["errors"]:
+        row["status"] = "FAILED"
+        row["detail"] = "Lint reported errors; package update cannot be accepted."
+    return row
+
+
+def _product_result(result: CommandResult, kind: str) -> dict:
+    """Retain product evidence and reject truncated or explicitly empty test runs."""
+    row = _run_result(result, required=True)
+    row.update(
+        kind=kind,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        output_complete=not result.truncated,
+    )
+    if result.truncated:
+        row.update(
+            status="FAILED",
+            detail=f"{kind} output is truncated; complete diagnostics are required before accepting a package update.",
+        )
+    elif kind in {"unit_tests", "build_and_unit_tests"}:
+        output = result.stdout + result.stderr
+        empty = re.search(
+            r"no tests (?:found|to run)|no test is available|tests (?:are )?skipped|tests run:\s*0\b|:test\s+(?:NO-SOURCE|SKIPPED)|\b0 tests? (?:run|passed)\b|\btests:\s*0\b",
+            output,
+            re.IGNORECASE,
+        )
+        counts = re.findall(
+            r"(?:tests run:|tests:|passed:)\s*(\d+)|(\d+)\s+tests?\s+(?:completed|passed)",
+            output,
+            re.IGNORECASE,
+        )
+        if empty and not any(
+            int(count) > 0 for groups in counts for count in groups if count
+        ):
+            row.update(
+                status="FAILED",
+                detail="Unit tests did not run; a successful exit without executed tests is not passing evidence.",
+            )
+    return row
 
 
 def _row(

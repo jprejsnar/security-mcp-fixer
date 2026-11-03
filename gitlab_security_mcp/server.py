@@ -43,26 +43,32 @@ Local-only GitLab security remediation. Call the tools in this order:
     concrete caller breakages when found; distinguish incomplete evidence
     from proven breakage. Never claim 100% runtime compatibility from a scan.
 7. qualify_package_update with the exact version-bound documentation review.
-    Corporate approvers must provision PACKAGE_UPDATE_POLICY independently.
-    Do not create, edit, or invent license approvals. Free commercial use,
-    redistribution rights, and obligations must be approved for the target.
-    Repository-owned license checks must approve the entire resolved graph,
-    including new transitive packages. Missing approval/checks blocks editing.
-8. apply_minimal_fix only when eligible. For API changes, make only the
-    declared surgical source fixes and meaningful AAA regression tests using
-    the host's editor. At most 5 source/test files and 200 added/deleted lines;
-    larger migrations require manual review. No broad product rewrite.
-    Major package candidates require major_upgrade review evidence and
-    source_fixes=[]. Do not adjust source, tests, frameworks, or test scripts
-    to make a major update pass. Skip incompatible callers for review with
+    Without a configured/existing policy, provide review.license {expression,
+    sources:[official target-version HTTPS URLs], commercial_use_permitted:true,
+    no_license_fees:true, obligations, assessment}. Read actual terms; do not
+    invent corporate approval. A missing default policy file is not a blocker.
+    PACKAGE_UPDATE_POLICY, when set, or an existing default policy remains
+    mandatory and must be independently provisioned. Never fabricate or edit
+    corporate approvals. All checks defined by that policy remain required.
+8. apply_minimal_fix only when eligible. Every major, minor, revision or build
+    package update requires compatible_without_code_changes=true and
+    source_fixes=[]. Neither production nor unit-test callers may require API
+    adaptations. Never add, edit or weaken production code, tests, frameworks,
+    or check scripts to make any package version pass. Major candidates also
+    require major_upgrade caller/API evidence. Skip incompatible callers with
     their concrete API evidence, not just a version-number warning.
 9. generate_aaa_test for supported base-image changes; it does not invent
     arbitrary API tests. Dependency-only fixes retain the product unit suite.
-10. run_validation_matrix after each package update. Required baseline and
-     post-update build, unit tests, terminating runtime smoke tests, and full
-     dependency/license checks must pass. No passing marker for skipped tests.
-     Fix only declared API adaptations and rerun checks; failures remain
-     unresolved and local/uncommitted. Validate before the next package edit.
+10. Qualification runs lint before permitting the version edit and records
+    every emitted warning, informational and unknown diagnostic. Run
+    run_validation_matrix after each package update. Accept only with no lint
+    errors, a successful production build, and built/executed unit tests with
+    no failures, plus all configured corporate checks. Warnings/info/unknown
+    output alone are not lint failures. Missing/skipped or truncated checks
+    cannot pass. Failed attempted updates are rejected and updater-owned
+    dependency edits are restored when unchanged since application. Later user
+    edits are preserved and require manual cleanup. Report the exact failures;
+    never adapt production/tests to fix them. Validate before the next edit.
 11. generate_local_report, showing qualification and unresolved findings.
 Do not commit, push, open a merge request, or dismiss GitLab findings.
 This server refuses those actions. Findings that cannot be resolved from
@@ -193,21 +199,27 @@ def verify_security_finding(finding_id: str) -> dict[str, Any]:
     )
 )
 def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str, Any]:
-    """Qualify a package target with reviewed docs, corporate approval, and checks.
+    """Qualify a package target with reviewed APIs, license terms, and checks.
 
     review must identify ecosystem, package, and target exactly. Include
-    documentation {complete, sources, summary}, compatible=true, api_changes,
-    frameworks [{name, version, source_url, assessment}], and source_fixes
-    [{path, reason}] (or []). Read complete official target-version docs;
+    documentation {complete, sources, summary}, compatible=true,
+    compatible_without_code_changes=true, api_changes,
+    frameworks [{name, version, source_url, assessment}], and source_fixes=[].
+    Production AND unit-test callers must need no API adaptations for every
+    major/minor/revision/build version. Read official target-version docs;
     attestations are audited, not independent proof of documentation reading.
     Corporate approval comes only from the configured policy file. This tool
-    runs the product baseline and all policy checks before permitting an edit.
+    records baseline lint diagnostics, builds and unit tests, and all policy
+    checks before permitting an edit. Missing checks never count as passing.
+    If no corporate policy is configured/present, include license {expression,
+    sources, commercial_use_permitted:true, no_license_fees:true, obligations,
+    assessment}. No corporate approval JSON file is required in that mode.
     For proposed major_upgrade=true also provide major_upgrade {scan_id from
     proposed_fix.caller_scan, compatible_without_code_changes:true,
     caller_breakages_found:false, migration_sources:[official HTTPS URLs],
     api_comparison, caller_assessment, dependency_assessment,
     reviewed_files:[{path, sha256, assessment}]}. Read every source reference
-    and relevant installed dependency callers. Major source_fixes must be [].
+    and relevant installed dependency callers. All source_fixes must be [].
     This is reviewed evidence, not a mathematical compatibility guarantee.
     """
     return _run("qualify_package_update", finding_id, review)

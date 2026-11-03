@@ -36,16 +36,17 @@ separate deployed services or background queues.
 
 ### System context
 
-The MCP host orchestrates the tools and performs documentation review. Corporate
-approvers own the license policy; neither the server nor the host AI grants
-approval. Repository scripts and wrappers execute locally and must be trusted.
+The MCP host orchestrates the tools and performs API/license documentation
+review. Corporate policies are optional; when configured or present, their
+approvals and checks remain mandatory. Neither the server nor the host AI grants
+corporate approval. Repository scripts execute locally and must be trusted.
 
 ```mermaid
 flowchart TB
   reviewer["Human reviewer"] --> host["MCP host and AI agent"]
   host <-->|"MCP requests and results over stdio"| server["Local Python MCP process"]
   host -->|"Read exact-version docs and compatibility guides"| publisher["Official publisher documentation"]
-  host -->|"Only declared API adaptations and AAA tests"| checkout["Target application checkout"]
+  host -->|"Package dependency version edits only"| checkout["Target application checkout"]
 
   subgraph remoteServices["Remote read services"]
     gitlab["GitLab GraphQL vulnerability report"]
@@ -179,7 +180,7 @@ flowchart TD
 | `create_security_branch()` | Require successful pulls; create `security-fixes-Month-dd-YYYY`, for example `security-fixes-November-02-2026`. |
 | `list_security_findings(project_id=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id)` | Record evidence, decision, proposed plan and any review prompt. |
-| `qualify_package_update(finding_id, review)` | Require a verified package candidate, exact-target review, independent approval and passing baseline checks. |
+| `qualify_package_update(finding_id, review)` | Require exact-target API/license review and passing baseline checks; enforce corporate policy when configured/present. |
 | `apply_minimal_fix(finding_id)` | Apply the supported plan; require fresh qualification and validation of prior package edits. |
 | `generate_aaa_test(finding_id)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
 | `run_validation_matrix()` | Run applicable stack checks and post-update package qualifiers; retain failures and incomplete evidence. |
@@ -204,7 +205,7 @@ A finding is auto-fixed only when all of these are true:
 - An online advisory confirms it and publishes a fixed version newer than what is installed.
 - The edit is a lockfile refresh, a manifest version bump, a package override, or an unpinned `FROM` tag bump.
 - Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing baseline/post-update checks. Major image-tag changes still require manual review.
-- Package updates also pass the mandatory compatibility, corporate-approval, and before/after product-check qualifiers below. Same-major does not prove compatibility.
+- Every package update requires no production/unit-test API adaptations, no lint errors, and passing before/after builds and executed unit tests, plus configured corporate checks. Same-major does not prove compatibility.
 
 An advisory that names the identifier but not the package found in the repo is listed for you to review. It is not reported as a false positive, because the cause may be a naming difference.
 
@@ -257,8 +258,8 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
 - A GitLab token with `read_api` and access to the project's vulnerability report.
 - The GitLab project path or numeric ID and a local checkout of its `main` branch.
 - The package managers and toolchains required by the target application.
-- Independently approved package policy and meaningful product-check scripts
-  before attempting package updates.
+- Meaningful lint/build/unit-test checks and documented license review; independently
+  approved corporate policy only when required/configured for your organization.
 
 Point `REPO_ROOT` at the application Git checkout, not this MCP project.
 Validation supports split Node/.NET repositories: Node checks run at the
@@ -289,24 +290,27 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
    Quarkus platform/BOM and extension alignment, Java requirements, and .NET
    target frameworks as applicable. Never force peer resolution or change the
    product framework/runtime/BOM to disguise an incompatible package update.
-3. Corporate approvers independently approve the exact package version for
-   commercial distribution without license fees, documenting license expression,
-   approval reference, and obligations. Free download or a familiar license name
-   is not corporate approval. Review custom/composite licenses, notices,
-   attribution, source-disclosure, redistribution, patent, and other conditions.
-4. Baseline and post-update build, unit-test, terminating runtime-smoke, and full
-   resolved-dependency license checks pass with positive, untruncated evidence.
-   The license audit must verify approved actual resolved versions and terms for
-   the entire graph, including newly introduced transitive packages; merely
-   recognizing an SPDX string is insufficient. Unknown/unapproved terms block.
+3. Without a configured/existing policy, provide `review.license` with the
+  exact-target license expression, official HTTPS sources, commercial-use and
+  no-license-fee assessments, and distribution obligations. This is documented
+  terms review, not corporate approval. Unknown/unlicensed terms block editing.
+  When a corporate policy is configured or present, independent exact-version
+  approval and all its checks remain required; the AI must not invent approvals.
+4. Baseline and post-update lint, production builds and unit tests pass. Node
+  components must define `lint`, `build` and `test` scripts. Missing, truncated,
+  skipped or explicitly empty test runs are not passing evidence. Every emitted
+  lint warning, informational and unknown diagnostic is recorded with stdout
+  and stderr. Warnings/info/unknown output alone does not block a successful
+  lint run; errors or a nonzero lint exit block acceptance.
+  Corporate-policy mode additionally requires positive, untruncated runtime
+  smoke and full resolved-dependency license checks with configured markers.
 
-An incompatible or uncertain target is skipped for review. If documented API
-changes in a non-major package update need only small caller adaptations, the AI declares the source/test paths
-in its review, applies the package update, makes those adaptations and regression
-tests, then reruns validation. Source changes are limited to five supported
-source/test files and 200 added/deleted lines in total. Undeclared edits or larger
-migrations fail qualification. Do not weaken assertions, skip tests, or rewrite
-the product to obtain passing results.
+An incompatible or uncertain target is skipped for review. All major, minor,
+revision and build updates require `compatible_without_code_changes: true`
+and `source_fixes: []`: neither production nor unit-test callers may need API
+changes. No production/test edits, new regression tests, or weakened check
+scripts are allowed to support any package version update. This rule applies
+even to a one-line adaptation or a nominally backward-compatible release.
 
 A major number alone is not evidence that a caller breaks. For major package
 candidates, verification returns a bounded lexical `caller_scan` with a
@@ -322,14 +326,16 @@ be empty, reviewed caller files must have current SHA256 evidence, and all
 identified source references must be assessed. Transitive npm updates also
 require installed `node_modules` consumer source evidence. The server rejects
 stale scans and source/test changes, and records the reviewed evidence. A failed
-or skipped build/unit test never becomes a validated fix. Existing runtime,
-license, and corporate approval gates still apply; failed edits remain local
-and unresolved rather than being automatically rolled back.
+or skipped lint/build/unit check never becomes a validated fix. Configured
+corporate checks still apply. Failed attempted updates are rejected and the
+plugin restores its own dependency-file edits only when their hashes still
+match the applied edit. Later user edits are preserved with a manual-cleanup
+message. Previously accepted updates are not automatically undone.
 
 #### Package update sequence
 
-This diagram separates host review, corporate policy, and server-enforced checks.
-Every blocked or failed result must be inspected; no automatic rollback occurs.
+This diagram shows the optional corporate-policy mode and server-enforced checks.
+Inspect every failure and rollback result; later edits require manual cleanup.
 
 ```mermaid
 sequenceDiagram
@@ -348,7 +354,7 @@ sequenceDiagram
   Docs-->>Host: Target-version documentation
   Host->>MCP: qualify_package_update(finding_id, review)
   MCP->>Policy: Match exact package, target, approvals and checks
-  MCP->>Repo: Run stack baseline and four policy checks
+  MCP->>Repo: Record lint and run build/unit baseline and policy checks
   alt Missing evidence or failed baseline
     MCP-->>Host: QUALIFICATION_REQUIRED and reason
   else Baseline and policy accepted
@@ -364,16 +370,15 @@ sequenceDiagram
         MCP-->>Host: Fix failure, inspect partial edits manually without automatic rollback
       else Edit applied
         MCP-->>Host: APPLIED, package PENDING_VALIDATION
-        opt Declared API adaptations required
-          Host->>Repo: Edit only declared caller paths and AAA regression tests
-        end
+        Note over Host,Repo: Production code, unit tests and check scripts stay unchanged
         Host->>MCP: run_validation_matrix()
         MCP->>Policy: Recheck approval and policy hash
         MCP->>Repo: Check edit scope, stack validation and all policy checks
         alt All required checks pass
           MCP-->>Host: VALIDATION_COMPLETE and package VALIDATED
         else Failed or incomplete evidence
-          MCP-->>Host: Validation failure or incomplete, package remains pending
+          MCP->>Repo: Restore updater-owned dependency edits when unchanged
+          MCP-->>Host: Update rejected with failed checks and rollback result
         end
       end
     end
@@ -382,9 +387,11 @@ sequenceDiagram
 
 #### Corporate policy setup
 
-Before a remediation run, corporate approvers provision a controlled JSON policy.
-Set `PACKAGE_UPDATE_POLICY` to its absolute path in the MCP process environment;
-the default is `.security-mcp/package-update-policy.json` under `REPO_ROOT`.
+Corporate-policy mode is optional. Set `PACKAGE_UPDATE_POLICY` to a controlled
+JSON file's absolute path, or provision `.security-mcp/package-update-policy.json`
+under `REPO_ROOT`. An explicit path or an existing default file is enforced;
+missing/invalid explicit policy fails closed. When neither exists, qualification
+uses documented license review and lint/build/unit checks without creating a policy.
 Keep approvals access-controlled, preferably outside the AI-writable checkout.
 The AI/server must never create or modify actual approvals. The server reads and
 hashes this file; it cannot authenticate a corporate signer or grant legal rights.
@@ -425,7 +432,7 @@ manager. Configure real repository-owned scripts/profiles/tests before starting
 on clean main; they are not supplied automatically by this MCP server. Markers
 must be emitted only after meaningful tests and complete license-policy checks,
 never by a placeholder `echo`, an empty test run, or a generic build-success line.
-Missing tools, check definitions, markers, or approvals prevent package edits.
+In corporate-policy mode, missing tools, checks, markers, or approvals block edits.
 
 | Manager | Build | Unit Tests | Runtime Smoke | Resolved-Graph License Audit |
 | --- | --- | --- | --- | --- |
@@ -457,7 +464,16 @@ actual review. This illustrative input is not evidence for a real package:
     "sources": ["https://publisher.example/version-specific-docs"],
     "summary": "Actual findings from the complete official documentation review"
   },
+  "license": {
+    "expression": "ACTUAL_TARGET_LICENSE_EXPRESSION",
+    "sources": ["https://publisher.example/target-license"],
+    "commercial_use_permitted": true,
+    "no_license_fees": true,
+    "obligations": "Actual distribution obligations from the reviewed terms",
+    "assessment": "Actual target-version license review, not corporate approval"
+  },
   "compatible": true,
+  "compatible_without_code_changes": true,
   "api_changes": "Actual API changes and the smallest required caller adaptations",
   "frameworks": [{
     "name": "ACTUAL_PRODUCT_FRAMEWORK_OR_RUNTIME",
@@ -469,11 +485,10 @@ actual review. This illustrative input is not evidence for a real package:
 }
 ```
 
-Include every relevant framework/runtime/BOM and publisher source. For adaptations,
-replace `source_fixes: []` with declared `{path, reason}` entries for the small
-caller and regression-test changes. The host AI edits these files after package
-application, not arbitrary files or manifests. These adaptations are only for
-non-major package updates; major candidates require unchanged source/tests.
+Include every relevant framework/runtime/BOM and publisher source. Keep
+`source_fixes: []` for every version increment. Confirm that both production
+and unit-test APIs need no adaptations. If either requires changes, reject the
+package update with the concrete API incompatibility instead of editing code.
 Guessed SAST rewrites remain unsupported.
 
 For `proposed_fix.major_upgrade=true`, also include the following review object.
@@ -511,19 +526,20 @@ Requalify before application if either changes. `APPLIED` means local edits only
 the package qualifier remains `PENDING_VALIDATION` until all post-checks pass.
 Reports keep pending/failed updates unresolved, retain documentation/approval
 references, and retract green results after later source or policy changes.
-Failed/partial edits are not automatically rolled back; review them locally.
+Failed post-update checks reject attempted updates and safely restore owned
+dependency edits. Inspect preserved files/manual-cleanup notices. Partial
+application failures still require local inspection.
 
 These gates enforce reviewed evidence and repository-owned checks, not a proof
 of every possible runtime behavior or an independent verification that an AI
 read every page. Their assurance depends on test coverage, truthful review,
-correct full-graph license auditing, and authentic corporate approval. Snapshot
+correct configured license auditing and authentic corporate approvals when used. Snapshot
 checks prune dependency/build/cache directories and stop at the file/size cap;
 they are not cross-process locks or verification of all generated binaries.
 
-Qualification policy reads are capped at 1 MiB and declared source-file reads
-at 512 KiB, including files that grow during a read. Source comparisons trim
-unchanged context and reject more than 4 million remaining line pairs before
-running the quadratic diff matcher; costly migrations require manual review.
+Qualification policy reads are capped at 1 MiB and caller evidence reads at
+512 KiB. Dependency rollback originals and checkout hashes are bounded by
+100 MiB. No production/test source migrations are permitted.
 Each status refresh hashes the checkout once for all validated packages.
 The advisory cache retains at most 256 records and releases them on shutdown.
 Unreadable directories fail evidence collection rather than proving absence.
@@ -799,15 +815,15 @@ requirements into the configured virtual environment before restarting.
 | `GITHUB_TOKEN` or `GH_TOKEN` | no | Raises the GitHub Advisory rate limit. |
 | `NVD_API_KEY` | no | Raises the NVD rate limit. OSV is tried first and does not need a key. |
 | `VALIDATION_TIMEOUT_SEC` | no | Per validation command. Defaults to 600. |
-| `PACKAGE_UPDATE_POLICY` | required for package edits | Absolute path to corporation-managed exact-version approvals and mandatory product checks; defaults to `.security-mcp/package-update-policy.json` in `REPO_ROOT`. |
+| `PACKAGE_UPDATE_POLICY` | optional | Enforce corporate exact-version approvals and checks at this absolute path. Existing default `.security-mcp/package-update-policy.json` also enables enforcement. If neither exists, use documented license review and lint/build/unit checks. |
 
 For a self-hosted GitLab instance, set `GITLAB_API_URL` to `https://gitlab.example.com/api/v4`.
 
 Use the server's actual process environment, not only a terminal opened after
 the host started. GitLab credentials are required for retrieval; startup alone
 does not prove authentication or project access. Configure
-`VALIDATION_TIMEOUT_SEC` as a positive integer and provide `PACKAGE_UPDATE_POLICY`
-before requesting package qualification.
+`VALIDATION_TIMEOUT_SEC` as a positive integer. Configure `PACKAGE_UPDATE_POLICY`
+only when using independently provisioned corporate approval/check requirements.
 
 ## Running within Cursor
 
@@ -908,7 +924,7 @@ command transcripts, and absence of an audit record does not prove a fix passed.
 ## Running remediation
 
 1. Install runtime dependencies and configure your MCP host.
-2. Provision independent corporate approvals and all mandatory product checks.
+2. Review exact-target license terms and provide lint/build/unit checks; provision corporate approvals/checks if configured or required by your organization.
 3. Check out clean `main` in `REPO_ROOT`; finish any in-progress Git operation.
 4. Start/reload `gitlab-security` and enable its tools.
 5. Ask the host agent to follow the workflow below.
@@ -921,10 +937,12 @@ Example agent request:
 Use the gitlab-security MCP tools in order. Run prechecks, pull main twice,
 create the security branch, list findings, verify each finding, apply only
 eligible fixes after reviewing official package docs and calling
-qualify_package_update with compatibility evidence and existing corporate
-license approvals. Never create/edit approvals or force incompatible framework
-versions. Make only declared surgical API fixes and AAA regression tests.
-Run all product build, unit, runtime, and resolved-license checks after each
+qualify_package_update with compatibility and documented license evidence,
+obeying any configured corporate policy. Never invent approvals or force incompatible framework
+versions. Never change production code, unit tests or check scripts to support
+any package version. Record lint warnings/info/unknowns before applying updates.
+Accept only with no lint errors, passing builds and executed unit tests.
+Run all configured runtime and resolved-license checks after each
 package edit before continuing, and generate the local report.
 Display unresolved_issues_table at the end of your final response. Stop on
 run-level failures or failed/incomplete validation. Retain finding-level
@@ -976,8 +994,7 @@ until your normal publication and scanning process updates them.
 | Image tag | An unpinned `FROM image:tag` whose name matches the finding | 3 |
 
 The server applies plans scoring at most 3; it does not perform arbitrary source
-rewrites. Declared host-authored package API adaptations are a separate, bounded
-exception under qualification, not an automated SAST patching capability.
+rewrites or production/unit-test adaptations for any package version increment.
 Unsupported edits and breaking upgrades remain for manual review.
 
 Lockfile refreshes use the package manager already selected by the repo (`npm`, `pnpm`, or `yarn`) and pass `--ignore-scripts` on that refresh. Validation then runs the project's own install and test commands.
@@ -986,21 +1003,22 @@ Lockfile refreshes use the package manager already selected by the repo (`npm`, 
 
 | Stack | Commands |
 | --- | --- |
-| Node | `npm ci` (or the pnpm/Yarn frozen install), `lint` / `build` / `test` when those scripts exist, and `npm audit --json` as information only |
-| .NET | `dotnet restore` (`--locked-mode` when `packages.lock.json` exists), `dotnet build`, `dotnet test`. A target framework other than `net10.0` is reported, and the build still runs. |
-| Java | `mvnw` or `mvn --batch-mode clean verify` and `dependency:tree`, or the Gradle wrapper's `dependencies`, `test`, and `build`. A JDK other than 17 is reported. |
+| Node | Frozen dependency install, required `lint`, `build` and `test` scripts for package updates, plus informational advisory audit. |
+| .NET | Restore, `dotnet format --verify-no-changes --no-restore` for package lint, Release production build and test. A non-`net10.0` target is reported. |
+| Java | Maven Checkstyle (including test sources), `clean verify` and `dependency:tree`; or Gradle `checkstyleMain checkstyleTest`, `test` and `build`. Checkstyle must be configured for package qualification. JDK 17 is required. |
 | NGINX | `nginx -t` when `nginx` is installed and a config file is present |
 | Container | `FROM` is required. `docker build --check` runs when Docker is available. A missing daemon is recorded as skipped. |
 
 A failed required command sets `VALIDATION_FAILED`; a missing required tool or
 incomplete required evidence yields `VALIDATION_INCOMPLETE`. Neither permits
 claiming a package update is validated. Policy check failures produce required
-failed rows even when other checks can still run. Edits remain local and are not
-automatically reverted. The Node advisory audit is informational, not a
+failed rows even when other checks can still run. Failed attempted package
+updates restore updater-owned dependency files only if unchanged since apply;
+other edits remain local and require review. The Node audit is informational, not a
 substitute for the mandatory compatibility and resolved-license checks.
 
-Package qualification adds its four required checks to the detected-stack
-matrix both before and after the update. A successful generic build alone is
+Package qualification requires lint/build/unit evidence before and after the
+update, plus all four corporate checks when a policy is used. A build alone is
 insufficient. Validate each package edit before applying the next; new changes
 can invalidate earlier receipts, so the final checkout must pass again.
 
@@ -1106,8 +1124,8 @@ for deployment and restart differences.
 | `PRECHECK_FAILED` | Return to clean `main` and finish Git operations manually. The MCP does not discard your work. |
 | Dated branch already exists | Review, rename or remove it manually; the server refuses to reuse another run's branch name. |
 | `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability or a package-name mismatch does not prove a false positive. |
-| `QUALIFICATION_REQUIRED` | Complete exact-version review, independent approval and all baseline checks; requalify if checkout/policy hashes changed. |
+| `QUALIFICATION_REQUIRED` | Complete exact-version API/license review and baseline checks, plus corporate approval when configured; requalify after checkout/policy changes. |
 | `VALIDATION_REQUIRED` or `PENDING_VALIDATION` | Validate the previous package edit before attempting another; do not report it as resolved. |
-| `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect required rows, install missing tools or repair only permitted adaptations, then rerun. Failed edits remain local. |
+| `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
