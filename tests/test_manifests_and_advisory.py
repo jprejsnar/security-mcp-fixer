@@ -35,6 +35,147 @@ OSV = {
 }
 
 
+def test_gitlab_fetch_preserves_fuzzing_payloads_and_response_bodies():
+    """Retain scanner HTTP evidence through streamed GraphQL retrieval."""
+    # Arrange
+    scanner = {
+        "summary": "Unexpected response for mutated offset",
+        "request": {
+            "method": "POST",
+            "url": "https://example.invalid/queues?offset=-7473742310360238467",
+            "body": '{"queue":"test"}',
+            "headers": [{"name": "Authorization", "value": "secret-token"}],
+        },
+        "response": {
+            "statusCode": 500,
+            "reasonPhrase": "Internal Server Error",
+            "body": '{"error":"offset out of range"}',
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+        },
+        "supportingMessages": [
+            {
+                "name": "original request",
+                "request": {
+                    "url": "https://example.invalid/queues?offset=0",
+                    "body": "",
+                },
+                "response": {"statusCode": 200, "body": "[]"},
+            }
+        ],
+    }
+    details = [
+        {
+            "__typename": "VulnerabilityDetailDiff",
+            "fieldName": "payload",
+            "before": "0",
+            "after": "-7473742310360238467",
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return unbuffered findings with full scanner evidence."""
+        query = json.loads(request.content)["query"]
+        assert "latestSecurityReportFinding" in query
+        assert "supportingMessages" in query
+        assert "VulnerabilityDetailDiff" in query
+        node = {
+            "uuid": "fuzzing",
+            "reportType": "API_FUZZING",
+            "state": "DETECTED",
+            "location": {"path": "/queues", "param": "offset", "requestMethod": "POST"},
+            "latestSecurityReportFinding": {"evidence": scanner, "details": details},
+        }
+        body = json.dumps(
+            {
+                "data": {
+                    "project": {
+                        "vulnerabilities": {
+                            "nodes": [node],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            }
+        ).encode()
+        return httpx.Response(200, content=iter([body[:19], body[19:]]))
+
+    # Act
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        result = GitLabClient("test-token", http=http).fetch("group/project")
+
+    # Assert
+    assert result.ok, result.error
+    finding = result.findings[0]
+    captured = finding["scannerEvidence"]
+    assert captured["request"]["body"] == scanner["request"]["body"]
+    assert captured["request"]["url"] == scanner["request"]["url"]
+    assert captured["response"]["body"] == scanner["response"]["body"]
+    assert captured["response"]["statusCode"] == 500
+    assert captured["supportingMessages"] == scanner["supportingMessages"]
+    assert captured["request"]["headers"][0]["value"] == "[REDACTED]"
+    assert scanner["request"]["headers"][0]["value"] == "secret-token"
+    assert finding["scannerDetails"] == details
+    assert finding["location"]["param"] == "offset"
+    assert finding["location"]["requestMethod"] == "POST"
+    assert finding["evidence"] == []
+
+
+@pytest.mark.parametrize("body", [None, ""])
+def test_fuzzing_evidence_distinguishes_missing_and_empty_bodies(body):
+    """Keep empty bodies intact rather than treating them as missing evidence."""
+    # Arrange
+    node = {
+        "reportType": "API_FUZZING",
+        "latestSecurityReportFinding": {
+            "evidence": {"request": {"body": body}, "response": {"body": body}}
+        },
+    }
+
+    # Act
+    finding = normalize_finding(node, None)
+
+    # Assert
+    assert finding["scannerEvidence"]["request"]["body"] == body
+    assert finding["scannerEvidence"]["response"]["body"] == body
+    assert (
+        normalize_finding({"latestSecurityReportFinding": None}, None)[
+            "scannerEvidence"
+        ]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["AUTHORIZATION", "Cookie", "Set-Cookie", "X-Api-Key", "Proxy-Authorization"],
+)
+def test_fuzzing_evidence_redacts_headers_in_supporting_exchanges(name):
+    """Mask authentication headers in primary and supporting HTTP exchanges."""
+    # Arrange
+    exchange = {
+        "body": "preserve this payload",
+        "headers": [{"name": name, "value": "secret"}],
+    }
+    scanner = {
+        "request": exchange,
+        "response": exchange,
+        "supportingMessages": [{"request": exchange, "response": exchange}],
+    }
+
+    # Act
+    finding = normalize_finding(
+        {"latestSecurityReportFinding": {"evidence": scanner}}, None
+    )
+
+    # Assert
+    captured = finding["scannerEvidence"]
+    for message in [captured, *captured["supportingMessages"]]:
+        for kind in ("request", "response"):
+            assert message[kind]["headers"][0]["value"] == "[REDACTED]"
+            assert message[kind]["body"] == "preserve this payload"
+    assert exchange["headers"][0]["value"] == "secret"
+
+
 @pytest.mark.parametrize(
     "package, installed", [("minimatch", "11.0.0"), ("glob", "14.0.1")]
 )
@@ -920,6 +1061,53 @@ def test_malformed_gitlab_connection_fails_closed(connection):
     assert not result.ok
     assert result.findings == []
     assert result.error
+
+
+@pytest.mark.parametrize("project_id", ["group/project", "123"])
+def test_gitlab_reads_streamed_success_responses(project_id):
+    """Read real response streams before decoding project and findings JSON."""
+    # Arrange
+    requests = []
+    responses = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve split JSON bodies without preloading response content."""
+        requests.append(request)
+        if request.method == "GET":
+            payload = {"path_with_namespace": "group/project"}
+        else:
+            query = json.loads(request.content)["query"]
+            if "securityTrackedRefs(" in query:
+                connection = "securityTrackedRefs"
+                nodes = [{"id": "tracked-main", "name": "main", "refType": "BRANCH"}]
+            else:
+                connection = "vulnerabilities"
+                nodes = [{"uuid": "streamed-finding", "state": "DETECTED"}]
+            payload = {
+                "data": {
+                    "project": {
+                        connection: {
+                            "nodes": nodes,
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            }
+        body = json.dumps(payload).encode()
+        response = httpx.Response(200, content=iter([body[:17], body[17:]]))
+        responses.append(response)
+        return response
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        result = GitLabClient("test-token", http=http).fetch(project_id)
+
+    # Assert
+    assert result.ok, result.error
+    assert result.project_path == "group/project"
+    assert [finding["id"] for finding in result.findings] == ["streamed-finding"]
+    assert len(requests) == (3 if project_id == "123" else 2)
+    assert all(response.is_closed for response in responses)
 
 
 def test_gitlab_http_error_stops_reading_after_the_excerpt():

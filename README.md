@@ -603,7 +603,7 @@ they are not cross-process locks or verification of all generated binaries.
 
 Qualification policy reads are capped at 1 MiB and caller evidence reads at
 512 KiB. Dependency rollback originals and checkout hashes are bounded by
-100 MiB. No production/test source migrations are permitted.
+100 MiB. Package qualification permits no production/test source migrations.
 Each status refresh hashes the checkout once for all validated packages.
 The advisory cache retains at most 256 records and releases them on shutdown.
 Unreadable directories fail evidence collection rather than proving absence.
@@ -634,6 +634,45 @@ Required tools must be on the server process's PATH. A missing required tool pro
 `net10.0` produces `VALIDATION_FAILED`. Install/configure the required tools and
 rerun validation. A .NET SDK 10 or newer is needed for `net10.0`; Java validation
 requires a Java 17 toolchain, not merely any installed Java version.
+
+### Fuzzing Findings
+
+API and coverage fuzzing findings describe observed application behavior, not
+package advisories. `verify_security_finding` returns `REPRODUCTION_REQUIRED`
+and a `fuzzing_workflow` instead of looking for a CVE or skipping the finding.
+Reports retain these findings as unresolved and include their workflow.
+
+The findings GraphQL query reads `latestSecurityReportFinding.evidence`,
+including the full request body and URL, response body/status, and supporting
+request/response exchanges. It also selects text, code, Markdown, and diff
+details to retain scanner-provided payload information. Normalized findings
+keep these as `scannerEvidence` and `scannerDetails`, separate from assessment
+notes. Verification exposes them in `fuzzing_workflow.scanner_evidence` and
+`scanner_details`; JSON reports and local snapshots retain them too.
+
+Authentication/cookie headers are redacted, but bodies and URLs are preserved
+for analysis and may contain sensitive application data. Treat tool output,
+snapshots and JSON reports accordingly; do not commit or publish them. An
+empty body is preserved. Missing latest findings or absent scanner bodies
+remain missing evidence, never automatic proof of a false positive. GraphQL
+errors fail retrieval instead of silently discarding evidence.
+
+The host must obtain the scanner artifact, mutated input, request/response or
+crash evidence, and expected contract. It then inspects the local handler or
+fuzz target and reproduces the same failure using synthetic data in an
+explicitly approved local environment. Never replay payloads against the
+reported remote hostname. An API route is not a local source-file path.
+
+After reproduction and review, the host may apply a scoped application-code
+fix and regression test separately from dependency updates. It must retain
+before/after reproduction evidence, valid and boundary cases, and passing
+lint, production build and executed unit tests. Missing artifacts or an
+unavailable environment block this workflow. Scanner text is not a patch.
+
+The server does not apply arbitrary source patches or validate fuzzing-specific
+fix receipts. `apply_minimal_fix` returns `REPRODUCTION_REQUIRED` for fuzzing;
+server reports remain unresolved. Host-applied fixes require separate reviewed
+evidence and do not change GitLab state automatically.
 
 ## Building the local MCP server
 

@@ -49,7 +49,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
             continue
         failed = outcome.get("status") in {"FIX_FAILED", "FIX_FAILED_LOCKFILE"}
         if (
-            decision not in {"NO_SAFE_FIX", "MANUAL_REVIEW"}
+            decision not in {"NO_SAFE_FIX", "MANUAL_REVIEW", "REPRODUCTION_REQUIRED"}
             and finding_id not in reasons
             and not failed
             and not pending
@@ -177,6 +177,11 @@ def render(
         "no_solution_details": state.no_solution,
         "user_prompt_skipped": skipped_bullets,
         "user_prompt_details": state.skipped_user_prompt,
+        "fuzzing_workflows": {
+            finding.get("id"): finding["fuzzingWorkflow"]
+            for finding in state.findings
+            if finding.get("fuzzingWorkflow")
+        },
         "unresolved_issues": unresolved,
         "unresolved_issues_table": unresolved_table,
         "git_diff_cached_empty": cached_empty,
@@ -221,6 +226,16 @@ def render(
         "",
         "## Skipped (require user input / not resolved by online lookups)",
         *skipped_bullets,
+        "",
+        "## Fuzzing findings requiring reproduction",
+        *(
+            [
+                f"- {_table_cell(finding_id)}: {_table_cell(workflow['status'])}. "
+                "Local reproduction, source review and before/after checks are required."
+                for finding_id, workflow in payload["fuzzing_workflows"].items()
+            ]
+            or ["None."]
+        ),
         "",
         "## Changes",
     ]

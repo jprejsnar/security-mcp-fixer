@@ -459,6 +459,76 @@ class HybridRunner(CommandRunner):
         )
 
 
+@pytest.mark.parametrize("category", ["api_fuzzing", "coverage_fuzzing"])
+@pytest.mark.parametrize(
+    "scanner",
+    [
+        None,
+        {
+            "request": {"body": ""},
+            "response": {"body": "unexpected response", "statusCode": 500},
+        },
+    ],
+)
+def test_fuzzing_requires_reproduction_not_package_advisories(
+    tmp_path, monkeypatch, category, scanner
+):
+    """Keep fuzzing unresolved without treating missing advisories as skips."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+
+    finding = _finding("fuzzing", None, "bucket:param:Query: offset", version=None)
+    finding.update(
+        category=category, title="Malformed offset causes unexpected response"
+    )
+    finding["scannerEvidence"] = scanner
+    finding["scannerDetails"] = [
+        {"__typename": "VulnerabilityDetailDiff", "before": "0", "after": "-1"}
+    ]
+    finding["location"] = {
+        "file": "/service/queues",
+        "hostname": "https://example.invalid",
+    }
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    def refuse_lookup(*args, **kwargs):
+        """Fail if runtime fuzzing is routed through dependency evidence."""
+        pytest.fail("Fuzzing must not use package or advisory lookup")
+
+    monkeypatch.setattr(engine.advisory, "lookup", refuse_lookup)
+    monkeypatch.setattr(engine, "_snapshot", refuse_lookup)
+
+    # Act
+    result = engine.verify_security_finding("fuzzing")
+    applied = engine.apply_minimal_fix("fuzzing")
+    payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    assert result["decision"] == "REPRODUCTION_REQUIRED"
+    assert not result["eligible_for_auto_fix"]
+    assert not result["qualification_required"]
+    assert result["proposed_fix"] is None
+    assert result["fuzzing_workflow"]["status"] == "REPRODUCTION_REQUIRED"
+    assert result["fuzzing_workflow"]["scanner_evidence"] == scanner
+    assert result["fuzzing_workflow"]["scanner_details"] == finding["scannerDetails"]
+    assert finding["scannerEvidence"] == scanner
+    assert any(
+        "response body captured" in item if scanner else "response body missing" in item
+        for item in result["evidence"]
+    )
+    assert "local" in result["user_prompt"]
+    assert "skipped" not in result["user_prompt"].lower()
+    assert engine.state.skipped_user_prompt == []
+    assert engine.state.false_positives == []
+    assert payload["unresolved_issues"][0]["decision"] == "REPRODUCTION_REQUIRED"
+    assert payload["fuzzing_workflows"]["fuzzing"] == result["fuzzing_workflow"]
+    assert "## Fuzzing findings requiring reproduction" in markdown
+    assert applied["status"] == "REPRODUCTION_REQUIRED"
+    assert engine.state.changes == []
+
+
 class FakeGitLab:
     """Return scripted findings without contacting private GitLab services."""
 

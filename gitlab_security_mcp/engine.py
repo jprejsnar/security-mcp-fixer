@@ -530,6 +530,7 @@ class Engine:
             ),
             "proposed_fix": proposed,
             "user_prompt": prompt,
+            "fuzzing_workflow": finding.get("fuzzingWorkflow"),
         }
 
     @_serialized
@@ -663,6 +664,13 @@ class Engine:
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
+        if finding.get("category") in {"api_fuzzing", "coverage_fuzzing"}:
+            return {
+                "status": "REPRODUCTION_REQUIRED",
+                "finding_id": finding_id,
+                "reason": "Fuzzing requires reviewed local reproduction and host-applied source fixes, not an automatic package edit.",
+                "fuzzing_workflow": finding.get("fuzzingWorkflow"),
+            }
         if any(item["id"] == finding_id for item in self.state.skipped_user_prompt):
             prompt = next(
                 item["prompt"]
@@ -1119,6 +1127,60 @@ class Engine:
         ]
         category = finding.get("category") or ""
         component = finding.get("component")
+        if category in {"api_fuzzing", "coverage_fuzzing"}:
+            reason = (
+                "Fuzzing describes observed application behavior, not a package advisory. "
+                "Reproduce the scanner case locally and review the responsible code; "
+                "missing CVE or advisory records do not justify skipping or dismissing it. "
+                "No application defect or safe source fix has been verified yet."
+            )
+            steps = [
+                "Obtain the original scanner artifact: affected operation or fuzz target, "
+                "mutator, original and mutated input, request/response or crash evidence, "
+                "and the expected API or target contract. Keep credentials out of reports.",
+                "Inspect the matching local handler, parser, validation and error handling. "
+                "An API URL path is not a source-file path. Do not infer SQL injection or "
+                "a false positive solely from a scanner title, status code or missing file.",
+                "Use only an explicitly approved local test environment and synthetic data. "
+                "Do not replay fuzz payloads against the reported remote hostname. "
+                "Add a focused regression test that fails for the same security behavior "
+                "before the fix; a setup failure does not count as reproduction.",
+                "After reproduction and review, propose a minimal source fix tied to the "
+                "documented input/response contract. Preserve valid requests, authentication "
+                "and authorization; do not suppress the scanner or mask the defect.",
+                "Apply reviewed source and regression-test edits through the host only in "
+                "the approved checkout, separately from dependency updates. This server's "
+                "apply_minimal_fix cannot apply arbitrary application-code patches.",
+                "Rerun the identical reproduction and boundary/valid-input cases, lint, "
+                "production build and executed unit tests. Retain before/after evidence. "
+                "Keep the finding unresolved until those checks have passed; do not "
+                "fabricate evidence, dismiss GitLab findings, commit or push.",
+            ]
+            finding["fuzzingWorkflow"] = {
+                "status": "REPRODUCTION_REQUIRED",
+                "category": category,
+                "location": finding.get("location") or {},
+                "scanner_evidence": finding.get("scannerEvidence"),
+                "scanner_details": finding.get("scannerDetails") or [],
+                "steps": steps,
+                "source_edits_applied_by": "host_after_reproduction_and_review",
+            }
+            scanner = finding.get("scannerEvidence") or {}
+            request = scanner.get("request") or {}
+            response = scanner.get("response") or {}
+            evidence.append(
+                "GraphQL scanner evidence: "
+                f"request body {'captured' if request.get('body') is not None else 'missing'}, "
+                f"response body {'captured' if response.get('body') is not None else 'missing'}. "
+                "Read scanner_evidence and scanner_details in fuzzing_workflow; "
+                "HTTP errors or missing evidence alone do not prove a real defect or a false positive."
+            )
+            evidence.append(reason)
+            prompt = (
+                f"Finding {finding.get('id')} requires local fuzzing reproduction. "
+                + " ".join(steps)
+            )
+            return "REPRODUCTION_REQUIRED", reason, evidence, None, prompt
         if finding.get("falsePositiveFlag") is True:
             evidence.append(
                 "GitLab marked falsePositive=true. That flag alone is not sufficient; local evidence is required."

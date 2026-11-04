@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import re
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlparse
 
@@ -34,6 +35,21 @@ query SecurityFindings($fullPath: ID!, $trackedRefIds: [SecurityProjectTrackedCo
                 scanner { externalId name vendor }
                 identifiers { externalType externalId name url }
                 links { name url }
+                details { ...FuzzingDetail }
+                latestSecurityReportFinding {
+                    evidence {
+                        summary
+                        source { identifier name url }
+                        request { ...FuzzingRequest }
+                        response { ...FuzzingResponse }
+                        supportingMessages {
+                            name
+                            request { ...FuzzingRequest }
+                            response { ...FuzzingResponse }
+                        }
+                    }
+                    details { ...FuzzingDetail }
+                }
                 location {
                     ... on VulnerabilityLocationDependencyScanning {
                         file
@@ -69,6 +85,19 @@ query SecurityFindings($fullPath: ID!, $trackedRefIds: [SecurityProjectTrackedCo
       }
     }
   }
+}
+fragment FuzzingRequest on VulnerabilityRequest {
+    method url body headers { name value }
+}
+fragment FuzzingResponse on VulnerabilityResponse {
+    statusCode reasonPhrase body headers { name value }
+}
+fragment FuzzingDetail on VulnerabilityDetail {
+    __typename
+    ... on VulnerabilityDetailText { fieldName name description value }
+    ... on VulnerabilityDetailCode { fieldName name description lang value }
+    ... on VulnerabilityDetailMarkdown { fieldName name description value }
+    ... on VulnerabilityDetailDiff { fieldName name description before after }
 }
 """.strip()
 
@@ -313,6 +342,7 @@ class GitLabClient:
                     f"{_response_excerpt(response)}"
                 )
                 raise RuntimeError(detail)
+            response.read()
             payload = response.json()
         if not isinstance(payload, dict):
             raise RuntimeError(f"GitLab {method} {url} did not return a JSON object")
@@ -423,6 +453,9 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
     installed = dependency.get("version")
     solution = node.get("solution")
     file_path = location.get("file") or location.get("path")
+    latest = node.get("latestSecurityReportFinding") or {}
+    scanner_evidence = _scanner_evidence(latest.get("evidence"))
+    scanner_details = deepcopy(latest.get("details") or node.get("details") or [])
     return {
         "id": node.get("uuid")
         or node.get("id")
@@ -449,6 +482,9 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
             "class": location.get("vulnerableClass"),
             "method": location.get("vulnerableMethod"),
             "hostname": location.get("hostname"),
+            "path": location.get("path"),
+            "param": location.get("param"),
+            "requestMethod": location.get("requestMethod"),
         },
         "status": (node.get("state") or "").lower(),
         "trackedRef": node.get("trackedRef"),
@@ -459,11 +495,51 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
             link.get("url") for link in (node.get("links") or []) if link.get("url")
         ],
         "pipeline": pipeline,
+        "scannerEvidence": scanner_evidence,
+        "scannerDetails": scanner_details,
         "evidence": [],
         "assessment": None,
         "remediationDecision": None,
         "proposedFix": None,
     }
+
+
+def _scanner_evidence(evidence: dict | None) -> dict | None:
+    """Preserve HTTP bodies and payload URLs while masking credential headers."""
+    if evidence is None:
+        return None
+    if not isinstance(evidence, dict):
+        raise ValueError("GitLab returned malformed scanner evidence")
+    captured = deepcopy(evidence)
+    messages = captured.get("supportingMessages") or []
+    if not isinstance(messages, list) or any(
+        not isinstance(message, dict) for message in messages
+    ):
+        raise ValueError("GitLab returned malformed supporting messages")
+    sensitive = {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+    }
+    for message in [captured, *messages]:
+        for kind in ("request", "response"):
+            exchange = message.get(kind)
+            if exchange is None:
+                continue
+            if not isinstance(exchange, dict):
+                raise ValueError("GitLab returned malformed request/response evidence")
+            for header in exchange.get("headers") or []:
+                if not isinstance(header, dict) or not isinstance(
+                    header.get("name"), str
+                ):
+                    raise ValueError("GitLab returned malformed evidence headers")
+                if header["name"].strip().lower() in sensitive:
+                    header["value"] = "[REDACTED]"
+    return captured
 
 
 def split_states(findings: list[dict]) -> tuple[list[dict], dict]:
