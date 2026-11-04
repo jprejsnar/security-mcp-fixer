@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import sys
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -19,34 +21,45 @@ from gitlab_security_mcp.git_ops import branch_name_for
 
 
 def test_repository_override_recovers_unresolved_host_placeholder(repo, monkeypatch):
+    """Repository override recovers unresolved host placeholder."""
     # Arrange
     monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
 
-    # Act / Assert
+    # Act
     with pytest.raises(ValueError, match="unresolved host placeholder"):
         Engine.from_env()
     engine = Engine.from_env(str(repo))
     try:
-        assert engine.repo_root == repo.resolve()
-        assert engine.run_prechecks()["status"] == "PRECHECK_PASSED"
+        precheck = engine.run_prechecks()
     finally:
         engine.close()
 
+    # Assert
+    assert engine.repo_root == repo.resolve()
+    assert precheck["status"] == "PRECHECK_PASSED"
+
 
 def test_missing_repository_has_actionable_error(tmp_path, monkeypatch):
+    """Missing repository has actionable error."""
     # Arrange
     monkeypatch.setenv("REPO_ROOT", str(tmp_path / "missing"))
 
-    # Act / Assert
-    with pytest.raises(ValueError, match="Repository directory does not exist"):
+    # Act
+    with pytest.raises(
+        ValueError, match="Repository directory does not exist"
+    ) as raised:
         Engine.from_env()
+
+    # Assert
+    assert "Repository directory does not exist" in str(raised.value)
 
 
 def test_server_recovers_configuration_error(repo, monkeypatch):
+    """Server recovers configuration error."""
     # Arrange
     from gitlab_security_mcp import server
 
-    monkeypatch.setattr(server, "engine", None)
+    server._close_engine()
     monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
 
     # Act
@@ -57,17 +70,83 @@ def test_server_recovers_configuration_error(repo, monkeypatch):
         assert failed["status"] == "ERROR"
         assert failed["stage"] == "configuration"
         assert "unresolved host placeholder" in failed["error"]
-        assert "run_prechecks" in failed["action"]
+        assert "repo_root" in failed["action"]
         assert recovered["status"] == "PRECHECK_PASSED"
         assert recovered["repo_root"] == str(repo.resolve())
-        refused = server.run_prechecks(repo_root=str(repo.parent))
-        assert refused["status"] == "ERROR"
-        assert "active run" in refused["error"]
+        other = server.run_prechecks(repo_root=str(repo.parent))
+        assert other["status"] == "PRECHECK_FAILED"
+        assert server.get_run_status(repo_root=str(repo))["status"] == "PRECHECK_PASSED"
     finally:
         server._close_engine()
 
 
+def test_two_repositories_run_at_the_same_time(tmp_path):
+    """Two repositories run at the same time."""
+    # Arrange
+    from gitlab_security_mcp import server
+    from tests.conftest import git
+
+    server._close_engine()
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    for checkout in (first, second):
+        checkout.mkdir()
+        git(checkout, "init", "-b", "main")
+    barrier = threading.Barrier(2)
+    results: dict[str, dict] = {}
+
+    def check(name: str, checkout: Path) -> None:
+        """Run prechecks for one checkout once both workers are ready."""
+        barrier.wait(timeout=5)
+        results[name] = server.run_prechecks(repo_root=str(checkout))
+
+    workers = [
+        threading.Thread(target=check, args=("first", first)),
+        threading.Thread(target=check, args=("second", second)),
+    ]
+
+    # Act
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+
+        # Assert
+        assert results["first"]["status"] == "PRECHECK_PASSED"
+        assert results["second"]["status"] == "PRECHECK_PASSED"
+        assert results["first"]["repo_root"] != results["second"]["repo_root"]
+        ambiguous = server.get_run_status()
+        assert ambiguous["status"] == "ERROR"
+        assert "Pass repo_root" in ambiguous["error"]
+        assert (
+            server.get_run_status(repo_root=str(first))["status"] == "PRECHECK_PASSED"
+        )
+        assert (
+            server.get_run_status(repo_root=str(second))["status"] == "PRECHECK_PASSED"
+        )
+    finally:
+        server._close_engine()
+
+
+def test_server_logs_go_to_stderr():
+    """Server logs go to stderr."""
+    # Arrange
+    from gitlab_security_mcp import server
+
+    server.logger.handlers.clear()
+
+    # Act
+    server._configure_logging()
+    server._configure_logging()
+
+    # Assert
+    assert len(server.logger.handlers) == 1
+    assert server.logger.handlers[0].stream is sys.stderr
+
+
 def test_non_git_precheck_does_not_persist_run_state(tmp_path):
+    """Non git precheck does not persist run state."""
     # Arrange
     engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
 
@@ -94,6 +173,7 @@ def test_non_git_precheck_does_not_persist_run_state(tmp_path):
     ],
 )
 def test_unreadable_manifest_requires_review(tmp_path, manifest, contents):
+    """Unreadable manifest requires review."""
     # Arrange
     (tmp_path / manifest).write_text(contents, encoding="utf-8")
     finding = _finding("finding", "org.example:lodash", "CVE-TEST")
@@ -114,6 +194,7 @@ def test_unreadable_manifest_requires_review(tmp_path, manifest, contents):
     "failure", [OSError("Executable vanished"), RuntimeError("Output reader failed")]
 )
 def test_validation_execution_failure_returns_failed_result(tmp_path, failure):
+    """Validation execution failure returns failed result."""
     # Arrange
     from unittest.mock import Mock
 
@@ -156,14 +237,16 @@ def test_invalid_policy_path_does_not_allocate_owned_clients(tmp_path, monkeypat
 
     monkeypatch.setattr(Path, "resolve", resolve_policy)
 
-    # Act / Assert
+    # Act
     with pytest.raises((OSError, ValueError)):
         Engine(tmp_path)
+    # Assert
     gitlab_factory.assert_not_called()
     advisory_factory.assert_not_called()
 
 
 def test_engine_constructor_failure_closes_owned_client(tmp_path, monkeypatch):
+    """Engine constructor failure closes owned client."""
     # Arrange
     from unittest.mock import Mock
 
@@ -187,6 +270,7 @@ def test_engine_constructor_failure_closes_owned_client(tmp_path, monkeypatch):
 
 
 def test_engine_constructor_preserves_primary_error(tmp_path, monkeypatch):
+    """Engine constructor preserves primary error."""
     # Arrange
     from unittest.mock import Mock
 
@@ -210,6 +294,7 @@ def test_engine_constructor_preserves_primary_error(tmp_path, monkeypatch):
 
 
 def test_engine_close_attempts_all_owned_clients_once(tmp_path, monkeypatch):
+    """Engine close attempts all owned clients once."""
     # Arrange
     from unittest.mock import Mock
 
@@ -236,6 +321,7 @@ def test_engine_close_attempts_all_owned_clients_once(tmp_path, monkeypatch):
 
 
 def test_engine_close_waits_for_active_tool(tmp_path):
+    """Engine close waits for active tool."""
     # Arrange
     import threading
     from unittest.mock import Mock
@@ -293,6 +379,7 @@ def test_engine_close_waits_for_active_tool(tmp_path):
 
 
 def test_engine_results_are_detached_snapshots(tmp_path):
+    """Engine results are detached snapshots."""
     # Arrange
     finding = _finding("finding", "lodash", "CVE-TEST")
     engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=ScriptedAdvisory())
@@ -309,6 +396,8 @@ def test_engine_results_are_detached_snapshots(tmp_path):
 
 
 def test_falsey_engine_dependencies_are_preserved(tmp_path):
+    """Falsey engine dependencies are preserved."""
+
     # Arrange
     class FalseyDependency:
         """Expose a falsey injected dependency whose ownership stays external."""
@@ -477,6 +566,7 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
     tmp_path, monkeypatch, outcome, affected, fixed, expected
 ):
     """Require matching, comparable advisory evidence before planning edits."""
+    # Arrange
     manifest = tmp_path / "package.json"
     original = json.dumps({"dependencies": {"lodash": "4.17.20"}})
     manifest.write_text(original, encoding="utf-8")
@@ -500,8 +590,10 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
     engine.state.status = "FINDINGS_LISTED"
     engine.state.findings = [finding]
 
+    # Act
     result = engine.verify_security_finding(finding["id"])
 
+    # Assert
     assert result["decision"] == expected
     assert result["eligible_for_auto_fix"] is False
     assert result["qualification_required"] is (expected == "CHANGE_REQUIRED")
@@ -517,6 +609,7 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
 
 def test_report_ends_with_unresolved_security_issues_table(tmp_path):
     """Keep unresolved issues unique and place their table last in reports."""
+    # Arrange
     from gitlab_security_mcp.report import write_report
     from gitlab_security_mcp.state import RunState
 
@@ -562,10 +655,12 @@ def test_report_ends_with_unresolved_security_issues_table(tmp_path):
         ],
     )
 
+    # Act
     result = write_report(tmp_path, state, staged=[], diff_stat="", diff_files="")
     markdown = Path(result["human_report"]).read_text(encoding="utf-8")
     payload = json.loads(Path(result["json_report"]).read_text(encoding="utf-8"))
 
+    # Assert
     assert [item["id"] for item in result["unresolved_issues"]] == [
         "no-fix",
         "manual",
@@ -584,13 +679,16 @@ def test_report_ends_with_unresolved_security_issues_table(tmp_path):
 
 def test_unresolved_table_does_not_claim_unverified_findings_are_resolved():
     """Distinguish missing verification from confirmed issue resolution."""
+    # Arrange
     from gitlab_security_mcp.report import render
     from gitlab_security_mcp.state import RunState
 
     state = RunState(findings=[_finding("unverified", "lodash", "CVE-2021-23337")])
 
+    # Act
     payload, markdown = render(state, staged=[], diff_stat="", diff_files="")
 
+    # Assert
     assert payload["unresolved_issues"] == []
     assert payload["unverified_findings"] == ["unverified"]
     assert (
@@ -612,6 +710,7 @@ def test_unresolved_table_does_not_claim_unverified_findings_are_resolved():
     ],
 )
 def test_supported_runtime_validation_matrix(tmp_path, stack, runtime, expected):
+    """Supported runtime validation matrix."""
     # Arrange
     from unittest.mock import Mock
 
@@ -665,6 +764,7 @@ def test_supported_runtime_validation_matrix(tmp_path, stack, runtime, expected)
 
 @pytest.mark.parametrize("filename", ["App.slnx", "App.fsproj", "App.vbproj"])
 def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename):
+    """Dotnet 10 project formats are detected and validated."""
     # Arrange
     from unittest.mock import Mock
 
@@ -741,6 +841,7 @@ def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename
 def test_advisory_verified_dependency_fix_across_stacks(
     tmp_path, monkeypatch, manager, filename, contents, package, installed, target
 ):
+    """Advisory verified dependency fix across stacks."""
     # Arrange
     (tmp_path / filename).write_text(contents, encoding="utf-8")
     finding = _finding("cross-stack", package, "CVE-TEST", installed)
@@ -758,10 +859,13 @@ def test_advisory_verified_dependency_fix_across_stacks(
         ),
     )
     runner = HybridRunner(tmp_path)
+    from tests.conftest import documentation_client
+
     engine = Engine(
         tmp_path,
         gitlab=FakeGitLab([finding]),
         advisory=advisory,
+        docs=documentation_client(),
         runner=runner,
         which=lambda name: name,
     )
@@ -802,6 +906,7 @@ def test_advisory_verified_dependency_fix_across_stacks(
 def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
     tmp_path, package, installed, target, major
 ):
+    """Nested node finding reaches advisory in dotnet repo."""
     # Arrange
     from unittest.mock import Mock
 
@@ -844,6 +949,7 @@ def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
 
 
 def test_unresolved_java_transitive_dependency_is_not_false_positive(tmp_path):
+    """Unresolved java transitive dependency is not false positive."""
     # Arrange
     (tmp_path / "pom.xml").write_text("<project />", encoding="utf-8")
     finding = _finding("transitive", "org.example:transitive", "CVE-TEST", "1.0.0")
@@ -862,6 +968,7 @@ def test_unresolved_java_transitive_dependency_is_not_false_positive(tmp_path):
 
 
 def test_modern_yarn_validation_uses_supported_commands(tmp_path):
+    """Modern yarn validation uses supported commands."""
     # Arrange
     from unittest.mock import Mock
 
@@ -902,6 +1009,7 @@ def test_modern_yarn_validation_uses_supported_commands(tmp_path):
     ],
 )
 def test_modern_yarn_lockfile_refresh(tmp_path, strategy, expected):
+    """Modern yarn lockfile refresh."""
     # Arrange
     from unittest.mock import Mock
 
@@ -953,6 +1061,7 @@ def test_modern_yarn_lockfile_refresh(tmp_path, strategy, expected):
 def test_missing_required_tool_keeps_validation_incomplete(
     tmp_path, manifest, contents
 ):
+    """Missing required tool keeps validation incomplete."""
     # Arrange
     from unittest.mock import Mock
 
@@ -980,6 +1089,7 @@ def test_missing_required_tool_keeps_validation_incomplete(
 
 
 def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
+    """Split frontend backend validation uses component directories."""
     # Arrange
     from unittest.mock import Mock
 
@@ -1034,6 +1144,7 @@ def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
 
 
 def test_prechecks_fail_closed(repo):
+    """Prechecks fail closed."""
     # Arrange
     engine = Engine(
         repo,
@@ -1065,6 +1176,7 @@ def test_prechecks_fail_closed(repo):
 
 
 def test_full_local_run_reports_every_required_section(cloned_repo):
+    """Full local run reports every required section."""
     # Arrange
     package = {
         "name": "app",
@@ -1091,10 +1203,13 @@ def test_full_local_run_reports_every_required_section(cloned_repo):
         _finding("none", "ms", "CVE-NONE"),
     ]
     runner = HybridRunner(cloned_repo)
+    from tests.conftest import documentation_client
+
     engine = Engine(
         cloned_repo,
         gitlab=FakeGitLab(findings),
         advisory=ScriptedAdvisory(),
+        docs=documentation_client(),
         runner=runner,
         which=lambda name: name,
         today=date(2026, 11, 1),
@@ -1167,6 +1282,7 @@ def test_full_local_run_reports_every_required_section(cloned_repo):
 
 
 def test_existing_branch_name_stops_the_run(cloned_repo):
+    """Existing branch name stops the run."""
     # Arrange
     engine = Engine(
         cloned_repo,
@@ -1190,6 +1306,7 @@ def test_existing_branch_name_stops_the_run(cloned_repo):
 
 
 def test_image_bump_and_aaa_test(repo):
+    """Image bump and aaa test."""
     # Arrange
     (repo / "Dockerfile").write_text("FROM nginx:1.25.1\n", encoding="utf-8")
     (repo / "package.json").write_text(
@@ -1224,10 +1341,13 @@ def test_image_bump_and_aaa_test(repo):
                 sources=["osv:CVE-IMG"],
             )
 
+    from tests.conftest import documentation_client
+
     engine = Engine(
         repo,
         gitlab=FakeGitLab([finding]),
         advisory=ImageAdvisory(),
+        docs=documentation_client(),
         runner=HybridRunner(repo),
         which=lambda name: name,
     )
@@ -1245,11 +1365,14 @@ def test_image_bump_and_aaa_test(repo):
     assert decision["proposed_fix"]["strategy"] == "image_tag"
     assert applied["status"] == "APPLIED"
     assert "nginx:1.27.0" in (repo / "Dockerfile").read_text(encoding="utf-8")
+    assert all(item["ok"] for item in applied["change"]["documentation"])
+    assert any(item["name"] == "docker" for item in applied["change"]["documentation"])
     assert generated["status"] == "GENERATED"
     assert "Arrange" in test_text and "Act" in test_text and "Assert" in test_text
 
 
 def test_missing_package_is_a_false_positive_without_guessing(repo):
+    """Missing package is a false positive without guessing."""
     # Arrange
     (repo / "package.json").write_text(
         json.dumps({"dependencies": {"left-pad": "1.0.0"}}), encoding="utf-8"
@@ -1273,6 +1396,7 @@ def test_missing_package_is_a_false_positive_without_guessing(repo):
 
 
 def test_path_outside_the_repo_is_not_a_false_positive(repo):
+    """Path outside the repo is not a false positive."""
     # Arrange
     finding = _finding("escape", "app", "CVE-SAST")
     finding["category"] = "sast"
@@ -1295,6 +1419,7 @@ def test_path_outside_the_repo_is_not_a_false_positive(repo):
 
 
 def test_listing_again_keeps_existing_decisions(repo):
+    """Listing again keeps existing decisions."""
     # Arrange
     finding = _finding("gone", "left-pad", "CVE-FP")
     engine = Engine(
@@ -1316,6 +1441,7 @@ def test_listing_again_keeps_existing_decisions(repo):
 
 
 def test_incomplete_plan_is_refused(repo):
+    """Incomplete plan is refused."""
     # Arrange
     finding = _finding("fix", "lodash", "CVE-FIX", "4.17.20")
     finding["remediationDecision"] = "CHANGE_REQUIRED"
@@ -1338,6 +1464,7 @@ def test_incomplete_plan_is_refused(repo):
 
 
 def test_major_version_fix_needs_caller_qualification(repo):
+    """Major version fix needs caller qualification."""
     # Arrange
     (repo / "package.json").write_text(
         json.dumps({"dependencies": {"minimist": "0.2.1"}}), encoding="utf-8"
@@ -1379,6 +1506,7 @@ def test_major_version_fix_needs_caller_qualification(repo):
 
 
 def test_generated_test_never_overwrites_an_existing_file(repo):
+    """Generated test never overwrites an existing file."""
     # Arrange
     from gitlab_security_mcp.aaa import generate_aaa_test
 
@@ -1403,6 +1531,7 @@ def test_generated_test_never_overwrites_an_existing_file(repo):
 
 
 def test_report_says_unknown_when_the_index_cannot_be_read(tmp_path):
+    """Report says unknown when the index cannot be read."""
     # Arrange
     from gitlab_security_mcp.report import render
     from gitlab_security_mcp.state import RunState
@@ -1419,6 +1548,7 @@ def test_report_says_unknown_when_the_index_cannot_be_read(tmp_path):
 
 
 def test_state_snapshot_leaves_no_temp_files(tmp_path):
+    """State snapshot leaves no temp files."""
     # Arrange
     from gitlab_security_mcp.state import RunState
 
@@ -1440,6 +1570,7 @@ def test_state_snapshot_leaves_no_temp_files(tmp_path):
 
 
 def test_tools_are_registered():
+    """Tools are registered."""
     # Arrange
     from gitlab_security_mcp.server import mcp
 

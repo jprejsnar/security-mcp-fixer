@@ -31,6 +31,25 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
+def documentation_client(pages: dict[str, str] | None = None):
+    """Serve publisher markers locally so tests can authorize an edit offline."""
+    import httpx
+
+    from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
+
+    known = {url: marker for _name, url, marker in REQUIRED_DOCS}
+    known.update(pages or {})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return the prepared page, or the URL when the test did not override it."""
+        url = str(request.url)
+        if url not in known:
+            return httpx.Response(200, text=url)
+        return httpx.Response(200, text=known[url])
+
+    return OfficialDocs(http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+
 def approve_package_for_test(root: Path, plan: dict) -> dict:
     """Write synthetic approval and review evidence only in fixture roots."""
     import json

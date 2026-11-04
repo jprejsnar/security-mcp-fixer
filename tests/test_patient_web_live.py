@@ -50,7 +50,10 @@ def patient_web_findings(request):
 
 def test_retrieve_patient_web_security_findings(patient_web_findings):
     """Check live ids, report filters, and normalized finding metadata."""
+    # Arrange
+    # Act
     finding_ids = [finding["id"] for finding in patient_web_findings]
+    # Assert
     assert len(set(finding_ids)) == len(finding_ids)
     for finding in patient_web_findings:
         assert finding["status"] in {"detected", "confirmed"}
@@ -65,6 +68,7 @@ def test_patient_web_findings_have_verified_safe_solutions(
     patient_web_findings, monkeypatch
 ):
     """Verify live advisory plans without applying local or GitLab changes."""
+    # Arrange
     configured_root = os.environ.get("PATIENT_WEB_REPO_ROOT")
     if not configured_root:
         pytest.fail(
@@ -91,6 +95,7 @@ def test_patient_web_findings_have_verified_safe_solutions(
         monkeypatch.setattr(engine.runner, "run", refuse_commands)
         engine.state.status = "FINDINGS_LISTED"
         engine.state.findings = patient_web_findings
+        # Act
         try:
             for finding in patient_web_findings:
                 result = engine.verify_security_finding(finding["id"])
@@ -116,6 +121,7 @@ def test_patient_web_findings_have_verified_safe_solutions(
         finally:
             engine.close()
 
+    # Assert
     assert not unresolved, "Findings without a verified safe solution:\n" + "\n".join(
         unresolved
     )

@@ -779,9 +779,10 @@ project cannot infer that project's directory. For example, study-service uses
 
 Alternatively, have the agent call
 `run_prechecks(repo_root="C:\\Users\\James.Prejsnar\\source\\repos\\study-service")`.
-This overrides `REPO_ROOT` for the process's run, including an unresolved
-placeholder. Repository selection is locked after prechecks pass; restart the
-server to switch an active run to another checkout.
+This overrides `REPO_ROOT` for that checkout, including an unresolved
+placeholder. Each checkout keeps its own run, so pass the same `repo_root`
+on later tool calls when more than one repository is active. Omit it only
+when a single checkout is active.
 
 Engine configuration is deferred until a tool is called, so invalid paths or
 settings do not prevent MCP initialization or tool discovery. Tool errors

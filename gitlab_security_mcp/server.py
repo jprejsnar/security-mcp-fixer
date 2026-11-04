@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,9 @@ INSTRUCTIONS = """
 Local-only GitLab security remediation. Call the tools in this order:
 1. run_prechecks(repo_root=<absolute application checkout path>). Always pass
     the active application's path when the host starts this server elsewhere.
-    Unresolved ${workspaceFolder} values are not repository paths.
+    Unresolved ${workspaceFolder} values are not repository paths. Each checkout
+    keeps its own run. Pass that same repo_root to later tools when more than
+    one checkout is active.
 2. pull_main_twice
 3. create_security_branch
 4. list_security_findings
@@ -50,7 +53,12 @@ Local-only GitLab security remediation. Call the tools in this order:
     PACKAGE_UPDATE_POLICY, when set, or an existing default policy remains
     mandatory and must be independently provisioned. Never fabricate or edit
     corporate approvals. All checks defined by that policy remain required.
-8. apply_minimal_fix only when eligible. Every major, minor, revision or build
+8. apply_minimal_fix only when eligible. Before every edit, the server reads
+    the current Docker, nginx, GitLab, Java, Node.js, Angular, Crystal,
+    Microsoft, .NET 10, TypeScript, CVE, CWE, NSA, and NIST pages. A failed
+    read blocks the write. Dockerfile, nginx, and GitLab CI findings change
+    only a cited line whose directive those current pages still document.
+    Every major, minor, revision or build
     package update requires compatible_without_code_changes=true and
     source_fixes=[]. Neither production nor unit-test callers may require API
     adaptations. Never add, edit or weaken production code, tests, frameworks,
@@ -81,53 +89,79 @@ mcp = MCPServer(
     instructions=INSTRUCTIONS,
     version=__version__,
 )
-engine: Engine | None = None
-_engine_lock = threading.RLock()
+# One engine per checkout. The registry lock covers only map updates.
+# Tool work uses the engine's own lock, so two repositories can proceed together.
+_engines: dict[Path, Engine] = {}
+_registry_lock = threading.Lock()
 
 
 def _close_engine() -> None:
-    """Release the engine if configuration succeeded and tools initialized it."""
-    with _engine_lock:
-        if engine is not None:
-            engine.close()
+    """Close every checkout engine. A second call does nothing."""
+    with _registry_lock:
+        engines = list(_engines.values())
+        _engines.clear()
+    failures: list[Exception] = []
+    for item in engines:
+        try:
+            item.close()
+        except Exception as exc:
+            logger.exception("Could not close the engine for %s", item.repo_root)
+            failures.append(exc)
+    if failures:
+        raise failures[0]
 
 
 atexit.register(_close_engine)
+
+
+def _engine_for(repo_root: str | None) -> Engine:
+    """Return the engine for one checkout, creating it on first use.
+
+    The registry lock is not held while the tool runs. Each engine serializes
+    its own checkout, and different checkouts do not share that lock.
+    """
+    with _registry_lock:
+        if repo_root is None:
+            if len(_engines) > 1:
+                raise ValueError(
+                    "More than one repository is active. Pass repo_root to select the checkout."
+                )
+            if len(_engines) == 1:
+                return next(iter(_engines.values()))
+            created = Engine.from_env(None)
+        else:
+            requested = Path(repo_root).expanduser().resolve()
+            existing = _engines.get(requested)
+            if existing is not None:
+                return existing
+            created = Engine.from_env(repo_root)
+            existing = _engines.get(created.repo_root)
+            if existing is not None:
+                created.close()
+                return existing
+        _engines[created.repo_root] = created
+        return created
 
 
 def _run(
     tool_name: str, *args, repo_root: str | None = None, **kwargs
 ) -> dict[str, Any]:
     """Log tool exceptions and return errors without crashing MCP stdio."""
-    global engine
-    with _engine_lock:
-        try:
-            if engine is not None and repo_root is not None:
-                requested = Path(repo_root).expanduser().resolve()
-                if requested != engine.repo_root:
-                    if engine.state.status not in {"NOT_STARTED", "PRECHECK_FAILED"}:
-                        raise ValueError(
-                            "Cannot change repositories during an active run. "
-                            "Restart the MCP server to select another checkout."
-                        )
-                    replacement = Engine.from_env(repo_root)
-                    engine.close()
-                    engine = replacement
-            if engine is None:
-                engine = Engine.from_env(repo_root)
-            return getattr(engine, tool_name)(*args, **kwargs)
-        except Exception as exc:
-            logger.exception("%s failed", tool_name)
-            return {
-                "status": "ERROR",
-                "stage": "configuration" if engine is None else tool_name,
-                "error": str(exc),
-                "repo_root": str(engine.repo_root) if engine is not None else None,
-                "server_cwd": os.getcwd(),
-                "action": "Call run_prechecks(repo_root=<absolute application checkout path>). "
-                "For persistent configuration, set REPO_ROOT to that absolute path "
-                "and restart the MCP server. Check server stderr for diagnostic details.",
-            }
+    selected: Engine | None = None
+    try:
+        selected = _engine_for(repo_root)
+        return getattr(selected, tool_name)(*args, **kwargs)
+    except Exception as exc:
+        logger.exception("%s failed", tool_name)
+        return {
+            "status": "ERROR",
+            "stage": "configuration" if selected is None else tool_name,
+            "error": str(exc),
+            "repo_root": str(selected.repo_root) if selected is not None else None,
+            "server_cwd": os.getcwd(),
+            "action": "Call the tool with repo_root=<absolute application checkout path>. "
+            "Each checkout keeps its own run. Check server stderr for diagnostic details.",
+        }
 
 
 @mcp.tool(
@@ -139,7 +173,7 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
     """Select the absolute application checkout; require clean main and no merge.
 
     Pass the active workspace path explicitly when REPO_ROOT is unset or contains
-    an unresolved host placeholder. Selection is locked after prechecks pass.
+    an unresolved host placeholder. Another checkout can run at the same time.
     """
     return _run("run_prechecks", repo_root=repo_root)
 
@@ -152,9 +186,9 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
         open_world_hint=True,
     )
 )
-def pull_main_twice() -> dict[str, Any]:
-    """Phase 1. Fast-forward main twice. Any failure stops the run."""
-    return _run("pull_main_twice")
+def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
+    """Phase 1. Fast-forward main twice. Any failure stops that checkout's run."""
+    return _run("pull_main_twice", repo_root=repo_root)
 
 
 @mcp.tool(
@@ -165,9 +199,9 @@ def pull_main_twice() -> dict[str, Any]:
         open_world_hint=False,
     )
 )
-def create_security_branch() -> dict[str, Any]:
+def create_security_branch(repo_root: str | None = None) -> dict[str, Any]:
     """Phase 2. Create security-fixes-Month-dd-YYYY. Stop if that name already exists."""
-    return _run("create_security_branch")
+    return _run("create_security_branch", repo_root=repo_root)
 
 
 @mcp.tool(
@@ -175,9 +209,11 @@ def create_security_branch() -> dict[str, Any]:
         title="List security findings", read_only_hint=True, open_world_hint=True
     )
 )
-def list_security_findings(project_id: str | None = None) -> dict[str, Any]:
+def list_security_findings(
+    project_id: str | None = None, repo_root: str | None = None
+) -> dict[str, Any]:
     """Phase 3. Read the still-detected GitLab vulnerability report on main."""
-    return _run("list_security_findings", project_id)
+    return _run("list_security_findings", project_id, repo_root=repo_root)
 
 
 @mcp.tool(
@@ -185,9 +221,11 @@ def list_security_findings(project_id: str | None = None) -> dict[str, Any]:
         title="Verify security finding", read_only_hint=True, open_world_hint=True
     )
 )
-def verify_security_finding(finding_id: str) -> dict[str, Any]:
+def verify_security_finding(
+    finding_id: str, repo_root: str | None = None
+) -> dict[str, Any]:
     """Phase 4. Verify one finding with local evidence and online advisories before any edit."""
-    return _run("verify_security_finding", finding_id)
+    return _run("verify_security_finding", finding_id, repo_root=repo_root)
 
 
 @mcp.tool(
@@ -198,7 +236,9 @@ def verify_security_finding(finding_id: str) -> dict[str, Any]:
         open_world_hint=True,
     )
 )
-def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str, Any]:
+def qualify_package_update(
+    finding_id: str, review: dict[str, Any], repo_root: str | None = None
+) -> dict[str, Any]:
     """Qualify a package target with reviewed APIs, license terms, and checks.
 
     review must identify ecosystem, package, and target exactly. Include
@@ -222,7 +262,7 @@ def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str,
     and relevant installed dependency callers. All source_fixes must be [].
     This is reviewed evidence, not a mathematical compatibility guarantee.
     """
-    return _run("qualify_package_update", finding_id, review)
+    return _run("qualify_package_update", finding_id, review, repo_root=repo_root)
 
 
 @mcp.tool(
@@ -233,9 +273,9 @@ def qualify_package_update(finding_id: str, review: dict[str, Any]) -> dict[str,
         open_world_hint=True,
     )
 )
-def apply_minimal_fix(finding_id: str) -> dict[str, Any]:
+def apply_minimal_fix(finding_id: str, repo_root: str | None = None) -> dict[str, Any]:
     """Apply only a fresh qualified package plan; resolution requires post-checks."""
-    return _run("apply_minimal_fix", finding_id)
+    return _run("apply_minimal_fix", finding_id, repo_root=repo_root)
 
 
 @mcp.tool(
@@ -246,9 +286,9 @@ def apply_minimal_fix(finding_id: str) -> dict[str, Any]:
         open_world_hint=False,
     )
 )
-def generate_aaa_test(finding_id: str) -> dict[str, Any]:
+def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str, Any]:
     """Phase 5. Add an Arrange-Act-Assert test when the fix changes runtime behavior."""
-    return _run("generate_aaa_test", finding_id)
+    return _run("generate_aaa_test", finding_id, repo_root=repo_root)
 
 
 @mcp.tool(
@@ -259,9 +299,9 @@ def generate_aaa_test(finding_id: str) -> dict[str, Any]:
         open_world_hint=True,
     )
 )
-def run_validation_matrix() -> dict[str, Any]:
+def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
     """Phase 6. Run Node, .NET, Java 17, NGINX, and container checks that apply to this repo."""
-    return _run("run_validation_matrix")
+    return _run("run_validation_matrix", repo_root=repo_root)
 
 
 @mcp.tool(
@@ -272,13 +312,13 @@ def run_validation_matrix() -> dict[str, Any]:
         open_world_hint=False,
     )
 )
-def generate_local_report() -> dict[str, Any]:
+def generate_local_report(repo_root: str | None = None) -> dict[str, Any]:
     """Phase 7. Write the human and JSON report, including false positives and skipped findings.
 
     Display unresolved_issues_table at the end of the final response. It lists
     issues not safely addressed by package or code updates and the reasons.
     """
-    return _run("generate_local_report")
+    return _run("generate_local_report", repo_root=repo_root)
 
 
 @mcp.tool(
@@ -286,15 +326,27 @@ def generate_local_report() -> dict[str, Any]:
         title="Get run status", read_only_hint=True, open_world_hint=False
     )
 )
-def get_run_status() -> dict[str, Any]:
-    """Return the current phase, branch, and counts for this run."""
-    return _run("get_run_status")
+def get_run_status(repo_root: str | None = None) -> dict[str, Any]:
+    """Return the current phase, branch, and counts for one checkout."""
+    return _run("get_run_status", repo_root=repo_root)
+
+
+def _configure_logging() -> None:
+    """Send this server's logs to stderr so they cannot corrupt MCP stdout."""
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def main() -> None:
     """Serve MCP tools over stdio until the client disconnects."""
+    _configure_logging()
     try:
-        mcp.run()
+        mcp.run(transport="stdio")
     finally:
         try:
             _close_engine()

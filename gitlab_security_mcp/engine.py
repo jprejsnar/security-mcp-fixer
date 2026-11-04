@@ -19,6 +19,7 @@ from gitlab_security_mcp.advisory import (
     AdvisoryLookup,
 )
 from gitlab_security_mcp.commands import CommandRunner
+from gitlab_security_mcp.config_findings import assess_config, config_kind
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
 from gitlab_security_mcp.gitlab_client import GitLabClient
 from gitlab_security_mcp.manifests import (
@@ -26,6 +27,7 @@ from gitlab_security_mcp.manifests import (
     locate_package,
     manifests_were_parsed,
 )
+from gitlab_security_mcp.official_docs import OfficialDocs
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
     backup_dependency_files,
@@ -95,6 +97,7 @@ class Engine:
         *,
         gitlab: GitLabClient | None = None,
         advisory: AdvisoryClient | None = None,
+        docs: OfficialDocs | None = None,
         runner: CommandRunner | None = None,
         which: Callable[[str], str | None] | None = None,
         today: date | None = None,
@@ -123,6 +126,7 @@ class Engine:
         self.git = GitOps(self.repo_root, self.runner)
         self._owns_gitlab = gitlab is None
         self._owns_advisory = advisory is None
+        self._owns_docs = docs is None
         self.gitlab = (
             gitlab if gitlab is not None else GitLabClient(gitlab_token, gitlab_api_url)
         )
@@ -132,6 +136,9 @@ class Engine:
                 if advisory is not None
                 else AdvisoryClient(github_token=github_token, nvd_api_key=nvd_api_key)
             )
+            # The documentation client opens only when an edit needs it, so
+            # a run that never writes does not keep an unused connection.
+            self.docs = docs
         except BaseException:
             if self._owns_gitlab:
                 try:
@@ -139,6 +146,13 @@ class Engine:
                 except Exception:
                     logger.exception(
                         "Could not close GitLab client after initialization failure"
+                    )
+            if self._owns_advisory and hasattr(self, "advisory"):
+                try:
+                    self.advisory.close()
+                except Exception:
+                    logger.exception(
+                        "Could not close advisory client after initialization failure"
                     )
             raise
         self.which = which if which is not None else shutil.which
@@ -150,11 +164,17 @@ class Engine:
         self._files_truncated = False
         self._closed = False
 
+    def _documentation(self) -> OfficialDocs:
+        """Return the injected documentation client or open one on first use."""
+        if self.docs is None:
+            self.docs = OfficialDocs()
+        return self.docs
+
     def close(self) -> None:
         """Wait for active tools and close each owned HTTP client once.
 
-        Injected clients stay open. Cleanup failures propagate after both
-        owned clients are attempted; later tool calls return an error.
+        Injected clients stay open. Cleanup failures propagate after every
+        owned client is attempted; later tool calls return an error.
         """
         with self._lock:
             if self._closed:
@@ -164,8 +184,12 @@ class Engine:
                 if self._owns_gitlab:
                     self.gitlab.close()
             finally:
-                if self._owns_advisory:
-                    self.advisory.close()
+                try:
+                    if self._owns_advisory:
+                        self.advisory.close()
+                finally:
+                    if self._owns_docs and self.docs is not None:
+                        self.docs.close()
 
     @classmethod
     def from_env(cls, repo_root: str | None = None) -> Engine:
@@ -710,6 +734,18 @@ class Engine:
                     "finding_id": finding_id,
                     "reason": str(exc),
                 }
+        review = self._documentation().read_before_fix(
+            finding, proposed.get("doc_pages") or []
+        )
+        if not review.complete or (
+            proposed.get("strategy") == "config_line" and not proposed.get("doc_pages")
+        ):
+            return {
+                "status": "DOCS_REQUIRED",
+                "finding_id": finding_id,
+                "reason": review.reason(),
+                "documentation": review.as_list(),
+            }
         plan = Plan(
             strategy=proposed["strategy"],
             score=proposed["score"],
@@ -721,6 +757,10 @@ class Engine:
             manager=proposed.get("manager"),
             description=proposed.get("description") or "",
             oracle=proposed.get("oracle"),
+            line=proposed.get("line"),
+            expected_line=proposed.get("expected_line"),
+            replacement_line=proposed.get("replacement_line"),
+            doc_pages=tuple(proposed.get("doc_pages") or ()),
         )
         outcome = apply_plan(self.repo_root, plan, self.runner, self.which)
         if package_update:
@@ -737,6 +777,7 @@ class Engine:
             "commands": outcome.get("commands") or [],
             "oracle": plan.oracle,
             "detail": outcome.get("detail"),
+            "documentation": review.as_list(),
             "package_update": package_update,
             "ecosystem": plan.ecosystem,
             "package": plan.package,
@@ -1114,6 +1155,13 @@ class Engine:
                 None,
                 self._prompt(finding, None, reason),
             )
+        kind = config_kind(location_file if isinstance(location_file, str) else None)
+        if kind and category != "container_scanning":
+            return self._decide_config(finding, evidence)
+        if kind == "dockerfile":
+            evidence.append(
+                "Dockerfile container findings keep the image-tag plan. Writing it still requires a fresh read of the official documentation."
+            )
 
         files, files_truncated = self._snapshot()
         hit, truncated = locate_package(
@@ -1289,6 +1337,48 @@ class Engine:
             proposed["major_upgrade"] = True
             proposed["caller_scan"] = scan_package_callers(self.repo_root, proposed)
         return "CHANGE_REQUIRED", plan.description, evidence, proposed, None
+
+    def _decide_config(
+        self, finding: dict, evidence: list[str]
+    ) -> tuple[str, str, list[str], dict | None, str | None]:
+        """Decide a Dockerfile, nginx, or GitLab CI finding from its cited line.
+
+        A matching directive is only proposed after the current publisher
+        pages still document it. Other cited lines stay on manual review.
+        """
+        assessment = assess_config(self.repo_root, finding)
+        evidence.append(assessment.reason)
+        if assessment.decision == "missing":
+            return "FALSE_POSITIVE", assessment.reason, evidence, None, None
+        if assessment.decision != "plan" or assessment.plan is None:
+            return (
+                "MANUAL_REVIEW",
+                assessment.reason,
+                evidence,
+                None,
+                self._prompt(finding, None, assessment.reason),
+            )
+        proposed = assessment.plan.as_dict()
+        review = self._documentation().read_before_fix(finding, proposed["doc_pages"])
+        evidence.append(review.reason())
+        evidence.extend(
+            f"Read {item['name']} {item['url']}"
+            + (f" sha256={item['sha256']}" if item.get("sha256") else "")
+            for item in review.as_list()
+        )
+        if not review.complete:
+            reason = review.reason()
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                evidence,
+                None,
+                self._prompt(finding, None, reason),
+            )
+        evidence.append(
+            f"Minimal fix score {assessment.plan.score}: {assessment.plan.description}"
+        )
+        return "CHANGE_REQUIRED", assessment.plan.description, evidence, proposed, None
 
     def _prompt(
         self, finding: dict, looked_up: AdvisoryLookup | None, reason: str

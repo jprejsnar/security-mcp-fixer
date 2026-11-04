@@ -57,6 +57,10 @@ class Plan:
     manager: str | None
     description: str
     oracle: str | None = None
+    line: int | None = None
+    expected_line: str | None = None
+    replacement_line: str | None = None
+    doc_pages: tuple[dict, ...] = ()
 
     def as_dict(self) -> dict:
         """Return the plan as plain JSON-safe data."""
@@ -71,6 +75,17 @@ class Plan:
             "manager": self.manager,
             "description": self.description,
             "oracle": self.oracle,
+            "line": self.line,
+            "expected_line": self.expected_line,
+            "replacement_line": self.replacement_line,
+            "doc_pages": [
+                {
+                    "name": page["name"],
+                    "url": page["url"],
+                    "markers": list(page["markers"]),
+                }
+                for page in self.doc_pages
+            ],
             "qualifiers": {
                 "status": "REQUIRED",
                 "package": self.package,
@@ -305,7 +320,7 @@ def apply_plan(
     """
     edited: list[str] = []
     commands: list[str] = []
-    if not safe_version(plan.target):
+    if plan.strategy != "config_line" and not safe_version(plan.target):
         return _failed(
             "FIX_FAILED", plan, f"Refusing unsafe target version {plan.target!r}."
         )
@@ -314,6 +329,10 @@ def apply_plan(
             "FIX_FAILED", plan, "The plan does not name a build file to edit."
         )
     try:
+        if plan.strategy == "config_line":
+            from gitlab_security_mcp.config_findings import apply_config_line
+
+            return _applied(plan, apply_config_line(root, plan), commands)
         if plan.strategy == "image_tag":
             token = (
                 f"{plan.package}:{plan.installed}" if plan.installed else plan.package

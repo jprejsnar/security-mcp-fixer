@@ -68,8 +68,38 @@ def test_python_lint_standards(mode):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "source_path",
+    sorted((ROOT / "tests").glob("test_*.py")),
+    ids=lambda path: path.name,
+)
+def test_unit_tests_follow_arrange_act_assert(source_path):
+    """Require a docstring and commented Arrange, Act, and Assert sections."""
+    # Arrange
+    source = source_path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    tree = ast.parse(source, filename=str(source_path))
+    missing = []
+
+    # Act
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        if not ast.get_docstring(node):
+            missing.append(f"{node.name}: docstring")
+        body = lines[node.lineno - 1 : node.end_lineno]
+        found = {line.strip() for line in body}
+        for label in ("# Arrange", "# Act", "# Assert"):
+            if label not in found:
+                missing.append(f"{node.name}: {label}")
+
+    # Assert
+    assert not missing, "\n".join(missing)
+
+
 @pytest.mark.parametrize("source_path", SOURCE_FILES, ids=lambda path: path.name)
 def test_source_retains_python_311_syntax(source_path):
+    """Parse production modules with the Python 3.11 grammar."""
     # Arrange
     source = source_path.read_text(encoding="utf-8")
 

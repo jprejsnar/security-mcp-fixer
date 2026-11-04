@@ -23,6 +23,7 @@ from gitlab_security_mcp.validate import _lint_result, _product_result
 
 @pytest.mark.parametrize("truncated,code", [(False, 0), (False, 1), (True, 0)])
 def test_lint_records_warnings_information_and_unknowns(truncated, code):
+    """Lint records warnings information and unknowns."""
     # Arrange
     result = CommandResult(
         ["npm", "run", "lint"],
@@ -50,6 +51,7 @@ def test_lint_records_warnings_information_and_unknowns(truncated, code):
 
 
 def test_lint_json_errors_fail_even_with_exit_zero():
+    """Lint json errors fail even with exit zero."""
     # Arrange
     result = CommandResult(
         ["npm", "run", "lint"],
@@ -88,6 +90,7 @@ def test_lint_json_errors_fail_even_with_exit_zero():
 def test_lint_summaries_do_not_confuse_zero_errors_or_source_filenames(
     output, expected
 ):
+    """Lint summaries do not confuse zero errors or source filenames."""
     # Arrange
     result = CommandResult(
         ["npm", "run", "lint"], 0, output, "", 0, False, "out", "err"
@@ -113,6 +116,7 @@ def test_lint_summaries_do_not_confuse_zero_errors_or_source_filenames(
 def test_unit_test_checks_require_executed_tests_without_rejecting_empty_modules(
     output, expected
 ):
+    """Unit test checks require executed tests without rejecting empty modules."""
     # Arrange
     result = CommandResult(["npm", "test"], 0, output, "", 0, False, "out", "err")
 
@@ -178,6 +182,7 @@ def package_policy(tmp_path):
 def test_nested_node_qualification_checks_use_component_directory(
     tmp_path, package_policy
 ):
+    """Nested node qualification checks use component directory."""
     # Arrange
     from unittest.mock import Mock
 
@@ -243,10 +248,13 @@ def package_engine(tmp_path, package_policy):
         fixed_versions=["1.0.1"],
         lowest_fixed_version="1.0.1",
     )
+    from tests.conftest import documentation_client
+
     engine = Engine(
         tmp_path,
         advisory=advisory,
         gitlab=Mock(),
+        docs=documentation_client(),
         runner=runner,
         which=lambda name: name,
     )
@@ -289,23 +297,28 @@ def package_review():
 def test_every_package_increment_rejects_code_adaptations(
     tmp_path, package_review, target, source_path
 ):
+    """Every package increment rejects code adaptations."""
     # Arrange
     package_review["target"] = target
     package_review["source_fixes"] = [
         {"path": source_path, "reason": "Adapt changed API"}
     ]
 
-    # Act / Assert
+    # Act
     with pytest.raises(
         ValueError, match="cannot require production or unit-test code changes"
-    ):
+    ) as raised:
         review_package(tmp_path, package_review)
+
+    # Assert
+    assert "cannot require production or unit-test code changes" in str(raised.value)
 
 
 @pytest.mark.parametrize("missing_script", [None, "lint", "build", "test"])
 def test_missing_default_policy_uses_documented_license_review(
     package_engine, package_review, missing_script
 ):
+    """Missing default policy uses documented license review."""
     # Arrange
     from gitlab_security_mcp.report import render
 
@@ -359,6 +372,8 @@ def test_missing_default_policy_uses_documented_license_review(
 def test_lint_diagnostics_are_retained_before_and_after_update(
     package_engine, package_review
 ):
+    """Lint diagnostics are retained before and after update."""
+
     # Arrange
     def run(argv, **kwargs):
         """Return nonblocking lint messages and passing product-check evidence."""
@@ -392,6 +407,8 @@ def test_lint_diagnostics_are_retained_before_and_after_update(
 def test_lint_baseline_is_retained_when_build_cannot_start(
     package_engine, package_review
 ):
+    """Lint baseline is retained when build cannot start."""
+
     # Arrange
     def run(argv, **kwargs):
         """Emit lint evidence then fail starting the build command."""
@@ -426,6 +443,7 @@ def test_lint_baseline_is_retained_when_build_cannot_start(
 def test_failed_baseline_records_check_and_does_not_apply(
     package_engine, package_review, stage
 ):
+    """Failed baseline records check and does not apply."""
     # Arrange
     before = (package_engine.repo_root / "package.json").read_bytes()
 
@@ -463,6 +481,7 @@ def test_failed_baseline_records_check_and_does_not_apply(
 def test_api_changes_or_uncertain_no_code_compatibility_blocks_qualification(
     package_engine, package_review, confirmation
 ):
+    """Api changes or uncertain no code compatibility blocks qualification."""
     # Arrange
     package_review["compatible_without_code_changes"] = confirmation
 
@@ -481,6 +500,7 @@ def test_api_changes_or_uncertain_no_code_compatibility_blocks_qualification(
 def test_failed_post_checks_reject_and_restore_only_dependency_edits(
     package_engine, package_review, stage
 ):
+    """Failed post checks reject and restore only dependency edits."""
     # Arrange
     manifest = package_engine.repo_root / "package.json"
     before = manifest.read_bytes()
@@ -538,6 +558,7 @@ def test_failed_post_checks_reject_and_restore_only_dependency_edits(
 def test_missing_explicit_policy_does_not_fall_back(
     tmp_path, monkeypatch, package_review
 ):
+    """Missing explicit policy does not fall back."""
     # Arrange
     from unittest.mock import Mock
 
@@ -546,15 +567,17 @@ def test_missing_explicit_policy_does_not_fall_back(
     engine = Engine(tmp_path, gitlab=Mock(), advisory=Mock())
     plan = {"ecosystem": "npm", "package": "example", "target": "1.0.1"}
 
-    # Act / Assert
+    # Act
     with pytest.raises(FileNotFoundError):
         engine._package_policy(plan, package_review)
+    # Assert
     assert not missing.exists()
 
 
 def test_missing_default_policy_does_not_fabricate_license_review(
     package_engine, package_review
 ):
+    """Missing default policy does not fabricate license review."""
     # Arrange
     package_engine.package_policy_path.unlink()
 
@@ -569,6 +592,7 @@ def test_missing_default_policy_does_not_fabricate_license_review(
 
 
 def test_existing_invalid_policy_does_not_fall_back(package_engine, package_review):
+    """Existing invalid policy does not fall back."""
     # Arrange
     package_engine.package_policy_path.write_text("{}", encoding="utf-8")
 
@@ -584,6 +608,7 @@ def test_existing_invalid_policy_does_not_fall_back(package_engine, package_revi
 def test_major_review_requires_hashed_callers_and_no_code_changes(
     tmp_path, package_review
 ):
+    """Major review requires hashed callers and no code changes."""
     # Arrange
     import hashlib
 
@@ -632,6 +657,7 @@ def test_major_review_requires_hashed_callers_and_no_code_changes(
 
 
 def test_caller_scan_does_not_confuse_glob_with_global(tmp_path):
+    """Caller scan does not confuse glob with global."""
     # Arrange
     (tmp_path / "app.ts").write_text(
         'globalThis.name;\nconst globalValue = true;\nimport {glob} from "glob";\n',
@@ -688,6 +714,7 @@ def major_package_update(tmp_path, package_engine, package_policy, package_revie
 def test_major_update_requires_passing_checks_without_code_adjustments(
     major_package_update, failure
 ):
+    """Major update requires passing checks without code adjustments."""
     # Arrange
     engine, review, source = major_package_update
     original = source.read_bytes()
@@ -740,6 +767,7 @@ def test_major_update_requires_passing_checks_without_code_adjustments(
 def test_major_update_refuses_missing_or_breaking_review(
     major_package_update, field, value
 ):
+    """Major update refuses missing or breaking review."""
     # Arrange
     engine, review, _source = major_package_update
     review["major_upgrade"][field] = value
@@ -762,14 +790,18 @@ def test_major_update_refuses_missing_or_breaking_review(
 def test_transitive_major_update_requires_dependency_source_review(
     major_package_update,
 ):
+    """Transitive major update requires dependency source review."""
     # Arrange
     engine, review, _source = major_package_update
     plan = engine.state.findings[0]["proposedFix"]
     plan["strategy"] = "override"
 
-    # Act / Assert
-    with pytest.raises(ValueError, match="installed dependency caller"):
+    # Act
+    with pytest.raises(ValueError, match="installed dependency caller") as raised:
         review_major_upgrade(engine.repo_root, plan, review)
+
+    # Assert
+    assert "installed dependency caller" in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -786,6 +818,7 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
     target,
     corporate_policy,
 ):
+    """Nested transitive pnpm major update preserves callers."""
     # Arrange
     import hashlib
     from unittest.mock import Mock
@@ -839,11 +872,14 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
         lowest_fixed_version=target,
         fixed_versions=[target],
     )
+    from tests.conftest import documentation_client
+
     engine = Engine(
         tmp_path,
         runner=runner,
         advisory=advisory,
         gitlab=Mock(),
+        docs=documentation_client(),
         which=lambda name: name,
     )
     engine.state.status = "FINDINGS_LISTED"
@@ -929,9 +965,12 @@ def test_unapproved_license_or_version_is_refused(tmp_path, package_policy, key,
     policy["approvals"][0][key] = value
     path.write_text(json.dumps(policy), encoding="utf-8")
 
-    # Act / Assert
-    with pytest.raises(ValueError):
+    # Act
+    with pytest.raises(ValueError) as raised:
         load_policy(tmp_path, path, plan)
+
+    # Assert
+    assert isinstance(raised.value, ValueError)
 
 
 @pytest.mark.parametrize(
@@ -950,9 +989,12 @@ def test_unknown_or_breaking_compatibility_is_refused(
     # Arrange
     package_review[field] = value
 
-    # Act / Assert
-    with pytest.raises(ValueError):
+    # Act
+    with pytest.raises(ValueError) as raised:
         review_package(tmp_path, package_review)
+
+    # Assert
+    assert isinstance(raised.value, ValueError)
 
 
 @pytest.mark.parametrize(
@@ -997,11 +1039,12 @@ def test_qualification_does_not_swallow_process_interrupts(
     runner = Mock()
     runner.run.side_effect = interrupt
 
-    # Act / Assert
+    # Act
     with pytest.raises(type(interrupt)):
         run_checks(
             tmp_path, package_policy[1]["checks"]["npm"], runner, lambda name: name, 30
         )
+    # Assert
     assert runner.run.call_count == 1
 
 
@@ -1019,12 +1062,17 @@ def test_bounded_reads_close_streams_and_limit_allocation(
     stream = BytesIO(b"abcde" if oversized else b"abcd")
     monkeypatch.setattr(Path, "open", lambda *args, **kwargs: stream)
 
-    # Act / Assert
+    # Act
     if oversized:
         with pytest.raises(ValueError, match="size limit"):
             _read_bounded(tmp_path / "source.ts", 4)
+        bounded = None
     else:
-        assert _read_bounded(tmp_path / "source.ts", 4) == b"abcd"
+        bounded = _read_bounded(tmp_path / "source.ts", 4)
+
+    # Assert
+    if not oversized:
+        assert bounded == b"abcd"
     assert stream.closed
 
 
@@ -1040,14 +1088,17 @@ def test_diff_work_is_bounded_without_rejecting_localized_edits(monkeypatch, mod
     if mode == "expensive":
         original, current = "before();\n" * 3, "after();\n" * 3
 
-    # Act / Assert
+    # Act
     if mode == "expensive":
         with pytest.raises(ValueError, match="work limit"):
             qualification._changed_lines(original, current)
+        changed = None
     else:
-        assert qualification._changed_lines(original, current) == (
-            0 if mode == "unchanged" else 1
-        )
+        changed = qualification._changed_lines(original, current)
+
+    # Assert
+    if mode != "expensive":
+        assert changed == (0 if mode == "unchanged" else 1)
 
 
 def test_status_refresh_hashes_checkout_once_for_multiple_packages(
@@ -1296,8 +1347,9 @@ def test_native_dotnet_smoke_filter_variants(tmp_path, flag, value):
 
     argv = ["dotnet", "test", "--configuration", "Release", "--nologo", flag, value]
 
-    # Act / Assert
+    # Act
     assert_allowed(argv, tmp_path)
+    # Assert
     assert argv[1:] in _check_variants("nuget", "runtime")
     with pytest.raises(PermissionError):
         assert_allowed([*argv[:-1], "AnyArbitraryTest"], tmp_path)
@@ -1313,9 +1365,10 @@ def test_documentation_and_check_definitions_are_required(
     del policy["checks"]["npm"]["runtime"]
     path.write_text(json.dumps(policy), encoding="utf-8")
 
-    # Act / Assert
+    # Act
     with pytest.raises(ValueError):
         review_package(tmp_path, package_review)
+    # Assert
     with pytest.raises(ValueError):
         load_policy(tmp_path, path, plan)
 
@@ -1374,9 +1427,14 @@ def test_source_changes_are_rejected_even_when_listed_as_allowed(
     if mode == "delete":
         source.unlink()
 
-    # Act / Assert
-    with pytest.raises(ValueError, match="production or unit-test code changed"):
+    # Act
+    with pytest.raises(
+        ValueError, match="production or unit-test code changed"
+    ) as raised:
         validate_edits(tmp_path, receipt, ["app.ts", "other.ts"])
+
+    # Assert
+    assert "production or unit-test code changed" in str(raised.value)
 
 
 @pytest.mark.parametrize(

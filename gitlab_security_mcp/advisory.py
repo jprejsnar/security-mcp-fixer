@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from dataclasses import dataclass, field
+from functools import partial
 
 import httpx
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
+from gitlab_security_mcp.fanout import map_ordered
 from gitlab_security_mcp.util import redact
 from gitlab_security_mcp.versions import (
     collect_fixed_versions,
@@ -28,6 +31,7 @@ OSV_QUERY = "https://api.osv.dev/v1/query"
 GITHUB_ADVISORIES = "https://api.github.com/advisories"
 NVD_CVE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MAX_CACHE_ENTRIES = 256
+_MAX_ADVISORY_BYTES = 2_000_000
 
 ECOSYSTEMS = {
     "npm": "npm",
@@ -89,6 +93,7 @@ class AdvisoryClient:
         self._cache: dict[str, dict | list | None] = {}
         self._closed = False
         self._lock = threading.RLock()
+        self._cache_lock = threading.Lock()
 
     def close(self) -> None:
         """Release cached payloads and owned HTTP resources exactly once."""
@@ -99,7 +104,8 @@ class AdvisoryClient:
                 if self._owns_http:
                     self.http.close()
             finally:
-                self._cache.clear()
+                with self._cache_lock:
+                    self._cache.clear()
                 self._closed = True
 
     def __enter__(self) -> AdvisoryClient:
@@ -119,8 +125,10 @@ class AdvisoryClient:
     ) -> AdvisoryLookup:
         """Match online advisory evidence to a package and installed version.
 
-        Prefer OSV, then GitHub Advisory Database, then NVD. Return an
-        AdvisoryLookup with affected status, candidate fixes, and sources.
+        Prefer OSV, then GitHub Advisory Database, then NVD. Identifiers within
+        one source are requested together; the next source is used only when
+        the earlier source has no record. Return an AdvisoryLookup with
+        affected status, candidate fixes, and sources.
         Failed requests, malformed responses, and calls after close return
         lookup_failed instead of authorizing an edit. Serialize cache and
         client access with shutdown; never treat lookup failure as safety.
@@ -158,11 +166,9 @@ class AdvisoryClient:
         sources: list[str] = []
         osv_records: list[dict] = []
 
-        for ident in identifiers:
-            try:
-                payload = self._get_json(OSV_VULN.format(ident=ident))
-            except httpx.HTTPError as exc:
-                errors.append(self._clean(f"osv:{ident}: {exc}"))
+        for _ident, payload, error in map_ordered(self._osv_record, identifiers):
+            if error:
+                errors.append(error)
                 continue
             if payload and isinstance(payload, dict) and payload.get("id"):
                 osv_records.append(payload)
@@ -186,21 +192,21 @@ class AdvisoryClient:
             except httpx.HTTPError as exc:
                 errors.append(self._clean(f"osv-query:{package}: {exc}"))
                 queried = None
-            for summary in (queried or {}).get("vulns") or []:
-                if not _overlaps(summary, identifiers, finding):
+            known = {item.get("id") for item in osv_records}
+            follow_ups = [
+                summary.get("id")
+                for summary in (queried or {}).get("vulns") or []
+                if summary.get("id") not in known
+                and _overlaps(summary, identifiers, finding)
+            ]
+            for _ident, full, error in map_ordered(self._osv_record, follow_ups):
+                if error:
+                    errors.append(error)
                     continue
-                try:
-                    full = self._get_json(OSV_VULN.format(ident=summary.get("id")))
-                except httpx.HTTPError as exc:
-                    errors.append(self._clean(f"osv:{summary.get('id')}: {exc}"))
-                    continue
-                if (
-                    full
-                    and full.get("id")
-                    and full.get("id") not in {item.get("id") for item in osv_records}
-                ):
+                if full and full.get("id") and full.get("id") not in known:
                     osv_records.append(full)
                     sources.append(f"osv:{full.get('id')}")
+                    known.add(full.get("id"))
 
         if osv_records:
             return _from_osv(osv_records, package, version, sources, errors)
@@ -236,31 +242,54 @@ class AdvisoryClient:
     def _github(
         self, identifiers: list[str], errors: list[str], sources: list[str]
     ) -> dict | None:
-        """Look up CVE or GHSA ids while preserving request error evidence."""
+        """Look up CVE or GHSA ids while preserving request error evidence.
+
+        Every eligible id is requested together. The earliest id in the
+        finding still wins when more than one record exists.
+        """
+        eligible = []
         for ident in identifiers:
-            params = {"ghsa_id": ident} if ident.upper().startswith("GHSA-") else None
-            if ident.upper().startswith("CVE-"):
-                params = {"cve_id": ident}
-            if params is None:
-                continue
-            try:
-                payload = self._get_json(
-                    GITHUB_ADVISORIES, params=params, headers=self._github_headers()
-                )
-            except httpx.HTTPError as exc:
-                errors.append(self._clean(f"github:{ident}: {exc}"))
+            if ident.upper().startswith("GHSA-"):
+                eligible.append((ident, {"ghsa_id": ident}))
+            elif ident.upper().startswith("CVE-"):
+                eligible.append((ident, {"cve_id": ident}))
+        headers = self._github_headers()
+        for ident, payload, error in map_ordered(
+            partial(self._github_one, headers=headers), eligible
+        ):
+            if error:
+                errors.append(error)
                 continue
             if isinstance(payload, list) and payload:
                 sources.append(f"github:{ident}")
                 return payload[0]
         return None
 
+    def _osv_record(self, ident: str) -> tuple[str, dict | None, str | None]:
+        """Fetch one OSV record without aborting the other identifier reads."""
+        try:
+            payload = self._get_json(OSV_VULN.format(ident=ident))
+        except Exception as exc:
+            return ident, None, self._clean(f"osv:{ident}: {exc}")
+        return ident, payload if isinstance(payload, dict) else None, None
+
+    def _github_one(
+        self, item: tuple[str, dict], headers: dict[str, str]
+    ) -> tuple[str, dict | list | None, str | None]:
+        """Fetch one GitHub advisory id without aborting the other reads."""
+        ident, params = item
+        try:
+            payload = self._get_json(GITHUB_ADVISORIES, params=params, headers=headers)
+        except Exception as exc:
+            return ident, None, self._clean(f"github:{ident}: {exc}")
+        return ident, payload, None
+
     def _nvd(self, cve: str, errors: list[str], sources: list[str]) -> dict | None:
         """Fetch the first matching NVD CVE record or record a lookup error."""
         headers = {"apiKey": self.nvd_api_key} if self.nvd_api_key else {}
         try:
             payload = self._get_json(NVD_CVE, params={"cveId": cve}, headers=headers)
-        except httpx.HTTPError as exc:
+        except Exception as exc:
             errors.append(self._clean(f"nvd:{cve}: {exc}"))
             return None
         vulnerabilities = (payload or {}).get("vulnerabilities") or []
@@ -294,41 +323,57 @@ class AdvisoryClient:
                 f"{name}={value}" for name, value in sorted((params or {}).items())
             )
         )
-        if key in self._cache:
-            return self._cache[key]
-        response = self.http.get(url, params=params, headers=headers)
-        try:
+        with self._cache_lock:
+            if key in self._cache:
+                return self._cache[key]
+        with self.http.stream("GET", url, params=params, headers=headers) as response:
             if response.status_code == 404:
                 payload = None
             else:
                 response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, (dict, list)):
-                    raise ValueError("Advisory response must be a JSON object or array")
-        finally:
-            response.close()
-        self._cache[key] = payload
-        if len(self._cache) > MAX_CACHE_ENTRIES:
-            self._cache.pop(next(iter(self._cache)))
+                payload = _decode_advisory(response)
+        with self._cache_lock:
+            if key in self._cache:
+                return self._cache[key]
+            self._cache[key] = payload
+            if len(self._cache) > MAX_CACHE_ENTRIES:
+                self._cache.pop(next(iter(self._cache)))
         return payload
 
     def _post_json(self, url: str, body: dict) -> dict | None:
         """Submit an advisory query and close its response after parsing."""
-        response = self.http.post(url, json=body)
-        try:
+        with self.http.stream("POST", url, json=body) as response:
             if response.status_code == 404:
                 return None
             response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("Advisory query response must be a JSON object")
-        finally:
-            response.close()
+            payload = _decode_advisory(response)
+        if not isinstance(payload, dict):
+            raise ValueError("Advisory query response must be a JSON object")
         return payload
 
     def _clean(self, text: str) -> str:
         """Redact advisory credentials before returning request details."""
         return redact(text, [self.github_token, self.nvd_api_key])
+
+
+def _bounded_bytes(response: httpx.Response, limit: int) -> bytes:
+    """Read a response without retaining more than ``limit`` bytes."""
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in response.iter_bytes():
+        size += len(chunk)
+        if size > limit:
+            raise ValueError("Advisory response exceeds the size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_advisory(response: httpx.Response) -> dict | list:
+    """Parse one advisory JSON body after enforcing the size limit."""
+    payload = json.loads(_bounded_bytes(response, _MAX_ADVISORY_BYTES))
+    if not isinstance(payload, (dict, list)):
+        raise ValueError("Advisory response must be a JSON object or array")
+    return payload
 
 
 def _advisory_id(value: str) -> bool:

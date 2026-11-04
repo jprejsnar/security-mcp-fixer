@@ -16,6 +16,7 @@ from gitlab_security_mcp.manifests import (
 
 
 def test_state_fdopen_failure_closes_descriptor(tmp_path, monkeypatch):
+    """State fdopen failure closes descriptor."""
     # Arrange
     from gitlab_security_mcp import state, util
 
@@ -39,6 +40,7 @@ def test_state_fdopen_failure_closes_descriptor(tmp_path, monkeypatch):
 
 
 def test_manifest_replace_failure_preserves_original(tmp_path, monkeypatch):
+    """Manifest replace failure preserves original."""
     # Arrange
     import os
 
@@ -66,6 +68,7 @@ def test_manifest_replace_failure_preserves_original(tmp_path, monkeypatch):
     ["null", "[]", '{"scripts":[]}', '{"scripts":{"test":null}}', "bad-json"],
 )
 def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
+    """Invalid validation metadata fails closed."""
     # Arrange
     from unittest.mock import Mock
 
@@ -88,6 +91,7 @@ def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
 
 @pytest.mark.parametrize("contents", ["null", "[]", '{"scripts":[]}', "bad-json"])
 def test_invalid_test_metadata_returns_not_generated(tmp_path, contents):
+    """Invalid test metadata returns not generated."""
     # Arrange
     from gitlab_security_mcp.aaa import generate_aaa_test
 
@@ -108,6 +112,7 @@ def test_invalid_test_metadata_returns_not_generated(tmp_path, contents):
 def test_generated_test_publication_failure_leaves_no_partial_file(
     tmp_path, monkeypatch
 ):
+    """Generated test publication failure leaves no partial file."""
     # Arrange
     import os
 
@@ -139,13 +144,18 @@ def test_generated_test_publication_failure_leaves_no_partial_file(
 @pytest.mark.parametrize("failure", [None, RuntimeError("Server stopped")])
 @pytest.mark.parametrize("initialized", [False, True])
 def test_server_exit_closes_engine(monkeypatch, failure, initialized):
+    """Server exit closes engine."""
     # Arrange
     from unittest.mock import Mock
 
     from gitlab_security_mcp import server
 
     engine = Mock() if initialized else None
-    monkeypatch.setattr(server, "engine", engine)
+    if engine is not None:
+        engine.repo_root = "checkout"
+        monkeypatch.setattr(server, "_engines", {engine.repo_root: engine})
+    else:
+        monkeypatch.setattr(server, "_engines", {})
     monkeypatch.setattr(server.mcp, "run", Mock(side_effect=failure))
 
     # Act
@@ -169,6 +179,7 @@ def test_server_exit_closes_engine(monkeypatch, failure, initialized):
     ],
 )
 def test_malformed_manifest_application_returns_failure(tmp_path, contents, strategy):
+    """Malformed manifest application returns failure."""
     # Arrange
     from unittest.mock import Mock
 
@@ -197,6 +208,7 @@ def test_malformed_manifest_application_returns_failure(tmp_path, contents, stra
 
 @pytest.mark.parametrize("writer", ["state", "report"])
 def test_failed_metadata_replace_preserves_previous_file(tmp_path, monkeypatch, writer):
+    """Failed metadata replace preserves previous file."""
     # Arrange
     import os
 
@@ -236,6 +248,7 @@ def test_failed_metadata_replace_preserves_previous_file(tmp_path, monkeypatch, 
 
 
 def test_npm_spec_edit_keeps_crlf_line_endings(tmp_path):
+    """Npm spec edit keeps crlf line endings."""
     # Arrange
     original = '{\r\n  "dependencies": {\r\n    "lodash": "4.17.20"\r\n  }\r\n}\r\n'
     (tmp_path / "package.json").write_bytes(original.encode("utf-8"))
@@ -251,6 +264,7 @@ def test_npm_spec_edit_keeps_crlf_line_endings(tmp_path):
 
 
 def test_override_keeps_indent_and_non_ascii(tmp_path):
+    """Override keeps indent and non ascii."""
     # Arrange
     (tmp_path / "package.json").write_text(
         '{\n    "author": "Zoë",\n    "dependencies": {}\n}\n',
@@ -267,6 +281,7 @@ def test_override_keeps_indent_and_non_ascii(tmp_path):
 
 
 def test_nested_nuget_version_does_not_borrow_the_next_package(tmp_path):
+    """Nested nuget version does not borrow the next package."""
     # Arrange
     project = tmp_path / "App.csproj"
     project.write_text(
@@ -291,6 +306,7 @@ def test_nested_nuget_version_does_not_borrow_the_next_package(tmp_path):
 
 
 def test_lockfile_parsers_handle_current_formats():
+    """Lockfile parsers handle current formats."""
     # Arrange
     pnpm9 = "packages:\n\n  lodash@4.17.20:\n    resolution: {}\n  '@scope/lodash@9.9.9':\n    resolution: {}\n"
     yarn1 = '"lodash@^4.17.0", "lodash@^4.17.15":\n  version "4.17.20"\n'
@@ -308,6 +324,7 @@ def test_lockfile_parsers_handle_current_formats():
 
 
 def test_dockerfile_tag_moves_every_stage_and_skips_digests(tmp_path):
+    """Dockerfile tag moves every stage and skips digests."""
     # Arrange
     (tmp_path / "Dockerfile").write_bytes(
         b"FROM nginx:1.25.1 AS build\r\nRUN true\r\nFROM nginx:1.25.1\r\nFROM nginx:1.25.1@sha256:abc\r\n"

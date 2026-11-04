@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import re
 import threading
 from dataclasses import dataclass, field
@@ -297,7 +298,7 @@ class GitLabClient:
 
     def _request(self, method: str, url: str, json_body: dict | None = None) -> dict:
         """Authenticate, close responses, and reject HTTP or GraphQL errors."""
-        response = self.http.request(
+        with self.http.stream(
             method,
             url,
             headers={
@@ -305,16 +306,14 @@ class GitLabClient:
                 "Accept": "application/json",
             },
             json=json_body,
-        )
-        try:
+        ) as response:
             if response.status_code >= 400:
                 detail = self._clean(
-                    f"GitLab {method} {url} returned {response.status_code}: {response.text[:500]}"
+                    f"GitLab {method} {url} returned {response.status_code}: "
+                    f"{_response_excerpt(response)}"
                 )
                 raise RuntimeError(detail)
             payload = response.json()
-        finally:
-            response.close()
         if not isinstance(payload, dict):
             raise RuntimeError(f"GitLab {method} {url} did not return a JSON object")
         if payload.get("errors"):
@@ -332,6 +331,30 @@ class GitLabClient:
     def _clean(self, text: str) -> str:
         """Remove the GitLab token from returned or logged request details."""
         return redact(text, [self.token])
+
+
+def _response_excerpt(response: httpx.Response, limit: int = 500) -> str:
+    """Decode only the first part of an error body.
+
+    The remainder stays on the wire and is discarded when the response
+    closes, so a large error page cannot be retained in the failure result.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    kept: list[str] = []
+    count = 0
+    for chunk in response.iter_bytes(chunk_size=256):
+        text = decoder.decode(chunk)
+        room = limit - count
+        if room <= 0:
+            break
+        piece = text[:room]
+        kept.append(piece)
+        count += len(piece)
+        if count >= limit:
+            break
+    if count < limit:
+        kept.append(decoder.decode(b"", final=True)[: limit - count])
+    return "".join(kept)
 
 
 def _connection(project: dict, name: str) -> dict:

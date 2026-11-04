@@ -23,14 +23,21 @@ from gitlab_security_mcp.git_ops import branch_name_for, meaningful_status
     ],
 )
 def test_read_only_package_lint_commands_are_allowlisted(tmp_path, argv):
-    # Arrange / Act / Assert
+    """Read-only package lint commands are allowlisted."""
+    # Arrange
+    # The command under test is the argv parameter.
+
+    # Act
     assert_allowed(argv, tmp_path)
+
+    # Assert
     with pytest.raises(PermissionError):
         assert_allowed([*argv, "--fix"], tmp_path)
 
 
 @pytest.mark.parametrize("failed_start", [1, 2])
 def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_start):
+    """Reader start failure cleans up process."""
     # Arrange
     from gitlab_security_mcp import commands
 
@@ -92,6 +99,7 @@ def test_fixture_git_processes_have_timeouts(tmp_path, monkeypatch):
 
 
 def test_pipe_reader_stops_when_descendant_keeps_pipe_open():
+    """Pipe reader stops when descendant keeps pipe open."""
     # Arrange
     import os
     import threading
@@ -136,6 +144,7 @@ def test_pipe_reader_stops_when_descendant_keeps_pipe_open():
     [["yarn", "up", "-R", "lodash"], ["yarn", "install", "--mode=update-lockfile"]],
 )
 def test_modern_yarn_remediation_disables_scripts_and_allows_lock_changes(argv):
+    """Modern yarn remediation disables scripts and allows lock changes."""
     # Arrange
     from gitlab_security_mcp.commands import _child_env
 
@@ -148,6 +157,7 @@ def test_modern_yarn_remediation_disables_scripts_and_allows_lock_changes(argv):
 
 
 def test_server_notes_do_not_count_as_a_dirty_tree():
+    """Server notes do not count as a dirty tree."""
     # Arrange
     metadata = "?? .security-mcp/audit.jsonl"
     source = "?? package.json"
@@ -162,6 +172,7 @@ def test_server_notes_do_not_count_as_a_dirty_tree():
 
 
 def test_branch_name_uses_english_month():
+    """Branch name uses english month."""
     # Arrange
     day = date(2026, 11, 1)
 
@@ -173,6 +184,7 @@ def test_branch_name_uses_english_month():
 
 
 def test_git_mutations_are_rejected(repo):
+    """Git mutations are rejected."""
     # Arrange
     (repo / "note.txt").write_text("local\n", encoding="utf-8")
     runner = CommandRunner(repo)
@@ -198,6 +210,7 @@ def test_git_mutations_are_rejected(repo):
 
 
 def test_security_branch_checkout_is_allowed(repo):
+    """Security branch checkout is allowed."""
     # Arrange
     checkout = ["git", "checkout", "-b", "security-fixes-November-01-2026"]
     refresh = [
@@ -219,24 +232,33 @@ def test_security_branch_checkout_is_allowed(repo):
 
 
 def test_shell_metacharacters_are_rejected(repo):
+    """Shell metacharacters are rejected."""
     # Arrange
     argv = ["npm", "ci;calc"]
 
-    # Act / Assert
-    with pytest.raises(PermissionError):
+    # Act
+    with pytest.raises(PermissionError) as raised:
         assert_allowed(argv, repo)
+
+    # Assert
+    assert isinstance(raised.value, PermissionError)
 
 
 def test_relative_executable_paths_are_rejected(repo):
+    """Relative executable paths are rejected."""
     # Arrange
     argv = ["node_modules/.bin/npm", "ci"]
 
-    # Act / Assert
-    with pytest.raises(PermissionError, match="Relative executable"):
+    # Act
+    with pytest.raises(PermissionError, match="Relative executable") as raised:
         assert_allowed(argv, repo)
+
+    # Assert
+    assert "Relative executable" in str(raised.value)
 
 
 def test_children_get_an_empty_stdin_and_no_git_prompt(repo, monkeypatch):
+    """Children get an empty stdin and no git prompt."""
     # Arrange
     import subprocess
 
@@ -263,6 +285,7 @@ def test_children_get_an_empty_stdin_and_no_git_prompt(repo, monkeypatch):
 
 
 def test_timeout_kills_the_command_and_reports_124(repo):
+    """Timeout kills the command and reports 124."""
     # Arrange
     runner = CommandRunner(repo)
 
@@ -279,6 +302,7 @@ def test_timeout_kills_the_command_and_reports_124(repo):
 
 
 def test_audit_log_stores_hashes_and_truncates(repo):
+    """Audit log stores hashes and truncates."""
     # Arrange
     from tests.conftest import commit_all
 

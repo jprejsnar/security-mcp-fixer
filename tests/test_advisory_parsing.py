@@ -33,6 +33,7 @@ def test_solution_version_is_verified_outside_all_affected_ranges(
     events, expected_fixed
 ):
     """Reject solution hints that are still inside another affected range."""
+    # Arrange
     record = {
         "id": "GHSA-35jh-r3h4-6jhm",
         "aliases": ["CVE-2021-23337"],
@@ -49,6 +50,7 @@ def test_solution_version_is_verified_outside_all_affected_ranges(
         assert request.url.host == "api.osv.dev"
         return httpx.Response(200, json=record)
 
+    # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         client = AdvisoryClient(http=http)
         finding = {
@@ -58,6 +60,7 @@ def test_solution_version_is_verified_outside_all_affected_ranges(
         }
         vulnerable = client.lookup(finding, "npm", "lodash", "4.17.20")
 
+        # Assert
         assert vulnerable.affected is True
         assert vulnerable.lowest_fixed_version == expected_fixed
         if expected_fixed:
@@ -126,6 +129,8 @@ def _client(handler) -> tuple[httpx.Client, AdvisoryClient]:
 
 
 def test_github_first_patched_version_is_used():
+    """Github first patched version is used."""
+
     # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
         """Return GitHub evidence after OSV misses the requested finding."""
@@ -161,6 +166,7 @@ def test_github_first_patched_version_is_used():
 
 
 def test_osv_record_for_another_package_needs_a_person():
+    """Osv record for another package needs a person."""
     # Arrange
     record = {
         "id": "GHSA-other",
@@ -196,6 +202,7 @@ def test_osv_record_for_another_package_needs_a_person():
 
 
 def test_nvd_ignores_fixes_for_other_products():
+    """Nvd ignores fixes for other products."""
     # Arrange
     nvd = {
         "vulnerabilities": [
@@ -247,6 +254,7 @@ def test_nvd_ignores_fixes_for_other_products():
 
 
 def test_first_unaffected_skips_a_fix_inside_another_range():
+    """First unaffected skips a fix inside another range."""
     # Arrange
     entry = {
         "ranges": [
@@ -274,6 +282,7 @@ def test_first_unaffected_skips_a_fix_inside_another_range():
 
 
 def test_major_upgrade_detection():
+    """Major upgrade detection."""
     # Arrange
     cases = [
         ("4.17.20", "4.17.21"),

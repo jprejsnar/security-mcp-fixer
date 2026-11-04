@@ -39,6 +39,7 @@ OSV = {
     "package, installed", [("minimatch", "11.0.0"), ("glob", "14.0.1")]
 )
 def test_nested_pnpm_dependency_retains_component_paths(tmp_path, package, installed):
+    """Nested pnpm dependency retains component paths."""
     # Arrange
     frontend = tmp_path / "frontend"
     frontend.mkdir()
@@ -69,6 +70,7 @@ def test_nested_pnpm_dependency_retains_component_paths(tmp_path, package, insta
 def test_nested_pnpm_plan_applies_only_in_frontend(
     tmp_path, package, installed, target
 ):
+    """Nested pnpm plan applies only in frontend."""
     # Arrange
     from unittest.mock import Mock
 
@@ -140,6 +142,7 @@ def test_package_plans_require_version_specific_qualifiers(ecosystem):
 def test_nested_node_lockfile_uses_its_own_manager(
     tmp_path, manager, lockfile, contents
 ):
+    """Nested node lockfile uses its own manager."""
     # Arrange
     (tmp_path / "package.json").write_text(
         '{"packageManager":"npm@10.0.0"}', encoding="utf-8"
@@ -164,6 +167,7 @@ def test_nested_node_lockfile_uses_its_own_manager(
 
 
 def test_workspace_dependency_keeps_child_manifest_and_shared_lockfile(tmp_path):
+    """Workspace dependency keeps child manifest and shared lockfile."""
     # Arrange
     (tmp_path / "package.json").write_text(
         '{"workspaces":["frontend"]}', encoding="utf-8"
@@ -189,6 +193,7 @@ def test_workspace_dependency_keeps_child_manifest_and_shared_lockfile(tmp_path)
 
 
 def test_nested_pnpm_workspace_override_preserves_existing_configuration(tmp_path):
+    """Nested pnpm workspace override preserves existing configuration."""
     # Arrange
     from unittest.mock import Mock
 
@@ -244,12 +249,16 @@ def test_unreadable_walk_cannot_prove_package_absence(tmp_path, monkeypatch):
 
     monkeypatch.setattr(manifests.os, "walk", walk)
 
-    # Act / Assert
-    with pytest.raises(PermissionError, match="Unreadable product directory"):
+    # Act
+    with pytest.raises(PermissionError, match="Unreadable product directory") as raised:
         iter_files(tmp_path)
+
+    # Assert
+    assert "Unreadable product directory" in str(raised.value)
 
 
 def test_normalize_dependency_finding():
+    """Normalize dependency finding."""
     # Arrange
     node = {
         "uuid": "abc",
@@ -319,6 +328,8 @@ def _gitlab_transport(handler):
 
 @pytest.mark.parametrize("client_type", [GitLabClient, AdvisoryClient])
 def test_falsey_injected_http_client_is_preserved(client_type):
+    """Falsey injected http client is preserved."""
+
     # Arrange
     class FalseyHTTPClient(httpx.Client):
         """Retain normal HTTP behavior while testing falsey injection."""
@@ -342,6 +353,7 @@ def test_falsey_injected_http_client_is_preserved(client_type):
 
 
 def test_gitlab_graphql_is_read_only(tmp_path):
+    """Gitlab graphql is read only."""
     # Arrange
     calls = []
 
@@ -412,6 +424,7 @@ def test_gitlab_graphql_is_read_only(tmp_path):
 
 def test_report_filters_match_patient_web_ui():
     """Match UI status, tracked main, and still-detected activity filters."""
+    # Arrange
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -463,15 +476,18 @@ def test_report_filters_match_patient_web_ui():
             },
         )
 
+    # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
 
+    # Assert
     assert fetched.ok is True
     assert len(calls) == 2
 
 
 def test_project_report_findings_do_not_require_a_successful_pipeline():
     """Retrieve persistent findings independently of successful pipelines."""
+    # Arrange
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -503,9 +519,11 @@ def test_project_report_findings_do_not_require_a_successful_pipeline():
             },
         )
 
+    # Act
     with httpx.Client(transport=_gitlab_transport(handler)) as http:
         fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
 
+    # Assert
     assert fetched.ok is True
     assert [finding["id"] for finding in fetched.findings] == ["report-finding"]
     assert fetched.pipeline is None
@@ -541,6 +559,7 @@ def _vulnerability_page(pipeline_id: str, has_next: bool) -> dict:
 
 
 def test_report_pagination_preserves_each_findings_pipeline():
+    """Report pagination preserves each findings pipeline."""
     # Arrange
     pages = iter(
         [
@@ -588,15 +607,18 @@ def test_report_pagination_preserves_each_findings_pipeline():
 def test_report_empty_unreadable_or_invalid_pagination(connection, expected_ok):
     """Separate a valid empty connection from unreadable report data."""
 
+    # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
         """Inject the parametrized report connection for shape validation."""
         return httpx.Response(
             200, json={"data": {"project": {"vulnerabilities": connection}}}
         )
 
+    # Act
     with httpx.Client(transport=_gitlab_transport(handler)) as http:
         fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
 
+    # Assert
     assert fetched.ok is expected_ok
     assert fetched.findings == []
 
@@ -604,17 +626,20 @@ def test_report_empty_unreadable_or_invalid_pagination(connection, expected_ok):
 def test_report_findings_limit_marks_results_truncated():
     """Expose truncation when the finding cap stops a multi-page report."""
 
+    # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
         """Serve a page indicating additional findings remain unfetched."""
         return httpx.Response(
             200, json=_vulnerability_page("gid://gitlab/Ci::Pipeline/1", True)
         )
 
+    # Act
     with httpx.Client(transport=_gitlab_transport(handler)) as http:
         fetched = GitLabClient("glpat-test", http=http, max_findings=1).fetch(
             "group/project"
         )
 
+    # Assert
     assert fetched.ok is True
     assert len(fetched.findings) == 1
     assert fetched.truncated is True
@@ -635,6 +660,7 @@ def test_report_findings_limit_marks_results_truncated():
 def test_main_tracked_ref_missing_or_unreadable_fails_closed(connection):
     """Refuse unfiltered retrieval when tracked main cannot be resolved."""
 
+    # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
         """Inject invalid main metadata before any finding query is allowed."""
         body = json.loads(request.content.decode())
@@ -643,15 +669,18 @@ def test_main_tracked_ref_missing_or_unreadable_fails_closed(connection):
             200, json={"data": {"project": {"securityTrackedRefs": connection}}}
         )
 
+    # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
 
+    # Assert
     assert fetched.ok is False
     assert fetched.findings == []
 
 
 def test_main_tracked_ref_lookup_paginates():
     """Resolve main on a later page before querying filtered findings."""
+    # Arrange
     cursors = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -699,14 +728,18 @@ def test_main_tracked_ref_lookup_paginates():
             },
         )
 
+    # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
 
+    # Assert
     assert fetched.ok is True
     assert cursors == [None, "next"]
 
 
 def test_osv_lookup_marks_version_affected():
+    """Osv lookup marks version affected."""
+
     # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
         """Serve matching OSV ranges for a known vulnerable fixture version."""
@@ -732,6 +765,7 @@ def test_osv_lookup_marks_version_affected():
 
 
 def test_maven_pom_gradle_and_nuget_edits(tmp_path):
+    """Maven pom gradle and nuget edits."""
     # Arrange
     pom = tmp_path / "pom.xml"
     pom.write_text(
@@ -801,6 +835,7 @@ def test_maven_pom_gradle_and_nuget_edits(tmp_path):
 
 
 def test_plan_picks_lockfile_when_range_already_allows(tmp_path):
+    """Plan picks lockfile when range already allows."""
     # Arrange
     (tmp_path / "package.json").write_text(
         json.dumps({"dependencies": {"lodash": "^4.17.0"}}),
@@ -825,6 +860,7 @@ def test_plan_picks_lockfile_when_range_already_allows(tmp_path):
 
 @pytest.mark.parametrize("directory", ["node_modules", ".pnpm-store", ".angular"])
 def test_dependency_directories_are_not_scanned(tmp_path, directory):
+    """Dependency directories are not scanned."""
     # Arrange
     (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
     nested = tmp_path / directory / "left-pad"
@@ -840,12 +876,16 @@ def test_dependency_directories_are_not_scanned(tmp_path, directory):
 
 
 def test_manifest_write_refuses_paths_outside_the_repo(tmp_path):
+    """Manifest write refuses paths outside the repo."""
     # Arrange
     outside = tmp_path.parent / "outside-package.json"
 
-    # Act / Assert
-    with pytest.raises(ValueError, match="outside the repository"):
+    # Act
+    with pytest.raises(ValueError, match="outside the repository") as raised:
         update_npm_spec(tmp_path, str(outside), "lodash", "1.2.3")
+
+    # Assert
+    assert "outside the repository" in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -861,6 +901,8 @@ def test_manifest_write_refuses_paths_outside_the_repo(tmp_path):
     ],
 )
 def test_malformed_gitlab_connection_fails_closed(connection):
+    """Malformed gitlab connection fails closed."""
+
     # Arrange
     def handler(request):
         """Inject malformed node or page shapes without making HTTP requests."""
@@ -880,10 +922,43 @@ def test_malformed_gitlab_connection_fails_closed(connection):
     assert result.error
 
 
+def test_gitlab_http_error_stops_reading_after_the_excerpt():
+    """Keep only the first part of a GitLab error body."""
+    # Arrange
+    read_chunks = 0
+
+    def chunks():
+        """Yield the error page one small piece at a time."""
+        nonlocal read_chunks
+        for _ in range(40):
+            read_chunks += 1
+            yield b"A" * 100
+        read_chunks += 1
+        yield b"UNIQUE-TAIL"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        """Fail every GitLab call with a long streamed error page."""
+        return httpx.Response(500, content=chunks())
+
+    client = GitLabClient(
+        "glpat-test", http=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    # Act
+    result = client.fetch("group/project")
+
+    # Assert
+    assert result.ok is False
+    assert "500" in (result.error or "")
+    assert "UNIQUE-TAIL" not in (result.error or "")
+    assert read_chunks < 40
+
+
 @pytest.mark.parametrize(
     "payload", [None, [], {"errors": [None]}, {"data": {"project": []}}]
 )
 def test_malformed_gitlab_payload_returns_error(payload):
+    """Malformed gitlab payload returns error."""
     # Arrange
     with httpx.Client(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
@@ -903,6 +978,7 @@ def test_malformed_gitlab_payload_returns_error(payload):
     [b"not-json", b"null", b"42", b"[null]", b'{"affected":[null],"id":"CVE-TEST"}'],
 )
 def test_malformed_advisory_returns_lookup_failure(content):
+    """Malformed advisory returns lookup failure."""
     # Arrange
     with httpx.Client(
         transport=httpx.MockTransport(
@@ -923,6 +999,7 @@ def test_malformed_advisory_returns_lookup_failure(content):
 
 @pytest.mark.parametrize("client_type", [GitLabClient, AdvisoryClient])
 def test_operation_after_close_returns_failure(client_type):
+    """Operation after close returns failure."""
     # Arrange
     with httpx.Client() as http:
         client = (
@@ -950,6 +1027,7 @@ def test_operation_after_close_returns_failure(client_type):
 
 @pytest.mark.parametrize("client_type", [GitLabClient, AdvisoryClient])
 def test_close_waits_for_active_client_operation(client_type, monkeypatch):
+    """Close waits for active client operation."""
     # Arrange
     import threading
 
@@ -1037,6 +1115,7 @@ def test_close_waits_for_active_client_operation(client_type, monkeypatch):
 
 
 def test_owned_http_clients_close():
+    """Owned http clients close."""
     # Arrange
     gitlab = GitLabClient("glpat-test")
     advisory = AdvisoryClient()

@@ -11,6 +11,7 @@ from gitlab_security_mcp.versions import (
 
 
 def test_lowest_fixed_is_the_next_patch():
+    """Lowest fixed is the next patch."""
     # Arrange
     installed = "1.2.3"
     published = ["1.2.4", "1.3.0", "2.0.0"]
@@ -23,6 +24,7 @@ def test_lowest_fixed_is_the_next_patch():
 
 
 def test_lowest_fixed_skips_versions_already_installed():
+    """Lowest fixed skips versions already installed."""
     # Arrange
     installed = "1.2.4"
     published = ["1.2.4", "1.3.0"]
@@ -35,6 +37,7 @@ def test_lowest_fixed_skips_versions_already_installed():
 
 
 def test_npm_caret_allows_the_fix_and_bump_preserves_it():
+    """Npm caret allows the fix and bump preserves it."""
     # Arrange
     declared = "^1.2.0"
     exact = "1.2.3"
@@ -53,6 +56,7 @@ def test_npm_caret_allows_the_fix_and_bump_preserves_it():
 
 
 def test_osv_range_and_solution_text():
+    """Osv range and solution text."""
     # Arrange
     events = [{"introduced": "0"}, {"fixed": "4.17.21"}]
     affected = {

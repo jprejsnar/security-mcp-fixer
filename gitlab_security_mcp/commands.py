@@ -439,10 +439,13 @@ class CommandRunner:
         captured: dict[str, tuple[str, bool]] = {}
         errors: list[BaseException] = []
         threads: list[threading.Thread] = []
+        output_lock = threading.Lock()
         stop_readers = threading.Event()
         timed_out = False
         try:
-            self._start_readers(process, captured, errors, threads, stop_readers)
+            self._start_readers(
+                process, captured, errors, threads, stop_readers, output_lock
+            )
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -483,17 +486,27 @@ class CommandRunner:
         errors: list[BaseException],
         started: list[threading.Thread],
         stop: threading.Event,
+        output_lock: threading.Lock,
     ) -> None:
-        """Start one daemon thread per pipe so a full buffer cannot stall the child."""
+        """Start one reader per pipe so a full buffer cannot stall the child.
+
+        Readers are daemons so a reader that ignores the stop event cannot
+        keep the process alive after its join times out. A finished join
+        still happens-before the caller reads the captured output.
+        """
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("Command pipes were not opened")
 
         def read_stream(name: str, pipe) -> None:
             """Capture a capped stream or record its reader exception."""
             try:
-                captured[name] = _read_capped(pipe, self.max_output, stop)
+                result = _read_capped(pipe, self.max_output, stop)
             except Exception as exc:
-                errors.append(exc)
+                with output_lock:
+                    errors.append(exc)
+                return
+            with output_lock:
+                captured[name] = result
 
         threads = [
             threading.Thread(
