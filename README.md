@@ -6,10 +6,14 @@ advisories, qualifies compatible package updates, applies supported minimal edit
 and produces local Markdown and JSON reports.
 
 The MCP host starts this Python process and calls its eleven tools over stdio.
-There is no HTTP listener. "Local" describes execution and where edits are kept,
-not offline operation: GitLab and advisory lookups, Git pulls, and product checks
-can use the network. The server does not commit, push, open merge requests, dismiss
-findings, or write to the GitLab security API. You review and publish changes.
+One process can hold several application checkouts at once. Each checkout keeps
+its own run, and later calls select it with `repo_root` when more than one is
+active. There is no HTTP listener. "Local" describes execution and where edits
+are kept, not offline operation: GitLab, advisory, and publisher-page reads,
+Git pulls, and product checks can use the network. Before every edit the server
+reads the current required publisher pages. It does not commit, push, open merge
+requests, dismiss findings, or write to the GitLab security API. You review and
+publish changes.
 
 ## Contents
 
@@ -36,8 +40,9 @@ separate deployed services or background queues.
 
 ### System context
 
-The MCP host orchestrates the tools and performs API/license documentation
-review. Corporate policies are optional; when configured or present, their
+The MCP host orchestrates the tools and performs the exact-version API and
+license review. The server separately reads the required publisher pages before
+every edit. Corporate policies are optional; when configured or present, their
 approvals and checks remain mandatory. Neither the server nor the host AI grants
 corporate approval. Repository scripts execute locally and must be trusted.
 
@@ -45,20 +50,22 @@ corporate approval. Repository scripts execute locally and must be trusted.
 flowchart TB
   reviewer["Human reviewer"] --> host["MCP host and AI agent"]
   host <-->|"MCP requests and results over stdio"| server["Local Python MCP process"]
-  host -->|"Read exact-version docs and compatibility guides"| publisher["Official publisher documentation"]
-  host -->|"Package dependency version edits only"| checkout["Target application checkout"]
+  host -->|"Read exact-version package docs and compatibility guides"| publisher["Official publisher documentation"]
+  host -->|"Review package, image, and cited-line edits"| checkout["One or more application checkouts"]
 
   subgraph remoteServices["Remote read services"]
     gitlab["GitLab GraphQL vulnerability report"]
-    osv["OSV"]
-    github["GitHub Advisory Database"]
-    nvd["NVD"]
+    osv["OSV identifiers, requested together"]
+    github["GitHub Advisory identifiers, requested together"]
+    nvd["NVD, one CVE after earlier sources miss"]
+    publisherPages["Docker, nginx, GitLab, Java, Node.js, Angular, Crystal, Microsoft, .NET 10, TypeScript, CVE, CWE, NSA, and NIST pages"]
   end
 
-  server -->|"Tracked main and active findings"| gitlab
-  server -->|"First advisory source"| osv
-  server -->|"Fallback when OSV has no record"| github
-  server -->|"CVE fallback when earlier sources have no record"| nvd
+  server -->|"Tracked main and active findings, pages in cursor order"| gitlab
+  server -->|"Try OSV, then GitHub, then NVD"| osv
+  server -->|"Same source order; earliest GitHub id still wins"| github
+  server -->|"Only when OSV and GitHub have no record"| nvd
+  server -->|"Before every edit: required pages together, at most 8 at once"| publisherPages
   server -->|"Inspect and apply supported local edits"| checkout
   server -->|"Allowlisted Git and product checks"| commands["Local subprocesses"]
   commands --> checkout
@@ -71,36 +78,59 @@ flowchart TB
   checkout -->|"Review diff and publish manually"| reviewer
 ```
 
-Advisory fallback is not a three-source consensus vote. A record can still
-produce manual review when package identity, affected versions, or a safe target
-cannot be established. Publisher review is supplied by the host as structured
-evidence; the server does not independently read every documentation page.
+Advisory fallback is not a three-source consensus vote. Identifiers inside one
+source are requested together, in the finding's identifier order, with at most
+eight requests in flight. The next source starts only after the earlier source
+has no usable record. A record can still produce manual review when package
+identity, affected versions, or a safe target cannot be established. One failed
+or oversized advisory body does not discard the other identifiers from that
+source. Responses larger than 2 MB are rejected while they are read.
+
+The host still supplies the exact-version package, API, and license review used
+by qualification. Separately, the server reads the required publisher pages
+before it writes any package, image, or configuration edit. A failed or
+incomplete read returns `DOCS_REQUIRED` and does not change the file. Page
+bodies are hashed in full and then discarded. The recorded SHA-256 covers every
+response byte. Phrase checks use the first 1 MB. Up to four CVE records, their
+NVD detail pages, and four CWE definitions are added when the finding names them.
 
 ### Internal components
 
-All components below live in the same Python process. `Engine` owns phase and
-decision state and serializes public tool calls with a reentrant lock. HTTP
-clients and the command runner have their own serialized operations.
+All components below live in the same Python process. A registry keeps one
+`Engine` per checkout. The registry lock covers only that map. Each engine
+serializes its own tool calls, so two checkouts can proceed together. Independent
+documentation and advisory reads share a short-lived pool of at most eight
+workers. GitLab report pages stay in cursor order. Each command runner still
+runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
   launcher["Root server.py: source launcher"] --> tools["Package server.py: eleven MCP tools and error boundary"]
-  tools --> engine["engine.py: phase gates and finding decisions"]
+  tools --> registry["Checkout registry: one engine per resolved path"]
+  registry --> engine["engine.py: phase gates and finding decisions"]
 
   subgraph evidenceLayer["Evidence collection"]
-    gitlabClient["gitlab_client.py: GraphQL filtering and pagination"]
-    advisoryClient["advisory.py: HTTP lookups and bounded cache"]
+    gitlabClient["gitlab_client.py: GraphQL filtering and cursor pagination"]
+    advisoryClient["advisory.py: ordered sources, parallel identifiers, 256-record cache"]
+    officialDocs["official_docs.py: required pages before every edit"]
+    fanout["fanout.py: ordered reads, at most 8 workers"]
     manifests["manifests.py: discovery, parsing and local package evidence"]
     versions["versions.py: affected ranges and version comparison"]
+    configFindings["config_findings.py: cited nginx and GitLab CI lines"]
   end
 
   engine --> gitlabClient
   engine --> advisoryClient
+  engine --> officialDocs
+  advisoryClient --> fanout
+  officialDocs --> fanout
   engine --> manifests
   advisoryClient --> versions
   engine --> versions
+  engine --> configFindings
   engine --> qualification["qualification.py: review, approvals, snapshots and check evidence"]
   engine --> remediation["remediate.py: scored plans and supported edits"]
+  remediation --> configFindings
   remediation --> manifests
   engine --> aaa["aaa.py: supported base-image regression tests"]
   engine --> validation["validate.py: detected-stack validation matrix"]
@@ -133,9 +163,9 @@ safe fix are recorded and may be followed by other eligible findings.
 
 ```mermaid
 flowchart TD
-  startRun["Host starts a new MCP run"] --> prechecks["run_prechecks: clean main and no Git operation in progress"]
+  startRun["Host starts or selects one checkout run"] --> prechecks["run_prechecks repo_root: clean main and no Git operation in progress"]
   prechecks --> precheckGate{"Prechecks passed?"}
-  precheckGate -->|"No"| stopRun["Stop workflow and report the failure to the user"]
+  precheckGate -->|"No"| stopRun["Stop that checkout and report the failure"]
   precheckGate -->|"Yes"| pulls["pull_main_twice: git pull --ff-only twice"]
   pulls --> pullGate{"Both pulls passed and tree remains clean?"}
   pullGate -->|"No"| stopRun
@@ -147,18 +177,21 @@ flowchart TD
   retrievalGate -->|"No"| stopRun
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
   moreFindings -->|"No"| finalChecks["run_validation_matrix: final applicable checks"]
-  moreFindings -->|"Yes"| verify["verify_security_finding: local evidence and advisory"]
+  moreFindings -->|"Yes"| verify["verify_security_finding: local evidence, advisory, and config rules"]
   verify --> decisionGate{"Decision?"}
   decisionGate -->|"FALSE_POSITIVE"| retained["Retain evidence and continue"]
   decisionGate -->|"MANUAL_REVIEW or NO_SAFE_FIX"| unresolved["Retain unresolved reason and continue"]
   retained --> moreFindings
   unresolved --> moreFindings
-  decisionGate -->|"CHANGE_REQUIRED"| packageGate{"Package update?"}
-  packageGate -->|"Yes"| qualify["Review docs and policy, then qualify_package_update with baseline checks"]
+  decisionGate -->|"CHANGE_REQUIRED"| editKind{"What kind of edit?"}
+  editKind -->|"Package update"| qualify["Review package docs and policy, then qualify_package_update"]
   qualify --> qualifiedGate{"Exact plan QUALIFIED and still fresh?"}
   qualifiedGate -->|"No"| unresolved
-  qualifiedGate -->|"Yes"| apply["apply_minimal_fix: local edit only"]
-  packageGate -->|"No: supported image edit"| apply
+  qualifiedGate -->|"Yes"| readDocs["Server reads required publisher pages together"]
+  editKind -->|"Image tag or cited nginx or GitLab CI line"| readDocs
+  readDocs --> docsGate{"Every required page read?"}
+  docsGate -->|"No: DOCS_REQUIRED"| unresolved
+  docsGate -->|"Yes"| apply["apply_minimal_fix: local edit only"]
   apply --> appliedGate{"APPLIED?"}
   appliedGate -->|"No"| blockedEdit["Keep outcome; inspect partial edits before continuing"]
   blockedEdit --> reports["generate_local_report: preserve unresolved and validation evidence"]
@@ -173,19 +206,23 @@ flowchart TD
 
 ### Tool reference
 
+Every tool accepts optional `repo_root`. Pass the same absolute checkout on
+every call when more than one repository is active. Omit it only while a single
+checkout is active.
+
 | Tool | Responsibility and gate |
 | --- | --- |
 | `run_prechecks(repo_root=None)` | Select the absolute application checkout; require clean `main`; reject merge, rebase, cherry-pick, revert or bisect in progress. |
-| `pull_main_twice()` | Require successful prechecks; perform two fast-forward-only pulls. |
-| `create_security_branch()` | Require successful pulls; create `security-fixes-Month-dd-YYYY`, for example `security-fixes-November-02-2026`. |
-| `list_security_findings(project_id=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
-| `verify_security_finding(finding_id)` | Record evidence, decision, proposed plan and any review prompt. |
-| `qualify_package_update(finding_id, review)` | Require exact-target API/license review and passing baseline checks; enforce corporate policy when configured/present. |
-| `apply_minimal_fix(finding_id)` | Apply the supported plan; require fresh qualification and validation of prior package edits. |
-| `generate_aaa_test(finding_id)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
-| `run_validation_matrix()` | Run applicable stack checks and post-update package qualifiers; retain failures and incomplete evidence. |
-| `generate_local_report()` | Write local Markdown/JSON reports and return the unresolved-issues table. |
-| `get_run_status()` | Return phase, counts and package-validation status; retract stale green package evidence. |
+| `pull_main_twice(repo_root=None)` | Require successful prechecks; perform two fast-forward-only pulls. |
+| `create_security_branch(repo_root=None)` | Require successful pulls; create `security-fixes-Month-dd-YYYY`, for example `security-fixes-November-03-2026`. |
+| `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
+| `verify_security_finding(finding_id, repo_root=None)` | Record evidence, decision, proposed plan, and any review prompt. Config proposals also record the publisher pages read for that rule. |
+| `qualify_package_update(finding_id, review, repo_root=None)` | Require exact-target API/license review and passing baseline checks; enforce corporate policy when configured/present. |
+| `apply_minimal_fix(finding_id, repo_root=None)` | Read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
+| `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
+| `run_validation_matrix(repo_root=None)` | Run applicable stack checks and post-update package qualifiers; retain failures and incomplete evidence. |
+| `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the unresolved-issues table. |
+| `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
 ### GitLab report filters
 
@@ -203,13 +240,17 @@ A finding is auto-fixed only when all of these are true:
 
 - Local evidence shows the vulnerable package or image is present.
 - An online advisory confirms it and publishes a fixed version newer than what is installed.
-- The edit is a lockfile refresh, a manifest version bump, a package override, or an unpinned `FROM` tag bump.
+- The edit is a lockfile refresh, a manifest version bump, a package override, an unpinned `FROM` tag bump, or one cited nginx or GitLab CI line that the current publisher page still documents.
 - Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing baseline/post-update checks. Major image-tag changes still require manual review.
 - Every package update requires no production/unit-test API adaptations, no lint errors, and passing before/after builds and executed unit tests, plus configured corporate checks. Same-major does not prove compatibility.
 
 An advisory that names the identifier but not the package found in the repo is listed for you to review. It is not reported as a false positive, because the cause may be a naming difference.
 
 Unknown reachability is not treated as a false positive. Secret detection and DAST findings are reported for you to handle. They are not rewritten. SAST findings are not patched by guessing at source changes.
+
+A cited nginx or GitLab CI line can change only when the current line still matches the plan and the live publisher page still contains the documented phrase. Supported line edits are `server_tokens on` to `off`, `autoindex on` to `off`, removal of `TLSv1` and `TLSv1.1` from `ssl_protocols` when `TLSv1.2` or `TLSv1.3` remains, and these GitLab CI variables when set to `true`, `1`, or `yes`: `SAST_DISABLED`, `DEPENDENCY_SCANNING_DISABLED`, `CONTAINER_SCANNING_DISABLED`, `SECRET_DETECTION_DISABLED`, and `DAST_DISABLED`. The replacement is `"false"`. `CODE_QUALITY_DISABLED` is left unchanged. Comments and unmatched lines stay on manual review. A missing configuration file can be a false positive. A path outside the checkout cannot.
+
+Container-scanning Dockerfile findings stay on the image-tag path. Other Dockerfile lines, including `USER root`, are not rewritten unless a later rule names one documented one-line edit. The current Docker reference does not authorize an automatic `ADD` to `COPY` change.
 
 ## Safety boundaries
 
@@ -237,12 +278,29 @@ or proof that GitLab considers a finding resolved.
 
 ### Robustness
 
-Engine tools and HTTP client operations are serialized within one process.
-Shutdown waits for active operations, closes owned clients once, and rejects
-later calls. Tool results are detached snapshots rather than live state.
-Malformed advisory responses fail lookup; malformed local evidence requires
-manual review instead of being treated as package absence. Validation read or
-execution failures produce `VALIDATION_FAILED`.
+Each checkout's tools are serialized with that engine's lock. Two checkouts in
+the same process do not share that lock. Shutdown copies the registry, then
+closes every owned client after its in-flight read finishes, and later calls
+are rejected. Tool results are detached snapshots rather than live state.
+
+Independent documentation pages and advisory identifiers are fetched together,
+at most eight at a time, and returned in request order. A single request stays
+on the caller thread. One page or identifier failure is recorded without
+dropping the other results from that batch. GitLab pagination stays sequential
+because each page needs the previous cursor. OSV, GitHub, and NVD stay in that
+order. The command runner still runs one child at a time. Its stdout and stderr
+readers publish through a lock so their records cannot interleave. Readers are
+daemon threads so a reader that ignores its stop signal cannot keep the process
+alive after the join timeout.
+
+Advisory responses larger than 2 MB are refused. The cache holds at most 256
+records and is cleared on shutdown. GitLab error text keeps the first 500
+characters and discards the rest of the body. Documentation hashes cover the
+full page. Phrase checks use only the retained 1 MB prefix.
+
+Malformed advisory responses fail that identifier's lookup. Malformed local
+evidence requires manual review instead of being treated as package absence.
+Validation read or execution failures produce `VALIDATION_FAILED`.
 
 State, manifests, and individual report files are replaced atomically. Generated
 tests are published without replacing existing files. Command readers stop
@@ -365,6 +423,10 @@ sequenceDiagram
     alt Qualification stale or previous edit unvalidated
       MCP-->>Host: QUALIFICATION_REQUIRED or VALIDATION_REQUIRED
     else Fresh exact plan
+      MCP->>Docs: Read the required publisher pages together
+      alt A required page cannot be read
+        MCP-->>Host: DOCS_REQUIRED and no file change
+      else Current pages were read
       MCP->>Repo: Apply supported package edit
       alt Edit could not be applied
         MCP-->>Host: Fix failure, inspect partial edits manually without automatic rollback
@@ -380,6 +442,7 @@ sequenceDiagram
           MCP->>Repo: Restore updater-owned dependency edits when unchanged
           MCP-->>Host: Update rejected with failed checks and rollback result
         end
+      end
       end
     end
   end
@@ -531,8 +594,9 @@ dependency edits. Inspect preserved files/manual-cleanup notices. Partial
 application failures still require local inspection.
 
 These gates enforce reviewed evidence and repository-owned checks, not a proof
-of every possible runtime behavior or an independent verification that an AI
-read every page. Their assurance depends on test coverage, truthful review,
+of every possible runtime behavior. The server does read the required publisher
+pages before an edit, and that read is separate from the host's exact-version
+package review. Their assurance depends on test coverage, truthful review,
 correct configured license auditing and authentic corporate approvals when used. Snapshot
 checks prune dependency/build/cache directories and stop at the file/size cap;
 they are not cross-process locks or verification of all generated binaries.
@@ -867,9 +931,9 @@ than relying only on a short natural-language success message.
 | Result | Fields to inspect |
 | --- | --- |
 | Finding retrieval | `count`, `truncated`, `findings`, and pipeline provenance. A truncated list is incomplete. |
-| Finding verification | `decision`, `reason`, `evidence`, `proposed_fix`, and `qualification_required`. |
+| Finding verification | `decision`, `reason`, `evidence`, `proposed_fix`, and `qualification_required`. Config evidence includes each publisher page name, URL, and SHA-256. |
 | Package qualification | `status`, approval evidence, `baseline_results`, or the blocking `reason`. |
-| Fix application | `status`, `change.files`, `change.detail`, and `change.qualification_status`. `APPLIED` is not validated. |
+| Fix application | `status`, `change.files`, `change.detail`, `change.documentation`, and `change.qualification_status`. `DOCS_REQUIRED` means nothing was written. `APPLIED` is not validated. |
 | Validation | Overall `status` and each row in `results`, including `required`, command, status and detail. |
 | Report generation | `human_report`, `json_report`, `unresolved_issues`, and `unresolved_issues_table`. |
 | Current status | `status`, `stop_stage`, counts, `report_path`, and `package_updates`. |
@@ -890,8 +954,8 @@ Get-ChildItem .\.security-mcp\reports\security-remediation-report-*
 To read a known report path returned by the tool:
 
 ```powershell
-Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-November-02-2026.md'
-Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-November-02-2026.json' -Raw | ConvertFrom-Json
+Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-November-03-2026.md'
+Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-November-03-2026.json' -Raw | ConvertFrom-Json
 ```
 
 On macOS/Linux, use `ls .security-mcp/reports/` and `cat` with the actual
@@ -935,11 +999,15 @@ command transcripts, and absence of an audit record does not prove a fix passed.
 Example agent request:
 
 ```text
-Use the gitlab-security MCP tools in order. Run prechecks, pull main twice,
-create the security branch, list findings, verify each finding, apply only
-eligible fixes after reviewing official package docs and calling
+Use the gitlab-security MCP tools in order for one checkout. Pass the same
+absolute repo_root on every call when more than one checkout is active. Run
+prechecks, pull main twice, create the security branch, list findings, and
+verify each finding. For package updates, review the exact target docs and call
 qualify_package_update with compatibility and documented license evidence,
-obeying any configured corporate policy. Never invent approvals or force incompatible framework
+obeying any configured corporate policy. Let the server read the required
+publisher pages before every edit. Treat DOCS_REQUIRED as no change. Cited
+nginx and GitLab CI lines may change only when the current page still documents
+that one-line edit. Never invent approvals or force incompatible framework
 versions. Never change production code, unit tests or check scripts to support
 any package version. Record lint warnings/info/unknowns before applying updates.
 Accept only with no lint errors, passing builds and executed unit tests.
@@ -992,10 +1060,12 @@ until your normal publication and scanning process updates them.
 | Lockfile refresh | The declared npm, pnpm, or Yarn range already allows the fixed version | 1 |
 | Manifest bump | `package.json`, `pom.xml`, Gradle, `libs.versions.toml`, or a NuGet `PackageReference` | 2 |
 | Override or direct pin | A transitive npm, pnpm, Yarn, or NuGet package | 3 |
-| Image tag | An unpinned `FROM image:tag` whose name matches the finding | 3 |
+| Image tag | An unpinned `FROM image:tag` whose name matches the finding. Digest-pinned references stay unchanged. | 3 |
+| Cited configuration line | The current line is `server_tokens on`, `autoindex on`, obsolete TLS in `ssl_protocols`, or a documented GitLab security-disable variable set to true | 2 |
 
-The server applies plans scoring at most 3; it does not perform arbitrary source
+The server applies plans scoring at most 3. It does not perform arbitrary source
 rewrites or production/unit-test adaptations for any package version increment.
+A configuration edit changes only the cited line and keeps its line ending.
 Unsupported edits and breaking upgrades remain for manual review.
 
 Lockfile refreshes use the package manager already selected by the repo (`npm`, `pnpm`, or `yarn`) and pass `--ignore-scripts` on that refresh. Validation then runs the project's own install and test commands.
@@ -1062,11 +1132,13 @@ and docstrings retain the line-length lint exemption; this is a project
 convention, not strict 79-column standard-library formatting. Syntax checks
 are not runtime certification on every supported Python version.
 
-The offline behavioral suite covers cleanup, concurrent shutdown, inherited
-pipes, worker startup failure, command timeouts, qualification bounds, edit
-limits, advisory parsing, manifest changes, and report outcomes. Fatal resource
-and thread warnings expose regressions; they do not prove the absence of every
-possible leak/race on arbitrary workloads or certify free-threaded Python.
+The offline behavioral suite covers cleanup, concurrent checkout shutdown,
+ordered fan-out, documentation hashes past the retained prefix, oversized
+advisory bodies, GitLab error excerpts, inherited pipes, worker startup failure,
+command timeouts, qualification bounds, cited-line edits, manifest changes, and
+report outcomes. Fatal resource and thread warnings expose regressions; they do
+not prove the absence of every possible leak/race on arbitrary workloads or
+certify free-threaded Python.
 
 ### Patient-web live integration checks
 
@@ -1124,7 +1196,9 @@ for deployment and restart differences.
 | `truncated: true` | Treat retrieval/discovery as incomplete; do not claim all findings or absent packages were verified. |
 | `PRECHECK_FAILED` | Return to clean `main` and finish Git operations manually. The MCP does not discard your work. |
 | Dated branch already exists | Review, rename or remove it manually; the server refuses to reuse another run's branch name. |
-| `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability or a package-name mismatch does not prove a false positive. |
+| `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability, a package-name mismatch, or an undocumented configuration line does not prove a false positive. |
+| `DOCS_REQUIRED` | The required publisher pages were not read completely. Nothing was written. Retry when those pages can be fetched. Do not apply the edit from memory. |
+| More than one repository is active | Pass `repo_root` on every tool call. Omitting it is valid only while one checkout is active. |
 | `QUALIFICATION_REQUIRED` | Complete exact-version API/license review and baseline checks, plus corporate approval when configured; requalify after checkout/policy changes. |
 | `VALIDATION_REQUIRED` or `PENDING_VALIDATION` | Validate the previous package edit before attempting another; do not report it as resolved. |
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
