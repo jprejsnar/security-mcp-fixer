@@ -39,7 +39,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
         pending = (
             outcome.get("package_update")
             and outcome.get("qualification_status") != "VALIDATED"
-        )
+        ) or outcome.get("validation_pending", False)
         required = (finding.get("proposedFix") or {}).get("qualifiers") and outcome.get(
             "status"
         ) != "APPLIED"
@@ -47,7 +47,11 @@ def _unresolved_issues(state: RunState) -> list[dict]:
             outcome.get("status") == "APPLIED" and not pending
         ):
             continue
-        failed = outcome.get("status") in {"FIX_FAILED", "FIX_FAILED_LOCKFILE"}
+        failed = (
+            outcome.get("status")
+            in {"FIX_FAILED", "FIX_FAILED_LOCKFILE", "ROLLED_BACK"}
+            or qualification.get("status") == "REJECTED"
+        )
         if (
             decision not in {"NO_SAFE_FIX", "MANUAL_REVIEW", "REPRODUCTION_REQUIRED"}
             and finding_id not in reasons
@@ -65,12 +69,15 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 "installed_version": finding.get("installedVersion"),
                 "title": finding.get("title") or finding_id,
                 "identifiers": finding.get("identifiers") or [],
+                "security_validation_sites": sorted(
+                    set(finding.get("securityValidationSites") or [])
+                ),
                 "location": finding.get("location") or {},
                 "decision": outcome.get("status") if failed else decision,
                 "reason": (outcome.get("detail") if failed or pending else None)
                 or qualification.get("reason")
                 or (
-                    "Package update requires reviewed compatibility, license terms or configured policy, and before/after product checks."
+                    "Security fix requires reviewed evidence and successful post-update product checks."
                     if pending or required
                     else None
                 )
@@ -109,8 +116,8 @@ def render(
     ] or ["None."]
     unresolved = _unresolved_issues(state)
     unresolved_lines = [
-        "| Severity | Package | Version | Issue | Reason Not Addressed |",
-        "|---|---|---|---|---|",
+        "| Severity | Package | Version | Issue | Reason Not Addressed | Security Validation Sites |",
+        "|---|---|---|---|---|---|",
     ]
     for item in unresolved:
         identifiers = ", ".join(
@@ -125,6 +132,7 @@ def render(
             item["installed_version"],
             issue,
             item["reason"],
+            ", ".join(item["security_validation_sites"]) or "Not recorded",
         ]
         unresolved_lines.append(
             "| " + " | ".join(_table_cell(cell) for cell in cells) + " |"
@@ -140,7 +148,12 @@ def render(
         "branch": state.branch_name,
         "pipeline": state.pipeline,
         "findings_total": len(state.findings),
+        "http_timings_file": ".security-mcp/http-timings.jsonl",
         "findings_truncated": state.findings_truncated,
+        "security_validation_sites": {
+            finding["id"]: sorted(set(finding.get("securityValidationSites") or []))
+            for finding in state.findings
+        },
         "unverified_findings": unverified,
         "excluded_findings": state.excluded_findings,
         "decisions": {
@@ -149,6 +162,14 @@ def render(
         "changes_made": state.changes,
         "validation_status": state.validation_status,
         "validation": state.validation_results,
+        "batch_isolation": state.batch_isolation,
+        "lint_baseline": state.lint_baseline,
+        "lint_issues_file": ".security-mcp/lint-issues.json"
+        if state.lint_baseline is not None
+        else None,
+        "lint_rules_file": ".security-mcp/lint-rules.json"
+        if state.lint_baseline is not None
+        else None,
         "package_qualifications": {
             finding.get("id"): {
                 key: qualification.get(key)
@@ -247,6 +268,19 @@ def render(
             )
     else:
         lines.append("No files were changed.")
+    lines.extend(
+        [
+            "",
+            "## Pre-change Lint Issues",
+            ".security-mcp/lint-issues.json"
+            if state.lint_baseline is not None
+            else "Not recorded.",
+            "Observed rule names: .security-mcp/lint-rules.json"
+            if state.lint_baseline is not None
+            else "No rule inventory recorded.",
+            "Existing lint issues are recorded separately from final batch build and unit-test acceptance.",
+        ]
+    )
     lines.extend(["", "## Package Update Qualifications"])
     if payload["package_qualifications"]:
         for finding_id, qualification in payload["package_qualifications"].items():
@@ -273,12 +307,40 @@ def render(
     else:
         lines.append("No package qualification evidence recorded.")
     lines.extend(
-        ["", "## Validation", f"Status: {state.validation_status or 'not run'}"]
+        [
+            "",
+            "## Validation",
+            f"Status: {state.validation_status or 'not run'}",
+            "HTTP timing log: .security-mcp/http-timings.jsonl (new HTTP requests only).",
+        ]
     )
     for item in state.validation_results:
         lines.append(
             f"- {item.get('status')}: {item.get('command') or item.get('detail')}"
         )
+        if item.get("command") and item.get("detail"):
+            lines.append(f"  Detail: {item['detail']}")
+        for key in ("stdout_log_path", "stderr_log_path"):
+            if item.get(key):
+                lines.append(f"  {key}: {item[key]}")
+    if state.batch_isolation:
+        lines.extend(["", "## Batch Isolation"])
+        for trial in state.batch_isolation:
+            selected = ", ".join(trial["finding_ids"]) or "original baseline"
+            lines.append(f"- {trial['status']}: {selected}")
+            for failure in trial["failures"]:
+                lines.append(
+                    f"  Failure: {failure.get('detail') or failure.get('command')}"
+                )
+                for key in ("stdout_log_path", "stderr_log_path"):
+                    if failure.get(key):
+                        lines.append(f"  {key}: {failure[key]}")
+    payload["final_summary_markdown"] = "\n".join(
+        [
+            "## Unresolved Security Issues",
+            payload["unresolved_issues_table"],
+        ]
+    )
     lines.extend(
         [
             "",
@@ -297,8 +359,7 @@ def render(
             "- Confirm validation.",
             "- Commit and push yourself if you are satisfied.",
             "",
-            "## Unresolved Security Issues",
-            unresolved_table,
+            payload["final_summary_markdown"],
             "",
         ]
     )
@@ -326,13 +387,22 @@ def write_report(
     atomic_write_text(human_path, markdown)
     return {
         "status": "REPORT_GENERATED",
+        "final_summary_markdown": payload["final_summary_markdown"],
         "human_report": str(human_path),
         "json_report": str(json_path),
+        "http_timings_path": str(root / payload["http_timings_file"]),
         "false_positives": payload["false_positives"],
         "no_solution": payload["no_solution_issues"],
         "user_prompt_skipped": payload["user_prompt_skipped"],
         "unresolved_issues": payload["unresolved_issues"],
         "unresolved_issues_table": payload["unresolved_issues_table"],
+        "lint_baseline": payload["lint_baseline"],
+        "lint_issues_path": str(root / ".security-mcp" / "lint-issues.json")
+        if state.lint_baseline is not None
+        else None,
+        "lint_rules_path": str(root / ".security-mcp" / "lint-rules.json")
+        if state.lint_baseline is not None
+        else None,
         "git_diff_cached_empty": payload["git_diff_cached_empty"],
         "note": "All changes remain uncommitted. Review the report, then commit manually if you are satisfied.",
     }

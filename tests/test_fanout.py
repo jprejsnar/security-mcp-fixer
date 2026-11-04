@@ -1,14 +1,135 @@
 """Check that independent reads overlap and keep their input order."""
 
+import json
 import logging
 import threading
 import time
 
 import httpx
+import pytest
 
 from gitlab_security_mcp.advisory import _MAX_ADVISORY_BYTES, AdvisoryClient
 from gitlab_security_mcp.fanout import map_ordered
+from gitlab_security_mcp.gitlab_client import GitLabClient
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
+from gitlab_security_mcp.util import timed_http_stream
+
+
+@pytest.mark.parametrize("outcome", ["success", "http_error", "timeout", "body_error"])
+def test_http_timings_include_body_failures_without_secrets(
+    tmp_path, monkeypatch, outcome
+):
+    """Persist elapsed spans for success and failures without request secrets."""
+    # Arrange
+    readings = iter([1.0, 1.125])
+    monkeypatch.setattr("gitlab_security_mcp.util.perf_counter", lambda: next(readings))
+    path = tmp_path / ".security-mcp" / "http-timings.jsonl"
+
+    def handler(request):
+        """Return a response or raise a transport error containing private data."""
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("secret-body", request=request)
+        return httpx.Response(
+            503 if outcome == "http_error" else 200, text="secret-body"
+        )
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        try:
+            with timed_http_stream(
+                client,
+                "GET",
+                "https://username:secret-password@example.test/docs?token=secret-query#secret-fragment",
+                source="test",
+                log_path=path,
+                headers={"Authorization": "Bearer secret-header"},
+            ) as response:
+                response.read()
+                response.raise_for_status()
+                if outcome == "body_error":
+                    raise ValueError("secret-body")
+        except (httpx.HTTPError, ValueError):
+            assert outcome != "success"
+
+    # Assert
+    text = path.read_text(encoding="utf-8")
+    record = json.loads(text)
+    assert record["url"] == "https://example.test/docs"
+    assert record["duration_ms"] == 125.0
+    assert record["status_code"] == (
+        None if outcome == "timeout" else 503 if outcome == "http_error" else 200
+    )
+    assert (
+        record["error"]
+        == {
+            "success": None,
+            "http_error": "HTTPStatusError",
+            "timeout": "ReadTimeout",
+            "body_error": "ValueError",
+        }[outcome]
+    )
+    assert record["started_at"] <= record["finished_at"]
+    assert record["worker"]
+    assert "secret" not in text
+
+
+@pytest.mark.parametrize("operation", ["advisory_get", "advisory_post", "gitlab"])
+def test_http_clients_write_timing_records(tmp_path, operation):
+    """Record real client request paths and avoid inventing requests for cache hits."""
+    # Arrange
+    path = tmp_path / "http-timings.jsonl"
+
+    def handler(_request):
+        """Return bounded JSON through the client-owned streaming path."""
+        return httpx.Response(200, json={"ok": True})
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        if operation == "gitlab":
+            client = GitLabClient("secret-token", http=http, http_log_path=path)
+            assert client._request(
+                "POST", "https://example.test/api/graphql", {"query": "secret-body"}
+            ) == {"ok": True}
+        else:
+            client = AdvisoryClient(http=http, http_log_path=path)
+            if operation == "advisory_get":
+                assert client._get_json("https://example.test/advisory") == {"ok": True}
+                assert client._get_json("https://example.test/advisory") == {"ok": True}
+            else:
+                assert client._post_json(
+                    "https://example.test/query", {"version": "secret-body"}
+                ) == {"ok": True}
+
+    # Assert
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["source"] == ("gitlab" if operation == "gitlab" else "advisory")
+    assert records[0]["status_code"] == 200
+    assert records[0]["duration_ms"] >= 0
+    assert "secret" not in path.read_text()
+
+
+def test_http_log_write_failure_preserves_request_result(tmp_path):
+    """Keep successful HTTP work successful when local timing storage is unavailable."""
+    # Arrange
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+
+    def handler(_request):
+        """Return the same response regardless of log storage availability."""
+        return httpx.Response(200, text="ok")
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with timed_http_stream(
+            client,
+            "GET",
+            "https://example.test/",
+            source="test",
+            log_path=blocked / "timings.jsonl",
+        ) as response:
+            # Assert
+            assert response.read() == b"ok"
 
 
 def _overlap_handler(state: dict, lock: threading.Lock, body: str):
@@ -29,17 +150,18 @@ def _overlap_handler(state: dict, lock: threading.Lock, body: str):
     return handler
 
 
-def test_required_docs_are_requested_together_and_stay_in_order():
+def test_required_docs_are_requested_together_and_stay_in_order(tmp_path):
     """Overlap publisher reads and return them in catalog order."""
     # Arrange
     state = {"inflight": 0, "max": 0}
     markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
     docs = OfficialDocs(
+        http_log_path=tmp_path / "http-timings.jsonl",
         http=httpx.Client(
             transport=httpx.MockTransport(
                 _overlap_handler(state, threading.Lock(), markers)
             )
-        )
+        ),
     )
 
     # Act
@@ -51,6 +173,23 @@ def test_required_docs_are_requested_together_and_stay_in_order():
     assert [item.name for item in review.sources] == [
         name for name, _url, _marker in REQUIRED_DOCS
     ]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "http-timings.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == len(REQUIRED_DOCS)
+    assert {record["url"] for record in records} == {
+        url for _name, url, _marker in REQUIRED_DOCS
+    }
+    assert all(
+        record["source"] == "documentation" and record["status_code"] == 200
+        for record in records
+    )
+    assert any(
+        first["started_at"] < second["started_at"] < first["finished_at"]
+        for first in records
+        for second in records
+    )
 
 
 def test_one_doc_failure_keeps_the_other_page_results():
@@ -116,15 +255,17 @@ def test_close_waits_until_the_doc_read_finishes():
     assert docs.read_before_fix({}).sources[0].error == "Documentation client is closed"
 
 
-def test_advisory_identifiers_are_requested_together_in_order():
-    """Fetch every OSV id at once and keep the finding's identifier order."""
+@pytest.mark.parametrize("repeated", [False, True])
+def test_advisory_identifiers_are_requested_together_in_order(repeated):
+    """Fetch distinct OSV ids once, concurrently, in first-occurrence order."""
     # Arrange
-    state = {"inflight": 0, "max": 0}
+    state = {"inflight": 0, "max": 0, "requests": 0}
     lock = threading.Lock()
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Serve one OSV record per identifier and count overlapping calls."""
         with lock:
+            state["requests"] += 1
             state["inflight"] += 1
             state["max"] = max(state["max"], state["inflight"])
         try:
@@ -155,7 +296,7 @@ def test_advisory_identifiers_are_requested_together_in_order():
 
     # Act
     result = client.lookup(
-        {"identifiers": ["CVE-2020-0001", "CVE-2020-0002"]},
+        {"identifiers": ["CVE-2020-0001", "CVE-2020-0002"] * (3 if repeated else 1)},
         "npm",
         "left-pad",
         "1.0.0",
@@ -165,6 +306,7 @@ def test_advisory_identifiers_are_requested_together_in_order():
     assert state["max"] >= 2
     assert result.outcome == "resolved"
     assert result.sources == ["osv:CVE-2020-0001", "osv:CVE-2020-0002"]
+    assert state["requests"] == 2
 
 
 def test_earlier_github_identifier_wins_when_reads_overlap():

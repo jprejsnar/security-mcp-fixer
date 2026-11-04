@@ -253,7 +253,7 @@ def test_engine_constructor_failure_closes_owned_client(tmp_path, monkeypatch):
     from gitlab_security_mcp import engine as module
 
     gitlab = Mock()
-    monkeypatch.setattr(module, "GitLabClient", lambda *args: gitlab)
+    monkeypatch.setattr(module, "GitLabClient", lambda *args, **kwargs: gitlab)
 
     def fail_advisory(**kwargs):
         """Fail construction after the engine has acquired its GitLab client."""
@@ -303,7 +303,7 @@ def test_engine_close_attempts_all_owned_clients_once(tmp_path, monkeypatch):
     gitlab = Mock()
     advisory = Mock()
     gitlab.close.side_effect = OSError("Close failed")
-    monkeypatch.setattr(module, "GitLabClient", lambda *args: gitlab)
+    monkeypatch.setattr(module, "GitLabClient", lambda *args, **kwargs: gitlab)
     monkeypatch.setattr(module, "AdvisoryClient", lambda **kwargs: advisory)
     engine = Engine(tmp_path)
 
@@ -617,25 +617,285 @@ def _finding(fid, package, identifier, version="1.0.0"):
     }
 
 
+def test_mcp_progress_is_delivered_while_tool_is_running(monkeypatch):
+    """Send live bars through the request session before returning a tool result."""
+    # Arrange
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from mcp.server.mcpserver.server import Context
+    from mcp.server.mcpserver.tools.base import Tool
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    updates = []
+    console = Mock()
+    monkeypatch.setattr(server, "_progress_console", console)
+
+    async def exercise():
+        """Keep the fake tool open until its first real notification is received."""
+        received = threading.Event()
+
+        async def report(progress, total, message):
+            """Capture the MCP notification and unblock the running tool."""
+            updates.append(message)
+            received.set()
+
+        def work() -> dict:
+            """Block SDK tool completion until a live message crosses the MCP loop."""
+            sink = progress_sink.get()
+            sink("Tests [##########..........] 1/2 tests (50%)")
+            console.write.assert_called_once()
+            assert received.wait(2)
+            return {"status": "DONE"}
+
+        async def call_next(context):
+            """Use the real SDK's synchronous-tool dispatch rather than a test shim."""
+            return await Tool.from_function(work).run({}, Context())
+
+        context = SimpleNamespace(
+            method="tools/call", session=SimpleNamespace(report_progress=report)
+        )
+        return await server._progress_middleware(context, call_next)
+
+    # Act
+    result = asyncio.run(exercise())
+
+    # Assert
+    assert result == {"status": "DONE", "progress_output": updates}
+    assert updates == ["Tests [##########..........] 1/2 tests (50%)"]
+    assert progress_sink.get() is None
+
+
+def test_progress_is_returned_when_host_drops_notifications():
+    """Keep a visible progress transcript when the caller supplied no progress token."""
+    # Arrange
+    import asyncio
+    from types import SimpleNamespace
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    message = "Tests [##########..........] 1/2 test suites (50%)"
+
+    async def report(*args):
+        """Model the SDK's no-op when no caller progress token exists."""
+        return None
+
+    async def call_next(context):
+        """Emit progress before returning ordinary structured tool data."""
+        progress_sink.get()(message)
+        return {"status": "DONE"}
+
+    context = SimpleNamespace(
+        method="tools/call", session=SimpleNamespace(report_progress=report)
+    )
+
+    # Act
+    result = asyncio.run(server._progress_middleware(context, call_next))
+
+    # Assert
+    assert result["progress_output"] == [message]
+    assert result["status"] == "DONE"
+    assert progress_sink.get() is None
+
+
+def test_windows_progress_console_is_isolated_and_cleaned_up(monkeypatch, capsys):
+    """Open a separate console without mixing human output into MCP stdout."""
+    # Arrange
+    import io
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import server
+
+    process = Mock(stdin=io.StringIO())
+    launch = Mock(return_value=process)
+    monkeypatch.setattr(server.sys, "platform", "win32")
+    monkeypatch.setenv("PROGRESS_CONSOLE", "on")
+    monkeypatch.setattr(server.subprocess, "Popen", launch)
+
+    # Act
+    console = server._open_progress_console()
+    console.write("Tests [##########..........] 1/2 test suites (50%)")
+    output = process.stdin.getvalue()
+    console.close()
+
+    # Assert
+    assert "1/2 test suites (50%)" in output
+    assert "waiting for tool calls" in output
+    assert launch.call_args.kwargs["stdout"] == server.subprocess.DEVNULL
+    assert launch.call_args.kwargs["stderr"] == server.subprocess.DEVNULL
+    assert launch.call_args.kwargs["creationflags"] == 0x10
+    assert process.stdin.closed
+    process.wait.assert_called_once_with(timeout=2)
+    assert capsys.readouterr().out == ""
+
+
+def test_progress_mcp_text_is_bounded_and_keeps_report_last():
+    """Retain progress without displacing the report or growing results forever."""
+    # Arrange
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp.types import CallToolResult, TextContent
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    final = "## Unresolved Security Issues\nNone."
+
+    async def report(*args):
+        """Model a host that did not opt into live progress."""
+        return None
+
+    async def call_next(context):
+        """Return the SDK's real result type after many progress updates."""
+        for index in range(70):
+            progress_sink.get()(f"Progress {index}")
+        return CallToolResult(
+            content=[TextContent(text=final)],
+            structuredContent={"final_summary_markdown": final},
+        )
+
+    context = SimpleNamespace(
+        method="tools/call", session=SimpleNamespace(report_progress=report)
+    )
+
+    # Act
+    result = asyncio.run(server._progress_middleware(context, call_next))
+
+    # Assert
+    assert result.content[0].text.startswith("## Execution Progress")
+    assert result.content[-1].text == final
+    assert result.structured_content["final_summary_markdown"] == final
+    assert result.structured_content["progress_output"] == [
+        f"Progress {index}" for index in range(6, 70)
+    ]
+
+
+def test_progress_console_can_be_disabled(monkeypatch):
+    """Respect headless and CI launches that opt out of extra console windows."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import server
+
+    launch = Mock()
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+    monkeypatch.setattr(server.subprocess, "Popen", launch)
+
+    # Act
+    console = server._open_progress_console()
+
+    # Assert
+    assert console is None
+    launch.assert_not_called()
+
+
+def test_report_tool_delivers_security_report_as_mcp_text(repo, monkeypatch):
+    """Deliver the final security report as text, not nested JSON."""
+    # Arrange
+    import asyncio
+
+    from mcp.server.mcpserver.server import Context
+    from mcp.server.mcpserver.tools.base import Tool
+    from mcp.types import CallToolResult
+
+    from gitlab_security_mcp import server
+
+    engine = Engine(repo, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
+    monkeypatch.setattr(server, "_engine_for", lambda _root: engine)
+
+    # Act
+    result = asyncio.run(
+        Tool.from_function(server.generate_local_report).run(
+            {}, Context(), convert_result=True
+        )
+    )
+
+    # Assert
+    assert isinstance(result, CallToolResult)
+    text = result.content[0].text
+    assert text == result.structured_content["final_summary_markdown"]
+    assert text.startswith("## Unresolved Security Issues")
+    assert text.rstrip().endswith(result.structured_content["unresolved_issues_table"])
+
+
+def test_report_error_is_visible_as_text(monkeypatch):
+    """Retain error signaling and readable failure details when reporting fails."""
+    # Arrange
+    from gitlab_security_mcp import server
+
+    monkeypatch.setattr(
+        server,
+        "_run",
+        lambda *args, **kwargs: {"status": "ERROR", "error": "Checkout unavailable"},
+    )
+
+    # Act
+    result = server.generate_local_report()
+
+    # Assert
+    assert result.is_error
+    assert result.structured_content["status"] == "ERROR"
+    assert "Checkout unavailable" in result.content[0].text
+
+
+def test_finding_progress_identifies_item_and_steps(tmp_path, caplog, monkeypatch):
+    """Emit finding-specific progress before and after the advisory decision."""
+    # Arrange
+    import logging
+
+    from gitlab_security_mcp.engine import logger
+
+    monkeypatch.setattr(logger, "propagate", True)
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"lodash": "4.17.20"}}), encoding="utf-8"
+    )
+    finding = _finding("progress-item", "lodash", "CVE-FIX", "4.17.20")
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=ScriptedAdvisory())
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        result = engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert result["decision"] == "CHANGE_REQUIRED"
+    messages = [row.message for row in caplog.records]
+    assert any("progress-item" in text and "started" in text for text in messages)
+    assert any(
+        "progress-item" in text and "local dependency" in text for text in messages
+    )
+    assert any("progress-item" in text and "advisory" in text for text in messages)
+    assert any(
+        "progress-item" in text and "CHANGE_REQUIRED" in text for text in messages
+    )
+
+
 @pytest.mark.parametrize(
     "outcome, affected, fixed, expected",
     [
         ("resolved", True, "4.17.21", "CHANGE_REQUIRED"),
-        ("no_fix_published", True, None, "NO_SAFE_FIX"),
-        ("resolved", True, None, "NO_SAFE_FIX"),
-        ("resolved", None, "4.17.21", "MANUAL_REVIEW"),
+        ("no_fix_published", True, None, "CHANGE_REQUIRED"),
+        ("resolved", True, None, "CHANGE_REQUIRED"),
+        ("resolved", None, "4.17.21", "CHANGE_REQUIRED"),
         ("resolved", False, "4.17.21", "FALSE_POSITIVE"),
-        ("package_mismatch", None, "4.17.21", "MANUAL_REVIEW"),
-        ("lookup_failed", None, None, "MANUAL_REVIEW"),
-        ("not_found", None, None, "MANUAL_REVIEW"),
+        ("package_mismatch", None, "4.17.21", "CHANGE_REQUIRED"),
+        ("lookup_failed", None, None, "CHANGE_REQUIRED"),
+        ("not_found", None, None, "CHANGE_REQUIRED"),
         ("resolved", True, "5.0.0", "CHANGE_REQUIRED"),
         ("resolved", True, "not-a-version", "NO_SAFE_FIX"),
     ],
 )
-def test_solution_requires_advisory_evidence_and_safe_plan(
+def test_solution_reconciles_gitlab_with_advisory_evidence_and_safe_plan(
     tmp_path, monkeypatch, outcome, affected, fixed, expected
 ):
-    """Require matching, comparable advisory evidence before planning edits."""
+    """Accept matched GitLab recommendations without ignoring advisory conflicts."""
     # Arrange
     manifest = tmp_path / "package.json"
     original = json.dumps({"dependencies": {"lodash": "4.17.20"}})
@@ -652,7 +912,15 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
         sources=["osv:CVE-2021-23337"],
     )
     advisory = ScriptedAdvisory()
-    monkeypatch.setattr(advisory, "lookup", lambda *args: lookup)
+    monkeypatch.setattr(
+        advisory,
+        "lookup",
+        lambda _finding, _ecosystem, _package, version: (
+            lookup
+            if version == "4.17.20"
+            else AdvisoryLookup(outcome="not_found", summary="No target record.")
+        ),
+    )
     runner = HybridRunner(tmp_path)
     engine = Engine(
         tmp_path, gitlab=FakeGitLab([finding]), advisory=advisory, runner=runner
@@ -668,7 +936,7 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
     assert result["eligible_for_auto_fix"] is False
     assert result["qualification_required"] is (expected == "CHANGE_REQUIRED")
     if expected == "CHANGE_REQUIRED":
-        assert result["proposed_fix"]["target"] == fixed
+        assert result["proposed_fix"]["target"] == (fixed or "4.17.21")
         assert result["proposed_fix"]["package"] == "lodash"
         assert result["proposed_fix"]["strategy"] == "manifest_bump"
     else:
@@ -677,8 +945,99 @@ def test_solution_requires_advisory_evidence_and_safe_plan(
     assert runner.calls == []
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    ["package_mismatch", "not_found", "no_fix_published", "resolved", "lookup_failed"],
+)
+@pytest.mark.parametrize("target_outcome", ["not_found", "lookup_failed"])
+def test_gitlab_fix_is_candidate_when_public_advisory_lacks_fix(
+    tmp_path, outcome, target_outcome
+):
+    """Use GitLab's qs fix without requiring OSV to repeat its package metadata."""
+    # Arrange
+    from unittest.mock import Mock
+
+    manifest = tmp_path / "package.json"
+    original = json.dumps({"dependencies": {"qs": "6.16.1"}})
+    manifest.write_text(original, encoding="utf-8")
+    finding = _finding("qs-fix", "qs", "CVE-2026-110910", "6.16.1")
+    finding["solution"] = "Upgrade to version 6.16.2."
+    finding["fixedVersions"] = ["6.16.2"]
+    advisory = Mock()
+    advisory.lookup.side_effect = [
+        AdvisoryLookup(
+            outcome=outcome,
+            affected=True if outcome == "no_fix_published" else None,
+            summary="Public advisory does not publish a matching package fix.",
+            sources=["osv:CVE-2026-110910"],
+        ),
+        AdvisoryLookup(
+            outcome=target_outcome,
+            summary="No affected range for the recommended target.",
+        ),
+    ]
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert result["decision"] == "CHANGE_REQUIRED"
+    assert result["proposed_fix"]["target"] == "6.16.2"
+    assert result["proposed_fix"]["package"] == "qs"
+    assert result["qualification_required"] is True
+    assert result["eligible_for_auto_fix"] is False
+    assert any("GitLab" in item and "6.16.2" in item for item in result["evidence"])
+    advisory.lookup.assert_called_with(finding, "npm", "qs", "6.16.2")
+    assert manifest.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    "scanner_version, fixed, initial_outcome, target_outcome, target_affected",
+    [
+        ("6.16.0", "6.16.2", "package_mismatch", "not_found", None),
+        ("unknown", "6.16.2", "package_mismatch", "not_found", None),
+        ("6.16.1", "6.16.1", "package_mismatch", "not_found", None),
+        ("6.16.1", "6.16.0", "package_mismatch", "not_found", None),
+        ("6.16.1", "invalid", "package_mismatch", "not_found", None),
+        ("6.16.1", "", "package_mismatch", "not_found", None),
+        ("6.16.1", "6.16.2", "package_mismatch", "resolved", True),
+    ],
+)
+def test_gitlab_fix_does_not_override_conflicts_or_invalid_evidence(
+    tmp_path, scanner_version, fixed, initial_outcome, target_outcome, target_affected
+):
+    """Block stale scanner versions, non-upgrades, and known-affected targets."""
+    # Arrange
+    from unittest.mock import Mock
+
+    manifest = tmp_path / "package.json"
+    original = json.dumps({"dependencies": {"qs": "6.16.1"}})
+    manifest.write_text(original, encoding="utf-8")
+    finding = _finding("qs-fix", "qs", "CVE-2026-110910", scanner_version)
+    finding["fixedVersions"] = [fixed] if fixed else []
+    advisory = Mock()
+    advisory.lookup.side_effect = [
+        AdvisoryLookup(outcome=initial_outcome),
+        AdvisoryLookup(outcome=target_outcome, affected=target_affected),
+    ]
+    engine = Engine(tmp_path, gitlab=FakeGitLab([finding]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert result["decision"] == "MANUAL_REVIEW"
+    assert result["proposed_fix"] is None
+    assert manifest.read_text(encoding="utf-8") == original
+
+
 def test_report_ends_with_unresolved_security_issues_table(tmp_path):
-    """Keep unresolved issues unique and place their table last in reports."""
+    """Keep unresolved issues unique and end their table with the usage footer."""
     # Arrange
     from gitlab_security_mcp.report import write_report
     from gitlab_security_mcp.state import RunState
@@ -695,6 +1054,11 @@ def test_report_ends_with_unresolved_security_issues_table(tmp_path):
         ]
     ]
     findings[0]["title"] = "Issue | with\na newline"
+    findings[0]["securityValidationSites"] = [
+        "https://api.osv.dev",
+        "https://services.nvd.nist.gov",
+        "https://api.osv.dev",
+    ]
     state = RunState(
         findings=[*findings, findings[0].copy()],
         decisions={
@@ -737,6 +1101,9 @@ def test_report_ends_with_unresolved_security_issues_table(tmp_path):
         "failed",
     ]
     assert payload["unresolved_issues"] == result["unresolved_issues"]
+    assert result["final_summary_markdown"] == payload["final_summary_markdown"]
+    assert markdown.rstrip().endswith(result["final_summary_markdown"])
+    assert result["final_summary_markdown"].endswith(result["unresolved_issues_table"])
     assert markdown.rstrip().endswith(result["unresolved_issues_table"])
     assert markdown.index("## Unresolved Security Issues") > markdown.index(
         "## What you do next"
@@ -745,6 +1112,23 @@ def test_report_ends_with_unresolved_security_issues_table(tmp_path):
     assert "Code update needs a reviewer." in result["unresolved_issues_table"]
     assert "Lockfile update failed." in result["unresolved_issues_table"]
     assert "Earlier failure." not in result["unresolved_issues_table"]
+    assert (
+        "| Reason Not Addressed | Security Validation Sites |"
+        in result["unresolved_issues_table"]
+    )
+    assert result["unresolved_issues"][0]["security_validation_sites"] == [
+        "https://api.osv.dev",
+        "https://services.nvd.nist.gov",
+    ]
+    assert (
+        "https://api.osv.dev, https://services.nvd.nist.gov"
+        in result["unresolved_issues_table"]
+    )
+    assert "Not recorded" in result["unresolved_issues_table"]
+    assert (
+        payload["security_validation_sites"]["no-fix"]
+        == result["unresolved_issues"][0]["security_validation_sites"]
+    )
 
 
 def test_unresolved_table_does_not_claim_unverified_findings_are_resolved():
@@ -1312,7 +1696,7 @@ def test_full_local_run_reports_every_required_section(cloned_repo):
     assert precheck["status"] == "PRECHECK_PASSED"
     assert pulls["status"] == "PULLS_SUCCEEDED"
     assert len(pulls["results"]) == 2
-    assert created == {
+    assert {key: created[key] for key in ("status", "branch")} == {
         "status": "BRANCH_CREATED",
         "branch": branch_name_for(date(2026, 11, 1)),
     }
@@ -1351,6 +1735,86 @@ def test_full_local_run_reports_every_required_section(cloned_repo):
     assert status["false_positives_count"] == 1
 
 
+@pytest.mark.parametrize("component", [".", "frontend", "workspace"])
+@pytest.mark.parametrize("failed_step", [None, "clean", "install"])
+def test_pnpm_preparation_runs_after_both_pulls_before_security_checks(
+    tmp_path, component, failed_step
+):
+    """Prepare pnpm components in order and never scan after preparation fails."""
+    # Arrange
+    from unittest.mock import Mock
+
+    root = tmp_path if component == "workspace" else tmp_path / component
+    root.mkdir(exist_ok=True)
+    (root / "package.json").write_text(
+        json.dumps({"packageManager": "pnpm@12.15.0", "scripts": {"clean": "fixture"}}),
+        encoding="utf-8",
+    )
+    if component == "workspace":
+        (root / "pnpm-workspace.yaml").write_text(
+            "packages:\n  - packages/*\n", encoding="utf-8"
+        )
+        child = root / "packages" / "app"
+        child.mkdir(parents=True)
+        (child / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@12.15.0"}), encoding="utf-8"
+        )
+    events = []
+
+    def execute(argv, **kwargs):
+        """Record real command boundaries and fail only the selected pnpm step."""
+        events.append(argv)
+        if argv[0] == "pnpm":
+            assert kwargs["cwd"] == root.resolve()
+        return CommandResult(
+            argv,
+            1 if argv == ["pnpm", failed_step] else 0,
+            "ok",
+            "preparation failed" if argv == ["pnpm", failed_step] else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    runner = Mock()
+    runner.run.side_effect = execute
+    engine = Engine(
+        tmp_path, runner=runner, gitlab=Mock(), advisory=Mock(), which=lambda name: name
+    )
+    engine.git = Mock()
+    engine.git.current_branch.return_value = "main"
+    engine.git.head.return_value = "unchanged"
+    engine.git.dirty_lines.return_value = []
+    engine.git.run.side_effect = lambda args, **kwargs: execute(
+        ["git", *args], **kwargs
+    )
+    engine.state.status = "PRECHECK_PASSED"
+    engine._files = []
+
+    # Act
+    result = engine.pull_main_twice()
+
+    # Assert
+    expected = [
+        ["git", "pull", "--ff-only"],
+        ["git", "pull", "--ff-only"],
+        ["pnpm", "clean"],
+    ]
+    if failed_step != "clean":
+        expected.append(["pnpm", "install"])
+    assert events == expected
+    engine.gitlab.fetch.assert_not_called()
+    if failed_step:
+        assert result["status"] == "PREPARATION_FAILED"
+        assert result["failed_command"] == ["pnpm", failed_step]
+        assert engine.create_security_branch()["status"] == "BRANCH_CREATION_FAILED"
+        assert engine.list_security_findings()["status"] == "ERROR"
+    else:
+        assert result["status"] == "PULLS_SUCCEEDED"
+        assert len(result["preparation"]) == 2
+
+
 def test_existing_branch_name_stops_the_run(cloned_repo):
     """Existing branch name stops the run."""
     # Arrange
@@ -1380,7 +1844,16 @@ def test_image_bump_and_aaa_test(repo):
     # Arrange
     (repo / "Dockerfile").write_text("FROM nginx:1.25.1\n", encoding="utf-8")
     (repo / "package.json").write_text(
-        json.dumps({"name": "app", "scripts": {"test": "node --test"}}),
+        json.dumps(
+            {
+                "name": "app",
+                "scripts": {
+                    "lint": "fixture",
+                    "build": "fixture",
+                    "test": "node --test",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     finding = {

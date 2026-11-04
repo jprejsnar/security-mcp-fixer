@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import shutil
 import threading
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import fields
 from datetime import date
+from inspect import signature
 from pathlib import Path
+from time import monotonic
+from urllib.parse import urlsplit
 
 from gitlab_security_mcp.aaa import generate_aaa_test
 from gitlab_security_mcp.advisory import (
@@ -18,11 +23,12 @@ from gitlab_security_mcp.advisory import (
     AdvisoryClient,
     AdvisoryLookup,
 )
-from gitlab_security_mcp.commands import CommandRunner
+from gitlab_security_mcp.commands import CommandRunner, progress_sink, resolve_tool
 from gitlab_security_mcp.config_findings import assess_config, config_kind
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
 from gitlab_security_mcp.gitlab_client import GitLabClient
 from gitlab_security_mcp.manifests import (
+    detect_stack,
     iter_files,
     locate_package,
     manifests_were_parsed,
@@ -46,9 +52,14 @@ from gitlab_security_mcp.qualification import (
 from gitlab_security_mcp.remediate import Plan, apply_plan, plan_remediation
 from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.state import RunState
-from gitlab_security_mcp.util import resolve_inside
-from gitlab_security_mcp.validate import run_validation
-from gitlab_security_mcp.versions import is_major_upgrade, parse_version
+from gitlab_security_mcp.util import atomic_write_text, resolve_inside
+from gitlab_security_mcp.validate import lint_rule_inventory, run_validation
+from gitlab_security_mcp.versions import (
+    is_major_upgrade,
+    lowest_fixed,
+    parse_fixed_versions,
+    parse_version,
+)
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -70,6 +81,7 @@ def _serialized(method):
     so a tool can call another tool method without deadlocking.
     Copy results before unlocking so callers cannot mutate active state.
     """
+    parameters = signature(method)
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -77,9 +89,44 @@ def _serialized(method):
         with self._lock:
             if self._closed:
                 return {"status": "ERROR", "reason": "Engine is closed"}
-            return deepcopy(method(self, *args, **kwargs))
+            finding_id = parameters.bind(self, *args, **kwargs).arguments.get(
+                "finding_id"
+            )
+            started = monotonic()
+            self._progress(finding_id, f"{method.__name__} started")
+            try:
+                result = method(self, *args, **kwargs)
+            except BaseException as exc:
+                self._progress(
+                    finding_id, f"{method.__name__} failed ({type(exc).__name__})"
+                )
+                raise
+            result = deepcopy(result)
+            outcome = result.get("decision") or result.get("status") or "complete"
+            self._progress(
+                finding_id,
+                f"{method.__name__} finished: {outcome} ({monotonic() - started:.2f}s)",
+            )
+            return result
 
     return wrapper
+
+
+class _ValidationRunner:
+    """Share exact command evidence across detected checks and corporate policy."""
+
+    def __init__(self, runner, root: Path):
+        """Limit cached results to one validation of one checkout state."""
+        self.runner = runner
+        self.root = root
+        self.results = {}
+
+    def run(self, argv, **kwargs):
+        """Execute each exact command once per working directory."""
+        key = (tuple(argv), Path(kwargs.get("cwd", self.root)).resolve())
+        if key not in self.results:
+            self.results[key] = self.runner.run(argv, **kwargs)
+        return self.results[key]
 
 
 class Engine:
@@ -116,6 +163,7 @@ class Engine:
         Initialization errors propagate after owned-client cleanup.
         """
         self.repo_root = Path(repo_root).resolve()
+        self.http_log_path = self.repo_root / ".security-mcp" / "http-timings.jsonl"
         self._package_policy_required = bool(os.environ.get("PACKAGE_UPDATE_POLICY"))
         self.package_policy_path = Path(
             os.environ.get("PACKAGE_UPDATE_POLICY")
@@ -128,13 +176,21 @@ class Engine:
         self._owns_advisory = advisory is None
         self._owns_docs = docs is None
         self.gitlab = (
-            gitlab if gitlab is not None else GitLabClient(gitlab_token, gitlab_api_url)
+            gitlab
+            if gitlab is not None
+            else GitLabClient(
+                gitlab_token, gitlab_api_url, http_log_path=self.http_log_path
+            )
         )
         try:
             self.advisory = (
                 advisory
                 if advisory is not None
-                else AdvisoryClient(github_token=github_token, nvd_api_key=nvd_api_key)
+                else AdvisoryClient(
+                    github_token=github_token,
+                    nvd_api_key=nvd_api_key,
+                    http_log_path=self.http_log_path,
+                )
             )
             # The documentation client opens only when an edit needs it, so
             # a run that never writes does not keep an unused connection.
@@ -162,12 +218,13 @@ class Engine:
         self.state = RunState()
         self._files: list[Path] | None = None
         self._files_truncated = False
+        self._product_baseline: dict | None = None
         self._closed = False
 
     def _documentation(self) -> OfficialDocs:
         """Return the injected documentation client or open one on first use."""
         if self.docs is None:
-            self.docs = OfficialDocs()
+            self.docs = OfficialDocs(http_log_path=self.http_log_path)
         return self.docs
 
     def close(self) -> None:
@@ -322,7 +379,7 @@ class Engine:
 
     @_serialized
     def pull_main_twice(self) -> dict:
-        """Fast-forward main twice. Either failure stops the run."""
+        """Fast-forward main twice, then clean/install pnpm before security checks."""
         if self.state.status != "PRECHECK_PASSED":
             return {"status": "PULL_FAILED", "reason": "Precheck not passed"}
         results = []
@@ -383,10 +440,92 @@ class Engine:
                     "results": results,
                 },
             )
-        self.state.status = "PULLS_SUCCEEDED"
         self.state.pulls = results
+        self._drop_snapshot()
+        try:
+            preparation = self._prepare_pnpm()
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._drop_snapshot()
+            return self._stop(
+                "PREPARATION_FAILED",
+                "pnpm_preparation",
+                {
+                    "status": "PREPARATION_FAILED",
+                    "reason": str(exc),
+                    "results": results,
+                },
+            )
+        self._drop_snapshot()
+        if preparation and preparation[-1]["exit_code"] != 0:
+            return self._stop(
+                "PREPARATION_FAILED",
+                "pnpm_preparation",
+                {
+                    "status": "PREPARATION_FAILED",
+                    "reason": "pnpm preparation failed; security checks were not started.",
+                    "failed_command": preparation[-1]["argv"],
+                    "results": results,
+                    "preparation": preparation,
+                },
+            )
+        self.state.status = "PULLS_SUCCEEDED"
         self._remember()
-        return {"status": "PULLS_SUCCEEDED", "results": results}
+        return {
+            "status": "PULLS_SUCCEEDED",
+            "results": results,
+            "preparation": preparation,
+        }
+
+    def _prepare_pnpm(self) -> list[dict]:
+        """Clean then install each pnpm project, once per workspace root."""
+        files, truncated = self._snapshot()
+        if truncated:
+            raise RuntimeError(
+                "Cannot prepare pnpm projects: checkout file discovery was truncated"
+            )
+        roots = sorted({path.parent for path in files if path.name == "package.json"})
+        pnpm_roots = [
+            root
+            for root in roots
+            if detect_stack(
+                root, [path for path in files if path.parent == root]
+            ).node_manager
+            == "pnpm"
+            or (root / "pnpm-workspace.yaml").is_file()
+        ]
+        results = []
+        for root in pnpm_roots:
+            if any(
+                parent in pnpm_roots and (parent / "pnpm-workspace.yaml").is_file()
+                for parent in root.parents
+            ):
+                continue
+            tool = resolve_tool("pnpm", self.which)
+            if not tool:
+                raise RuntimeError(
+                    "pnpm is required for post-pull clean/install but is not on PATH"
+                )
+            for step in ("clean", "install"):
+                self._progress(
+                    None, f"Post-pull pnpm {step} in {root.relative_to(self.repo_root)}"
+                )
+                result = self.runner.run(
+                    [tool, step], timeout=self.validation_timeout, check=False, cwd=root
+                )
+                results.append(
+                    {
+                        "argv": list(result.argv),
+                        "cwd": str(root),
+                        "exit_code": result.exit_code,
+                        "stdout": result.stdout[-500:],
+                        "stderr": result.stderr[-500:],
+                        "stdout_log_path": result.stdout_log_path,
+                        "stderr_log_path": result.stderr_log_path,
+                    }
+                )
+                if result.exit_code != 0:
+                    return results
+        return results
 
     @_serialized
     def create_security_branch(self) -> dict:
@@ -481,6 +620,7 @@ class Engine:
                 "reason": "Retain the applied package's original evidence; run post-update validation instead",
             }
         try:
+            self._progress(finding_id, "Assessing scanner category and local evidence")
             decision, reason, evidence, proposed, prompt = self._decide(finding)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             reason = f"Finding evidence could not be read safely: {exc}"
@@ -523,6 +663,9 @@ class Engine:
             "decision": decision,
             "reason": reason,
             "evidence": evidence,
+            "security_validation_sites": list(
+                finding.get("securityValidationSites") or []
+            ),
             "eligible_for_auto_fix": decision == "CHANGE_REQUIRED"
             and not (proposed and proposed.get("ecosystem") in PACKAGE_ECOSYSTEMS),
             "qualification_required": bool(
@@ -535,13 +678,18 @@ class Engine:
 
     @_serialized
     def qualify_package_update(self, finding_id: str, review: dict) -> dict:
-        """Require reviewed APIs/license terms and a passing product baseline.
+        """Require reviewed APIs/license terms; defer product checks to the batch.
 
         The hosting AI supplies its complete official-documentation review
         without production or unit-test adaptations. Configured/existing corporate
         policies remain mandatory; otherwise documented license review is
         used without inventing corporate approval. Requalify after changes.
         """
+        if self.state.manual_cleanup_required:
+            return {
+                "status": "MANUAL_REVIEW_REQUIRED",
+                "reason": "Restore or review preserved edits, then run validation before continuing",
+            }
         finding = self._finding(finding_id)
         if (
             self.state.status not in AFTER_BRANCH
@@ -567,7 +715,6 @@ class Engine:
             }
         finding.pop("packageQualification", None)
         baseline = {"results": []}
-        checks = []
         try:
             if not isinstance(review, dict) or any(
                 review.get(key) != plan.get(key)
@@ -576,39 +723,34 @@ class Engine:
                 raise ValueError(
                     "Documentation review must identify the exact ecosystem, package, and target"
                 )
+            self._progress(
+                finding_id, "Reviewing exact-target APIs, callers, and license policy"
+            )
             source_before = review_package(self.repo_root, review)
             major_review = review_major_upgrade(self.repo_root, plan, review)
             policy = self._package_policy(plan, review)
             tree = tree_snapshot(self.repo_root)
             scripts = package_script_hashes(self.repo_root, tree)
-            baseline = run_validation(
-                self.repo_root,
-                self.runner,
-                self.which,
-                timeout=self.validation_timeout,
-                package_checks=True,
-            )
-            if baseline["status"] != "VALIDATION_COMPLETE":
-                raise ValueError(
-                    "Package update not applied: baseline checks failed or are incomplete. "
-                    + "; ".join(
-                        f"{row.get('kind') or row.get('command') or 'validation'}: {row.get('detail', row['status'])}"
-                        for row in baseline["results"]
-                        if row.get("required") and row["status"] != "PASSED"
-                    )
+            lint_recorded = self.state.lint_baseline is not None
+            if not lint_recorded:
+                self._progress(
+                    finding_id,
+                    "Recording informational lint only; build and all unit tests run after the complete batch",
                 )
-            checks = run_checks(
-                self.repo_root,
-                policy["checks"],
-                self.runner,
-                self.which,
-                self.validation_timeout,
-                plan=plan,
-            )
-            if any(row["status"] != "PASSED" for row in checks):
-                raise ValueError(
-                    "Configured baseline product-check evidence is failed/incomplete"
+                baseline = run_validation(
+                    self.repo_root,
+                    self.runner,
+                    self.which,
+                    timeout=self.validation_timeout,
+                    package_checks=True,
+                    record_lint=True,
+                    lint_only=True,
                 )
+                self._capture_lint_baseline(finding_id, baseline["results"])
+            self._progress(
+                finding_id,
+                "Configured product checks are deferred to final batch validation",
+            )
             if major_review is not None:
                 major_review = review_major_upgrade(self.repo_root, plan, review)
             validate_edits(
@@ -617,7 +759,7 @@ class Engine:
                 [],
             )
             receipt = {
-                "check_contract": "lint-build-unit-no-code-v1",
+                "check_contract": "lint-baseline-build-unit-no-code-v2",
                 "status": "QUALIFIED",
                 "plan": deepcopy(plan),
                 "review": deepcopy(review),
@@ -626,13 +768,13 @@ class Engine:
                 "source_before": source_before,
                 "tree": tree,
                 "package_script_hashes": scripts,
-                "baseline_results": baseline["results"] + checks,
+                "baseline_results": baseline["results"],
             }
         except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
             finding["packageQualification"] = {
                 "status": "BLOCKED",
                 "reason": str(exc),
-                "baseline_results": baseline["results"] + checks,
+                "baseline_results": baseline["results"],
             }
             if plan.get("major_upgrade") and isinstance(review, dict):
                 finding["packageQualification"].update(
@@ -644,7 +786,7 @@ class Engine:
                 "finding_id": finding_id,
                 "reason": str(exc),
                 "eligible_for_auto_fix": False,
-                "baseline_results": baseline["results"] + checks,
+                "baseline_results": baseline["results"],
             }
         finding["packageQualification"] = receipt
         self._remember()
@@ -655,12 +797,23 @@ class Engine:
             "approval": policy["approval"],
             "policy_mode": policy["policy_mode"],
             "baseline_results": receipt["baseline_results"],
-            "note": "Apply only the reviewed dependency version edits. Do not change production code, unit tests, or check scripts. Lint, builds and unit tests must pass again before acceptance.",
+            "lint_issues_path": str(
+                self.repo_root / ".security-mcp" / "lint-issues.json"
+            ),
+            "lint_rules_path": str(
+                self.repo_root / ".security-mcp" / "lint-rules.json"
+            ),
+            "note": "Apply all reviewed package updates, then run one final production build and all unit tests. Existing lint issues are informational. Failed batches require isolation and guarded rollback.",
         }
 
     @_serialized
     def apply_minimal_fix(self, finding_id: str) -> dict:
         """Apply a verified plan only after package qualification passes."""
+        if self.state.manual_cleanup_required:
+            return {
+                "status": "MANUAL_REVIEW_REQUIRED",
+                "reason": "Manual cleanup and validation are required before another edit",
+            }
         finding = self._finding(finding_id)
         if finding is None:
             return {"status": "ERROR", "reason": "Finding not found"}
@@ -690,6 +843,16 @@ class Engine:
                 "finding_id": finding_id,
             }
         proposed = finding.get("proposedFix") or {}
+        if any(
+            change.get("validation_pending") and not change.get("package_update")
+            for change in self.state.changes
+            if change.get("status") == "APPLIED"
+        ):
+            return {
+                "status": "VALIDATION_REQUIRED",
+                "reason": "Validate the single pending security fix before applying another",
+                "finding_id": finding_id,
+            }
         required = ("strategy", "score", "ecosystem", "package", "target")
         if any(key not in proposed for key in required):
             return {
@@ -700,21 +863,13 @@ class Engine:
         package_update = proposed["ecosystem"] in PACKAGE_ECOSYSTEMS
         if package_update:
             self._refresh_package_validation()
-            if any(
-                change.get("qualification_status") != "VALIDATED"
-                for change in self._package_changes()
-            ):
-                return {
-                    "status": "VALIDATION_REQUIRED",
-                    "reason": "Validate the previous package update before another edit",
-                    "finding_id": finding_id,
-                }
             receipt = finding.get("packageQualification") or {}
             try:
                 if (
                     receipt.get("status") != "QUALIFIED"
                     or receipt.get("plan") != proposed
-                    or receipt.get("check_contract") != "lint-build-unit-no-code-v1"
+                    or receipt.get("check_contract")
+                    != "lint-baseline-build-unit-no-code-v2"
                 ):
                     raise ValueError(
                         "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
@@ -742,8 +897,44 @@ class Engine:
                     "finding_id": finding_id,
                     "reason": str(exc),
                 }
+        self._progress(
+            finding_id, "Reading required official documentation before editing"
+        )
+        if self.state.lint_baseline is None:
+            files, _truncated = self._snapshot()
+            stack = detect_stack(self.repo_root, files)
+            applicable = bool(stack.node or stack.dotnet or stack.java)
+            baseline = (
+                run_validation(
+                    self.repo_root,
+                    self.runner,
+                    self.which,
+                    timeout=self.validation_timeout,
+                    package_checks=True,
+                    record_lint=True,
+                    lint_only=True,
+                )
+                if applicable
+                else {"status": "VALIDATION_COMPLETE", "results": []}
+            )
+            self._capture_lint_baseline(
+                finding_id, baseline["results"], applicable=applicable
+            )
+        atomic_write_text(
+            self.repo_root / ".security-mcp" / "lint-issues.json",
+            json.dumps(self.state.lint_baseline, indent=2),
+        )
+        atomic_write_text(
+            self.repo_root / ".security-mcp" / "lint-rules.json",
+            json.dumps(
+                lint_rule_inventory(self.state.lint_baseline["results"]), indent=2
+            ),
+        )
         review = self._documentation().read_before_fix(
             finding, proposed.get("doc_pages") or []
+        )
+        self._record_validation_sites(
+            finding, [item["url"] for item in review.as_list()]
         )
         if not review.complete or (
             proposed.get("strategy") == "config_line" and not proposed.get("doc_pages")
@@ -770,6 +961,15 @@ class Engine:
             replacement_line=proposed.get("replacement_line"),
             doc_pages=tuple(proposed.get("doc_pages") or ()),
         )
+        self._progress(
+            finding_id,
+            "Applying reviewed dependency/configuration edit and lockfile refresh",
+        )
+        if not package_update:
+            finding["localFixAttempt"] = {
+                "tree": tree_snapshot(self.repo_root),
+                "dependency_before": backup_dependency_files(self.repo_root, proposed),
+            }
         outcome = apply_plan(self.repo_root, plan, self.runner, self.which)
         if package_update:
             receipt["applied_dependency_hashes"] = dependency_file_hashes(
@@ -791,7 +991,14 @@ class Engine:
             "package": plan.package,
             "target": plan.target,
             "qualification_status": "PENDING_VALIDATION" if package_update else None,
+            "validation_pending": outcome["status"] == "APPLIED",
         }
+        if not package_update:
+            finding["localFixAttempt"]["applied_dependency_hashes"] = (
+                dependency_file_hashes(
+                    self.repo_root, finding["localFixAttempt"]["dependency_before"]
+                )
+            )
         self.state.changes.append(change)
         self._drop_snapshot()
         if outcome["status"] == "APPLIED":
@@ -799,12 +1006,24 @@ class Engine:
             self.state.validation_status = None
             if package_update:
                 finding["packageQualification"]["status"] = "PENDING_VALIDATION"
-                for applied in self._package_changes():
-                    applied["qualification_status"] = "PENDING_VALIDATION"
-                    self._finding(applied["finding_id"])["packageQualification"][
-                        "status"
-                    ] = "PENDING_VALIDATION"
         elif outcome["status"] in {"FIX_FAILED", "FIX_FAILED_LOCKFILE"}:
+            attempt = receipt if package_update else finding["localFixAttempt"]
+            rollback = rollback_dependency_files(self.repo_root, attempt)
+            change["rollback"] = rollback
+            safe = (
+                rollback["status"] == "ROLLED_BACK"
+                and tree_snapshot(self.repo_root) == attempt["tree"]
+            )
+            outcome["continue_with_next_finding"] = safe
+            self.state.manual_cleanup_required = not safe
+            self._product_baseline = None
+            if package_update:
+                receipt["status"] = change["qualification_status"] = "REJECTED"
+            change["detail"] = (
+                (outcome.get("detail") or "The planned fix could not be applied.")
+                + " "
+                + rollback["detail"]
+            )
             self.state.no_solution.append(
                 {
                     "id": finding_id,
@@ -818,7 +1037,8 @@ class Engine:
             "status": outcome["status"],
             "finding_id": finding_id,
             "change": change,
-            "note": "Not accepted until post-update lint has no errors, production builds and unit tests pass, and configured policy checks pass. Production/unit-test code and check scripts must remain unchanged for every version increment.",
+            "continue_with_next_finding": outcome.get("continue_with_next_finding"),
+            "note": "Initial lint issues are recorded separately. Not accepted until production builds, all unit tests, and configured policy checks pass. Production/unit-test code and check scripts must remain unchanged.",
         }
 
     @_serialized
@@ -860,6 +1080,276 @@ class Engine:
 
     @_serialized
     def run_validation_matrix(self) -> dict:
+        """Validate the batch once; isolate failed updates only after a failure."""
+        self._refresh_package_validation()
+        pending = [
+            change
+            for change in self._package_changes()
+            if change.get("qualification_status") != "VALIDATED"
+        ]
+        if (
+            not pending
+            and self._product_baseline is not None
+            and not any(
+                change.get("validation_pending")
+                for change in self.state.changes
+                if change.get("status") == "APPLIED"
+            )
+            and self._product_baseline["tree"] == tree_snapshot(self.repo_root)
+        ):
+            return {**deepcopy(self._product_baseline["validation"]), "cached": True}
+        outcome = self._validate_current_batch()
+        if outcome["status"] == "VALIDATION_COMPLETE":
+            self._product_baseline = {
+                "tree": tree_snapshot(self.repo_root),
+                "validation": deepcopy(outcome),
+            }
+            return outcome
+        if not pending:
+            return outcome
+        try:
+            return self._isolate_package_batch(pending, outcome)
+        except (OSError, ValueError, RuntimeError, TypeError) as exc:
+            self.state.manual_cleanup_required = True
+            self.state.status = self.state.validation_status = "VALIDATION_FAILED"
+            self.state.stop_stage = "batch_isolation"
+            for change in pending:
+                change["qualification_status"] = "REJECTED"
+                self._finding(change["finding_id"])["packageQualification"].update(
+                    status="REJECTED", reason=str(exc)
+                )
+            outcome.update(
+                status="VALIDATION_FAILED",
+                reason="Package updates are not accepted: " + str(exc),
+                continue_with_next_finding=False,
+                rollbacks=[
+                    {"finding_id": change["finding_id"], **change["rollback"]}
+                    for change in pending
+                    if change.get("rollback")
+                ],
+            )
+            self._remember()
+            return outcome
+
+    def _isolate_package_batch(self, changes: list[dict], initial: dict) -> dict:
+        """Split failed groups, retain passing combinations, and guard every restore."""
+        templates = {
+            change["finding_id"]: deepcopy(
+                self._finding(change["finding_id"])["packageQualification"]
+            )
+            for change in changes
+        }
+        by_id = {change["finding_id"]: change for change in changes}
+        identifiers = list(by_id)
+        baseline_tree = templates[identifiers[0]]["tree"]
+        originals = {}
+        expected = {}
+        for receipt in templates.values():
+            for path, text in receipt["dependency_before"].items():
+                originals.setdefault(path, text)
+            expected.update(receipt["applied_dependency_hashes"])
+        active = tuple(identifiers)
+        cache = {active: deepcopy(initial)}
+        trials = []
+        self.state.batch_isolation = trials
+        rejected = {}
+
+        def record(selected: tuple[str, ...], result: dict) -> None:
+            """Retain failed commands and log paths without losing final green evidence."""
+            trials.append(
+                {
+                    "finding_ids": list(selected),
+                    "status": result["status"],
+                    "failures": [
+                        deepcopy(row)
+                        for row in result.get("results", [])
+                        if row.get("required") and row["status"] != "PASSED"
+                    ],
+                }
+            )
+
+        record(active, initial)
+
+        def activate(selected: tuple[str, ...]) -> None:
+            """Restore the baseline, then replay only previously reviewed dependency plans."""
+            nonlocal expected, active
+            for receipt in templates.values():
+                policy = self._package_policy(receipt["plan"], receipt["review"])
+                if policy["policy_sha256"] != receipt["policy_sha256"]:
+                    raise ValueError(
+                        "Qualification policy changed; isolation requires a fresh review"
+                    )
+            rollback = rollback_dependency_files(
+                self.repo_root,
+                {"dependency_before": originals, "applied_dependency_hashes": expected},
+            )
+            for change in changes:
+                change["rollback"] = deepcopy(rollback)
+                if rollback["status"] == "ROLLED_BACK":
+                    change.update(status="ROLLED_BACK", validation_pending=False)
+            if (
+                rollback["status"] != "ROLLED_BACK"
+                or tree_snapshot(self.repo_root) != baseline_tree
+            ):
+                raise ValueError(
+                    "Batch isolation stopped: later edits were preserved; manual cleanup is required. "
+                    + rollback["detail"]
+                )
+            for finding_id, change in by_id.items():
+                receipt = deepcopy(templates[finding_id])
+                receipt.pop("validated_tree", None)
+                receipt["status"] = "REJECTED"
+                self._finding(finding_id)["packageQualification"] = receipt
+                change.update(
+                    status="ROLLED_BACK",
+                    qualification_status="REJECTED",
+                    validation_pending=False,
+                )
+            expected = dependency_file_hashes(self.repo_root, originals)
+            active = ()
+            for finding_id in selected:
+                receipt = self._finding(finding_id)["packageQualification"]
+                proposed = receipt["plan"]
+                review = self._documentation().read_before_fix(
+                    self._finding(finding_id), proposed.get("doc_pages") or []
+                )
+                if not review.complete:
+                    raise ValueError(review.reason())
+                receipt["tree"] = tree_snapshot(self.repo_root)
+                receipt["dependency_before"] = backup_dependency_files(
+                    self.repo_root, proposed
+                )
+                plan = Plan(
+                    **{
+                        item.name: proposed[item.name]
+                        for item in fields(Plan)
+                        if item.name in proposed
+                    }
+                )
+                outcome = apply_plan(self.repo_root, plan, self.runner, self.which)
+                expected = dependency_file_hashes(self.repo_root, originals)
+                receipt["applied_dependency_hashes"] = dependency_file_hashes(
+                    self.repo_root, receipt["dependency_before"]
+                )
+                if outcome["status"] != "APPLIED":
+                    raise ValueError(
+                        "Reviewed subset could not be reapplied: "
+                        + str(outcome.get("detail") or outcome["status"])
+                    )
+                receipt["status"] = "PENDING_VALIDATION"
+                by_id[finding_id].update(
+                    status="APPLIED",
+                    qualification_status="PENDING_VALIDATION",
+                    validation_pending=True,
+                )
+            active = selected
+            self._drop_snapshot()
+
+        def trial(selected: tuple[str, ...], *, force: bool = False) -> dict:
+            """Avoid duplicate diagnostic selections; always validate the final active tree."""
+            if not force and selected in cache:
+                return cache[selected]
+            self._progress(
+                None,
+                "Diagnosing failed batch: testing subset "
+                + ", ".join(selected or ("original baseline",)),
+            )
+            activate(selected)
+            result = self._validate_current_batch(
+                require_package_checks=True,
+                baseline_policies=list(templates.values()) if not selected else None,
+            )
+            cache[selected] = deepcopy(result)
+            record(selected, result)
+            return result
+
+        accepted = []
+
+        def retain(group: list[str]) -> None:
+            """Try a whole group before splitting so one offender costs logarithmic probes."""
+            selected = tuple(accepted + group)
+            result = trial(selected)
+            if result["status"] == "VALIDATION_COMPLETE":
+                accepted.extend(group)
+            elif len(group) > 1:
+                middle = len(group) // 2
+                retain(group[:middle])
+                retain(group[middle:])
+            else:
+                rejected[group[0]] = (
+                    "Rejected after build/test or policy failure with retained updates "
+                    + repr(accepted)
+                    + ": "
+                    + "; ".join(
+                        str(row.get("detail") or row.get("command"))
+                        for row in result.get("results", [])
+                        if row.get("required") and row["status"] != "PASSED"
+                    )
+                )
+
+        retain(identifiers)
+        selected = tuple(accepted)
+        final = trial(
+            selected,
+            force=active != selected
+            or cache.get(selected, {}).get("status") != "VALIDATION_COMPLETE",
+        )
+        for finding_id, reason in rejected.items():
+            change = by_id[finding_id]
+            change.update(
+                status="ROLLED_BACK",
+                qualification_status="REJECTED",
+                validation_pending=False,
+                detail="Package update rejected: " + reason,
+            )
+            receipt = self._finding(finding_id)["packageQualification"]
+            receipt.update(
+                status="REJECTED",
+                reason=reason,
+                rollback=deepcopy(change.get("rollback")),
+            )
+        self.state.batch_isolation = trials
+        final.update(
+            isolation_trials=trials,
+            retained_updates=accepted,
+            rejected_updates=[
+                {"finding_id": finding_id, "reason": reason}
+                for finding_id, reason in rejected.items()
+            ],
+            rollbacks=[
+                {"finding_id": finding_id, **by_id[finding_id]["rollback"]}
+                for finding_id in rejected
+                if by_id[finding_id].get("rollback")
+            ],
+        )
+        if final["status"] == "VALIDATION_COMPLETE":
+            self.state.manual_cleanup_required = False
+            self._product_baseline = {
+                "tree": tree_snapshot(self.repo_root),
+                "validation": deepcopy(final),
+            }
+            if not accepted:
+                final.update(
+                    status="FIX_REJECTED",
+                    continue_with_next_finding=True,
+                    reason="All candidates rejected; the restored baseline build and all unit tests passed.",
+                )
+                self.state.status = "FIXES_IN_PROGRESS"
+        else:
+            final.update(
+                reason="The restored subset or original baseline still fails; no green checkout is claimed.",
+                continue_with_next_finding=False,
+            )
+            self.state.manual_cleanup_required = True
+        self._remember()
+        return final
+
+    def _validate_current_batch(
+        self,
+        *,
+        require_package_checks: bool = False,
+        baseline_policies: list[dict] | None = None,
+    ) -> dict:
         """Run the detected stack's checks. A missing branch blocks this."""
         if self.state.status not in AFTER_BRANCH:
             return {
@@ -867,12 +1357,38 @@ class Engine:
                 "reason": "Create the security branch before validation.",
             }
         package_changes = self._package_changes()
+        local_changes = [
+            change
+            for change in self.state.changes
+            if change.get("status") == "APPLIED"
+            and change.get("validation_pending")
+            and not change.get("package_update")
+        ]
+        pending = [
+            change
+            for change in package_changes
+            if change.get("qualification_status") != "VALIDATED"
+        ]
+        accepted_before = {
+            change["finding_id"]: (
+                deepcopy(change),
+                deepcopy(self._finding(change["finding_id"])["packageQualification"]),
+            )
+            for change in package_changes
+            if change not in pending
+        }
+        for change in package_changes:
+            self._progress(
+                change["finding_id"], "Running post-update build and all unit tests"
+            )
+        validation_runner = _ValidationRunner(self.runner, self.repo_root)
         outcome = run_validation(
             self.repo_root,
-            self.runner,
+            validation_runner,
             self.which,
             timeout=self.validation_timeout,
-            package_checks=bool(package_changes),
+            package_checks=bool(package_changes) or require_package_checks,
+            skip_lint=True,
         )
         allowed_files = [
             path for change in self.state.changes for path in change.get("files") or []
@@ -887,6 +1403,18 @@ class Engine:
             .get("applied_dependency_hashes", {})
             .items()
         }
+        for receipt in baseline_policies or []:
+            checks = run_checks(
+                self.repo_root,
+                receipt["checks"],
+                validation_runner,
+                self.which,
+                self.validation_timeout,
+                plan=receipt["plan"],
+            )
+            outcome["results"].extend(checks)
+            if any(row["status"] != "PASSED" for row in checks):
+                outcome["status"] = "VALIDATION_FAILED"
         for change in package_changes:
             finding = self._finding(change["finding_id"])
             receipt = (finding or {}).get("packageQualification") or {}
@@ -897,7 +1425,10 @@ class Engine:
             try:
                 if not receipt.get("plan"):
                     raise ValueError("Package qualification is missing")
-                if receipt.get("check_contract") != "lint-build-unit-no-code-v1":
+                if (
+                    receipt.get("check_contract")
+                    != "lint-baseline-build-unit-no-code-v2"
+                ):
                     raise ValueError(
                         "Package qualification predates mandatory lint/no-code checks; requalification is required"
                     )
@@ -913,10 +1444,14 @@ class Engine:
                     allowed_files,
                     expected_dependencies=expected_dependencies,
                 )
+                if outcome["status"] != "VALIDATION_COMPLETE":
+                    raise ValueError(
+                        "Product build/unit validation failed or is incomplete; candidate cannot be accepted"
+                    )
                 checks = run_checks(
                     self.repo_root,
                     policy["checks"],
-                    self.runner,
+                    validation_runner,
                     self.which,
                     self.validation_timeout,
                     plan=receipt["plan"],
@@ -961,9 +1496,11 @@ class Engine:
                 else "PENDING_VALIDATION"
             )
             change["qualification_status"] = receipt["status"] = status
+            change["validation_pending"] = status != "VALIDATED"
+            self._progress(change["finding_id"], f"Post-update validation: {status}")
             if status == "VALIDATED":
                 change["detail"] = (
-                    "Accepted: no production/unit-test API changes, no lint errors, production build and unit tests passed; all configured policy checks passed"
+                    "Accepted: no production/unit-test API changes; initial lint issues recorded separately; production build and all unit tests passed; configured policy checks passed"
                 )
             else:
                 failures = [
@@ -976,26 +1513,69 @@ class Engine:
                     for row in failures
                 )
         self.state.validation_results = outcome["results"]
-        if package_changes and outcome["status"] != "VALIDATION_COMPLETE":
-            outcome["reason"] = (
-                "Package updates are not accepted: lint errors, missing/incomplete checks, build or unit-test failures, or prohibited code changes require rejecting the update, not adapting production or unit tests. See results for each failed check."
-            )
-            outcome["rollbacks"] = []
-            for change in reversed(package_changes):
-                receipt = self._finding(change["finding_id"])["packageQualification"]
-                if receipt.get("validated_tree") is not None:
-                    continue
-                rollback = rollback_dependency_files(self.repo_root, receipt)
-                receipt["rollback"] = change["rollback"] = rollback
-                receipt["status"] = change["qualification_status"] = "REJECTED"
-                if rollback["status"] == "ROLLED_BACK":
-                    change["status"] = "ROLLED_BACK"
-                change["detail"] += " " + rollback["detail"]
-                outcome["rollbacks"].append(
-                    {"finding_id": change["finding_id"], **rollback}
+        for change in local_changes:
+            if outcome["status"] == "VALIDATION_COMPLETE":
+                change["validation_pending"] = False
+                continue
+            attempt = self._finding(change["finding_id"])["localFixAttempt"]
+            rollback = rollback_dependency_files(self.repo_root, attempt)
+            change["rollback"] = rollback
+            failures = [
+                row
+                for row in outcome["results"]
+                if row.get("required") and row["status"] != "PASSED"
+            ]
+            change["detail"] = (
+                "Security fix rejected: "
+                + "; ".join(
+                    str(row.get("detail") or row.get("command")) for row in failures
                 )
-        self.state.validation_status = outcome["status"]
-        if outcome["status"] == "VALIDATION_FAILED":
+                + " "
+                + rollback["detail"]
+            )
+            safe = (
+                rollback["status"] == "ROLLED_BACK"
+                and tree_snapshot(self.repo_root) == attempt["tree"]
+            )
+            if rollback["status"] == "ROLLED_BACK":
+                change["status"] = "ROLLED_BACK"
+                change["validation_pending"] = False
+            outcome["continue_with_next_finding"] = safe
+            outcome.setdefault("rollbacks", []).append(
+                {"finding_id": change["finding_id"], **rollback}
+            )
+            if safe:
+                for package_change in package_changes:
+                    if package_change["finding_id"] in accepted_before:
+                        previous_change, previous_receipt = accepted_before[
+                            package_change["finding_id"]
+                        ]
+                        package_change.clear()
+                        package_change.update(previous_change)
+                        self._finding(package_change["finding_id"])[
+                            "packageQualification"
+                        ] = previous_receipt
+                self._refresh_package_validation()
+                safe = all(
+                    item.get("qualification_status") == "VALIDATED"
+                    for item in self._package_changes()
+                )
+                outcome["continue_with_next_finding"] = safe
+            if safe:
+                outcome["status"] = "FIX_REJECTED"
+        if outcome.get("continue_with_next_finding") is False:
+            self.state.manual_cleanup_required = True
+        elif outcome["status"] == "VALIDATION_COMPLETE":
+            self.state.manual_cleanup_required = False
+        self.state.validation_status = (
+            "VALIDATION_FAILED"
+            if outcome["status"] == "FIX_REJECTED"
+            else outcome["status"]
+        )
+        if outcome["status"] == "FIX_REJECTED":
+            self.state.status = "FIXES_IN_PROGRESS"
+            self.state.stop_stage = None
+        elif outcome["status"] == "VALIDATION_FAILED":
             self.state.status = "VALIDATION_FAILED"
             self.state.stop_stage = "validation"
         else:
@@ -1039,6 +1619,7 @@ class Engine:
         return {
             "status": self.state.status,
             "stop_stage": self.state.stop_stage,
+            "manual_cleanup_required": self.state.manual_cleanup_required,
             "branch": self.state.branch_name,
             "findings_count": len(self.state.findings),
             "changes_count": len(self.state.changes),
@@ -1046,6 +1627,14 @@ class Engine:
             "no_solution_count": len(self.state.no_solution),
             "skipped_user_prompt_count": len(self.state.skipped_user_prompt),
             "report_path": self.state.report_path,
+            "lint_issues_path": str(
+                self.repo_root / ".security-mcp" / "lint-issues.json"
+            )
+            if self.state.lint_baseline is not None
+            else None,
+            "lint_rules_path": str(self.repo_root / ".security-mcp" / "lint-rules.json")
+            if self.state.lint_baseline is not None
+            else None,
             "package_updates": [
                 {
                     "finding_id": change["finding_id"],
@@ -1056,6 +1645,31 @@ class Engine:
                 for change in self._package_changes()
             ],
         }
+
+    def _capture_lint_baseline(
+        self, finding_id: str | None, results: list[dict], *, applicable: bool = True
+    ) -> None:
+        """Publish best-effort pre-change lint evidence without gating security fixes."""
+        rows = [deepcopy(row) for row in results if row.get("kind") == "lint"]
+        baseline = {
+            "schema_version": 1,
+            "phase": "before_changes",
+            "tree": tree_snapshot(self.repo_root),
+            "finding_id": finding_id,
+            "complete": not applicable
+            or (bool(rows) and all(row.get("output_complete") for row in rows)),
+            "applicable": applicable,
+            "results": rows,
+        }
+        atomic_write_text(
+            self.repo_root / ".security-mcp" / "lint-issues.json",
+            json.dumps(baseline, indent=2),
+        )
+        atomic_write_text(
+            self.repo_root / ".security-mcp" / "lint-rules.json",
+            json.dumps(lint_rule_inventory(rows), indent=2),
+        )
+        self.state.lint_baseline = baseline
 
     def _package_changes(self) -> list[dict]:
         """Return applied package changes whose product guarantees need checks."""
@@ -1073,6 +1687,15 @@ class Engine:
 
     def _refresh_package_validation(self) -> None:
         """Invalidate green evidence when the checkout or approval policy moves."""
+        if any(
+            change.get("qualification_status") == "PENDING_VALIDATION"
+            for change in self._package_changes()
+        ) or any(
+            change.get("validation_pending")
+            for change in self.state.changes
+            if change.get("status") == "APPLIED"
+        ):
+            return
         snapshot = None
         snapshot_checked = False
         for change in self._package_changes():
@@ -1090,7 +1713,8 @@ class Engine:
                 )
                 valid = (
                     snapshot is not None
-                    and receipt.get("check_contract") == "lint-build-unit-no-code-v1"
+                    and receipt.get("check_contract")
+                    == "lint-baseline-build-unit-no-code-v2"
                     and receipt.get("validated_tree") == snapshot
                     and receipt.get("policy_sha256") == policy["policy_sha256"]
                 )
@@ -1225,6 +1849,9 @@ class Engine:
                 "Dockerfile container findings keep the image-tag plan. Writing it still requires a fresh read of the official documentation."
             )
 
+        self._progress(
+            finding.get("id"), "Inspecting local dependency manifests and lockfiles"
+        )
         files, files_truncated = self._snapshot()
         hit, truncated = locate_package(
             self.repo_root,
@@ -1284,12 +1911,14 @@ class Engine:
         installed = (hit.version if hit else None) or finding.get("installedVersion")
         ecosystem = hit.ecosystem if hit else None
         package_name = hit.name if hit else component
+        self._progress(finding.get("id"), "Checking public advisory evidence")
         looked_up = self.advisory.lookup(
             finding,
             ecosystem or (hit.manager if hit else None),
             package_name,
             installed,
         )
+        self._record_validation_sites(finding, looked_up.validation_sites)
         evidence.append(looked_up.summary or "No advisory summary.")
         if looked_up.ranges:
             finding["affectedRange"] = ", ".join(looked_up.ranges)
@@ -1298,6 +1927,71 @@ class Engine:
             evidence.append("Sources: " + ", ".join(looked_up.sources))
         if looked_up.errors:
             evidence.append("Lookup errors: " + "; ".join(looked_up.errors))
+
+        if (
+            category == "dependency_scanning"
+            and hit is not None
+            and component == hit.name
+            and parse_version(installed) is not None
+            and (
+                not finding.get("installedVersion")
+                or parse_version(finding["installedVersion"])
+                == parse_version(installed)
+            )
+            and looked_up.affected is not False
+            and (
+                looked_up.outcome != "resolved"
+                or looked_up.affected is None
+                or not looked_up.lowest_fixed_version
+            )
+        ):
+            gitlab_fixed = lowest_fixed(
+                installed,
+                finding.get("fixedVersions")
+                or parse_fixed_versions(finding.get("solution")),
+            )
+            if gitlab_fixed:
+                self._progress(
+                    finding.get("id"),
+                    f"Checking GitLab-recommended target {gitlab_fixed} against public advisories",
+                )
+                target_lookup = self.advisory.lookup(
+                    finding, ecosystem or hit.manager, package_name, gitlab_fixed
+                )
+                self._record_validation_sites(finding, target_lookup.validation_sites)
+                evidence.append(
+                    f"GitLab recommends {package_name} {gitlab_fixed}; the finding matches "
+                    f"the local dependency at {installed}. Target advisory check: "
+                    + (target_lookup.summary or target_lookup.outcome)
+                )
+                if target_lookup.sources:
+                    evidence.append(
+                        "Target sources: " + ", ".join(target_lookup.sources)
+                    )
+                if target_lookup.errors:
+                    evidence.append(
+                        "Target lookup errors: " + "; ".join(target_lookup.errors)
+                    )
+                if target_lookup.affected is True:
+                    reason = (
+                        f"GitLab recommends {gitlab_fixed}, but public advisory evidence "
+                        "marks that target as affected."
+                    )
+                    return (
+                        "MANUAL_REVIEW",
+                        reason,
+                        evidence,
+                        None,
+                        self._prompt(finding, target_lookup, reason),
+                    )
+                looked_up = AdvisoryLookup(
+                    outcome="resolved",
+                    affected=True,
+                    fixed_versions=[gitlab_fixed],
+                    lowest_fixed_version=gitlab_fixed,
+                    summary=f"Using GitLab's explicit fix {gitlab_fixed}; public advisory metadata is incomplete.",
+                )
+                evidence.append(looked_up.summary)
 
         if looked_up.outcome in {"lookup_failed", "not_found", PACKAGE_MISMATCH}:
             reason = looked_up.summary
@@ -1341,6 +2035,9 @@ class Engine:
 
         image_only = category == "container_scanning" and hit is None
         fixed = looked_up.lowest_fixed_version
+        self._progress(
+            finding.get("id"), f"Planning minimal dependency change to {fixed}"
+        )
         plan, plan_reason = plan_remediation(
             self.repo_root, finding, None if image_only else hit, fixed, files
         )
@@ -1388,7 +2085,7 @@ class Engine:
             )
         if plan.ecosystem in PACKAGE_ECOSYSTEMS:
             evidence.append(
-                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy, and passing before/after checks."
+                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply all reviewed updates, then require a passing final build, all unit tests and configured checks."
             )
             if major_upgrade:
                 evidence.append(
@@ -1422,6 +2119,9 @@ class Engine:
             )
         proposed = assessment.plan.as_dict()
         review = self._documentation().read_before_fix(finding, proposed["doc_pages"])
+        self._record_validation_sites(
+            finding, [item["url"] for item in review.as_list()]
+        )
         evidence.append(review.reason())
         evidence.extend(
             f"Read {item['name']} {item['url']}"
@@ -1442,6 +2142,15 @@ class Engine:
         )
         return "CHANGE_REQUIRED", assessment.plan.description, evidence, proposed, None
 
+    def _record_validation_sites(self, finding: dict, urls: list[str]) -> None:
+        """Keep the distinct sites actually used to assess this finding."""
+        sites = set(finding.get("securityValidationSites") or [])
+        for url in urls:
+            parsed = urlsplit(url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                sites.add(f"{parsed.scheme}://{parsed.netloc}")
+        finding["securityValidationSites"] = sorted(sites)
+
     def _prompt(
         self, finding: dict, looked_up: AdvisoryLookup | None, reason: str
     ) -> str:
@@ -1454,6 +2163,28 @@ class Engine:
             "Tell the agent the fixed version to apply, or confirm that this is a false positive. "
             "This finding is skipped and the remaining findings continue."
         )
+
+    def _progress(self, finding_id: str | None, step: str) -> None:
+        """Emit bounded, single-line progress without scanner payloads or review contents."""
+        finding = self._finding(finding_id) if finding_id else None
+        label = " ".join(str(finding_id or "run").split())[:200]
+        package = " ".join(str((finding or {}).get("component") or "N/A").split())[:200]
+        repository = " ".join(str(self.repo_root).split())[:500]
+        step = " ".join(step.split())[:500]
+        logger.info(
+            "Progress repo=%s finding=%s package=%s: %s",
+            repository,
+            label,
+            package,
+            step,
+        )
+        sink = progress_sink.get()
+        if sink is not None:
+            bar = "#" * 20 if " finished:" in step else "?" * 20
+            try:
+                sink(f"[{bar}] {package} / {label}: {step}")
+            except Exception:
+                logger.warning("Could not publish step progress", exc_info=True)
 
     def _finding(self, finding_id: str) -> dict | None:
         """Return the active finding matching an id, or None if absent."""

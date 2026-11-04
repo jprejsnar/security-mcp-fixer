@@ -3,6 +3,7 @@
 import hashlib
 
 import httpx
+import pytest
 
 from gitlab_security_mcp.config_findings import config_kind
 from gitlab_security_mcp.engine import Engine
@@ -56,7 +57,7 @@ def test_nginx_server_tokens_changes_only_the_cited_line(tmp_path):
     docs = documentation_client({_NGINX_CORE: "Syntax server_tokens on | off"})
     engine = _ready(
         tmp_path,
-        _finding("nginx.conf", 3),
+        _finding("nginx.conf", 3, identifiers=["CVE-NO-PUBLIC-RECORD"]),
         docs,
         "nginx.conf",
         text,
@@ -70,6 +71,8 @@ def test_nginx_server_tokens_changes_only_the_cited_line(tmp_path):
     # Assert
     assert decision["decision"] == "CHANGE_REQUIRED"
     assert decision["proposed_fix"]["strategy"] == "config_line"
+    assert "https://nginx.org" in decision["security_validation_sites"]
+    assert "https://services.nvd.nist.gov" not in decision["security_validation_sites"]
     assert applied["status"] == "APPLIED"
     assert (
         updated
@@ -95,6 +98,7 @@ def test_nginx_autoindex_and_obsolete_tls_follow_the_module_pages(tmp_path):
     # Act
     autoindex = engine.verify_security_finding("config")
     applied_autoindex = engine.apply_minimal_fix("config")
+    validated_autoindex = engine.run_validation_matrix()
     tls = engine.verify_security_finding("tls")
     applied_tls = engine.apply_minimal_fix("tls")
     updated = (tmp_path / "nginx.conf").read_text(encoding="utf-8")
@@ -102,8 +106,52 @@ def test_nginx_autoindex_and_obsolete_tls_follow_the_module_pages(tmp_path):
     # Assert
     assert autoindex["proposed_fix"]["package"] == "autoindex"
     assert tls["proposed_fix"]["package"] == "ssl_protocols"
+    assert validated_autoindex["status"] == "VALIDATION_COMPLETE"
     assert applied_autoindex["status"] == applied_tls["status"] == "APPLIED"
     assert updated == "autoindex off;\nssl_protocols TLSv1.2;\n"
+
+
+@pytest.mark.parametrize("later_edit", [False, True])
+def test_failed_configuration_fix_rolls_back_without_overwriting_later_edits(
+    tmp_path, monkeypatch, later_edit
+):
+    """Restore only updater-owned configuration edits and explain rejected checks."""
+    # Arrange
+    original = "server_tokens on;\n"
+    docs = documentation_client({_NGINX_CORE: "Syntax server_tokens on | off"})
+    engine = _ready(tmp_path, _finding("nginx.conf", 1), docs, "nginx.conf", original)
+    engine.verify_security_finding("config")
+    applied = engine.apply_minimal_fix("config")
+    path = tmp_path / "nginx.conf"
+    if later_edit:
+        path.write_text("user-owned edit\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "gitlab_security_mcp.engine.run_validation",
+        lambda *args, **kwargs: {
+            "status": "VALIDATION_FAILED",
+            "results": [
+                {
+                    "status": "FAILED",
+                    "required": True,
+                    "kind": "build",
+                    "detail": "fixture build failed",
+                }
+            ],
+        },
+    )
+
+    # Act
+    result = engine.run_validation_matrix()
+
+    # Assert
+    assert applied["status"] == "APPLIED"
+    assert (tmp_path / ".security-mcp" / "lint-issues.json").is_file()
+    assert result["continue_with_next_finding"] is not later_edit
+    assert result["status"] == ("VALIDATION_FAILED" if later_edit else "FIX_REJECTED")
+    assert path.read_text(encoding="utf-8") == (
+        "user-owned edit\n" if later_edit else original
+    )
+    assert "fixture build failed" in engine.state.changes[0]["detail"]
 
 
 def test_gitlab_ci_reenables_only_the_cited_security_scanner(tmp_path):
@@ -184,6 +232,44 @@ def test_missing_nginx_file_is_a_false_positive_and_escape_is_not(tmp_path):
     assert absent["decision"] == "FALSE_POSITIVE"
     assert outside["decision"] == "MANUAL_REVIEW"
     assert "outside the repository" in outside["reason"]
+
+
+@pytest.mark.parametrize("status", [404, 503])
+def test_missing_security_reference_pages_do_not_block_code_edits(tmp_path, status):
+    """Apply documented configuration fixes even when all security sites lack data."""
+    # Arrange
+    security_hosts = {"www.cve.org", "cwe.mitre.org", "www.nsa.gov", "nvd.nist.gov"}
+    markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
+
+    def handler(request):
+        """Keep actual publisher guidance available while security references fail."""
+        return (
+            httpx.Response(status, text="No security data")
+            if request.url.host in security_hosts
+            else httpx.Response(200, text=markers + " server_tokens on | off")
+        )
+
+    docs = OfficialDocs(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    finding = _finding("nginx.conf", 1, identifiers=["CVE-2024-12345", "CWE-79"])
+    engine = _ready(tmp_path, finding, docs, "nginx.conf", "server_tokens on;\n")
+
+    # Act
+    review = docs.read_before_fix(finding)
+    decision = engine.verify_security_finding("config")
+    applied = engine.apply_minimal_fix("config")
+
+    # Assert
+    assert review.complete is True
+    assert "informational" in review.reason()
+    assert all(not source.required for source in review.sources if not source.ok)
+    assert decision["decision"] == "CHANGE_REQUIRED"
+    assert applied["status"] == "APPLIED"
+    assert (tmp_path / "nginx.conf").read_text(
+        encoding="utf-8"
+    ) == "server_tokens off;\n"
+    assert {"https://" + host for host in security_hosts}.issubset(
+        finding["securityValidationSites"]
+    )
 
 
 def test_incomplete_documentation_blocks_the_configuration_edit(tmp_path):

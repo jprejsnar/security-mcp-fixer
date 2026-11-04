@@ -3,11 +3,89 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
+
+import httpx
+
+_HTTP_LOG_LOCK = threading.Lock()
+logger = logging.getLogger("gitlab_security_mcp")
+
+
+def _http_log_url(url: str | httpx.URL) -> str:
+    """Keep the endpoint without user credentials, query values or fragments."""
+    try:
+        return str(
+            httpx.URL(url).copy_with(
+                username="", password="", query=None, fragment=None
+            )
+        )
+    except (httpx.InvalidURL, ValueError):
+        return "[invalid URL]"
+
+
+@contextmanager
+def timed_http_stream(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    source: str,
+    log_path: Path | None = None,
+    **kwargs,
+) -> Iterator[httpx.Response]:
+    """Time a request through body consumption and log safe concurrent spans.
+
+    Only the final append is serialized. Network and body work stay concurrent.
+    Transport failures retain their exception class, never exception messages,
+    request headers, payloads, query strings or response bodies.
+    """
+    started_at = datetime.now(UTC).isoformat()
+    started = perf_counter()
+    response = None
+    error = None
+    try:
+        with client.stream(method, url, **kwargs) as response:
+            yield response
+    except Exception as exc:
+        error = type(exc).__name__
+        raise
+    finally:
+        duration_ms = round((perf_counter() - started) * 1000, 3)
+        record = {
+            "event": "http_request",
+            "source": source,
+            "method": method.upper(),
+            "url": _http_log_url(url),
+            "final_url": _http_log_url(response.url) if response is not None else None,
+            "started_at": started_at,
+            "finished_at": datetime.now(UTC).isoformat(),
+            "duration_ms": duration_ms,
+            "status_code": response.status_code if response is not None else None,
+            "error": error,
+            "worker": threading.current_thread().name,
+        }
+        text = json.dumps(record, ensure_ascii=True)
+        logger.info("HTTP timing %s", text)
+        if log_path is not None:
+            try:
+                with _HTTP_LOG_LOCK:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(text + "\n")
+            except OSError as exc:
+                logger.warning(
+                    "Could not write HTTP timing log: %s", type(exc).__name__
+                )
 
 
 def json_object(text: str) -> dict:

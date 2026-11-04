@@ -1,8 +1,8 @@
 """Read current publisher documentation before any local security edit.
 
 A fix is authorized only after this run retrieves every required page.
-Cached or remembered guidance is not enough, and a failed read blocks the
-write. Response bodies are hashed and discarded so they are not retained
+Cached or remembered publisher guidance is not enough. Security-reference
+pages are informational and cannot block the write. Bodies are hashed and discarded
 on the engine.
 """
 
@@ -12,11 +12,14 @@ import hashlib
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import httpx
 
+from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.fanout import map_ordered
+from gitlab_security_mcp.util import timed_http_stream
 
 # Publishers named by the remediation contract. Each marker must appear in
 # the live page, which rejects an empty or unrelated response.
@@ -66,6 +69,7 @@ _CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _CWE = re.compile(r"CWE-(\d{1,5})", re.IGNORECASE)
 _MAX_BODY = 1_000_000
 _MAX_IDENTIFIERS = 4
+INFORMATIONAL_SECURITY_DOCS = frozenset({"cve", "cwe", "nsa", "nist"})
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,7 @@ class DocSource:
     status_code: int | None
     sha256: str | None
     error: str | None
+    required: bool = True
 
     def as_dict(self) -> dict:
         """Return the page result for evidence and reports."""
@@ -88,6 +93,7 @@ class DocSource:
             "status_code": self.status_code,
             "sha256": self.sha256,
             "error": self.error,
+            "required": self.required,
         }
 
 
@@ -99,17 +105,27 @@ class DocReview:
 
     @property
     def complete(self) -> bool:
-        """Return whether every requested page passed its marker check."""
-        return bool(self.sources) and all(item.ok for item in self.sources)
+        """Require publisher checks without gating on security-reference availability."""
+        return bool(self.sources) and all(
+            item.ok or not item.required for item in self.sources
+        )
 
     def reason(self) -> str:
         """Explain a complete read or name the pages that blocked the edit."""
         failed = [
             f"{item.name} ({item.error or item.status_code})"
             for item in self.sources
-            if not item.ok
+            if not item.ok and item.required
         ]
         if not failed:
+            missing = [
+                item.name for item in self.sources if not item.ok and not item.required
+            ]
+            if missing:
+                return (
+                    "Required publisher documentation was read. Security-reference data unavailable (informational): "
+                    + ", ".join(missing)
+                )
             return "Current official documentation was read before the edit."
         return (
             "Official documentation was not read completely, so nothing was changed: "
@@ -130,9 +146,12 @@ class OfficialDocs:
     hashes. An injected client stays open.
     """
 
-    def __init__(self, *, http: httpx.Client | None = None):
+    def __init__(
+        self, *, http: httpx.Client | None = None, http_log_path: Path | None = None
+    ):
         """Retain a caller-owned client, or open one with redirects enabled."""
         self._owns_http = http is None
+        self.http_log_path = http_log_path
         self.http = (
             http
             if http is not None
@@ -165,7 +184,8 @@ class OfficialDocs:
 
         ``doc_pages`` entries supply a name, an https URL, and the phrases
         that must still appear before that rule can change a line. Network
-        and response failures become an incomplete review instead of an edit.
+        and response failures block required publisher reads only; failed
+        security-reference pages are retained as informational evidence.
         """
         with self._lock:
             if self._closed:
@@ -182,14 +202,45 @@ class OfficialDocs:
                     )
                 )
             pages = _pages_for(finding, doc_pages or [])
+            sink = progress_sink.get()
+            completed = 0
+            progress_lock = threading.Lock()
+
+            def notify() -> None:
+                """Report completed requests, not whether optional sources had records."""
+                total = len(pages)
+                filled = completed * 20 // total if total else 20
+                message = (
+                    f"Documentation [{'#' * filled}{'.' * (20 - filled)}] "
+                    f"{completed}/{total} requests completed"
+                )
+                logger.info(message)
+                if sink is not None:
+                    try:
+                        sink(message)
+                    except Exception:
+                        logger.warning(
+                            "Could not publish documentation progress", exc_info=True
+                        )
+
+            def read(page: dict) -> DocSource:
+                """Advance the live bar as each concurrent documentation request ends."""
+                nonlocal completed
+                result = self._read_guarded(page)
+                with progress_lock:
+                    completed += 1
+                    notify()
+                return result
+
+            notify()
             # The lock stays held so close cannot drop the client mid-request.
             # Each page is still fetched on its own worker.
-            return DocReview(tuple(map_ordered(self._read_guarded, pages)))
+            return DocReview(tuple(map_ordered(read, pages)))
 
     def _read_guarded(self, page: dict) -> DocSource:
         """Keep one page failure from discarding the other page results."""
         try:
-            return self._read_page(page)
+            return replace(self._read_page(page), required=page.get("required", True))
         except Exception as exc:
             logger.exception(
                 "Could not read official documentation page %s", page.get("url")
@@ -201,6 +252,7 @@ class OfficialDocs:
                 None,
                 None,
                 type(exc).__name__,
+                required=page.get("required", True),
             )
 
     def _read_page(self, page: dict) -> DocSource:
@@ -223,9 +275,12 @@ class OfficialDocs:
                 name, url, False, None, None, "URL is not an allowlisted https document"
             )
         try:
-            with self.http.stream(
+            with timed_http_stream(
+                self.http,
                 "GET",
                 url,
+                source="documentation",
+                log_path=self.http_log_path,
                 headers={
                     "User-Agent": "gitlab-security-mcp",
                     "Accept": "text/html,application/json",
@@ -286,9 +341,14 @@ def _hashed_prefix(response: httpx.Response) -> tuple[str, str]:
 
 
 def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
-    """Build the always-required pages plus CVE, CWE, and rule pages."""
+    """Build publisher/rule requirements and informational security-reference pages."""
     pages = [
-        {"name": name, "url": url, "markers": (marker,)}
+        {
+            "name": name,
+            "url": url,
+            "markers": (marker,),
+            "required": name not in INFORMATIONAL_SECURITY_DOCS,
+        }
         for name, url, marker in REQUIRED_DOCS
     ]
     text = " ".join(
@@ -304,6 +364,7 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
         pages.append(
             {
                 "name": f"cve:{cve}",
+                "required": False,
                 "url": f"https://www.cve.org/CVERecord?id={cve}",
                 "markers": (cve,),
             }
@@ -311,6 +372,7 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
         pages.append(
             {
                 "name": f"nist:{cve}",
+                "required": False,
                 "url": f"https://nvd.nist.gov/vuln/detail/{cve}",
                 "markers": (cve,),
             }
@@ -320,6 +382,7 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
         pages.append(
             {
                 "name": f"cwe:{cwe}",
+                "required": False,
                 "url": f"https://cwe.mitre.org/data/definitions/{int(number)}.html",
                 "markers": (cwe,),
             }

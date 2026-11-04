@@ -7,11 +7,12 @@ import re
 import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
-from gitlab_security_mcp.util import redact
+from gitlab_security_mcp.util import redact, timed_http_stream
 from gitlab_security_mcp.versions import parse_fixed_versions
 
 FINDINGS_QUERY = """
@@ -147,6 +148,7 @@ class GitLabClient:
         *,
         http: httpx.Client | None = None,
         max_findings: int = 1000,
+        http_log_path: Path | None = None,
     ):
         """Configure report retrieval and retain any caller-owned HTTP client."""
         self.token = token
@@ -154,6 +156,7 @@ class GitLabClient:
         self._owns_http = http is None
         self.http = http if http is not None else httpx.Client(timeout=30.0)
         self.max_findings = max_findings
+        self.http_log_path = http_log_path
         self._closed = False
         self._lock = threading.RLock()
 
@@ -327,9 +330,12 @@ class GitLabClient:
 
     def _request(self, method: str, url: str, json_body: dict | None = None) -> dict:
         """Authenticate, close responses, and reject HTTP or GraphQL errors."""
-        with self.http.stream(
+        with timed_http_stream(
+            self.http,
             method,
             url,
+            source="gitlab",
+            log_path=self.http_log_path,
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",

@@ -35,6 +35,20 @@ def test_read_only_package_lint_commands_are_allowlisted(tmp_path, argv):
         assert_allowed([*argv, "--fix"], tmp_path)
 
 
+@pytest.mark.parametrize("step", ["clean", "install"])
+def test_exact_pnpm_preparation_commands_are_allowlisted(tmp_path, step):
+    """Permit the requested preparation commands without allowing force options."""
+    # Arrange
+    argv = ["pnpm", step]
+
+    # Act
+    assert_allowed(argv, tmp_path)
+
+    # Assert
+    with pytest.raises(PermissionError):
+        assert_allowed([*argv, "--force"], tmp_path)
+
+
 @pytest.mark.parametrize("failed_start", [1, 2])
 def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_start):
     """Reader start failure cleans up process."""
@@ -299,6 +313,217 @@ def test_timeout_kills_the_command_and_reports_124(repo):
     # Assert
     assert result.exit_code == 124
     assert "Timed out after 0s" in result.stderr
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_product_logs_preserve_all_output_and_final_summary(
+    tmp_path, monkeypatch, code
+):
+    """Keep complete disk logs and final diagnostics without unbounded RAM previews."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp import commands
+
+    real_popen = commands.subprocess.Popen
+    summary = "Tests: 4910 passed, 4910 total\n"
+    diagnostic = "AssertionError: expected updated dependency API\n"
+    script = f"import sys; sys.stdout.write('a'*200000+{summary!r}); sys.stderr.write('b'*200000+{diagnostic!r}); sys.exit({code})"
+
+    def product_process(argv, **kwargs):
+        """Replace only the test's pnpm command with a deterministic noisy child."""
+        assert argv == ["pnpm", "test"]
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(commands.subprocess, "Popen", product_process)
+    updates = []
+    runner = CommandRunner(tmp_path, max_output=128, progress_callback=updates.append)
+
+    # Act
+    result = runner.run(["pnpm", "test"], timeout=30, check=False)
+    record = json.loads(runner.audit_path.read_text(encoding="utf-8").splitlines()[-1])
+
+    # Assert
+    assert result.exit_code == code
+    assert result.truncated is True
+    assert len(result.stdout) <= 128
+    assert len(result.stderr) <= 128
+    assert result.stdout.replace("\r\n", "\n").endswith(summary)
+    assert result.stderr.replace("\r\n", "\n").endswith(diagnostic)
+    assert (
+        commands.Path(result.stdout_log_path).read_text(encoding="utf-8")
+        == "a" * 200000 + summary
+    )
+    assert (
+        commands.Path(result.stderr_log_path).read_text(encoding="utf-8")
+        == "b" * 200000 + diagnostic
+    )
+    assert record["stdout_log_path"] == result.stdout_log_path
+    assert record["stderr_log_path"] == result.stderr_log_path
+    assert any("4910/4910 tests (100%)" in text for text in updates)
+    assert updates[-1].endswith(f"command finished; exit {code}")
+    assert ("!" * 20 if code else "#" * 20) in updates[-1]
+
+
+def test_test_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch):
+    """Publish real completed-test counts while the child is still executing."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp import commands
+
+    real_popen = commands.subprocess.Popen
+    children = []
+    updates = []
+    script = (
+        "import sys; print('Tests: 1 passed, 2 total', flush=True); "
+        "sys.stdin.readline(); print('Tests: 2 passed, 2 total', flush=True)"
+    )
+
+    def product_process(argv, **kwargs):
+        """Let only this synthetic child wait for acknowledgement of live progress."""
+        kwargs["stdin"] = commands.subprocess.PIPE
+        child = real_popen([sys.executable, "-c", script], **kwargs)
+        children.append(child)
+        return child
+
+    def record_progress(text):
+        """Release the child only after its first test result was reported."""
+        updates.append(text)
+        if "1/2 tests" in text:
+            assert children[0].poll() is None
+            children[0].stdin.write("\n")
+            children[0].stdin.flush()
+
+    monkeypatch.setattr(commands.subprocess, "Popen", product_process)
+    runner = CommandRunner(tmp_path, progress_callback=record_progress)
+
+    # Act
+    result = runner.run(["pnpm", "test"], timeout=10, check=False)
+    children[0].stdin.close()
+
+    # Assert
+    assert result.exit_code == 0
+    assert any("1/2 tests" in text and "50%" in text for text in updates)
+    assert any("2/2 tests" in text and "100%" in text for text in updates)
+
+
+@pytest.mark.parametrize("suite_count", [2, 3])
+def test_jest_progress_uses_current_discovered_suite_total(
+    tmp_path, monkeypatch, suite_count
+):
+    """Use current Jest discovery rather than a stale count or guessed case total."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp import commands
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "jest --watch=false --coverage"}}),
+        encoding="utf-8",
+    )
+    paths = [f"test-{index}.spec.ts" for index in range(suite_count)]
+    calls = []
+    updates = []
+    real_popen = commands.subprocess.Popen
+
+    def product_process(argv, **kwargs):
+        """Return discovery or suite events without launching a real product runner."""
+        calls.append(argv)
+        output = (
+            json.dumps(paths)
+            if "--listTests" in argv
+            else "\n".join(f"PASS {path}\n  \\u2713 case" for path in paths).replace(
+                "\\u2713", "\u2713"
+            )
+        )
+        script = f"import sys; sys.stdout.buffer.write({output.encode('utf-8')!r})"
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(commands.subprocess, "Popen", product_process)
+    runner = CommandRunner(tmp_path, progress_callback=updates.append)
+
+    # Act
+    result = runner.run(["pnpm", "test"], timeout=10, check=False)
+
+    # Assert
+    assert result.exit_code == 0
+    assert calls == [["pnpm", "test", "--listTests", "--json"], ["pnpm", "test"]]
+    assert any(f"0/{suite_count} test suites" in text for text in updates)
+    assert any(
+        f"{suite_count}/{suite_count} test suites (100%)" in text for text in updates
+    )
+    assert any("case total unavailable" in text for text in updates)
+
+
+@pytest.mark.parametrize(
+    "scripts",
+    [
+        {"test": "jest && jest"},
+        {"test": "jest; another-command"},
+        {"test": "jest", "pretest": "npm run build"},
+        {"test": "jest", "posttest": "npm run build"},
+    ],
+)
+def test_jest_discovery_does_not_repeat_hooks_or_compound_scripts(
+    tmp_path, monkeypatch, scripts
+):
+    """Never add hidden work by listing a compound or lifecycle-managed script."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp import commands
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": scripts}), encoding="utf-8"
+    )
+    real_popen = commands.subprocess.Popen
+    calls = []
+
+    def product_process(argv, **kwargs):
+        """Record commands without running fixture-owned package scripts."""
+        calls.append(argv)
+        return real_popen(
+            [sys.executable, "-c", "print('Tests: 1 passed, 1 total')"], **kwargs
+        )
+
+    monkeypatch.setattr(commands.subprocess, "Popen", product_process)
+
+    # Act
+    result = CommandRunner(tmp_path).run(["pnpm", "test"], timeout=10, check=False)
+
+    # Assert
+    assert result.exit_code == 0
+    assert calls == [["pnpm", "test"]]
+
+
+def test_documentation_progress_counts_completed_requests():
+    """Publish live completion counts for every concurrently fetched document."""
+    # Arrange
+    import httpx
+
+    from gitlab_security_mcp.commands import progress_sink
+    from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
+
+    updates = []
+    body = " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=body))
+    token = progress_sink.set(updates.append)
+
+    # Act
+    try:
+        with httpx.Client(transport=transport) as http:
+            with OfficialDocs(http=http) as docs:
+                review = docs.read_before_fix({})
+    finally:
+        progress_sink.reset(token)
+
+    # Assert
+    total = len(review.sources)
+    assert review.complete is True
+    assert f"0/{total} requests completed" in updates[0]
+    assert f"{total}/{total} requests completed" in updates[-1]
+    assert len(updates) == total + 1
 
 
 def test_audit_log_stores_hashes_and_truncates(repo):

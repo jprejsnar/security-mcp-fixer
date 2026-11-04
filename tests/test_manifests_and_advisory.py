@@ -35,6 +35,52 @@ OSV = {
 }
 
 
+@pytest.mark.parametrize("mode", ["resolved", "missing", "unavailable"])
+def test_advisory_sites_include_attempts_but_not_unused_providers(mode):
+    """Report sites used even when providers return no record or fail."""
+    # Arrange
+    visited = set()
+
+    def handler(request):
+        """Supply advisory data or a deterministic no-record/service failure."""
+        visited.add(f"{request.url.scheme}://{request.url.host}")
+        if mode == "resolved" and request.url.host == "api.osv.dev":
+            return httpx.Response(200, json=OSV)
+        return httpx.Response(404 if mode == "missing" else 503)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            result = client.lookup(
+                {"identifiers": ["CVE-2021-23337"]}, "npm", "lodash", "4.17.20"
+            )
+            cached = client.lookup(
+                {"identifiers": ["CVE-2021-23337"]}, "npm", "lodash", "4.17.20"
+            )
+
+    # Assert
+    expected = (
+        ["https://api.osv.dev"]
+        if mode == "resolved"
+        else [
+            "https://api.github.com",
+            "https://api.osv.dev",
+            "https://services.nvd.nist.gov",
+        ]
+    )
+    assert result.validation_sites == expected
+    assert cached.validation_sites == expected
+    assert set(result.validation_sites) == visited
+    assert (
+        result.outcome
+        == {
+            "resolved": "resolved",
+            "missing": "not_found",
+            "unavailable": "lookup_failed",
+        }[mode]
+    )
+
+
 def test_gitlab_fetch_preserves_fuzzing_payloads_and_response_bodies():
     """Retain scanner HTTP evidence through streamed GraphQL retrieval."""
     # Arrange

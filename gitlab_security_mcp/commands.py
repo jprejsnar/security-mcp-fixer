@@ -5,15 +5,20 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
+import logging
 import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from gitlab_security_mcp.util import safe_token
 
@@ -62,6 +67,9 @@ ALLOWED_SCRIPTS = {
 }
 _SECURITY_BRANCH = re.compile(r"^security-fixes-[A-Z][a-z]+-\d{2}-\d{4}$")
 _READ_SIZE = 8192
+progress_sink: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "security_mcp_progress", default=None
+)
 
 
 def tool_name(argv0: str) -> str:
@@ -161,6 +169,7 @@ def _npm_ok(args: list[str]) -> bool:
         ["--version"],
         ["ci"],
         ["test"],
+        ["test", "--", "--listTests", "--json"],
         ["audit", "--json"],
         [
             "install",
@@ -186,9 +195,12 @@ def _pnpm_ok(args: list[str]) -> bool:
     """Allow pnpm checks and script-free dependency refresh operations."""
     if args in (
         ["--version"],
+        ["clean"],
+        ["install"],
         ["install", "--frozen-lockfile"],
         ["install", "--lockfile-only", "--ignore-scripts"],
         ["test"],
+        ["test", "--listTests", "--json"],
         ["audit", "--json"],
     ):
         return True
@@ -208,6 +220,7 @@ def _yarn_ok(args: list[str]) -> bool:
         ["install", "--mode=update-lockfile"],
         ["install", "--ignore-scripts"],
         ["test"],
+        ["test", "--listTests", "--json"],
         ["audit", "--json"],
         ["npm", "audit", "--json"],
     ):
@@ -369,10 +382,135 @@ class CommandResult:
     truncated: bool
     stdout_sha256: str
     stderr_sha256: str
+    stdout_log_path: str | None = None
+    stderr_log_path: str | None = None
 
     def display(self) -> str:
         """Return the command as one quoted string for reports."""
         return subprocess.list2cmdline(self.argv)
+
+
+class CommandProgress:
+    """Publish bounded, output-driven progress without guessing test totals."""
+
+    def __init__(
+        self,
+        label: str,
+        callback: Callable[[str], None],
+        *,
+        total_suites: int | None = None,
+        test_output: bool = True,
+    ):
+        """Keep separate stream fragments and serialize progress notifications."""
+        self.label = label
+        self.callback = callback
+        self._lock = threading.Lock()
+        self._buffers: dict[str, str] = {}
+        self.completed = 0
+        self.total: int | None = None
+        self.suites: set[str] = set()
+        self.total_suites = total_suites
+        self.test_output = test_output
+        self.output_bytes = 0
+        self._last = ""
+        self._last_emitted = 0.0
+        self._emit("[....................] starting; total unavailable")
+        if total_suites:
+            self._tests(force=True)
+
+    def _emit(self, detail: str, *, force: bool = False) -> None:
+        """Publish only changed progress without exposing raw command output."""
+        text = f"{self.label}: {detail}"
+        now = time.monotonic()
+        if text != self._last and (force or now - self._last_emitted >= 0.25):
+            self._last = text
+            self._last_emitted = now
+            try:
+                self.callback(text)
+            except Exception:
+                logging.getLogger("gitlab_security_mcp").warning(
+                    "Could not publish command progress", exc_info=True
+                )
+
+    def _tests(self, *, force: bool = False) -> None:
+        """Render percentages only when the runner supplied a positive total."""
+        if self.total:
+            filled = min(20, self.completed * 20 // self.total)
+            self._emit(
+                f"[{'#' * filled}{'.' * (20 - filled)}] "
+                f"{self.completed}/{self.total} tests "
+                f"({min(100, self.completed * 100 // self.total)}%)",
+                force=force,
+            )
+        elif self.total_suites:
+            completed = len(self.suites)
+            filled = min(20, completed * 20 // self.total_suites)
+            self._emit(
+                f"[{'#' * filled}{'.' * (20 - filled)}] "
+                f"{completed}/{self.total_suites} test suites "
+                f"({min(100, completed * 100 // self.total_suites)}%); "
+                f"{self.completed} test cases reported; case total unavailable",
+                force=force,
+            )
+        else:
+            self._emit(
+                f"[????????????????????] {self.completed}/? tests; total unavailable",
+                force=force,
+            )
+
+    def feed(self, stream: str, block: str) -> None:
+        """Consume live fragments before preview truncation can discard results."""
+        with self._lock:
+            self.output_bytes += len(block.encode("utf-8", errors="replace"))
+            text = self._buffers.get(stream, "") + block.replace("\r", "\n")
+            lines = text.split("\n")
+            self._buffers[stream] = lines.pop()[-32768:]
+            previous = self._last
+            for line in lines:
+                if not self.test_output:
+                    continue
+                line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+                summary = re.search(r"Tests:\s*(.*)", line)
+                if summary:
+                    total = re.search(r"([\d,]+)\s+total\b", summary[1])
+                    counts = re.findall(
+                        r"([\d,]+)\s+(?:passed|failed|skipped|pending|todo)\b",
+                        summary[1],
+                    )
+                    if total and counts:
+                        self.total = int(total[1].replace(",", ""))
+                        self.completed = sum(
+                            int(count.replace(",", "")) for count in counts
+                        )
+                        self._tests(force=True)
+                elif re.match(r"^\s*[\u2713\u221a\u2714\u2715\u2716\u00d7]\s+", line):
+                    self.completed += 1
+                    self._tests()
+                elif re.match(r"^\s*(?:PASS|FAIL)\s+", line):
+                    if len(self.suites) < 20000:
+                        self.suites.add(line.strip())
+                    self._tests()
+            if self._last == previous and block:
+                if self.completed or self.suites or self.total_suites:
+                    self._tests()
+                else:
+                    self._emit(
+                        f"[????????????????????] running; {self.output_bytes} output bytes received; "
+                        "total unavailable"
+                    )
+
+    def finish(self, exit_code: int) -> None:
+        """Flush final partial lines and distinguish command exit from test success."""
+        for stream in tuple(self._buffers):
+            self.feed(stream, "\n")
+        with self._lock:
+            if self.completed or self.suites:
+                self._tests(force=True)
+            self._emit(
+                f"[{'#' * 20 if exit_code == 0 else '!' * 20}] "
+                f"command finished; exit {exit_code}",
+                force=True,
+            )
 
 
 class CommandRunner:
@@ -389,12 +527,21 @@ class CommandRunner:
         *,
         max_output: int = 65536,
         audit_path: Path | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ):
         """Configure the repository boundary, output cap, and local audit path."""
         self.repo_root = repo_root
         self.max_output = max_output
         self.audit_path = audit_path or (repo_root / ".security-mcp" / "audit.jsonl")
         self._lock = threading.Lock()
+        self._command_log_paths: dict[str, Path] = {}
+        self.progress_callback = progress_callback or self._print_progress
+        self._command_progress: CommandProgress | None = None
+
+    @staticmethod
+    def _print_progress(text: str) -> None:
+        """Keep live text progress off the MCP JSON-RPC stdout stream."""
+        print(text, file=sys.stderr, flush=True)
 
     def run(
         self,
@@ -421,6 +568,29 @@ class CommandRunner:
     ) -> CommandResult:
         """Own child cleanup, cancellable readers, and audit publication."""
         started = time.monotonic()
+        total_suites = self._discover_test_suites(argv, timeout, workdir)
+        self._command_log_paths = {}
+        if tool_name(argv[0]) != "git" and any(
+            arg
+            in ALLOWED_SCRIPTS
+            | {
+                "clean",
+                "install",
+                "verify",
+                "format",
+                "checkstyle:check",
+                "checkstyleMain",
+                "checkstyleTest",
+            }
+            for arg in argv[1:]
+        ):
+            directory = self.repo_root / ".security-mcp" / "command-logs"
+            directory.mkdir(parents=True, exist_ok=True)
+            identifier = uuid4().hex
+            self._command_log_paths = {
+                name: directory / f"{identifier}.{name}.log"
+                for name in ("stdout", "stderr")
+            }
         # stdin is the MCP JSON-RPC stream. A child that inherits it could
         # consume protocol bytes, so it gets an empty stdin instead.
         process = subprocess.Popen(
@@ -435,6 +605,22 @@ class CommandRunner:
             shell=False,
             env=_child_env(argv),
             **_process_group_options(),
+        )
+        sink = progress_sink.get()
+
+        def notify(text: str) -> None:
+            """Forward reader-thread updates to the request captured by this command."""
+            self.progress_callback(text)
+            if sink is not None:
+                sink(text)
+
+        self._command_progress = CommandProgress(
+            subprocess.list2cmdline([tool_name(argv[0]), *argv[1:]]),
+            notify,
+            total_suites=total_suites,
+            test_output=any(
+                arg in {"test", "test:unit", "test:ci", "verify"} for arg in argv[1:]
+            ),
         )
         captured: dict[str, tuple[str, bool]] = {}
         errors: list[BaseException] = []
@@ -468,9 +654,16 @@ class CommandRunner:
         if timed_out:
             stderr = f"{stderr}\nTimed out after {timeout}s"
             exit_code = 124
+        self._command_progress.finish(exit_code)
         duration_ms = int((time.monotonic() - started) * 1000)
         truncated = stdout_truncated or stderr_truncated
         result = self._finish(argv, exit_code, stdout, stderr, duration_ms, truncated)
+        result.stdout_log_path = (
+            str(self._command_log_paths["stdout"]) if self._command_log_paths else None
+        )
+        result.stderr_log_path = (
+            str(self._command_log_paths["stderr"]) if self._command_log_paths else None
+        )
         self._audit(result, workdir)
         if check and result.exit_code != 0:
             detail = (result.stderr or result.stdout).strip()
@@ -478,6 +671,50 @@ class CommandRunner:
                 f"{result.display()} failed ({result.exit_code}): {detail[:500]}"
             )
         return result
+
+    def _discover_test_suites(
+        self, argv: list[str], timeout: int, workdir: Path
+    ) -> int | None:
+        """Ask a plain Jest script for this run's files without executing tests."""
+        manager = tool_name(argv[0])
+        if manager not in {"npm", "pnpm", "yarn"} or argv[1:] != ["test"]:
+            return None
+        try:
+            manifest = json.loads(
+                (workdir / "package.json").read_text(encoding="utf-8")
+            )
+            scripts = manifest.get("scripts", {})
+            script = scripts.get("test", "")
+            if (
+                not isinstance(script, str)
+                or not re.match(r"^\s*jest(?:\s|$)", script)
+                or _bad_argument(script)
+                or scripts.get("pretest")
+                or scripts.get("posttest")
+            ):
+                return None
+            discovery = self._run_locked(
+                [*argv, *(["--"] if manager == "npm" else []), "--listTests", "--json"],
+                timeout=min(timeout, 30),
+                check=False,
+                workdir=workdir,
+            )
+            if discovery.exit_code or discovery.truncated:
+                return None
+            for line in discovery.stdout.splitlines():
+                if not line.strip().startswith("["):
+                    continue
+                try:
+                    paths = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(paths, list) and all(
+                    isinstance(path, str) for path in paths
+                ):
+                    return len(set(paths)) or None
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return None
 
     def _start_readers(
         self,
@@ -500,7 +737,15 @@ class CommandRunner:
         def read_stream(name: str, pipe) -> None:
             """Capture a capped stream or record its reader exception."""
             try:
-                result = _read_capped(pipe, self.max_output, stop)
+                result = _read_capped(
+                    pipe,
+                    self.max_output,
+                    stop,
+                    log_path=self._command_log_paths.get(name),
+                    on_output=(lambda block: self._command_progress.feed(name, block))
+                    if self._command_progress is not None
+                    else None,
+                )
             except Exception as exc:
                 with output_lock:
                     errors.append(exc)
@@ -530,8 +775,16 @@ class CommandRunner:
         truncated: bool,
     ) -> CommandResult:
         """Cap retained output and hash exactly the text returned to callers."""
-        kept_out = stdout[: self.max_output]
-        kept_err = stderr[: self.max_output]
+
+        def preview(text: str) -> str:
+            """Keep the command's start and final summary within the memory cap."""
+            if len(text) <= self.max_output:
+                return text
+            tail = self.max_output // 2
+            return text[: self.max_output - tail] + (text[-tail:] if tail else "")
+
+        kept_out = preview(stdout)
+        kept_err = preview(stderr)
         return CommandResult(
             argv=list(argv),
             exit_code=exit_code,
@@ -561,6 +814,8 @@ class CommandRunner:
             "stdout_sha256": result.stdout_sha256,
             "stderr_sha256": result.stderr_sha256,
             "truncated": result.truncated,
+            "stdout_log_path": result.stdout_log_path,
+            "stderr_log_path": result.stderr_log_path,
             "stdout_bytes_kept": len(result.stdout.encode("utf-8", errors="replace")),
             "stderr_bytes_kept": len(result.stderr.encode("utf-8", errors="replace")),
         }
@@ -568,7 +823,14 @@ class CommandRunner:
             handle.write(json.dumps(record) + "\n")
 
 
-def _read_capped(pipe, limit: int, stop: threading.Event) -> tuple[str, bool]:
+def _read_capped(
+    pipe,
+    limit: int,
+    stop: threading.Event,
+    *,
+    log_path: Path | None = None,
+    on_output: Callable[[str], None] | None = None,
+) -> tuple[str, bool]:
     """Read a pipe while retaining at most ``limit`` characters.
 
     Drain excess output while the child runs to avoid pipe-buffer deadlock.
@@ -579,7 +841,13 @@ def _read_capped(pipe, limit: int, stop: threading.Event) -> tuple[str, bool]:
     kept = 0
     truncated = False
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    tail = ""
+    tail_limit = limit // 2
+    shutdown_bytes = 0
+    log = None
     try:
+        if log_path is not None:
+            log = log_path.open("w", encoding="utf-8", newline="")
         while True:
             available = _pipe_available(pipe)
             if available is None:
@@ -593,10 +861,20 @@ def _read_capped(pipe, limit: int, stop: threading.Event) -> tuple[str, bool]:
             if not raw:
                 break
             block = decoder.decode(raw)
+            if on_output is not None:
+                on_output(block)
+            if log is not None:
+                log.write(block)
+            if tail_limit:
+                tail = (tail + block)[-tail_limit:]
+            if stop.is_set():
+                shutdown_bytes += len(raw)
+                if shutdown_bytes > 1024 * 1024:
+                    raise RuntimeError(
+                        "Command descendants continued writing after shutdown; output capture is incomplete"
+                    )
             if kept >= limit:
                 truncated = True
-                if stop.is_set():
-                    break
                 continue
             room = limit - kept
             if len(block) <= room:
@@ -608,11 +886,24 @@ def _read_capped(pipe, limit: int, stop: threading.Event) -> tuple[str, bool]:
                 truncated = True
         final = decoder.decode(b"", final=True)
         if final:
+            if on_output is not None:
+                on_output(final)
+            if log is not None:
+                log.write(final)
+            if tail_limit:
+                tail = (tail + final)[-tail_limit:]
             chunks.append(final[: max(0, limit - kept)])
             truncated = truncated or kept + len(final) > limit
     finally:
-        pipe.close()
-    return "".join(chunks), truncated
+        try:
+            if log is not None:
+                log.close()
+        finally:
+            pipe.close()
+    prefix = "".join(chunks)
+    return (
+        prefix[: limit - tail_limit] + tail if truncated and tail_limit else prefix
+    ), truncated
 
 
 def _pipe_available(pipe) -> int | None:

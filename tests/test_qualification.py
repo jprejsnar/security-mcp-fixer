@@ -50,6 +50,165 @@ def test_lint_records_warnings_information_and_unknowns(truncated, code):
     assert row["stdout"] == result.stdout
 
 
+@pytest.mark.parametrize("kind", ["build", "unit_tests", "build_and_unit_tests"])
+@pytest.mark.parametrize("code", [0, 1, 124])
+def test_product_exit_is_not_overridden_by_clipped_verbose_output(kind, code):
+    """Accept verbose successful checks and retain exact diagnostics for failed exits."""
+    # Arrange
+    result = CommandResult(
+        ["pnpm", "test"],
+        code,
+        "Tests: 4910 passed, 4910 total",
+        "fixture diagnostic at the end",
+        100,
+        True,
+        "out",
+        "err",
+        "command.stdout.log",
+        "command.stderr.log",
+    )
+
+    # Act
+    row = _product_result(result, kind)
+
+    # Assert
+    assert row["status"] == ("PASSED" if code == 0 else "FAILED")
+    assert row["stdout_log_path"] == "command.stdout.log"
+    assert row["stderr_log_path"] == "command.stderr.log"
+    if code:
+        assert f"exited {code}" in row["detail"]
+        assert "fixture diagnostic at the end" in row["detail"]
+        assert "pnpm test" in row["detail"]
+
+
+@pytest.mark.parametrize(
+    "failed_check, code, output, truncated",
+    [
+        ("lint", 1, "lint failed", False),
+        ("lint", 0, '[{"messages":[{"severity":2,"message":"lint error"}]}]', False),
+        ("lint", 0, "0 errors, 2 warnings", True),
+        ("build", 1, "build failed", False),
+        (None, 0, "0 errors, 2 warnings", False),
+    ],
+)
+def test_node_validation_stops_after_required_check_fails(
+    tmp_path, failed_check, code, output, truncated
+):
+    """Avoid expensive downstream checks once the package update is already blocked."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.manifests import detect_stack
+    from gitlab_security_mcp.validate import _node
+
+    manifest = tmp_path / "package.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "packageManager": "pnpm@10.0.0",
+                "scripts": {
+                    "lint": "eslint .",
+                    "build": "vite build",
+                    "test": "vitest run",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = Mock()
+
+    def execute(argv, **kwargs):
+        """Return deterministic lint/build/test outcomes without launching product tools."""
+        failed = argv[1:] == ["run", failed_check]
+        lint = argv[1:] == ["run", "lint"]
+        return CommandResult(
+            argv,
+            code if failed else 0,
+            output if failed or lint else "Tests: 1 passed",
+            "",
+            0,
+            truncated if failed else False,
+            "out",
+            "err",
+        )
+
+    runner.run.side_effect = execute
+
+    # Act
+    rows = _node(
+        tmp_path,
+        detect_stack(tmp_path, [manifest]),
+        runner,
+        lambda name: name,
+        600,
+        package_checks=True,
+    )
+
+    # Assert
+    calls = [call.args[0][1:] for call in runner.run.call_args_list]
+    if failed_check is None:
+        assert ["run", "build"] in calls
+        assert ["test"] in calls
+        assert all(row["status"] == "PASSED" for row in rows if row.get("kind"))
+        return
+    assert ["run", failed_check] in calls
+    assert ["test"] not in calls
+    if failed_check == "lint":
+        assert ["run", "build"] not in calls
+    assert (
+        next(row for row in rows if row.get("kind") == failed_check)["status"]
+        == "FAILED"
+    )
+    skipped = [row for row in rows if row.get("kind") == "unit_tests"]
+    assert skipped and skipped[0]["status"] == "SKIPPED"
+    assert failed_check in skipped[0]["detail"]
+
+
+def test_node_validation_stops_when_required_lint_script_is_missing(tmp_path):
+    """Do not spend time on builds or tests when mandatory baseline lint cannot run."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.manifests import detect_stack
+    from gitlab_security_mcp.validate import _node
+
+    manifest = tmp_path / "package.json"
+    manifest.write_text(
+        json.dumps({"scripts": {"build": "vite build", "test": "vitest run"}}),
+        encoding="utf-8",
+    )
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        ["npm", "ci"], 0, "installed", "", 0, False, "out", "err"
+    )
+
+    # Act
+    rows = _node(
+        tmp_path,
+        detect_stack(tmp_path, [manifest]),
+        runner,
+        lambda name: name,
+        600,
+        package_checks=True,
+    )
+
+    # Assert
+    assert all(
+        call.args[0][1:] not in (["run", "build"], ["test"])
+        for call in runner.run.call_args_list
+    )
+    assert {row["kind"] for row in rows if row.get("kind")} == {
+        "lint",
+        "build",
+        "unit_tests",
+    }
+    assert all(
+        row["status"] == "SKIPPED" and row["required"]
+        for row in rows
+        if row.get("kind")
+    )
+
+
 def test_lint_json_errors_fail_even_with_exit_zero():
     """Lint json errors fail even with exit zero."""
     # Arrange
@@ -266,6 +425,419 @@ def package_engine(tmp_path, package_policy):
 
 
 @pytest.fixture
+def pending_package_batch(package_engine, package_review, request):
+    """Prepare independently reviewed version updates without product validation."""
+    # Arrange
+    package_engine.package_policy_path.unlink()
+    manifest = package_engine.repo_root / "package.json"
+    data = json.loads(manifest.read_text())
+    packages = [("package", "example"), ("other", "other")]
+    packages.extend(
+        (f"extra{index}", f"extra{index}")
+        for index in range(2, getattr(request, "param", 2))
+    )
+    data["dependencies"].update({package: "1.0.0" for _, package in packages})
+    manifest.write_text(json.dumps(data))
+    for finding_id, package in packages[1:]:
+        second = deepcopy(package_engine.state.findings[0])
+        second.update(id=finding_id, component=package)
+        package_engine.state.findings.append(second)
+    license_review = {
+        "expression": "MIT",
+        "sources": ["https://example.com/LICENSE"],
+        "commercial_use_permitted": True,
+        "no_license_fees": True,
+        "obligations": "Retain license notice",
+        "assessment": "Commercial use permitted",
+    }
+
+    # Act
+    for finding_id, package in packages:
+        package_engine.verify_security_finding(finding_id)
+        review = {
+            **deepcopy(package_review),
+            "package": package,
+            "license": license_review,
+        }
+        assert (
+            package_engine.qualify_package_update(finding_id, review)["status"]
+            == "QUALIFIED"
+        )
+        assert package_engine.apply_minimal_fix(finding_id)["status"] == "APPLIED"
+    return package_engine
+
+
+def test_package_batch_builds_and_tests_once(pending_package_batch):
+    """Apply independent updates before a single final build and unit-test run."""
+    # Arrange
+    package_engine = pending_package_batch
+    before = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
+
+    # Act
+    result = package_engine.run_validation_matrix()
+    cached = package_engine.run_validation_matrix()
+    calls = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
+
+    # Assert
+    assert ["run", "build"] not in before
+    assert ["test"] not in before
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    assert cached["cached"] is True
+    assert calls.count(["run", "build"]) == 1
+    assert calls.count(["test"]) == 1
+    assert all(
+        change["qualification_status"] == "VALIDATED"
+        for change in package_engine.state.changes
+    )
+
+
+@pytest.mark.parametrize("failed_kind", ["build", "test"])
+@pytest.mark.parametrize("bad", ["example", "other", "interaction"])
+def test_failed_batch_retains_green_subset(pending_package_batch, failed_kind, bad):
+    """Isolate bad updates or interacting pairs and retain a tested green subset."""
+    # Arrange
+    engine = pending_package_batch
+    manifest = engine.repo_root / "package.json"
+    from gitlab_security_mcp.report import render
+
+    def execute(argv, **kwargs):
+        """Fail only the selected update or the combination of both updates."""
+        installed = json.loads(manifest.read_text())["dependencies"]
+        affected = (
+            all(value == "1.0.1" for value in installed.values())
+            if bad == "interaction"
+            else installed[bad] == "1.0.1"
+        )
+        failed = affected and argv[1:] in (["run", failed_kind], [failed_kind])
+        return CommandResult(
+            argv,
+            int(failed),
+            "Tests: 1 passed",
+            "incompatible update" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    engine.runner.run.side_effect = execute
+
+    # Act
+    result = engine.run_validation_matrix()
+    installed = json.loads(manifest.read_text())["dependencies"]
+    payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    assert engine.state.validation_status == "VALIDATION_COMPLETE"
+    assert sorted(installed.values()) == ["1.0.0", "1.0.1"]
+    if bad != "interaction":
+        assert installed[bad] == "1.0.0"
+    assert len(result["rejected_updates"]) == 1
+    assert result["isolation_trials"]
+    assert payload["batch_isolation"] == result["isolation_trials"]
+    assert "## Batch Isolation" in markdown
+    assert all(
+        row["status"] == "PASSED" for row in result["results"] if row.get("required")
+    )
+
+
+def test_corporate_checks_share_the_final_build_and_tests(
+    package_engine, package_review
+):
+    """Honor policy markers without executing the same product commands twice."""
+    # Arrange
+    runner = package_engine.runner
+
+    # Act
+    qualified = package_engine.qualify_package_update("package", package_review)
+    before = [call.args[0][1:] for call in runner.run.call_args_list]
+    applied = package_engine.apply_minimal_fix("package")
+    result = package_engine.run_validation_matrix()
+    calls = [call.args[0][1:] for call in runner.run.call_args_list]
+
+    # Assert
+    assert qualified["status"] == "QUALIFIED"
+    assert applied["status"] == "APPLIED"
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    assert ["run", "build"] not in before and ["test"] not in before
+    assert calls.count(["run", "build"]) == calls.count(["test"]) == 1
+    assert (
+        calls.count(["run", "security:smoke"])
+        == calls.count(["run", "security:licenses"])
+        == 1
+    )
+
+
+@pytest.mark.parametrize("broken_baseline", [False, True])
+def test_failed_batch_verifies_the_restored_baseline(
+    pending_package_batch, broken_baseline
+):
+    """Reject every bad update but never claim an already-broken baseline is green."""
+    # Arrange
+    engine = pending_package_batch
+    manifest = engine.repo_root / "package.json"
+
+    def execute(argv, **kwargs):
+        """Fail builds for any updated dependency, optionally also on the baseline."""
+        installed = json.loads(manifest.read_text())["dependencies"]
+        failed = (broken_baseline or "1.0.1" in installed.values()) and argv[1:] == [
+            "run",
+            "build",
+        ]
+        return CommandResult(
+            argv,
+            int(failed),
+            "Tests: 1 passed",
+            "bad dependency or baseline" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    engine.runner.run.side_effect = execute
+
+    # Act
+    result = engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == (
+        "VALIDATION_FAILED" if broken_baseline else "FIX_REJECTED"
+    ), result
+    assert len(result["rejected_updates"]) == 2
+    assert set(json.loads(manifest.read_text())["dependencies"].values()) == {"1.0.0"}
+    assert result["isolation_trials"][-1]["finding_ids"] == []
+    assert engine.state.manual_cleanup_required is broken_baseline
+    assert (
+        engine.state.validation_status == "VALIDATION_COMPLETE"
+    ) is not broken_baseline
+
+
+@pytest.mark.parametrize("pending_package_batch", [4], indirect=True)
+def test_failed_group_is_split_without_discarding_compatible_updates(
+    pending_package_batch,
+):
+    """Keep a passing group and isolate one bad package without exhaustive subsets."""
+    # Arrange
+    engine = pending_package_batch
+    manifest = engine.repo_root / "package.json"
+
+    def execute(argv, **kwargs):
+        """Fail unit tests only while the third package is updated."""
+        failed = json.loads(manifest.read_text())["dependencies"][
+            "extra2"
+        ] == "1.0.1" and argv[1:] == ["test"]
+        return CommandResult(
+            argv,
+            int(failed),
+            "Tests: 1 passed",
+            "extra2 is incompatible" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    engine.runner.run.side_effect = execute
+
+    # Act
+    result = engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    assert result["rejected_updates"][0]["finding_id"] == "extra2"
+    assert len(result["retained_updates"]) == 3
+    assert len(result["isolation_trials"]) <= 5
+    assert (
+        list(json.loads(manifest.read_text())["dependencies"].values()).count("1.0.1")
+        == 3
+    )
+
+
+@pytest.mark.parametrize("failed_script", [None, "build", "test"])
+def test_missing_security_metadata_defers_to_product_validation(
+    package_engine, package_review, failed_script
+):
+    """Apply GitLab fixes without public records, then accept or roll back on product checks."""
+    # Arrange
+    finding = package_engine.state.findings[0]
+    finding["fixedVersions"] = ["1.0.1"]
+    sites = ["https://api.osv.dev", "https://services.nvd.nist.gov"]
+    package_engine.advisory.lookup.return_value = AdvisoryLookup(
+        outcome="lookup_failed",
+        summary="No public security data is available.",
+        errors=["Providers unavailable"],
+        validation_sites=sites,
+    )
+    manifest = package_engine.repo_root / "package.json"
+
+    def execute(argv, **kwargs):
+        """Fail only the selected check after the target version has been applied."""
+        installed = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"][
+            "example"
+        ]
+        failed = (
+            failed_script is not None
+            and installed == "1.0.1"
+            and argv[1:] in (["run", failed_script], [failed_script])
+        )
+        return CommandResult(
+            argv,
+            1 if failed else 0,
+            "CHECK_PASSED",
+            "fixture product failure" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    package_engine.runner.run.side_effect = execute
+
+    # Act
+    verified = package_engine.verify_security_finding("package")
+    qualified = package_engine.qualify_package_update("package", package_review)
+    applied = package_engine.apply_minimal_fix("package")
+    validated = package_engine.run_validation_matrix()
+
+    # Assert
+    assert verified["decision"] == "CHANGE_REQUIRED"
+    assert verified["security_validation_sites"] == sites
+    assert qualified["status"] == "QUALIFIED"
+    assert applied["status"] == "APPLIED"
+    assert validated["status"] == (
+        "FIX_REJECTED" if failed_script else "VALIDATION_COMPLETE"
+    )
+    assert json.loads(manifest.read_text(encoding="utf-8"))["dependencies"][
+        "example"
+    ] == ("1.0.0" if failed_script else "1.0.1")
+    assert set(sites).issubset(finding["securityValidationSites"])
+    if failed_script:
+        assert validated["continue_with_next_finding"] is True
+        assert "fixture product failure" in package_engine.state.changes[0]["detail"]
+
+
+@pytest.mark.parametrize("lint_problem", ["missing", "truncated", "timeout", "crash"])
+def test_informational_lint_never_blocks_build_and_unit_gates(
+    package_engine, package_review, lint_problem
+):
+    """Keep lint capture informational even when it is unavailable or incomplete."""
+    # Arrange
+    manifest = package_engine.repo_root / "package.json"
+    if lint_problem == "missing":
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        del data["scripts"]["lint"]
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    def execute(argv, **kwargs):
+        """Provide valid product checks and the requested lint capture failure."""
+        if argv[1:] == ["run", "lint"]:
+            if lint_problem == "crash":
+                raise RuntimeError("Lint could not start")
+            return CommandResult(
+                argv,
+                124 if lint_problem == "timeout" else 1,
+                "lint output",
+                "lint failed",
+                0,
+                lint_problem == "truncated",
+                "out",
+                "err",
+            )
+        return CommandResult(argv, 0, "CHECK_PASSED", "", 0, False, "out", "err")
+
+    package_engine.runner.run.side_effect = execute
+
+    # Act
+    qualified = package_engine.qualify_package_update("package", package_review)
+    retried = package_engine.qualify_package_update("package", package_review)
+    applied = package_engine.apply_minimal_fix("package")
+    validated = package_engine.run_validation_matrix()
+
+    # Assert
+    assert qualified["status"] == "QUALIFIED"
+    assert retried["status"] == "QUALIFIED"
+    assert applied["status"] == "APPLIED"
+    assert validated["status"] == "VALIDATION_COMPLETE"
+    assert package_engine.state.lint_baseline["complete"] is False
+    assert all(
+        not row["required"] for row in package_engine.state.lint_baseline["results"]
+    )
+    assert sum(
+        call.args[0][1:] == ["run", "lint"]
+        for call in package_engine.runner.run.call_args_list
+    ) == (0 if lint_problem == "missing" else 1)
+
+
+def test_validation_matrix_never_runs_lint_before_qualification(package_engine):
+    """Keep matrix validation limited to product checks even before lint capture."""
+    # Arrange
+    package_engine.runner.run.reset_mock()
+
+    # Act
+    result = package_engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE"
+    assert package_engine.state.lint_baseline is None
+    assert all(
+        call.args[0][1:] != ["run", "lint"]
+        for call in package_engine.runner.run.call_args_list
+    )
+    assert any(row.get("kind") == "build" for row in result["results"])
+    assert any(row.get("kind") == "unit_tests" for row in result["results"])
+
+
+def test_lint_rule_inventory_preserves_unique_structured_and_text_rule_names():
+    """Export exact rule IDs across supported lint formats without losing raw issues."""
+    # Arrange
+    from gitlab_security_mcp.validate import _lint_result, lint_rule_inventory
+
+    structured = json.dumps(
+        [
+            {
+                "filePath": "app.ts",
+                "messages": [
+                    {
+                        "severity": 2,
+                        "ruleId": "@typescript-eslint/no-explicit-any",
+                        "message": "Unexpected any",
+                    },
+                    {
+                        "severity": 1,
+                        "ruleId": "@typescript-eslint/no-explicit-any",
+                        "message": "Repeated rule",
+                    },
+                    {"severity": 2, "ruleId": None, "message": "Parsing error"},
+                ],
+            }
+        ]
+    )
+    text = "  1:4  error  Unused value  no-unused-vars\napp.cs(1,2): warning IDE0005: Unused import\n[WARN] app.java:2:1: Missing docs [MissingJavadocType]\napp.ts:1:4: Unused value [Error/no-unused-vars]"
+    rows = [
+        _lint_result(CommandResult([], 1, value, "", 0, False, "out", "err"))
+        for value in (structured, text)
+    ]
+
+    # Act
+    inventory = lint_rule_inventory(rows)
+
+    # Assert
+    assert inventory["rule_names"] == [
+        "@typescript-eslint/no-explicit-any",
+        "IDE0005",
+        "MissingJavadocType",
+        "no-unused-vars",
+    ]
+    assert inventory["rules"]["@typescript-eslint/no-explicit-any"]["occurrences"] == 2
+    assert inventory["rules"]["no-unused-vars"]["occurrences"] == 2
+    assert inventory["informational_only"] is True
+    assert inventory["complete"] is True
+    assert rows[0]["stdout"] == structured
+
+
+@pytest.fixture
 def package_review():
     """Provide explicit documentation and runtime compatibility attestations."""
     return {
@@ -290,6 +862,286 @@ def package_review():
         ],
         "source_fixes": [],
     }
+
+
+@pytest.mark.parametrize("failed_script", ["build", "test"])
+def test_security_loop_retains_good_fixes_and_continues_after_rejection(
+    package_engine, package_review, failed_script
+):
+    """Keep successful updates, rollback the failing candidate, and report its reason."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+
+    policy_path = package_engine.package_policy_path
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    for target in ("1.0.2", "1.0.3"):
+        approval = deepcopy(policy["approvals"][0])
+        approval["target"] = target
+        policy["approvals"].append(approval)
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    manifest = package_engine.repo_root / "package.json"
+
+    def execute(argv, **kwargs):
+        """Fail builds only for the deliberately incompatible middle version."""
+        installed = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"][
+            "example"
+        ]
+        failed = installed == "1.0.2" and argv[1:] in (
+            ["run", failed_script],
+            [failed_script],
+        )
+        if installed != "1.0.0":
+            assert (
+                package_engine.repo_root / ".security-mcp" / "lint-issues.json"
+            ).is_file()
+        return CommandResult(
+            argv,
+            1 if failed else 0,
+            "CHECK_PASSED",
+            "error: incompatible target API" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    package_engine.runner.run.side_effect = execute
+    results = []
+
+    # Act
+    for finding_id, target in (("good", "1.0.1"), ("bad", "1.0.2"), ("next", "1.0.3")):
+        finding = {
+            "id": finding_id,
+            "category": "dependency_scanning",
+            "component": "example",
+            "installedVersion": json.loads(manifest.read_text(encoding="utf-8"))[
+                "dependencies"
+            ]["example"],
+            "identifiers": ["CVE-TEST"],
+        }
+        package_engine.state.findings.append(finding)
+        package_engine.advisory.lookup.return_value = AdvisoryLookup(
+            outcome="resolved",
+            affected=True,
+            fixed_versions=[target],
+            lowest_fixed_version=target,
+        )
+        package_engine.verify_security_finding(finding_id)
+        review = {**deepcopy(package_review), "target": target}
+        assert (
+            package_engine.qualify_package_update(finding_id, review)["status"]
+            == "QUALIFIED"
+        )
+        assert package_engine.apply_minimal_fix(finding_id)["status"] == "APPLIED"
+        results.append(package_engine.run_validation_matrix())
+        if finding_id == "bad":
+            assert results[-1]["status"] == "FIX_REJECTED", {
+                "rollbacks": results[-1].get("rollbacks"),
+                "reason": results[-1].get("reason"),
+                "changes": [
+                    (row["finding_id"], row["status"], row.get("qualification_status"))
+                    for row in package_engine.state.changes
+                ],
+                "failed_checks": [
+                    row.get("detail")
+                    for row in results[-1]["results"]
+                    if row["status"] == "FAILED"
+                ],
+            }
+            assert results[-1]["continue_with_next_finding"] is True
+            assert (
+                json.loads(manifest.read_text(encoding="utf-8"))["dependencies"][
+                    "example"
+                ]
+                == "1.0.1"
+            )
+            assert (
+                next(
+                    row
+                    for row in package_engine.state.changes
+                    if row["finding_id"] == "good"
+                )["qualification_status"]
+                == "VALIDATED"
+            )
+    payload, markdown = render(
+        package_engine.state, staged=[], diff_stat="", diff_files=""
+    )
+
+    # Assert
+    assert results[0]["status"] == results[2]["status"] == "VALIDATION_COMPLETE"
+    assert (
+        json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]["example"]
+        == "1.0.3"
+    )
+    rejected = next(row for row in payload["unresolved_issues"] if row["id"] == "bad")
+    assert ("build" if failed_script == "build" else "unit_tests") in rejected["reason"]
+    assert "bad" in markdown
+    assert (
+        sum(
+            call.args[0][1:] == ["run", "lint"]
+            for call in package_engine.runner.run.call_args_list
+        )
+        == 1
+    )
+
+
+def test_qualification_defers_product_timeouts_to_final_validation(
+    package_engine, package_review
+):
+    """Record lint timeouts without running product checks before updates."""
+    # Arrange
+    original = (package_engine.repo_root / "package.json").read_bytes()
+    package_engine.runner.run.return_value = CommandResult(
+        ["npm", "run", "lint"], 124, "", "Timed out after 600s", 0, False, "out", "err"
+    )
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+
+    # Assert
+    assert package_engine.state.lint_baseline["complete"] is False
+    assert result["status"] == "QUALIFIED"
+    assert all(
+        call.args[0][1:] == ["run", "lint"]
+        for call in package_engine.runner.run.call_args_list
+    )
+    assert (package_engine.repo_root / "package.json").read_bytes() == original
+
+
+def test_qualification_defers_build_and_tests_until_after_fix(
+    package_engine, package_review
+):
+    """Capture lint before edits without running a duplicate product suite."""
+    # Arrange
+    package_engine.package_policy_path.unlink()
+    package_review["license"] = {
+        "expression": "MIT",
+        "sources": ["https://example.test/license/1.0.1"],
+        "commercial_use_permitted": True,
+        "no_license_fees": True,
+        "obligations": "Retain copyright and license notices",
+        "assessment": "Reviewed target-version terms; no license fee required",
+    }
+    original = (package_engine.repo_root / "package.json").read_bytes()
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+    commands = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
+
+    # Assert
+    assert result["status"] == "QUALIFIED"
+    assert ["run", "lint"] in commands
+    assert ["run", "build"] not in commands
+    assert ["test"] not in commands
+    assert commands == [["run", "lint"]]
+    assert (package_engine.repo_root / "package.json").read_bytes() == original
+    assert package_engine.apply_minimal_fix("package")["status"] == "APPLIED"
+    assert package_engine.run_validation_matrix()["status"] == "VALIDATION_COMPLETE"
+    commands = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
+    assert commands.count(["run", "build"]) == 1
+    assert commands.count(["test"]) == 1
+
+
+@pytest.mark.parametrize("exit_code", [0, 124])
+@pytest.mark.parametrize(
+    "filename,source,expected",
+    [
+        ("package.json", '{"scripts":{"lint":"eslint ."}}', ["npm", "run", "lint"]),
+        (
+            "App.csproj",
+            "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>",
+            ["dotnet", "format", "--verify-no-changes", "--no-restore"],
+        ),
+        (
+            "pom.xml",
+            "<project />",
+            [
+                "mvn",
+                "--batch-mode",
+                "checkstyle:check",
+                "-Dcheckstyle.includeTestSourceDirectory=true",
+            ],
+        ),
+        (
+            "build.gradle",
+            "plugins { id 'java' }",
+            ["gradle", "--no-daemon", "checkstyleMain", "checkstyleTest"],
+        ),
+    ],
+)
+def test_lint_only_mode_never_launches_product_work(
+    tmp_path, filename, source, expected, exit_code
+):
+    """All stacks collect only informational lint before the first edit."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.validate import run_validation
+
+    (tmp_path / filename).write_text(source, encoding="utf-8")
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        expected, exit_code, "lint output", "", 0, False, "out", "err"
+    )
+
+    # Act
+    result = run_validation(
+        tmp_path,
+        runner,
+        lambda name: name,
+        timeout=30,
+        package_checks=True,
+        record_lint=True,
+        lint_only=True,
+    )
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE"
+    assert runner.run.call_count == 1
+    assert runner.run.call_args.args[0] == expected
+    assert all(row["required"] is False for row in result["results"])
+    assert all(row["kind"] == "lint" for row in result["results"])
+
+
+def test_existing_lint_issues_are_saved_before_security_updates(
+    package_engine, package_review
+):
+    """Record baseline lint errors without rejecting an otherwise buildable security fix."""
+    # Arrange
+    original = (package_engine.repo_root / "package.json").read_bytes()
+
+    def execute(argv, **kwargs):
+        """Expose existing lint errors while baseline product checks remain successful."""
+        lint = argv[1:] == ["run", "lint"]
+        return CommandResult(
+            argv,
+            1 if lint else 0,
+            "error: existing issue\nwarning: existing warning\n"
+            if lint
+            else "CHECK_PASSED",
+            "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    package_engine.runner.run.side_effect = execute
+
+    # Act
+    result = package_engine.qualify_package_update("package", package_review)
+    path = package_engine.repo_root / ".security-mcp" / "lint-issues.json"
+
+    # Assert
+    assert path.is_file()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["phase"] == "before_changes"
+    assert payload["results"][0]["diagnostics"]["errors"] == ["error: existing issue"]
+    assert payload["results"][0]["diagnostics"]["warnings"] == [
+        "warning: existing warning"
+    ]
+    assert result["status"] == "QUALIFIED"
+    assert (package_engine.repo_root / "package.json").read_bytes() == original
 
 
 @pytest.mark.parametrize("target", ["2.0.0", "1.1.0", "1.0.1", "1.0.0.1"])
@@ -341,7 +1193,7 @@ def test_missing_default_policy_uses_documented_license_review(
     result = package_engine.qualify_package_update("package", package_review)
 
     # Assert
-    if missing_script:
+    if missing_script in {"build", "test"}:
         assert result["status"] == "QUALIFICATION_REQUIRED"
         assert "existing build and test scripts" in result["reason"]
         package_engine.runner.run.assert_not_called()
@@ -369,10 +1221,10 @@ def test_missing_default_policy_uses_documented_license_review(
     assert "documented license review, not corporate approval" in markdown
 
 
-def test_lint_diagnostics_are_retained_before_and_after_update(
+def test_lint_diagnostics_are_retained_once_before_updates(
     package_engine, package_review
 ):
-    """Lint diagnostics are retained before and after update."""
+    """Retain the initial lint snapshot without rerunning lint after a package edit."""
 
     # Arrange
     def run(argv, **kwargs):
@@ -396,7 +1248,7 @@ def test_lint_diagnostics_are_retained_before_and_after_update(
     assert applied["status"] == "APPLIED", applied
     assert validated["status"] == "VALIDATION_COMPLETE", validated
     receipt = package_engine.state.findings[0]["packageQualification"]
-    for phase in ("baseline_results", "post_results"):
+    for phase in ("baseline_results",):
         lint = next(row for row in receipt[phase] if row.get("kind") == "lint")
         assert lint["status"] == "PASSED"
         assert lint["diagnostics"]["warnings"]
@@ -433,17 +1285,20 @@ def test_lint_baseline_is_retained_when_build_cannot_start(
     result = package_engine.qualify_package_update("package", package_review)
 
     # Assert
-    assert result["status"] == "QUALIFICATION_REQUIRED"
-    assert "build" in result["reason"]
+    assert result["status"] == "QUALIFIED"
+    assert all(
+        call.args[0][1:] != ["run", "build"]
+        for call in package_engine.runner.run.call_args_list
+    )
     lint = next(row for row in result["baseline_results"] if row.get("kind") == "lint")
     assert lint["diagnostics"]["warnings"] == ["warning: existing issue"]
 
 
-@pytest.mark.parametrize("stage", ["lint", "build", "test"])
-def test_failed_baseline_records_check_and_does_not_apply(
+@pytest.mark.parametrize("stage", ["build", "test"])
+def test_preexisting_product_failures_are_detected_only_after_updates(
     package_engine, package_review, stage
 ):
-    """Failed baseline records check and does not apply."""
+    """Do not claim recovery when the original baseline also fails."""
     # Arrange
     before = (package_engine.repo_root / "package.json").read_bytes()
 
@@ -467,9 +1322,10 @@ def test_failed_baseline_records_check_and_does_not_apply(
     result = package_engine.qualify_package_update("package", package_review)
 
     # Assert
-    assert result["status"] == "QUALIFICATION_REQUIRED"
-    assert ("unit_tests" if stage == "test" else stage) in result["reason"]
-    assert any(row["status"] == "FAILED" for row in result["baseline_results"])
+    assert result["status"] == "QUALIFIED"
+    assert not any(
+        row.get("kind") in {"build", "unit_tests"} for row in result["baseline_results"]
+    )
     assert (
         package_engine.state.findings[0]["packageQualification"]["baseline_results"]
         == result["baseline_results"]
@@ -496,7 +1352,7 @@ def test_api_changes_or_uncertain_no_code_compatibility_blocks_qualification(
     package_engine.runner.run.assert_not_called()
 
 
-@pytest.mark.parametrize("stage", ["lint", "build", "test", "source", "scripts"])
+@pytest.mark.parametrize("stage", ["build", "test", "source", "scripts"])
 def test_failed_post_checks_reject_and_restore_only_dependency_edits(
     package_engine, package_review, stage
 ):
@@ -538,7 +1394,8 @@ def test_failed_post_checks_reject_and_restore_only_dependency_edits(
 
     # Assert
     assert result["status"] == "VALIDATION_FAILED", result
-    assert "not accepted" in result["reason"]
+    assert "not accepted" in result["reason"] or "no green checkout" in result["reason"]
+    assert result["continue_with_next_finding"] is False
     change = package_engine.state.changes[0]
     assert change["qualification_status"] == "REJECTED"
     assert "Package update rejected" in change["detail"]
@@ -1076,31 +1933,6 @@ def test_bounded_reads_close_streams_and_limit_allocation(
     assert stream.closed
 
 
-@pytest.mark.parametrize("mode", ["unchanged", "localized", "expensive"])
-def test_diff_work_is_bounded_without_rejecting_localized_edits(monkeypatch, mode):
-    """Keep localized changes fast and reject expensive arbitrary comparisons."""
-    # Arrange
-    from gitlab_security_mcp import qualification
-
-    monkeypatch.setattr(qualification, "MAX_DIFF_CELLS", 4)
-    original = "unchanged();\n" * 5000
-    current = original if mode == "unchanged" else original + "newApi();\n"
-    if mode == "expensive":
-        original, current = "before();\n" * 3, "after();\n" * 3
-
-    # Act
-    if mode == "expensive":
-        with pytest.raises(ValueError, match="work limit"):
-            qualification._changed_lines(original, current)
-        changed = None
-    else:
-        changed = qualification._changed_lines(original, current)
-
-    # Assert
-    if mode != "expensive":
-        assert changed == (0 if mode == "unchanged" else 1)
-
-
 def test_status_refresh_hashes_checkout_once_for_multiple_packages(
     package_engine, package_review, monkeypatch
 ):
@@ -1276,10 +2108,10 @@ def test_applied_evidence_is_retained_and_stale_validation_is_invalidated(
     "failure",
     ["policy_missing", "baseline", "runtime", "license_audit", "tool_missing"],
 )
-def test_incomplete_baselines_never_permit_edits(
+def test_policy_is_required_before_edits_but_checks_are_deferred(
     package_engine, package_review, package_policy, failure
 ):
-    """Require healthy existing product checks and corporate evidence first."""
+    """Require corporate evidence now and complete product checks after the batch."""
     # Arrange
     path, policy, _plan = package_policy
     original = (package_engine.repo_root / "package.json").read_bytes()
@@ -1305,8 +2137,16 @@ def test_incomplete_baselines_never_permit_edits(
     applied = package_engine.apply_minimal_fix("package")
 
     # Assert
-    assert result["status"] == applied["status"] == "QUALIFICATION_REQUIRED"
-    assert (package_engine.repo_root / "package.json").read_bytes() == original
+    if failure == "policy_missing":
+        assert result["status"] == applied["status"] == "QUALIFICATION_REQUIRED"
+        assert (package_engine.repo_root / "package.json").read_bytes() == original
+    else:
+        assert result["status"] == "QUALIFIED"
+        assert applied["status"] == "APPLIED"
+        assert not any(
+            call.args[0][1:] in (["run", "build"], ["test"])
+            for call in package_engine.runner.run.call_args_list
+        )
 
 
 @pytest.mark.parametrize(

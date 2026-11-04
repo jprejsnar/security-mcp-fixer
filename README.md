@@ -26,6 +26,7 @@ publish changes.
 - [MCP configuration](#mcp-configuration)
 - [Running within Cursor](#running-within-cursor)
 - [Reading output in Cursor](#reading-output-in-cursor)
+- [Run gitlab-security on this repo](#run-gitlab-security-on-this-repo)
 - [Running remediation](#running-remediation)
 - [Supported fixes](#supported-fixes)
 - [Validation](#validation)
@@ -58,7 +59,8 @@ flowchart TB
     osv["OSV identifiers, requested together"]
     github["GitHub Advisory identifiers, requested together"]
     nvd["NVD, one CVE after earlier sources miss"]
-    publisherPages["Docker, nginx, GitLab, Java, Node.js, Angular, Crystal, Microsoft, .NET 10, TypeScript, CVE, CWE, NSA, and NIST pages"]
+    publisherPages["Required publisher and directive documentation"]
+    securityPages["Informational CVE, CWE, NSA and NIST references"]
   end
 
   server -->|"Tracked main and active findings, pages in cursor order"| gitlab
@@ -66,11 +68,13 @@ flowchart TB
   server -->|"Same source order; earliest GitHub id still wins"| github
   server -->|"Only when OSV and GitHub have no record"| nvd
   server -->|"Before every edit: required pages together, at most 8 at once"| publisherPages
+  server -->|"Record consulted sites even when records are missing"| securityPages
+  server -->|"Live text bars via MCP progress notifications"| host
   server -->|"Inspect and apply supported local edits"| checkout
   server -->|"Allowlisted Git and product checks"| commands["Local subprocesses"]
   commands --> checkout
   commands -->|"Fast-forward pulls and branch-name lookup"| origin["Git origin"]
-  commands -->|"Repository-owned build, unit, runtime and license checks"| product["Installed toolchains and package managers"]
+  commands -->|"Post-pull pnpm clean/install, then final batch build and all tests"| product["Installed toolchains and package managers"]
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
   server -->|"Write snapshots, audit and reports"| artifacts["Target checkout: .security-mcp"]
@@ -89,7 +93,9 @@ source. Responses larger than 2 MB are rejected while they are read.
 The host still supplies the exact-version package, API, and license review used
 by qualification. Separately, the server reads the required publisher pages
 before it writes any package, image, or configuration edit. A failed or
-incomplete read returns `DOCS_REQUIRED` and does not change the file. Page
+incomplete required publisher read returns `DOCS_REQUIRED` and does not change
+the file. Missing or failed security-reference reads are informational, not
+permission to claim a finding is safe and not a veto on a concrete GitLab fix. Page
 bodies are hashed in full and then discarded. The recorded SHA-256 covers every
 response byte. Phrase checks use the first 1 MB. Up to four CVE records, their
 NVD detail pages, and four CWE definitions are added when the finding names them.
@@ -106,13 +112,15 @@ runs one allowlisted command at a time.
 ```mermaid
 flowchart TB
   launcher["Root server.py: source launcher"] --> tools["Package server.py: eleven MCP tools and error boundary"]
+  tools --> progress["Request-scoped progress middleware"]
+  progress --> hostDisplay["Host progress display, with stderr fallback"]
   tools --> registry["Checkout registry: one engine per resolved path"]
   registry --> engine["engine.py: phase gates and finding decisions"]
 
   subgraph evidenceLayer["Evidence collection"]
     gitlabClient["gitlab_client.py: GraphQL filtering and cursor pagination"]
     advisoryClient["advisory.py: ordered sources, parallel identifiers, 256-record cache"]
-    officialDocs["official_docs.py: required pages before every edit"]
+    officialDocs["official_docs.py: required publishers and optional security references"]
     fanout["fanout.py: ordered reads, at most 8 workers"]
     manifests["manifests.py: discovery, parsing and local package evidence"]
     versions["versions.py: affected ranges and version comparison"]
@@ -133,18 +141,20 @@ flowchart TB
   remediation --> configFindings
   remediation --> manifests
   engine --> aaa["aaa.py: supported base-image regression tests"]
-  engine --> validation["validate.py: detected-stack validation matrix"]
+  engine --> validation["validate.py: lint-only capture before edits, full checks after the complete batch"]
   validation --> manifests
   engine --> gitOps["git_ops.py: main, branch and diff operations"]
 
-  gitOps --> runner["commands.py: allowlist, timeout, capped readers and audit"]
+  gitOps --> runner["commands.py: allowlist, live readers, full logs, timeouts and audit"]
   qualification --> runner
   remediation --> runner
   validation --> runner
   runner --> processes["Git, package managers and product toolchains"]
+  runner -->|"Fresh Jest suite discovery and completed test counts"| progress
+  officialDocs -->|"Completed document request counts"| progress
 
   engine --> state["state.py: active RunState and inspection snapshot"]
-  engine --> report["report.py: human and machine-readable reports"]
+  engine --> report["report.py: security table, validation and batch isolation evidence"]
   state --> atomic["util.py: repository boundaries and atomic file publication"]
   report --> atomic
   manifests --> atomic
@@ -153,7 +163,9 @@ flowchart TB
 
 The snapshot is not a resume database. A restarted process creates a new
 `RunState`; it never reloads the saved snapshot. There is no cross-process lock,
-job scheduler, automatic rollback, or multi-file transaction.
+job scheduler, general-purpose rollback, or multi-file transaction. Failed fix
+candidates have guarded restoration of unchanged updater-owned files; later user
+edits are preserved rather than overwritten.
 
 ## Workflow
 
@@ -169,23 +181,33 @@ flowchart TD
   precheckGate -->|"Yes"| pulls["pull_main_twice: git pull --ff-only twice"]
   pulls --> pullGate{"Both pulls passed and tree remains clean?"}
   pullGate -->|"No"| stopRun
-  pullGate -->|"Yes"| branch["create_security_branch: dated name must be unused locally and on origin"]
+  pullGate -->|"Yes"| pnpmGate{"Any pnpm projects or workspaces?"}
+  pnpmGate -->|"Yes"| clean["pnpm clean at each pnpm project or workspace root"]
+  clean --> cleanGate{"Clean succeeded?"}
+  cleanGate -->|"No: PREPARATION_FAILED"| stopRun
+  cleanGate -->|"Yes"| install["pnpm install in the same directory"]
+  install --> installGate{"Every preparation command succeeded?"}
+  installGate -->|"No: PREPARATION_FAILED"| stopRun
+  installGate -->|"Yes"| branch["create_security_branch: dated name must be unused locally and on origin"]
+  pnpmGate -->|"No: preparation not applicable"| branch
   branch --> branchGate{"Branch created?"}
   branchGate -->|"No"| stopRun
   branchGate -->|"Yes"| listing["list_security_findings: active report on tracked main"]
   listing --> retrievalGate{"Retrieval succeeded without truncation?"}
   retrievalGate -->|"No"| stopRun
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
-  moreFindings -->|"No"| finalChecks["run_validation_matrix: final applicable checks"]
+  moreFindings -->|"No"| postChecks["run_validation_matrix: one final production build, all unit tests and policy checks"]
   moreFindings -->|"Yes"| verify["verify_security_finding: local evidence, advisory, and config rules"]
   verify --> decisionGate{"Decision?"}
   decisionGate -->|"FALSE_POSITIVE"| retained["Retain evidence and continue"]
   decisionGate -->|"MANUAL_REVIEW or NO_SAFE_FIX"| unresolved["Retain unresolved reason and continue"]
+  decisionGate -->|"REPRODUCTION_REQUIRED"| reproduction["Host-led approved local fuzzing reproduction, not a package fix"]
+  reproduction --> unresolved
   retained --> moreFindings
   unresolved --> moreFindings
   decisionGate -->|"CHANGE_REQUIRED"| editKind{"What kind of edit?"}
   editKind -->|"Package update"| qualify["Review package docs and policy, then qualify_package_update"]
-  qualify --> qualifiedGate{"Exact plan QUALIFIED and still fresh?"}
+  qualify --> qualifiedGate{"Review, lint capture and policy evidence complete?"}
   qualifiedGate -->|"No"| unresolved
   qualifiedGate -->|"Yes"| readDocs["Server reads required publisher pages together"]
   editKind -->|"Image tag or cited nginx or GitLab CI line"| readDocs
@@ -193,14 +215,15 @@ flowchart TD
   docsGate -->|"No: DOCS_REQUIRED"| unresolved
   docsGate -->|"Yes"| apply["apply_minimal_fix: local edit only"]
   apply --> appliedGate{"APPLIED?"}
-  appliedGate -->|"No"| blockedEdit["Keep outcome; inspect partial edits before continuing"]
-  blockedEdit --> reports["generate_local_report: preserve unresolved and validation evidence"]
-  appliedGate -->|"Yes"| regression["Host applies only declared API fixes and AAA tests; generate_aaa_test for supported images"]
-  regression --> postChecks["run_validation_matrix before another package edit"]
+  appliedGate -->|"No"| blockedEdit{"Safe restoration permits continuation?"}
+  blockedEdit -->|"Yes: retain failure reason"| moreFindings
+  blockedEdit -->|"No: manual cleanup required"| reports
+  appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
+  regression --> moreFindings
   postChecks --> validationGate{"VALIDATION_COMPLETE?"}
-  validationGate -->|"Yes"| moreFindings
-  validationGate -->|"No"| reports
-  finalChecks --> reports
+  validationGate -->|"Yes"| reports["generate_local_report: security table and validation evidence"]
+  validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
+  rollbackGate -->|"Retain green subset or report blocked recovery"| reports
   reports --> reviewDiff["Human reviews reports and git diff; commit and push manually"]
 ```
 
@@ -213,15 +236,15 @@ checkout is active.
 | Tool | Responsibility and gate |
 | --- | --- |
 | `run_prechecks(repo_root=None)` | Select the absolute application checkout; require clean `main`; reject merge, rebase, cherry-pick, revert or bisect in progress. |
-| `pull_main_twice(repo_root=None)` | Require successful prechecks; perform two fast-forward-only pulls. |
+| `pull_main_twice(repo_root=None)` | Require successful prechecks; perform two fast-forward-only pulls, then `pnpm clean` followed by `pnpm install` in each pnpm project/workspace root before any security checks. Any failure stops the run. |
 | `create_security_branch(repo_root=None)` | Require successful pulls; create `security-fixes-Month-dd-YYYY`, for example `security-fixes-November-03-2026`. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None)` | Record evidence, decision, proposed plan, and any review prompt. Config proposals also record the publisher pages read for that rule. |
-| `qualify_package_update(finding_id, review, repo_root=None)` | Require exact-target API/license review and passing baseline checks; enforce corporate policy when configured/present. |
+| `qualify_package_update(finding_id, review, repo_root=None)` | Require exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
 | `apply_minimal_fix(finding_id, repo_root=None)` | Read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
 | `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
-| `run_validation_matrix(repo_root=None)` | Run applicable stack checks and post-update package qualifiers; retain failures and incomplete evidence. |
-| `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the unresolved-issues table. |
+| `run_validation_matrix(repo_root=None)` | Validate the complete batch once. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
+| `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
 ### GitLab report filters
@@ -239,12 +262,20 @@ verified or resolved.
 A finding is auto-fixed only when all of these are true:
 
 - Local evidence shows the vulnerable package or image is present.
-- An online advisory confirms it and publishes a fixed version newer than what is installed.
+- An online advisory publishes a fixed version newer than what is installed, or GitLab explicitly recommends a newer fix for the matching local dependency. Missing data, missing records and failed public lookups do not veto GitLab's recommendation. Positive evidence that the proposed target remains affected is distinct from missing data.
 - The edit is a lockfile refresh, a manifest version bump, a package override, an unpinned `FROM` tag bump, or one cited nginx or GitLab CI line that the current publisher page still documents.
-- Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing baseline/post-update checks. Major image-tag changes still require manual review.
-- Every package update requires no production/unit-test API adaptations, no lint errors, and passing before/after builds and executed unit tests, plus configured corporate checks. Same-major does not prove compatibility.
+- Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing post-update checks. Major image-tag changes still require manual review.
+- Every package update requires no production/unit-test API adaptations and passing post-update builds and executed unit tests, plus configured corporate checks. Pre-change lint capture is informational only: errors, missing scripts or incomplete capture never block security fixes. Same-major does not prove compatibility.
 
-An advisory that names the identifier but not the package found in the repo is listed for you to review. It is not reported as a false positive, because the cause may be a naming difference.
+An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before the normal qualification workflow. Failed lookups of either the installed or target version are informational when GitLab provides a concrete newer fix. Build and all unit tests still determine product acceptance; failures reject and restore the attempted fix. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
+
+CVE, CWE, NSA and NIST security-reference pages are best-effort information,
+not an authorization gate for version or supported code/configuration fixes.
+Unavailable records, 404/503 responses and missing fix descriptions are recorded
+without blocking edits. Publisher directive pages and configured policy checks
+remain separate requirements. Validation evidence lists the actual consulted
+site URLs; it does not claim CVE, CWE, NSA or another provider was queried merely
+because its identifier was present.
 
 Unknown reachability is not treated as a false positive. Secret detection and DAST findings are reported for you to handle. They are not rewritten. SAST findings are not patched by guessing at source changes.
 
@@ -354,12 +385,21 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
   terms review, not corporate approval. Unknown/unlicensed terms block editing.
   When a corporate policy is configured or present, independent exact-version
   approval and all its checks remain required; the AI must not invent approvals.
-4. Baseline and post-update lint, production builds and unit tests pass. Node
-  components must define `lint`, `build` and `test` scripts. Missing, truncated,
-  skipped or explicitly empty test runs are not passing evidence. Every emitted
-  lint warning, informational and unknown diagnostic is recorded with stdout
-  and stderr. Warnings/info/unknown output alone does not block a successful
-  lint run; errors or a nonzero lint exit block acceptance.
+4. Before the first edit, lint runs and all emitted errors, warnings,
+  informational and unknown diagnostics, stdout and stderr are saved in
+  `.security-mcp/lint-issues.json`. Observed rule names, occurrence counts and
+  severities are exported to `.security-mcp/lint-rules.json`, independently of
+  the project's lint configuration. Errors, missing lint scripts, timeouts,
+  truncated output or lint execution failures never block editing. Completeness
+  is recorded honestly; an incomplete capture cannot list unseen rule IDs.
+  Apply all reviewed version updates first, then run one final production build
+  and all unit tests. Lint-only capture does not install or audit
+  dependencies first. Node components must define `build` and `test` scripts.
+  Missing, failed, timed-out, skipped or explicitly empty test runs are
+  not passing evidence. Initial lint evidence is retained rather than rerun on
+  qualification retries or after updates. No sleeps, cooldowns or polling delays
+  are required. Corporate approvals remain mandatory; configured commands run
+  in the final matrix, sharing exact build/test results rather than rerunning them.
   Corporate-policy mode additionally requires positive, untruncated runtime
   smoke and full resolved-dependency license checks with configured markers.
 
@@ -384,7 +424,8 @@ be empty, reviewed caller files must have current SHA256 evidence, and all
 identified source references must be assessed. Transitive npm updates also
 require installed `node_modules` consumer source evidence. The server rejects
 stale scans and source/test changes, and records the reviewed evidence. A failed
-or skipped lint/build/unit check never becomes a validated fix. Configured
+or skipped required build/unit check never becomes a validated fix. Lint is
+informational even when missing, failed, timed out or truncated. Configured
 corporate checks still apply. Failed attempted updates are rejected and the
 plugin restores its own dependency-file edits only when their hashes still
 match the applied edit. Later user edits are preserved with a manual-cleanup
@@ -405,46 +446,66 @@ sequenceDiagram
   participant Repo as Target checkout and product checks
 
   Approver->>Policy: Provision exact-version approvals and mandatory checks
+  Host->>MCP: run_prechecks then pull_main_twice
+  MCP->>Repo: Pull main twice, then pnpm clean and pnpm install when applicable
+  alt Pull or preparation fails
+    MCP-->>Host: Stop before branch creation and security checks
+  else Checkout prepared
+  Host->>MCP: create_security_branch then list_security_findings
+  loop Every eligible package update
   Host->>MCP: verify_security_finding(finding_id)
   MCP->>Repo: Inspect installed package and local evidence
+  Note over Host,MCP: Missing public advisory data does not veto a concrete newer GitLab target
   MCP-->>Host: CHANGE_REQUIRED and proposed exact target
   Host->>Docs: Read release notes, APIs, compatibility and license terms
   Docs-->>Host: Target-version documentation
   Host->>MCP: qualify_package_update(finding_id, review)
   MCP->>Policy: Match exact package, target, approvals and checks
-  MCP->>Repo: Record lint and run build/unit baseline and policy checks
-  alt Missing evidence or failed baseline
+  MCP->>Repo: Record informational lint once, defer product checks
+  alt Missing review or corporate approval evidence
     MCP-->>Host: QUALIFICATION_REQUIRED and reason
-  else Baseline and policy accepted
+  else Review and policy accepted
     MCP-->>Host: QUALIFIED with checkout and policy hashes
     Host->>MCP: apply_minimal_fix(finding_id)
     MCP->>Policy: Recheck unchanged policy
-    MCP->>Repo: Recheck checkout and previous package validation
-    alt Qualification stale or previous edit unvalidated
+    MCP->>Repo: Recheck checkout and exact reviewed plan
+    alt Qualification stale or non-package edit requires validation
       MCP-->>Host: QUALIFICATION_REQUIRED or VALIDATION_REQUIRED
     else Fresh exact plan
       MCP->>Docs: Read the required publisher pages together
+      MCP-->>Host: Live completed-document text bar
+      Note over Docs,MCP: CVE, CWE, NSA and NIST reads are informational
       alt A required page cannot be read
         MCP-->>Host: DOCS_REQUIRED and no file change
       else Current pages were read
       MCP->>Repo: Apply supported package edit
       alt Edit could not be applied
-        MCP-->>Host: Fix failure, inspect partial edits manually without automatic rollback
+        MCP->>Repo: Restore only unchanged updater-owned dependency edits
+        MCP-->>Host: Fix failure with safe-continuation or manual-cleanup evidence
       else Edit applied
         MCP-->>Host: APPLIED, package PENDING_VALIDATION
         Note over Host,Repo: Production code, unit tests and check scripts stay unchanged
-        Host->>MCP: run_validation_matrix()
-        MCP->>Policy: Recheck approval and policy hash
-        MCP->>Repo: Check edit scope, stack validation and all policy checks
-        alt All required checks pass
-          MCP-->>Host: VALIDATION_COMPLETE and package VALIDATED
-        else Failed or incomplete evidence
-          MCP->>Repo: Restore updater-owned dependency edits when unchanged
-          MCP-->>Host: Update rejected with failed checks and rollback result
-        end
       end
       end
     end
+  end
+  end
+  Host->>MCP: run_validation_matrix once after all updates
+  MCP->>Policy: Recheck approval, markers and policy hash
+  MCP->>Repo: One production build and all unit tests, plus configured checks
+  MCP-->>Host: Live command bars and fresh Jest suite progress
+  alt Complete batch passes
+    MCP-->>Host: VALIDATION_COMPLETE, all retained packages VALIDATED
+  else Failed batch
+    loop Split failed groups, test accepted plus candidate subsets
+      MCP->>Repo: Guarded dependency restore and reviewed subset replay
+      MCP->>Repo: Diagnostic build, all unit tests and mandatory policy checks
+    end
+    MCP->>Repo: Verify final passing subset, or restored baseline if all rejected
+    MCP-->>Host: Retained updates, rejected updates and isolation trials, or blocked recovery
+  end
+  Host->>MCP: generate_local_report
+  MCP-->>Host: Security Validation Sites in issues table, validation and isolation evidence
   end
 ```
 
@@ -580,7 +641,7 @@ read. These example values are placeholders, not compatibility evidence:
 For transitive packages, include the relevant installed dependency source files
 as well as repository references, not only an application file. Supply this
 object alongside the normal exact-target documentation/framework review and
-`source_fixes: []`. Evidence is checked again after baseline validation and
+`source_fixes: []`. Evidence is checked again after lint/policy review and
 before applying the plan; reverify if the checkout/callers change.
 
 `QUALIFICATION_REQUIRED` blocks an edit. `QUALIFIED` authorizes only the exact
@@ -624,8 +685,8 @@ do not establish compatibility or commercial approval for an individual update.
 | Java 17 | Maven direct versions/properties and Gradle coordinates/supported version-catalog entries | Java 17 check, Maven verify/dependency tree or Gradle dependencies/test/build; wrappers preferred |
 
 These are safe dependency-remediation paths, not a promise to fix every security
-finding. A matching advisory, a published compatible fix, and a supported local
-edit are required. Unresolved Java/NuGet transitive dependencies require review;
+finding. A matching advisory or locally verified GitLab recommendation, a compatible
+fix, and a supported local edit are required. Unresolved Java/NuGet transitive dependencies require review;
 SAST, DAST, secrets, unsupported dependency formats, and breaking upgrades are
 not patched by guessing.
 
@@ -974,8 +1035,86 @@ than relying only on a short natural-language success message.
 | Package qualification | `status`, approval evidence, `baseline_results`, or the blocking `reason`. |
 | Fix application | `status`, `change.files`, `change.detail`, `change.documentation`, and `change.qualification_status`. `DOCS_REQUIRED` means nothing was written. `APPLIED` is not validated. |
 | Validation | Overall `status` and each row in `results`, including `required`, command, status and detail. |
-| Report generation | `human_report`, `json_report`, `unresolved_issues`, and `unresolved_issues_table`. |
+| Report generation | `human_report`, `json_report`, `unresolved_issues`, and `unresolved_issues_table`. Saved JSON also contains `batch_isolation` trials. |
 | Current status | `status`, `stop_stage`, counts, `report_path`, and `package_updates`. |
+
+### Live progress and HTTP timings
+
+The server emits progress immediately to stderr, never protocol stdout. Each
+item log identifies the checkout, finding ID, package, and current step. Steps
+include local evidence, public advisories, target planning, compatibility/license
+review, lint/policy checks, official documentation, application, and post-update
+validation. Tool start/finish messages include the outcome and elapsed time;
+unexpected exceptions produce a failure message. The host AI's own reasoning
+and browsing between tool calls are not visible to this server.
+
+Long commands also emit live text bars through MCP `notifications/progress`
+when the client supplies a progress token, with the same command messages on
+stderr as a fallback. Updates are driven by output, not sleeps or elapsed-time
+percentages. Documentation reads count completed requests, including unsuccessful
+informational lookups. Commands with no reported total show activity and output
+bytes rather than a fabricated percentage. Progress rendering is rate-limited
+without delaying commands; command exit codes still determine success.
+
+On Windows, a stdio launch whose stderr is not an interactive terminal opens
+a separate **GitLab Security Progress** console automatically. Progress bars
+and stage messages appear there during the tool call, even when the editor
+hides server stderr or does not request MCP progress. The console uses an
+isolated text-only child process; human messages never enter protocol stdout.
+It closes when the server exits. Set `PROGRESS_CONSOLE=off` in the MCP server's
+environment for CI/headless runs, `on` to force the Windows console, or leave
+the default `auto` to retain ordinary terminal output when stderr is interactive.
+Restart the MCP server after changing code or this setting.
+
+Every tool call that emits progress also returns its most recent 64 messages
+in `progress_output`, with each message capped at 2,000 characters. MCP text
+results include an **Execution Progress** block before their ordinary result.
+This completion-time transcript is a fallback, not a claim that the host showed
+live updates. The final security report remains last.
+The host controls whether MCP progress/log notifications appear in chat;
+notifications alone cannot force an editor console to become visible. Full raw
+command stdout/stderr remain available in `.security-mcp/command-logs`.
+
+For a plain Jest `test` script, the server first runs the package manager's
+`test --listTests --json` (with npm's required `--` separator). This discovers
+the current test files without executing them. PASS/FAIL events advance a
+suite-based bar; individual case results are counted when emitted. Jest cannot
+reliably enumerate every dynamically generated case before execution, so the
+suite denominator is explicitly labeled, not presented as a case total. Fresh
+discovery handles added/removed files. Failed or unavailable discovery falls back
+to honest unknown-total progress and never prevents the real tests from running.
+
+Example live message:
+
+```text
+pnpm test: [##########..........] 170/339 test suites (50%); 2500 test cases reported; case total unavailable
+```
+
+When a host starts the server, use its MCP/server output or diagnostic logs to
+see these messages, or the Windows progress console described above. They do
+not appear automatically in an unrelated application terminal.
+
+HTTP requests made by the server also append JSON records to
+`.security-mcp/http-timings.jsonl` and emit the same records to stderr. Each
+record includes `source` (GitLab, advisory or documentation), `method`, sanitized
+`url` and `final_url`, UTC `started_at`/`finished_at`, monotonic `duration_ms`,
+`status_code`, exception-class `error`, and `worker`. Timing covers the complete
+streaming request, including redirects and body consumption, not just headers.
+Only log appends are locked; fan-out requests remain concurrent.
+
+For performance analysis, sort by `duration_ms`, group by URL/source, and compare
+start/end spans to confirm overlap. Do not sum concurrent spans as wall time.
+Advisory cache hits make no HTTP request and create no request record. These
+logs cover new server requests only, not host browsing, model inference, shell
+package-manager traffic or historical calls. Credentials, query strings,
+fragments, headers, payloads and bodies are not recorded. URLs still expose
+endpoint paths; keep these logs local. A timing-log write failure is reported
+but never changes the request result. Report results expose `http_timings_path`.
+
+Fan-out uses up to eight workers and preserves input order. Repeated advisory
+identifiers and OSV follow-up IDs are deduplicated before dispatch, avoiding
+duplicate concurrent cache misses. Publisher pages are still freshly read
+before each edit; concurrency never bypasses required evidence.
 
 ### Reading local report files
 
@@ -1025,6 +1164,41 @@ ordinary terminal stdout is not the report channel. Never add print-based
 debugging to the server's protocol stdout. Audit output hashes are not raw
 command transcripts, and absence of an audit record does not prove a fix passed.
 
+## Run gitlab-security on this repo
+
+1. Open the application repository you want to scan in your MCP-enabled editor.
+2. Configure and enable the `gitlab-security` MCP server and its tools using
+  [MCP configuration](#mcp-configuration). Restart it after source updates.
+3. Prepare clean `main`, valid GitLab access and the repository's toolchains.
+  A pnpm project must have an existing `clean` script and pnpm available on PATH.
+4. In the editor's agent chat, enter:
+
+```text
+run gitlab-security on this repo
+```
+
+This is a natural-language request to the MCP host, not a PowerShell, Bash or
+standalone CLI command. The host resolves the active application's absolute Git
+checkout root and passes it as `repo_root`; it must not select the MCP server's
+installation directory. A nested `frontend` is discovered automatically.
+When multiple repositories are open, identify the intended checkout explicitly.
+
+The host runs prechecks, two pulls, then automatic `pnpm clean` followed by
+`pnpm install` for each pnpm project/workspace before branching or security
+checks. Non-pnpm checkouts skip that preparation. A failed pull, missing pnpm or
+clean script, or failed clean/install stops the run; no deletion workaround or
+duplicate host-issued preparation is needed.
+
+Follow the live MCP progress notifications or the server output/log panel.
+Apply all reviewed version updates first, then run one final production build
+and all unit tests. Additional diagnostic runs occur only when that batch fails.
+There is no pre-edit product suite or timer-based progress estimate. The final
+response displays unresolved findings and consulted security sites. Review local
+reports and `git diff`; commit and push yourself.
+
+The installed `gitlab-security-mcp` executable starts the stdio server. It is not
+a command-line replacement for the agent request above.
+
 ## Running remediation
 
 1. Install runtime dependencies and configure your MCP host.
@@ -1032,7 +1206,7 @@ command transcripts, and absence of an audit record does not prove a fix passed.
 3. Check out clean `main` in `REPO_ROOT`; finish any in-progress Git operation.
 4. Start/reload `gitlab-security` and enable its tools.
 5. Ask the host agent to follow the workflow below.
-6. Review the returned unresolved table, local reports, and `git diff`.
+6. Review the returned unresolved table, validation/isolation evidence, local reports, and `git diff`.
 7. Commit and push manually only after reviewing the evidence and changes.
 
 Example agent request:
@@ -1040,7 +1214,10 @@ Example agent request:
 ```text
 Use the gitlab-security MCP tools in order for one checkout. Pass the same
 absolute repo_root on every call when more than one checkout is active. Run
-prechecks, pull main twice, create the security branch, list findings, and
+prechecks and pull main twice. Let pull_main_twice run pnpm clean followed by
+pnpm install in each pnpm project/workspace root before any security checks;
+do not issue duplicate preparation commands. Stop on PREPARATION_FAILED.
+Then create the security branch, list findings, and
 verify each finding. For package updates, review the exact target docs and call
 qualify_package_update with compatibility and documented license evidence,
 obeying any configured corporate policy. Let the server read the required
@@ -1048,12 +1225,27 @@ publisher pages before every edit. Treat DOCS_REQUIRED as no change. Cited
 nginx and GitLab CI lines may change only when the current page still documents
 that one-line edit. Never invent approvals or force incompatible framework
 versions. Never change production code, unit tests or check scripts to support
-any package version. Record lint warnings/info/unknowns before applying updates.
-Accept only with no lint errors, passing builds and executed unit tests.
-Run all configured runtime and resolved-license checks after each
-package edit before continuing, and generate the local report.
-Display unresolved_issues_table at the end of your final response. Stop on
-run-level failures or failed/incomplete validation. Retain finding-level
+any package version. Run lint before changes and retain every diagnostic and
+raw output in .security-mcp/lint-issues.json and observed violation rule IDs in
+.security-mcp/lint-rules.json. Lint capture is best-effort and never gates a fix,
+including missing scripts, execution failures and incomplete output. Apply all
+reviewed version updates first, then run the production build and all unit tests
+once for the complete batch, including mandatory configured policy checks.
+Do not run a pre-fix build/test suite. Keep live MCP progress
+bars visible; never insert sleeps, polling waits or elapsed-time percentages.
+Accept only with passing builds and executed unit tests.
+Only a failed final batch permits diagnostic build/test reruns. The server
+splits failed groups, replays reviewed subsets with guarded dependency restores,
+and retains a passing combination. Reject incompatible updates and interactions.
+Require a green final build and all unit tests, even when every update is
+rejected and the original baseline is restored. Never claim a broken baseline
+is recovered. Do not retry rejected targets blindly or adapt source/tests.
+Generate the local report and display final_summary_markdown verbatim at the
+end of your final response: the six-column security issues table. Inspect
+isolation_trials, retained_updates and rejected_updates after recovery.
+If validation returns FIX_REJECTED with continue_with_next_finding true,
+all candidates were rejected and the baseline proved green. Otherwise
+stop on run-level failures, incomplete validation or unsafe rollback. Retain finding-level
 manual-review and no-safe-fix reasons; continue only with eligible findings.
 Do not commit, push, dismiss findings, or claim pending edits are resolved.
 ```
@@ -1066,6 +1258,10 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | --- | --- |
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
+| `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type and worker. New GitLab/advisory/documentation calls only. |
+| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output. In-memory previews retain the beginning and final summary; clipping a successful build/test preview does not fail validation. |
+| `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
+| `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |
 | `.security-mcp/reports/security-remediation-report-*.md` | Human-readable findings, changes, validation and review evidence. |
 | `.security-mcp/reports/security-remediation-report-*.json` | Machine-readable companion evidence. |
 
@@ -1075,15 +1271,25 @@ The report includes these review categories:
 - Issues with no solution at this time
 - Findings skipped because they need your input
 
-Those skipped findings are also returned by `verify_security_finding` and `apply_minimal_fix` as `MANUAL_REVIEW` / `SKIPPED_USER_PROMPT`. Tell the agent how you want them handled. The server will not guess a version when OSV, GitHub Advisory, and NVD do not.
+Those skipped findings are also returned by `verify_security_finding` and `apply_minimal_fix` as `MANUAL_REVIEW` / `SKIPPED_USER_PROMPT`. Tell the agent how you want them handled. The server uses an explicit, locally matched GitLab recommendation when public advisory metadata is incomplete, but does not guess a version when neither GitLab nor public advisories supply one.
 
-The report ends with an **Unresolved Security Issues** table: severity, package,
-installed version, issue identifiers/title, and the reason no package or code
-update was applied. It includes no-safe-fix, manual-review, and failed-fix
-outcomes, but excludes false positives and validated package fixes (or applied
-non-package fixes). Pending/unqualified package updates remain unresolved. The MCP
-result returns `unresolved_issues` and `unresolved_issues_table` so the agent can
-display the same table at the end of its response. Unverified findings remain
+The final report block starts with an **Unresolved Security Issues** table: severity, package,
+installed version, issue identifiers/title, the reason no package or code
+update was applied, and **Security Validation Sites**. The new column lists
+distinct URLs for advisory/security-reference and publisher sites actually
+consulted, including missing-record or failed lookups. Unqueried sites are never
+invented; no captured sites displays `Not recorded`. JSON rows include
+`security_validation_sites`, and the report also maps sites for all findings,
+including successfully addressed findings. It includes no-safe-fix, manual-review, and failed-fix
+outcomes, but excludes false positives and successfully validated fixes.
+Pending/unqualified edits remain unresolved, including configuration edits
+awaiting validation. Rejected fixes include the failed check and rollback reason. The MCP
+result returns the complete `final_summary_markdown` as literal MCP text, not
+an escaped field inside JSON. Machine-readable structured content retains
+`unresolved_issues`, `final_summary_markdown`, batch isolation evidence and report paths.
+The host must reproduce the tool text at the end of its final assistant response;
+it must not replace the text with a report link. The `unresolved_issues_table`
+field contains only the security table and must be displayed in full. Unverified findings remain
 listed separately; they are not assumed to be resolved or unfixable.
 
 Report generation is not a validation gate: `REPORT_GENERATED` does not mean
@@ -1113,24 +1319,58 @@ Lockfile refreshes use the package manager already selected by the repo (`npm`, 
 
 | Stack | Commands |
 | --- | --- |
-| Node | Frozen dependency install, required `lint`, `build` and `test` scripts for package updates, plus informational advisory audit. |
+| Node | After pulls, pnpm projects run `pnpm clean` then `pnpm install`. Before edits, capture lint once without install/audit/build/test commands. After all version updates, frozen dependency install, one production `build`, all `test` cases and informational advisory audit. Missing/failed lint never gates a fix. |
 | .NET | Restore, `dotnet format --verify-no-changes --no-restore` for package lint, Release production build and test. A non-`net10.0` target is reported. |
-| Java | Maven Checkstyle (including test sources), `clean verify` and `dependency:tree`; or Gradle `checkstyleMain checkstyleTest`, `test` and `build`. Checkstyle must be configured for package qualification. JDK 17 is required. |
+| Java | Informational pre-edit Checkstyle capture. Post-fix Maven `clean verify` and `dependency:tree`; or Gradle `test` and `build`. JDK 17 is required. Missing/failed Checkstyle capture never gates a fix. |
 | NGINX | `nginx -t` when `nginx` is installed and a config file is present |
 | Container | `FROM` is required. `docker build --check` runs when Docker is available. A missing daemon is recorded as skipped. |
 
 A failed required command sets `VALIDATION_FAILED`; a missing required tool or
 incomplete required evidence yields `VALIDATION_INCOMPLETE`. Neither permits
-claiming a package update is validated. Policy check failures produce required
-failed rows even when other checks can still run. Failed attempted package
-updates restore updater-owned dependency files only if unchanged since apply;
-other edits remain local and require review. The Node audit is informational, not a
-substitute for the mandatory compatibility and resolved-license checks.
+claiming a security fix is validated. Policy checks remain mandatory. A rejected
+candidate restores only updater-owned files still matching their applied hashes;
+later user edits are never overwritten. Batch diagnosis returns
+`VALIDATION_COMPLETE` for a tested green subset, or `FIX_REJECTED` with
+`continue_with_next_finding: true` when all candidates were rejected and the
+restored baseline proved green. Retain every rejection reason in the report. Unsafe
+restoration sets `manual_cleanup_required` and blocks further edits until cleanup
+and validation succeed. The Node audit is informational, not a substitute for
+the mandatory compatibility and resolved-license checks.
 
-Package qualification requires lint/build/unit evidence before and after the
-update, plus all four corporate checks when a policy is used. A build alone is
-insufficient. Validate each package edit before applying the next; new changes
-can invalidate earlier receipts, so the final checkout must pass again.
+The engine attempts lint once before any edit, retaining the issues and an
+observed-rule inventory. No lint result gates a fix, including missing scripts,
+execution failures, timeouts or truncated output. It never reruns lint during
+post-fix validation or qualification retries. The complete batch must then
+pass a production build and all unit tests, plus configured policy checks.
+Node build failure stops downstream tests within that component; missing
+mandatory scripts also stop later checks. Unexecuted checks are explicitly
+skipped, never passed. The validator's standalone strict mode still treats lint
+failure as a blocking check; the remediation engine uses baseline-recording mode.
+
+Apply every reviewed version update before final validation. A build alone is
+insufficient. Initial lint output remains unchanged for the run. Configured
+corporate checks remain mandatory in the final matrix; identical commands at
+the same working directory share one execution while each success marker is
+checked independently. An unchanged successful matrix is reused on repeat calls.
+On failure only, grouped subset testing identifies offending updates and
+interactions without exhaustively enumerating combinations. The retained subset
+must pass the final build and all unit tests. If none pass, verify the restored
+baseline too; an already-broken baseline remains a failed run. Later edits are
+preserved and unsafe recovery requires manual cleanup. Diagnostic trials retain
+failed commands, details and log paths in the JSON report's `batch_isolation`
+and the Markdown **Batch Isolation** section. This is a tested compatible subset,
+not a claim to have found the globally largest passing combination.
+New checkout or policy changes invalidate accepted package receipts.
+
+Verbose build/unit-test output exceeding the preview cap is not a product
+failure. Actual command exit codes determine success, with explicit empty test
+runs still rejected. Complete local stdout/stderr logs and bounded beginning/end
+previews preserve final summaries. Rejection details include the failed command,
+exit code, final diagnostics and log paths. A failure reproduced on the original
+baseline is not evidence that a proposed package alone caused it.
+
+`generate_local_report` returns `final_summary_markdown`: display the complete
+security table at the end of the final response, not only file paths.
 
 ## Development and tests
 
@@ -1234,12 +1474,14 @@ for deployment and restart differences.
 | Retrieval fails or tracked main is unavailable | Check token scope/access, exact project path, GitLab URL and tracked branch. Do not use an unfiltered fallback. |
 | `truncated: true` | Treat retrieval/discovery as incomplete; do not claim all findings or absent packages were verified. |
 | `PRECHECK_FAILED` | Return to clean `main` and finish Git operations manually. The MCP does not discard your work. |
+| `PREPARATION_FAILED` | Inspect post-pull `pnpm clean` / `pnpm install` results and full command logs. Provide the repository's existing clean script and pnpm on PATH; resolve failures before security checks. Do not invent a clean script or delete directories as a workaround. |
 | Dated branch already exists | Review, rename or remove it manually; the server refuses to reuse another run's branch name. |
 | `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability, a package-name mismatch, or an undocumented configuration line does not prove a false positive. |
 | `DOCS_REQUIRED` | The required publisher pages were not read completely. Nothing was written. Retry when those pages can be fetched. Do not apply the edit from memory. |
 | More than one repository is active | Pass `repo_root` on every tool call. Omitting it is valid only while one checkout is active. |
-| `QUALIFICATION_REQUIRED` | Complete exact-version API/license review and baseline checks, plus corporate approval when configured; requalify after checkout/policy changes. |
+| `QUALIFICATION_REQUIRED` | Complete exact-version API/license review and configured corporate approval evidence; requalify after checkout/policy changes. Product checks run in the final matrix. |
 | `VALIDATION_REQUIRED` or `PENDING_VALIDATION` | Validate the previous package edit before attempting another; do not report it as resolved. |
+| `FIX_REJECTED` with `continue_with_next_finding: true` | Candidate failed checks and was safely restored. Keep earlier successes, skip this finding, continue, and include its failure reason in the final report. |
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |

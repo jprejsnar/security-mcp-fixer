@@ -26,18 +26,36 @@ def run_validation(
     *,
     timeout: int,
     package_checks: bool = False,
+    record_lint: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
 ) -> dict:
-    """Run detected stack checks and return required failures and skipped tools."""
+    """Run product checks, or capture informational lint without product work."""
     try:
         return _run_validation(
-            root, runner, which, timeout=timeout, package_checks=package_checks
+            root,
+            runner,
+            which,
+            timeout=timeout,
+            package_checks=package_checks,
+            record_lint=record_lint,
+            skip_lint=skip_lint,
+            lint_only=lint_only,
         )
     except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
         return {
-            "status": "VALIDATION_FAILED",
+            "status": "VALIDATION_COMPLETE" if lint_only else "VALIDATION_FAILED",
             "detected": {},
             "results": [
-                _row(None, "FAILED", True, f"Validation could not complete: {exc}")
+                {
+                    **_row(
+                        None,
+                        "FAILED",
+                        not lint_only,
+                        f"Validation could not complete: {exc}",
+                    ),
+                    **({"kind": "lint", "baseline_only": True} if lint_only else {}),
+                }
             ],
         }
 
@@ -49,12 +67,16 @@ def _run_validation(
     *,
     timeout: int,
     package_checks: bool = False,
+    record_lint: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
 ) -> dict:
     """Aggregate stack checks without hiding required failures or skips."""
     files, _truncated = iter_files(root)
     stack = detect_stack(root, files)
     results: list[dict] = []
-    results.extend(_versions(runner, which, stack, timeout))
+    if not lint_only:
+        results.extend(_versions(runner, which, stack, timeout))
     if stack.node:
         node_roots = sorted(
             {path.parent for path in files if path.name == "package.json"}
@@ -72,6 +94,9 @@ def _run_validation(
                     which,
                     timeout,
                     package_checks=package_checks,
+                    record_lint=record_lint,
+                    skip_lint=skip_lint,
+                    lint_only=lint_only,
                 )
             )
     if stack.dotnet:
@@ -98,15 +123,26 @@ def _run_validation(
                     which,
                     timeout,
                     package_checks=package_checks,
+                    skip_lint=skip_lint,
+                    lint_only=lint_only,
                 )
             )
     if stack.java:
         results.extend(
-            _java(root, stack, runner, which, timeout, package_checks=package_checks)
+            _java(
+                root,
+                stack,
+                runner,
+                which,
+                timeout,
+                package_checks=package_checks,
+                skip_lint=skip_lint,
+                lint_only=lint_only,
+            )
         )
-    if stack.nginx_configs:
+    if stack.nginx_configs and not lint_only:
         results.extend(_nginx(root, stack, runner, which, timeout))
-    if stack.dockerfiles:
+    if stack.dockerfiles and not lint_only:
         results.extend(_docker(root, stack, runner, which, timeout))
     if not any(
         [stack.node, stack.dotnet, stack.java, stack.nginx_configs, stack.dockerfiles]
@@ -123,7 +159,16 @@ def _run_validation(
         present = {row.get("kind") for row in results}
         if "build_and_unit_tests" in present:
             present.update({"build", "unit_tests"})
-        for kind in ("lint", "build", "unit_tests"):
+        kinds = (
+            ("lint",)
+            if lint_only
+            else (
+                ("build", "unit_tests")
+                if skip_lint
+                else ("lint", "build", "unit_tests")
+            )
+        )
+        for kind in kinds:
             if kind not in present:
                 row = _row(
                     None,
@@ -133,6 +178,13 @@ def _run_validation(
                 )
                 row["kind"] = kind
                 results.append(row)
+    if record_lint or lint_only:
+        for row in results:
+            if lint_only:
+                row.setdefault("kind", "lint")
+            if row.get("kind") == "lint":
+                row["required"] = False
+                row["baseline_only"] = True
     failed = any(
         item["status"] == "FAILED" and item.get("required", True) for item in results
     )
@@ -221,6 +273,9 @@ def _node(
     timeout: int,
     *,
     package_checks: bool = False,
+    record_lint: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
 ) -> list[dict]:
     """Install locked Node dependencies, then run declared project checks."""
     manager = stack.node_manager or "npm"
@@ -233,6 +288,19 @@ def _node(
     tool = resolve_tool(manager, which)
     if not tool:
         return [_row(None, "SKIPPED", True, f"{manager} is not on PATH.")]
+    if lint_only:
+        row = (
+            _execute_product_check(runner, [tool, "run", "lint"], timeout, root, "lint")
+            if "lint" in scripts
+            else _row(
+                None,
+                "SKIPPED",
+                False,
+                "No lint script; informational capture unavailable.",
+            )
+        )
+        row.update(kind="lint", cwd=str(root), required=False, baseline_only=True)
+        return [row]
     rows = []
     if manager == "npm":
         rows.append(_run(runner, [tool, "ci"], timeout, required=True, cwd=root))
@@ -316,22 +384,48 @@ def _node(
             )
         )
         return rows
+    blocked = None
     for script in ("lint", "build", "test"):
         kind = "unit_tests" if script == "test" else script
+        if kind == "lint" and skip_lint:
+            continue
+        if blocked is not None:
+            row = _row(
+                None,
+                "SKIPPED",
+                True,
+                f"Not run because the required {blocked} check did not pass; validation stopped early.",
+            )
+            row["kind"] = kind
+            row["cwd"] = str(root)
+            rows.append(row)
+            continue
         if script not in scripts:
             row = _row(
                 None,
                 "SKIPPED",
-                package_checks,
-                f"{root / 'package.json'} has no {script} script; configure this check before qualifying a package update.",
+                package_checks and not (record_lint and kind == "lint"),
+                f"{root / 'package.json'} has no {script} script; "
+                + (
+                    "informational lint capture unavailable."
+                    if record_lint and kind == "lint"
+                    else "configure this check before qualifying a package update."
+                ),
             )
             row["kind"] = kind
             rows.append(row)
+            if row["required"]:
+                blocked = kind
             continue
         argv = [tool, "test"] if script == "test" else [tool, "run", script]
         row = _execute_product_check(runner, argv, timeout, root, kind)
+        if record_lint and kind == "lint":
+            row["required"] = False
+            row["baseline_only"] = True
         row["cwd"] = str(root)
         rows.append(row)
+        if row["status"] != "PASSED" and row.get("required", True):
+            blocked = kind
     return rows
 
 
@@ -343,11 +437,23 @@ def _dotnet(
     timeout: int,
     *,
     package_checks: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
 ) -> list[dict]:
     """Restore NuGet dependencies and run Release build and test checks."""
     tool = resolve_tool("dotnet", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "dotnet is not on PATH.")]
+    if lint_only:
+        return [
+            _execute_product_check(
+                runner,
+                [tool, "format", "--verify-no-changes", "--no-restore"],
+                timeout,
+                root,
+                "lint",
+            )
+        ]
     locked = any(path.name == "packages.lock.json" for path in files)
     restore_args = [tool, "restore", "--locked-mode"] if locked else [tool, "restore"]
     restore = _run(runner, restore_args, timeout, required=True, cwd=root)
@@ -359,7 +465,7 @@ def _dotnet(
             )
         )
         return rows
-    if package_checks:
+    if package_checks and not skip_lint:
         rows.append(
             _execute_product_check(
                 runner,
@@ -398,6 +504,8 @@ def _java(
     timeout: int,
     *,
     package_checks: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
 ) -> list[dict]:
     """Prefer repository wrappers for Maven or Gradle validation."""
     if stack.java_build == "gradle":
@@ -405,6 +513,16 @@ def _java(
         tool = wrapper or resolve_tool("gradle", which)
         if not tool:
             return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
+        if lint_only:
+            return [
+                _execute_product_check(
+                    runner,
+                    [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
+                    timeout,
+                    root,
+                    "lint",
+                )
+            ]
         rows = [
             _run(runner, [tool, "--no-daemon", "dependencies"], timeout, required=True)
         ]
@@ -418,7 +536,7 @@ def _java(
                 )
             )
             return rows
-        if package_checks:
+        if package_checks and not skip_lint:
             rows.append(
                 _execute_product_check(
                     runner,
@@ -438,7 +556,7 @@ def _java(
     if not tool:
         return [_row(None, "SKIPPED", True, "mvnw or mvn is not available.")]
     lint = []
-    if package_checks:
+    if lint_only or (package_checks and not skip_lint):
         lint.append(
             _execute_product_check(
                 runner,
@@ -453,6 +571,8 @@ def _java(
                 "lint",
             )
         )
+    if lint_only:
+        return lint
     rows = [
         _run(runner, [tool, "--batch-mode", "clean", "verify"], timeout, required=True)
     ]
@@ -586,7 +706,10 @@ def _execute_product_check(
         row = _row(None, "FAILED", True, f"{kind} check could not execute: {exc}")
         row.update(command=argv, kind=kind, output_complete=False)
         return row
-    return _lint_result(result) if kind == "lint" else _product_result(result, kind)
+    row = _lint_result(result) if kind == "lint" else _product_result(result, kind)
+    if kind == "lint" and (result.exit_code == 124 or result.exit_code < 0):
+        row["output_complete"] = False
+    return row
 
 
 def _run_result(
@@ -662,12 +785,54 @@ def _lint_result(result: CommandResult) -> dict:
     row["diagnostics"] = diagnostics
     if diagnostics["errors"]:
         row["status"] = "FAILED"
-        row["detail"] = "Lint reported errors; package update cannot be accepted."
+        row["detail"] = "Lint reported errors."
     return row
 
 
+def lint_rule_inventory(rows: list[dict]) -> dict:
+    """List observed rule IDs without changing the project's linter configuration."""
+    rules: dict[str, dict] = {}
+    patterns = (
+        r"^\s*\d+:\d+\s+(?:error|warning)\s+.*?\s{2,}([@\w][\w@./-]*)\s*$",
+        r"\[(?:Error|Warning)/([^\]\s]+)\]\s*$",
+        r"\b(?:error|warning|info)\s+([A-Za-z]+\d+)\s*:",
+        r"^\[?(?:ERROR|WARN|INFO)\]?.+\s\[([A-Za-z][\w.]*)\]\s*$",
+    )
+    lint_rows = [row for row in rows if row.get("kind") == "lint"]
+    for row in lint_rows:
+        for severity, diagnostics in row.get("diagnostics", {}).items():
+            for diagnostic in diagnostics:
+                rule = None
+                if isinstance(diagnostic, dict):
+                    message = diagnostic.get("message")
+                    if isinstance(message, dict):
+                        rule = message.get("ruleId")
+                elif isinstance(diagnostic, str):
+                    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", diagnostic)
+                    for pattern in patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            rule = match.group(1)
+                            break
+                if not isinstance(rule, str) or not rule.strip():
+                    continue
+                entry = rules.setdefault(rule, {"occurrences": 0, "severities": []})
+                entry["occurrences"] += 1
+                if severity not in entry["severities"]:
+                    entry["severities"].append(severity)
+    return {
+        "schema_version": 1,
+        "source": ".security-mcp/lint-issues.json",
+        "informational_only": True,
+        "complete": bool(lint_rows)
+        and all(row.get("output_complete", False) for row in lint_rows),
+        "rule_names": sorted(rules),
+        "rules": {name: rules[name] for name in sorted(rules)},
+    }
+
+
 def _product_result(result: CommandResult, kind: str) -> dict:
-    """Retain product evidence and reject truncated or explicitly empty test runs."""
+    """Judge product exits and empty test runs, not the size of their output."""
     row = _run_result(result, required=True)
     row.update(
         kind=kind,
@@ -675,10 +840,15 @@ def _product_result(result: CommandResult, kind: str) -> dict:
         stderr=result.stderr,
         output_complete=not result.truncated,
     )
-    if result.truncated:
+    if result.truncated and kind == "lint":
         row.update(
             status="FAILED",
-            detail=f"{kind} output is truncated; complete diagnostics are required before accepting a package update.",
+            detail=f"{kind} output is truncated; "
+            + (
+                "available diagnostics are retained."
+                if kind == "lint"
+                else "complete diagnostics are required before accepting a package update."
+            ),
         )
     elif kind in {"unit_tests", "build_and_unit_tests"}:
         output = result.stdout + result.stderr
@@ -699,6 +869,19 @@ def _product_result(result: CommandResult, kind: str) -> dict:
                 status="FAILED",
                 detail="Unit tests did not run; a successful exit without executed tests is not passing evidence.",
             )
+    if result.exit_code != 0:
+        tail = (result.stderr or result.stdout).strip()[-2000:]
+        logs = ", ".join(
+            path for path in (result.stdout_log_path, result.stderr_log_path) if path
+        )
+        row["detail"] = (
+            f"{kind} command {result.display()} exited {result.exit_code}. {tail}"
+            + (f" Full output: {logs}" if logs else "")
+        )
+    elif result.truncated and row["status"] == "PASSED":
+        row["detail"] = (
+            f"{kind} command exited 0; only its in-memory output preview was clipped."
+        )
     return row
 
 
@@ -714,4 +897,6 @@ def _row(
         "detail": detail,
         "stdout_sha256": result.stdout_sha256 if result else None,
         "stderr_sha256": result.stderr_sha256 if result else None,
+        "stdout_log_path": result.stdout_log_path if result else None,
+        "stderr_log_path": result.stderr_log_path if result else None,
     }

@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
+import contextlib
 import logging
 import os
+import subprocess
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
-from mcp.types import ToolAnnotations
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from gitlab_security_mcp import __version__
+from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
 
 logger = logging.getLogger("gitlab_security_mcp")
@@ -25,7 +31,12 @@ Local-only GitLab security remediation. Call the tools in this order:
     Unresolved ${workspaceFolder} values are not repository paths. Each checkout
     keeps its own run. Pass that same repo_root to later tools when more than
     one checkout is active.
-2. pull_main_twice
+2. pull_main_twice. After both successful pulls this tool automatically runs
+    pnpm clean followed by pnpm install in each pnpm project/workspace root,
+    before branching or any security checks. Do not issue duplicate host commands.
+    Any preparation failure stops the run; fix it before continuing. Non-pnpm
+    repositories skip pnpm preparation. The repository must provide its own
+    clean script; do not invent one or replace it with a directory deletion.
 3. create_security_branch
 4. list_security_findings
 5. verify_security_finding for every finding
@@ -77,8 +88,13 @@ Local-only GitLab security remediation. Call the tools in this order:
     corporate approvals. All checks defined by that policy remain required.
 8. apply_minimal_fix only when eligible. Before every edit, the server reads
     the current Docker, nginx, GitLab, Java, Node.js, Angular, Crystal,
-    Microsoft, .NET 10, TypeScript, CVE, CWE, NSA, and NIST pages. A failed
-    read blocks the write. Dockerfile, nginx, and GitLab CI findings change
+    Microsoft, .NET 10, and TypeScript publisher pages. CVE, CWE, NSA and NIST
+    security-reference reads are informational: unavailable/missing records,
+    failed reads or absent fix data never veto a concrete GitLab recommendation.
+    Record actual security_validation_sites, including sites returning no data,
+    without claiming an unqueried site verified the finding. Required publisher
+    guidance remains distinct from optional security-reference data.
+    Dockerfile, nginx, and GitLab CI findings change
     only a cited line whose directive those current pages still document.
     Every major, minor, revision or build
     package update requires compatible_without_code_changes=true and
@@ -89,20 +105,61 @@ Local-only GitLab security remediation. Call the tools in this order:
     their concrete API evidence, not just a version-number warning.
 9. generate_aaa_test for supported base-image changes; it does not invent
     arbitrary API tests. Dependency-only fixes retain the product unit suite.
-10. Qualification runs lint before permitting the version edit and records
-    every emitted warning, informational and unknown diagnostic. Run
-    run_validation_matrix after each package update. Accept only with no lint
-    errors, a successful production build, and built/executed unit tests with
-    no failures, plus all configured corporate checks. Warnings/info/unknown
-    output alone are not lint failures. Missing/skipped or truncated checks
-    cannot pass. Failed attempted updates are rejected and updater-owned
-    dependency edits are restored when unchanged since application. Later user
-    edits are preserved and require manual cleanup. Report the exact failures;
-    never adapt production/tests to fix them. Validate before the next edit.
+10. Before the first edit, qualification runs lint and writes every emitted
+    error, warning, informational and unknown diagnostic plus raw streams to
+    .security-mcp/lint-issues.json, and detected rule names to
+    .security-mcp/lint-rules.json. Capture is best-effort and informational only:
+    lint errors, missing scripts, timeouts, truncated output or inability to
+    start lint never block a security fix. Preserve capture completeness honestly.
+    The rule inventory does not configure the project's linter. Do not rerun
+    lint for qualification retries or post-fix acceptance.
+    Long steps emit live text bars through MCP progress notifications and
+    stderr, plus an automatic live Windows console for hidden-stderr stdio
+    launches. PROGRESS_CONSOLE=off disables that window for CI/headless use.
+    Tool results retain bounded progress_output and an Execution Progress text
+    block when live notifications are unavailable; do not omit that output.
+    The completion transcript is not evidence the host displayed live updates.
+    Keep these visible rather than inserting sleeps or polling waits.
+    Jest discovers current test-file totals with --listTests --json before the
+    test command; the bar counts completed suites and reported individual cases.
+    Label suites versus cases explicitly. Never reuse yesterday's totals or
+    guess case counts from source text. For other commands, show real reported
+    counts when available and output-driven activity when totals are unknown;
+    never infer completion percentages from elapsed time.
+    LOOP over findings: verify, review, qualify and apply all eligible version
+    updates without running build/unit tests between updates. Then call
+    run_validation_matrix once for the complete batch. Accept only with a successful
+    production build and all built/executed unit tests passing, plus configured
+    corporate checks. A clipped in-memory build/test preview is not a failed
+    command: use actual exit codes and executed-test evidence. Full product
+    output is kept in .security-mcp/command-logs. For actual failures report the
+    command, exit code, final diagnostic and stdout/stderr log paths; never
+    reject a package solely because successful output exceeded the preview cap.
+    Do not run a default build/test baseline before edits. Capture lint only,
+    then apply the batch and validate; do not insert sleeps, polling delays or cooldowns.
+    Only if final validation fails may additional builds/unit tests run to
+    isolate offending updates or interactions. Preserve passing subsets, revert
+    only updater-owned changes, and require a final green build and all unit tests.
+    Read batch isolation diagnostics and every rejected finding's reason.
+    Never retry a rejected target blindly. Missing/incomplete checks never pass.
+    When continuation is false,
+    rollback cannot be proved safe or later edits need manual cleanup: stop
+    editing and report the blocker. Never adapt production/tests to make a fix
+    pass. At the end list every unapplied/rejected fix and its exact reason.
 11. generate_local_report, showing qualification and unresolved findings.
+    Display the returned final_summary_markdown verbatim at the end of the final
+    response, not just report paths. The tool's text content is this complete
+    Markdown block, not a JSON wrapper. Copy it into the final assistant message;
+    do not summarize it away or replace it with a report link.
+    Preserve the final table columns: Severity, Package, Version, Issue,
+    Reason Not Addressed, Security Validation Sites. List the actual consulted
+    site URLs even when the lookup failed; never fabricate verification sites.
 Do not commit, push, open a merge request, or dismiss GitLab findings.
-This server refuses those actions. Package findings that cannot be resolved
-from OSV, the GitHub Advisory Database, or NVD require manual review.
+This server refuses those actions. Missing/failed OSV, GitHub Advisory Database,
+NVD, CVE, CWE or NSA data does not block a concrete GitLab-recommended update
+for a locally matched dependency. Continue to qualification, application and
+build/all-unit-test validation; reject and restore fixes that fail those checks.
+Without any concrete target or supported code fix, do not invent one.
 API and coverage fuzzing require local reproduction instead of advisory lookup.
 Unknown reachability is not a false positive.
 """
@@ -112,6 +169,155 @@ mcp = MCPServer(
     instructions=INSTRUCTIONS,
     version=__version__,
 )
+
+_CONSOLE_READER = """
+import ctypes
+import sys
+ctypes.windll.kernel32.SetConsoleTitleW("GitLab Security Progress")
+ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+with open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1) as console:
+    for line in sys.stdin:
+        console.write(line)
+"""
+
+
+class _ProgressConsole:
+    """Own an isolated Windows console without inheriting MCP's stdio handles."""
+
+    def __init__(self, process: subprocess.Popen[str]):
+        """Serialize short writes and retain only the child owned by this server."""
+        self.process = process
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def write(self, text: str) -> None:
+        """Flush a live message; a closed console must not interrupt a tool."""
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self.process.stdin.write(text + "\n")
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                logger.warning(
+                    "Progress console closed; stderr and tool transcripts remain available."
+                )
+                self._closed = True
+
+    def close(self) -> None:
+        """Close stdin to end the reader and reap the owned child on shutdown."""
+        with self._lock:
+            self._closed = True
+            with contextlib.suppress(OSError, ValueError):
+                self.process.stdin.close()
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=2)
+
+
+def _open_progress_console() -> _ProgressConsole | None:
+    """Open visible output for a Windows stdio host unless explicitly disabled."""
+    mode = os.environ.get("PROGRESS_CONSOLE", "auto").lower()
+    if sys.platform != "win32" or mode in {"0", "off", "false"}:
+        return None
+    if mode == "auto" and sys.stderr.isatty():
+        return None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", _CONSOLE_READER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10),
+        )
+    except OSError:
+        logger.warning(
+            "Could not open progress console; stderr and tool transcripts remain available."
+        )
+        return None
+    console = _ProgressConsole(process)
+    console.write("GitLab Security Progress: waiting for tool calls.")
+    return console
+
+
+_progress_console: _ProgressConsole | None = None
+
+
+async def _progress_middleware(
+    context: ServerRequestContext[Any, Any], call_next: CallNext
+) -> HandlerResult:
+    """Deliver live text bars to the active MCP request without crossing checkouts."""
+    if context.method != "tools/call":
+        return await call_next(context)
+    loop = asyncio.get_running_loop()
+    messages: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
+    transcript: deque[str] = deque(maxlen=64)
+
+    def enqueue(text: str) -> None:
+        """Keep the most recent updates if a client consumes notifications slowly."""
+        transcript.append(text)
+        if messages.full():
+            messages.get_nowait()
+            messages.task_done()
+        messages.put_nowait(text)
+
+    def publish(text: str) -> None:
+        """Schedule updates from either command reader thread onto the MCP loop."""
+        text = str(text)[:2000]
+        if _progress_console is not None:
+            _progress_console.write(text)
+        loop.call_soon_threadsafe(enqueue, text)
+
+    async def deliver() -> None:
+        """Send monotonic notification sequence numbers with count-based text bars."""
+        sequence = 0
+        while True:
+            text = await messages.get()
+            try:
+                sequence += 1
+                await context.session.report_progress(sequence, None, text)
+            except Exception:
+                logger.warning("Could not send MCP progress", exc_info=True)
+            finally:
+                messages.task_done()
+
+    token = progress_sink.set(publish)
+    sender = asyncio.create_task(deliver())
+    try:
+        result = await call_next(context)
+    finally:
+        progress_sink.reset(token)
+        drained = loop.create_future()
+        loop.call_soon(drained.set_result, None)
+        await drained
+        await messages.join()
+        sender.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender
+    if transcript:
+        output = list(transcript)
+        if isinstance(result, dict):
+            result["progress_output"] = output
+        elif isinstance(result, CallToolResult):
+            if isinstance(result.structured_content, dict):
+                result.structured_content["progress_output"] = output
+            result.content.insert(
+                0,
+                TextContent(
+                    text="## Execution Progress\n```text\n"
+                    + "\n".join(output)
+                    + "\n```"
+                ),
+            )
+    return result
+
+
+mcp.middleware.append(_progress_middleware)
 # One engine per checkout. The registry lock covers only map updates.
 # Tool work uses the engine's own lock, so two repositories can proceed together.
 _engines: dict[Path, Engine] = {}
@@ -203,14 +409,20 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Pull main twice",
+        title="Pull main twice and prepare pnpm",
         read_only_hint=False,
-        destructive_hint=False,
+        destructive_hint=True,
         open_world_hint=True,
     )
 )
 def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
-    """Phase 1. Fast-forward main twice. Any failure stops that checkout's run."""
+    """Phase 1. Pull twice, then run pnpm clean followed by pnpm install.
+
+    Preparation runs once per pnpm project/workspace root before any security
+    checks. Any pull or preparation failure stops that checkout's run. Missing
+    clean scripts or unavailable pnpm are blockers, never silently skipped.
+    Non-pnpm repositories do not run pnpm preparation.
+    """
     return _run("pull_main_twice", repo_root=repo_root)
 
 
@@ -272,8 +484,13 @@ def qualify_package_update(
     major/minor/revision/build version. Read official target-version docs;
     attestations are audited, not independent proof of documentation reading.
     Corporate approval comes only from the configured policy file. This tool
-    records baseline lint diagnostics, builds and unit tests, and all policy
-    checks before permitting an edit. Missing checks never count as passing.
+    records best-effort initial lint diagnostics in .security-mcp/lint-issues.json
+    and observed rule IDs in .security-mcp/lint-rules.json. Lint is informational:
+    errors, missing scripts or incomplete capture never block editing. Do not
+    run default installs, audits, builds or unit tests before applying the fix.
+    Apply all reviewed version updates before the final build and unit tests.
+    Missing product checks never count as passing. Configured policy checks
+    remain mandatory in the final matrix. Never add waits or polling delays.
     If no corporate policy is configured/present, include license {expression,
     sources, commercial_use_permitted:true, no_license_fees:true, obligations,
     assessment}. No corporate approval JSON file is required in that mode.
@@ -323,7 +540,14 @@ def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str
     )
 )
 def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
-    """Phase 6. Run Node, .NET, Java 17, NGINX, and container checks that apply to this repo."""
+    """Validate all pending updates with one final build, all unit tests and policy checks.
+
+    Lint was recorded before edits, not rerun per fix. Only a failed batch triggers
+    grouped subset diagnosis and guarded reverts. Retain the tested passing subset;
+    isolation_trials and rejected_updates explain failures and interactions.
+    FIX_REJECTED means every candidate was rejected and the baseline proved green.
+    Stop on failed/incomplete recovery or manual cleanup. Report all rejections.
+    """
     return _run("run_validation_matrix", repo_root=repo_root)
 
 
@@ -335,13 +559,22 @@ def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
         open_world_hint=False,
     )
 )
-def generate_local_report(repo_root: str | None = None) -> dict[str, Any]:
-    """Phase 7. Write the human and JSON report, including false positives and skipped findings.
+def generate_local_report(repo_root: str | None = None) -> CallToolResult:
+    """Write reports and display final_summary_markdown verbatim, not only paths.
 
-    Display unresolved_issues_table at the end of the final response. It lists
-    issues not safely addressed by package or code updates and the reasons.
+    The final block contains unresolved issues, reasons and consulted security sites.
     """
-    return _run("generate_local_report", repo_root=repo_root)
+    result = _run("generate_local_report", repo_root=repo_root)
+    return CallToolResult(
+        content=[
+            TextContent(
+                text=result.get("final_summary_markdown")
+                or (f"Report generation failed: {result.get('error', 'unknown error')}")
+            )
+        ],
+        structuredContent=result,
+        isError=result.get("status") == "ERROR",
+    )
 
 
 @mcp.tool(
@@ -367,7 +600,9 @@ def _configure_logging() -> None:
 
 def main() -> None:
     """Serve MCP tools over stdio until the client disconnects."""
+    global _progress_console
     _configure_logging()
+    _progress_console = _open_progress_console()
     try:
         mcp.run(transport="stdio")
     finally:
@@ -375,6 +610,10 @@ def main() -> None:
             _close_engine()
         except Exception:
             logger.exception("Could not close the engine during server shutdown")
+        finally:
+            if _progress_console is not None:
+                _progress_console.close()
+                _progress_console = None
 
 
 if __name__ == "__main__":

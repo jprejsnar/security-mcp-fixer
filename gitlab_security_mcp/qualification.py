@@ -8,7 +8,6 @@ An SPDX identifier alone is not legal approval.
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import json
 import re
@@ -33,10 +32,7 @@ ARTIFACT_DIRS = {
 }
 MAX_TREE_BYTES = 100 * 1024 * 1024
 MAX_SOURCE_BYTES = 512 * 1024
-MAX_SOURCE_FILES = 5
-MAX_SOURCE_LINES = 200
 MAX_POLICY_BYTES = 1024 * 1024
-MAX_DIFF_CELLS = 4_000_000
 SOURCE_SUFFIXES = {
     ".js",
     ".mjs",
@@ -374,10 +370,10 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
         ).get("scripts", {})
         if not isinstance(scripts, dict) or any(
             not isinstance(scripts.get(kind), str) or not scripts[kind].strip()
-            for kind in ("lint", "build", "test")
+            for kind in ("build", "test")
         ):
             raise ValueError(
-                "Package updates require existing build and test scripts and a lint script; missing checks cannot count as passing"
+                "Package updates require existing build and test scripts; missing checks cannot count as passing"
             )
     fingerprint = {
         "mode": "documentation_review",
@@ -705,7 +701,7 @@ def validate_edits(
     *,
     expected_dependencies: dict | None = None,
 ) -> dict[str, str]:
-    """Reject undeclared, oversized, or computationally costly migrations."""
+    """Reject source adaptations and changes outside reviewed dependency files."""
     after = tree_snapshot(root)
     before = receipt["tree"]
     script_hashes = receipt.get(
@@ -740,58 +736,10 @@ def validate_edits(
         raise ValueError(
             "Dependency files changed beyond the applied version edit; production/test settings cannot be adapted to support an update"
         )
-    allowed = set(allowed_files) | set(receipt["source_before"])
+    allowed = set(allowed_files)
     if changed - allowed:
         raise ValueError(
             "Undeclared checkout changes require re-review: "
             + ", ".join(sorted(changed - allowed)[:10])
         )
-    lines = 0
-    for relative, original in receipt["source_before"].items():
-        path = resolve_inside(root, relative)
-        if path is None or not path.is_file():
-            raise ValueError(
-                "Surgical source file is missing, outside the repo, or too large"
-            )
-        current = _read_bounded(path, MAX_SOURCE_BYTES).decode("utf-8")
-        lines += _changed_lines(original or "", current)
-    if lines > MAX_SOURCE_LINES:
-        raise ValueError(
-            f"Source migration exceeds {MAX_SOURCE_LINES} added/deleted lines; manual review required"
-        )
     return after
-
-
-def _changed_lines(original: str, current: str) -> int:
-    """Count edits after trimming equal context and bounding quadratic work.
-
-    Large unchanged files and localized edits keep a linear fast path.
-    Reject costly comparisons instead of holding the engine lock while
-    SequenceMatcher processes arbitrarily many possible line pairs.
-    """
-    if original == current:
-        return 0
-    before, after = original.splitlines(), current.splitlines()
-    prefix = 0
-    common = min(len(before), len(after))
-    while prefix < common and before[prefix] == after[prefix]:
-        prefix += 1
-    old_end, new_end = len(before), len(after)
-    while (
-        old_end > prefix
-        and new_end > prefix
-        and before[old_end - 1] == after[new_end - 1]
-    ):
-        old_end -= 1
-        new_end -= 1
-    before, after = before[prefix:old_end], after[prefix:new_end]
-    if len(before) * len(after) > MAX_DIFF_CELLS:
-        raise ValueError(
-            "Source comparison exceeds the work limit; manual review required"
-        )
-    delta = difflib.SequenceMatcher(a=before, b=after)
-    return sum(
-        old_end - old_start + new_end - new_start
-        for tag, old_start, old_end, new_start, new_end in delta.get_opcodes()
-        if tag != "equal"
-    )

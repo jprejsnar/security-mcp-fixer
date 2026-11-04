@@ -7,12 +7,13 @@ import re
 import threading
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 
 import httpx
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import redact
+from gitlab_security_mcp.util import redact, timed_http_stream
 from gitlab_security_mcp.versions import (
     collect_fixed_versions,
     describe_ranges,
@@ -69,6 +70,7 @@ class AdvisoryLookup:
     summary: str = ""
     sources: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    validation_sites: list[str] = field(default_factory=list)
 
 
 class AdvisoryClient:
@@ -84,16 +86,19 @@ class AdvisoryClient:
         http: httpx.Client | None = None,
         github_token: str | None = None,
         nvd_api_key: str | None = None,
+        http_log_path: Path | None = None,
     ):
         """Configure advisory credentials and retain any caller-owned HTTP client."""
         self._owns_http = http is None
         self.http = http if http is not None else httpx.Client(timeout=30.0)
         self.github_token = github_token
         self.nvd_api_key = nvd_api_key
+        self.http_log_path = http_log_path
         self._cache: dict[str, dict | list | None] = {}
         self._closed = False
         self._lock = threading.RLock()
         self._cache_lock = threading.Lock()
+        self._validation_sites: set[str] = set()
 
     def close(self) -> None:
         """Release cached payloads and owned HTTP resources exactly once."""
@@ -130,14 +135,16 @@ class AdvisoryClient:
         the earlier source has no record. Return an AdvisoryLookup with
         affected status, candidate fixes, and sources.
         Failed requests, malformed responses, and calls after close return
-        lookup_failed instead of authorizing an edit. Serialize cache and
-        client access with shutdown; never treat lookup failure as safety.
+        lookup_failed rather than claiming the version is safe. The engine may
+        still use an explicit GitLab fix. Serialize access with shutdown and
+        retain sites consulted even when no record or fix data is available.
         """
         with self._lock:
+            self._validation_sites = set()
             try:
                 if self._closed:
                     raise RuntimeError("Advisory client is closed")
-                return self._lookup(finding, ecosystem, package, version)
+                result = self._lookup(finding, ecosystem, package, version)
             except (
                 httpx.HTTPError,
                 ValueError,
@@ -145,11 +152,13 @@ class AdvisoryClient:
                 AttributeError,
                 RuntimeError,
             ) as exc:
-                return AdvisoryLookup(
+                result = AdvisoryLookup(
                     outcome="lookup_failed",
                     summary="Online advisory data could not be read safely.",
                     errors=[self._clean(str(exc))],
                 )
+            result.validation_sites = sorted(self._validation_sites)
+            return result
 
     def _lookup(
         self,
@@ -159,9 +168,11 @@ class AdvisoryClient:
         version: str | None,
     ) -> AdvisoryLookup:
         """Resolve identifiers through advisory sources in priority order."""
-        identifiers = [
-            item for item in finding.get("identifiers") or [] if _advisory_id(item)
-        ]
+        identifiers = list(
+            dict.fromkeys(
+                item for item in finding.get("identifiers") or [] if _advisory_id(item)
+            )
+        )
         errors: list[str] = []
         sources: list[str] = []
         osv_records: list[dict] = []
@@ -193,12 +204,14 @@ class AdvisoryClient:
                 errors.append(self._clean(f"osv-query:{package}: {exc}"))
                 queried = None
             known = {item.get("id") for item in osv_records}
-            follow_ups = [
-                summary.get("id")
-                for summary in (queried or {}).get("vulns") or []
-                if summary.get("id") not in known
-                and _overlaps(summary, identifiers, finding)
-            ]
+            follow_ups = list(
+                dict.fromkeys(
+                    summary.get("id")
+                    for summary in (queried or {}).get("vulns") or []
+                    if summary.get("id") not in known
+                    and _overlaps(summary, identifiers, finding)
+                )
+            )
             for _ident, full, error in map_ordered(self._osv_record, follow_ups):
                 if error:
                     errors.append(error)
@@ -324,9 +337,20 @@ class AdvisoryClient:
             )
         )
         with self._cache_lock:
+            self._validation_sites.add(
+                str(httpx.URL(url).copy_with(path="", query=None, fragment=None))
+            )
             if key in self._cache:
                 return self._cache[key]
-        with self.http.stream("GET", url, params=params, headers=headers) as response:
+        with timed_http_stream(
+            self.http,
+            "GET",
+            url,
+            source="advisory",
+            log_path=self.http_log_path,
+            params=params,
+            headers=headers,
+        ) as response:
             if response.status_code == 404:
                 payload = None
             else:
@@ -342,7 +366,18 @@ class AdvisoryClient:
 
     def _post_json(self, url: str, body: dict) -> dict | None:
         """Submit an advisory query and close its response after parsing."""
-        with self.http.stream("POST", url, json=body) as response:
+        with self._cache_lock:
+            self._validation_sites.add(
+                str(httpx.URL(url).copy_with(path="", query=None, fragment=None))
+            )
+        with timed_http_stream(
+            self.http,
+            "POST",
+            url,
+            source="advisory",
+            log_path=self.http_log_path,
+            json=body,
+        ) as response:
             if response.status_code == 404:
                 return None
             response.raise_for_status()

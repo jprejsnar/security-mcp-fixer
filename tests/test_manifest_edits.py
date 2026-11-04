@@ -150,6 +150,7 @@ def test_server_exit_closes_engine(monkeypatch, failure, initialized):
 
     from gitlab_security_mcp import server
 
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
     engine = Mock() if initialized else None
     if engine is not None:
         engine.repo_root = "checkout"

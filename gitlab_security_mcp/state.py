@@ -34,6 +34,9 @@ class RunState:
     json_report_path: str | None = None
     excluded_findings: dict = field(default_factory=dict)
     pulls: list | None = None
+    lint_baseline: dict | None = None
+    manual_cleanup_required: bool = False
+    batch_isolation: list[dict] = field(default_factory=list)
 
     def save(self, repo_root: Path) -> None:
         """Write ``.security-mcp/run-state.json`` without leaving a half-written file."""
