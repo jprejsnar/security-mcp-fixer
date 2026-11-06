@@ -221,14 +221,23 @@ class AdvisoryClient:
                     sources.append(f"osv:{full.get('id')}")
                     known.add(full.get("id"))
 
+        mismatch = None
         if osv_records:
-            return _from_osv(osv_records, package, version, sources, errors)
+            osv_result = _from_osv(osv_records, package, version, sources, errors)
+            if osv_result.outcome != PACKAGE_MISMATCH:
+                return osv_result
+            mismatch = osv_result
 
-        github_record = self._github(identifiers, errors, sources)
+        github_record = self._github(
+            identifiers, errors, sources, package, osv_ecosystem
+        )
         if github_record is not None:
-            return _from_github(
+            github_result = _from_github(
                 github_record, package, osv_ecosystem, version, sources, errors
             )
+            if github_result.outcome != PACKAGE_MISMATCH:
+                return github_result
+            mismatch = github_result
 
         cve = next(
             (item for item in identifiers if item.upper().startswith("CVE-")), None
@@ -236,7 +245,12 @@ class AdvisoryClient:
         if cve:
             nvd_record = self._nvd(cve, errors, sources)
             if nvd_record is not None:
-                return _from_nvd(nvd_record, package, version, sources, errors)
+                nvd_result = _from_nvd(nvd_record, package, version, sources, errors)
+                if nvd_result.outcome != PACKAGE_MISMATCH:
+                    return nvd_result
+                mismatch = nvd_result
+        if mismatch is not None:
+            return mismatch
 
         if errors and not sources:
             return AdvisoryLookup(
@@ -253,12 +267,18 @@ class AdvisoryClient:
         )
 
     def _github(
-        self, identifiers: list[str], errors: list[str], sources: list[str]
+        self,
+        identifiers: list[str],
+        errors: list[str],
+        sources: list[str],
+        package: str | None,
+        ecosystem: str | None,
     ) -> dict | None:
         """Look up CVE or GHSA ids while preserving request error evidence.
 
-        Every eligible id is requested together. The earliest id in the
-        finding still wins when more than one record exists.
+        Every eligible id is requested together. The earliest id that names
+        this package still wins. A withdrawn advisory or a different package
+        in the same response does not hide a later matching record.
         """
         eligible = []
         for ident in identifiers:
@@ -273,9 +293,15 @@ class AdvisoryClient:
             if error:
                 errors.append(error)
                 continue
-            if isinstance(payload, list) and payload:
+            if not isinstance(payload, list):
+                continue
+            for record in payload:
+                if not isinstance(record, dict) or record.get("withdrawn_at"):
+                    continue
+                if package and not _github_record_matches(record, package, ecosystem):
+                    continue
                 sources.append(f"github:{ident}")
-                return payload[0]
+                return record
         return None
 
     def _osv_record(self, ident: str) -> tuple[str, dict | None, str | None]:
@@ -536,14 +562,20 @@ def _from_github(
     """Match GitHub package ranges and select a comparable patched floor."""
     github_eco = GITHUB_ECOSYSTEMS.get(ecosystem or "")
     vulns = record.get("vulnerabilities") or []
-    matched = []
+    exact = []
+    loose = []
     for item in vulns:
         pkg = item.get("package") or {}
-        if package and (pkg.get("name") or "").lower() != package.lower():
-            continue
+        name = pkg.get("name") or ""
         if github_eco and pkg.get("ecosystem") and pkg.get("ecosystem") != github_eco:
             continue
-        matched.append(item)
+        if not package:
+            exact.append(item)
+        elif name.lower() == package.lower():
+            exact.append(item)
+        elif _names_match(package, name):
+            loose.append(item)
+    matched = exact or loose
     if package and not matched:
         return AdvisoryLookup(
             outcome=PACKAGE_MISMATCH,
@@ -554,7 +586,13 @@ def _from_github(
     fixed: list[str] = []
     ranges: list[str] = []
     for item in matched:
-        patched = str(item.get("first_patched_version") or "").strip()
+        patched_value = item.get("first_patched_version")
+        if isinstance(patched_value, dict):
+            patched_value = patched_value.get("identifier")
+        if not patched_value:
+            older = item.get("patched_versions") or []
+            patched_value = older[0] if isinstance(older, list) and older else ""
+        patched = str(patched_value or "").strip()
         vulnerable = (item.get("vulnerable_version_range") or "").strip()
         if vulnerable:
             ranges.append(vulnerable)
@@ -591,6 +629,33 @@ def _from_github(
         sources=sources,
         errors=errors,
     )
+
+
+def _names_match(wanted: str, found: str) -> bool:
+    """Match a package name, including a Maven coordinate and its artifact id.
+
+    A bare artifact matches a ``group:artifact`` name. Two different groups
+    that share an artifact id do not match each other.
+    """
+    left = wanted.strip().lower()
+    right = found.strip().lower()
+    if not left or not right or left == right:
+        return bool(left) and left == right
+    if ":" in left and ":" in right:
+        return False
+    return left.rsplit(":", 1)[-1] == right.rsplit(":", 1)[-1]
+
+
+def _github_record_matches(record: dict, package: str, ecosystem: str | None) -> bool:
+    """Return whether one GitHub advisory names this package and ecosystem."""
+    github_eco = GITHUB_ECOSYSTEMS.get(ecosystem or "")
+    for item in record.get("vulnerabilities") or []:
+        pkg = item.get("package") or {}
+        if github_eco and pkg.get("ecosystem") and pkg.get("ecosystem") != github_eco:
+            continue
+        if _names_match(package, pkg.get("name") or ""):
+            return True
+    return False
 
 
 def _github_range_contains(version: str, text: str) -> bool | None:

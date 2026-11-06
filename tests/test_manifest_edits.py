@@ -11,6 +11,7 @@ from gitlab_security_mcp.manifests import (
     locate_package,
     update_csproj_version,
     update_dockerfile_tag,
+    update_gradle_version,
     update_npm_spec,
 )
 
@@ -341,3 +342,84 @@ def test_dockerfile_tag_moves_every_stage_and_skips_digests(tmp_path):
         text
         == "FROM nginx:1.27.0 AS build\r\nRUN true\r\nFROM nginx:1.27.0\r\nFROM nginx:1.25.1@sha256:abc\r\n"
     )
+
+
+def test_gradle_catalog_and_map_notation_update_one_coordinate(tmp_path):
+    """Update a Gradle catalog reference and a map-style dependency."""
+    # Arrange
+    catalog = tmp_path / "gradle" / "libs.versions.toml"
+    catalog.parent.mkdir()
+    catalog.write_text(
+        "\n".join(
+            [
+                "[versions]",
+                'commons = "1.9"',
+                "",
+                "[libraries]",
+                'commons-text = { group = "org.apache.commons", name = "commons-text", version.ref = "commons" }',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    build = tmp_path / "build.gradle"
+    build.write_text(
+        "implementation group: 'org.apache.commons', name: 'commons-text', version: '1.9'\n",
+        encoding="utf-8",
+    )
+
+    # Act
+    located, _truncated = locate_package(tmp_path, "org.apache.commons:commons-text")
+    catalog_updated = update_gradle_version(
+        tmp_path,
+        "gradle/libs.versions.toml",
+        "org.apache.commons:commons-text",
+        "1.10.0",
+    )
+    map_updated = update_gradle_version(
+        tmp_path, "build.gradle", "org.apache.commons:commons-text", "1.10.0"
+    )
+
+    # Assert
+    assert located is not None and located.manager == "gradle"
+    assert catalog_updated is True
+    assert 'commons = "1.10.0"' in catalog.read_text(encoding="utf-8")
+    assert map_updated is True
+    assert "version: '1.10.0'" in build.read_text(encoding="utf-8")
+
+
+def test_maven_and_gradle_builds_are_both_validated(tmp_path):
+    """Run Maven and Gradle checks when the checkout contains both."""
+    # Arrange
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.validate import run_validation
+
+    (tmp_path / "pom.xml").write_text("<project></project>", encoding="utf-8")
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+    calls = []
+
+    def run(argv, **_kwargs):
+        """Record each validation command and report a successful Java 17 run."""
+        calls.append(argv)
+        return CommandResult(
+            list(argv),
+            0,
+            'openjdk version "17.0.1"\nTests run: 1',
+            "",
+            1,
+            False,
+            "a" * 64,
+            "b" * 64,
+        )
+
+    runner = type("Runner", (), {"run": staticmethod(run)})()
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: name, timeout=30)
+
+    # Assert
+    tools = [argv[0] for argv in calls]
+    assert set(result["detected"]["java"]) == {"maven", "gradle"}
+    assert "mvn" in tools
+    assert "gradle" in tools
+    assert result["status"] == "VALIDATION_COMPLETE"

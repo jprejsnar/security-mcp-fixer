@@ -68,6 +68,7 @@ class StackInfo:
     target_frameworks: list[str] | None = None
     java: bool = False
     java_build: str | None = None
+    java_builds: list[str] | None = None
     nginx_configs: list[str] | None = None
     dockerfiles: list[str] | None = None
     lockfiles: dict[str, str] | None = None
@@ -110,7 +111,11 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
     if files is None:
         files, _truncated = iter_files(root)
     info = StackInfo(
-        target_frameworks=[], nginx_configs=[], dockerfiles=[], lockfiles={}
+        target_frameworks=[],
+        nginx_configs=[],
+        dockerfiles=[],
+        lockfiles={},
+        java_builds=[],
     )
     for path in files:
         name = path.name.lower()
@@ -135,12 +140,14 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
                 )
         elif name == "pom.xml":
             info.java = True
-            info.java_build = info.java_build or "maven"
+            if "maven" not in info.java_builds:
+                info.java_builds.append("maven")
         elif (
             name in {"build.gradle", "build.gradle.kts"} or name == "libs.versions.toml"
         ):
             info.java = True
-            info.java_build = "gradle"
+            if "gradle" not in info.java_builds:
+                info.java_builds.append("gradle")
         elif name == "nginx.conf" or name.endswith(".nginx"):
             info.nginx_configs.append(rel)
         elif name == "dockerfile" or name.endswith(".dockerfile"):
@@ -156,6 +163,10 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
             info.node_manager = "yarn"
         else:
             info.node_manager = "npm"
+    if info.java_builds:
+        # A Gradle file used to hide a Maven build. Keep the last tool as the
+        # single-build label and retain every detected build for validation.
+        info.java_build = info.java_builds[-1]
     return info
 
 
@@ -493,6 +504,18 @@ def locate_gradle(
                     lockfile=None,
                     direct=True,
                 )
+        mapped = _gradle_map_version(text, coordinate or "")
+        if mapped:
+            return PackageHit(
+                ecosystem="Maven",
+                manager="gradle",
+                name=coordinate or name,
+                version=mapped,
+                spec=mapped,
+                manifest=_rel(root, path),
+                lockfile=None,
+                direct=True,
+            )
     if coordinate:
         for path in files:
             if path.name != "libs.versions.toml":
@@ -530,6 +553,8 @@ def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None
         if not isinstance(library, dict):
             continue
         module = library.get("module")
+        if module is None and library.get("group") and library.get("name"):
+            module = f"{library['group']}:{library['name']}"
         if module != coordinate:
             continue
         if isinstance(library.get("version"), str):
@@ -899,7 +924,9 @@ def update_gradle_version(
         lambda match: _replace_groups(match, version), text, count=1
     )
     if count != 1:
-        return False
+        updated, count = _replace_gradle_map(text, package, version)
+        if count != 1:
+            return False
     _write(path, updated)
     return True
 
@@ -912,18 +939,64 @@ def _update_toml_version(path: Path, coordinate: str, version: str) -> bool:
     _current, ref = hit
     text = _read(path)
     if ref == "inline":
-        pattern = re.compile(
-            rf'(module\s*=\s*"{re.escape(coordinate)}"\s*,\s*version\s*=\s*")[^"]+(")'
-        )
+        group, artifact = _split_maven_name(coordinate)
+        patterns = [
+            re.compile(
+                rf'(module\s*=\s*"{re.escape(coordinate)}"\s*,\s*version\s*=\s*")[^"]+(")'
+            )
+        ]
+        if group and artifact:
+            patterns.append(
+                re.compile(
+                    rf'(group\s*=\s*"{re.escape(group)}"\s*,\s*'
+                    rf'name\s*=\s*"{re.escape(artifact)}"\s*,\s*version\s*=\s*")[^"]+(")'
+                )
+            )
     else:
-        pattern = re.compile(rf'(?m)^({re.escape(ref)}\s*=\s*")[^"]+(")')
-    updated, count = pattern.subn(
-        lambda match: _replace_groups(match, version), text, count=1
-    )
+        patterns = [re.compile(rf'(?m)^({re.escape(ref)}\s*=\s*")[^"]+(")')]
+    updated, count = text, 0
+    for pattern in patterns:
+        updated, count = pattern.subn(
+            lambda match: _replace_groups(match, version), text, count=1
+        )
+        if count == 1:
+            break
     if count != 1:
         return False
     _write(path, updated)
     return True
+
+
+def _gradle_map_pattern(package: str) -> re.Pattern[str] | None:
+    """Match one Gradle map declaration for a ``group:artifact`` coordinate.
+
+    Group 1 is the text through the version quote. Group 5 is the version.
+    """
+    group, artifact = _split_maven_name(package)
+    if not group or not artifact:
+        return None
+    return re.compile(
+        rf"""(group\s*[:=]\s*(['\"]){re.escape(group)}\2\s*,\s*"""
+        rf"""name\s*[:=]\s*(['\"]){re.escape(artifact)}\3\s*,\s*"""
+        rf"""version\s*[:=]\s*(['\"]))([^'\"]+)"""
+    )
+
+
+def _gradle_map_version(text: str, package: str) -> str | None:
+    """Return the version from a Gradle map declaration, when one exists."""
+    pattern = _gradle_map_pattern(package)
+    if pattern is None:
+        return None
+    match = pattern.search(text)
+    return match.group(5) if match else None
+
+
+def _replace_gradle_map(text: str, package: str, version: str) -> tuple[str, int]:
+    """Replace one Gradle ``group``/``name``/``version`` declaration."""
+    pattern = _gradle_map_pattern(package)
+    if pattern is None:
+        return text, 0
+    return pattern.subn(lambda match: f"{match.group(1)}{version}", text, count=1)
 
 
 def _is_dockerfile(path: Path) -> bool:

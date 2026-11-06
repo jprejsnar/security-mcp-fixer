@@ -200,7 +200,13 @@ def _run_validation(
         "detected": {
             "node": stack.node_manager if stack.node else None,
             "dotnet": stack.target_frameworks or None,
-            "java": stack.java_build if stack.java else None,
+            "java": (
+                stack.java_builds
+                if stack.java_builds and len(stack.java_builds) > 1
+                else stack.java_build
+            )
+            if stack.java
+            else None,
             "nginx": stack.nginx_configs or None,
             "docker": stack.dockerfiles or None,
         },
@@ -507,50 +513,115 @@ def _java(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> list[dict]:
-    """Prefer repository wrappers for Maven or Gradle validation."""
-    if stack.java_build == "gradle":
-        wrapper = _wrapper(root, "gradlew")
-        tool = wrapper or resolve_tool("gradle", which)
-        if not tool:
-            return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
-        if lint_only:
-            return [
-                _execute_product_check(
-                    runner,
-                    [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
-                    timeout,
+    """Validate every detected Maven and Gradle build, wrappers first."""
+    builds = list(stack.java_builds or [])
+    if not builds and stack.java_build:
+        builds = [stack.java_build]
+    rows: list[dict] = []
+    for build in builds:
+        one = StackInfo(
+            java=True,
+            java_build=build,
+            java_builds=[build],
+            target_frameworks=[],
+            nginx_configs=[],
+            dockerfiles=[],
+            lockfiles={},
+        )
+        if build == "gradle":
+            rows.extend(
+                _java_gradle(
                     root,
-                    "lint",
+                    one,
+                    runner,
+                    which,
+                    timeout,
+                    package_checks=package_checks,
+                    skip_lint=skip_lint,
+                    lint_only=lint_only,
                 )
-            ]
-        rows = [
-            _run(runner, [tool, "--no-daemon", "dependencies"], timeout, required=True)
+            )
+        elif build == "maven":
+            rows.extend(
+                _java_maven(
+                    root,
+                    one,
+                    runner,
+                    which,
+                    timeout,
+                    package_checks=package_checks,
+                    skip_lint=skip_lint,
+                    lint_only=lint_only,
+                )
+            )
+    return rows
+
+
+def _java_gradle(
+    root: Path,
+    stack: StackInfo,
+    runner,
+    which,
+    timeout: int,
+    *,
+    package_checks: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
+) -> list[dict]:
+    """Run the Gradle wrapper or the installed Gradle tool."""
+    wrapper = _wrapper(root, "gradlew")
+    tool = wrapper or resolve_tool("gradle", which)
+    if not tool:
+        return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
+    if lint_only:
+        return [
+            _execute_product_check(
+                runner,
+                [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
+                timeout,
+                root,
+                "lint",
+            )
         ]
-        if rows[0]["status"] == "FAILED":
-            rows.append(
-                _row(
-                    None,
-                    "SKIPPED",
-                    False,
-                    "Skipped Gradle test because dependencies failed.",
-                )
-            )
-            return rows
-        if package_checks and not skip_lint:
-            rows.append(
-                _execute_product_check(
-                    runner,
-                    [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
-                    timeout,
-                    root,
-                    "lint",
-                )
-            )
-        rows.append(_run(runner, [tool, "--no-daemon", "test"], timeout, required=True))
+    rows = [_run(runner, [tool, "--no-daemon", "dependencies"], timeout, required=True)]
+    if rows[0]["status"] == "FAILED":
         rows.append(
-            _run(runner, [tool, "--no-daemon", "build"], timeout, required=True)
+            _row(
+                None,
+                "SKIPPED",
+                False,
+                "Skipped Gradle test because dependencies failed.",
+            )
         )
         return rows
+    if package_checks and not skip_lint:
+        rows.append(
+            _execute_product_check(
+                runner,
+                [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
+                timeout,
+                root,
+                "lint",
+            )
+        )
+    rows.append(_run(runner, [tool, "--no-daemon", "test"], timeout, required=True))
+    rows.append(_run(runner, [tool, "--no-daemon", "build"], timeout, required=True))
+    return rows
+
+
+def _java_maven(
+    root: Path,
+    stack: StackInfo,
+    runner,
+    which,
+    timeout: int,
+    *,
+    package_checks: bool = False,
+    skip_lint: bool = False,
+    lint_only: bool = False,
+) -> list[dict]:
+    """Run the Maven wrapper or the installed Maven tool."""
+    del stack
     wrapper = _wrapper(root, "mvnw")
     tool = wrapper or resolve_tool("mvn", which)
     if not tool:

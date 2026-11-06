@@ -165,6 +165,113 @@ def test_github_first_patched_version_is_used():
     assert result.lowest_fixed_version == "4.17.21"
 
 
+def test_github_skips_another_package_and_a_withdrawn_advisory():
+    """Use the GitHub record that names the package, not the first array item."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a withdrawn advisory, a different package, then lodash."""
+        if request.url.host != "api.github.com":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "ghsa_id": "GHSA-withdrawn",
+                    "withdrawn_at": "2024-01-01T00:00:00Z",
+                    "vulnerabilities": [
+                        {
+                            "package": {"ecosystem": "npm", "name": "lodash"},
+                            "first_patched_version": "9.9.9",
+                            "vulnerable_version_range": "< 9.9.9",
+                        }
+                    ],
+                },
+                {
+                    "ghsa_id": "GHSA-other",
+                    "vulnerabilities": [
+                        {
+                            "package": {"ecosystem": "npm", "name": "left-pad"},
+                            "first_patched_version": "1.0.0",
+                            "vulnerable_version_range": "< 1.0.0",
+                        }
+                    ],
+                },
+                {
+                    "ghsa_id": "GHSA-lodash",
+                    "html_url": "https://github.com/advisories/GHSA-lodash",
+                    "vulnerabilities": [
+                        {
+                            "package": {"ecosystem": "npm", "name": "lodash"},
+                            "vulnerable_version_range": "< 4.17.21",
+                            "patched_versions": ["4.17.21"],
+                        }
+                    ],
+                },
+            ],
+        )
+
+    http, client = _client(handler)
+
+    # Act
+    with http:
+        result = client.lookup(FINDING, "npm", "lodash", "4.17.20")
+
+    # Assert
+    assert result.outcome == "resolved"
+    assert result.lowest_fixed_version == "4.17.21"
+    assert result.sources == ["github:CVE-2021-23337"]
+
+
+def test_osv_package_mismatch_can_use_the_github_record():
+    """Continue to GitHub when OSV names a different package."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve an unrelated OSV record and a matching GitHub advisory."""
+        if request.url.host == "api.osv.dev":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "CVE-2021-23337",
+                    "affected": [
+                        {"package": {"ecosystem": "npm", "name": "lodash-es"}}
+                    ],
+                },
+            )
+        if request.url.host == "api.github.com":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "ghsa_id": "GHSA-lodash",
+                        "vulnerabilities": [
+                            {
+                                "package": {
+                                    "ecosystem": "maven",
+                                    "name": "org.apache.commons:commons-text",
+                                },
+                                "vulnerable_version_range": "< 1.10.0",
+                                "first_patched_version": {"identifier": "1.10.0"},
+                            }
+                        ],
+                    }
+                ],
+            )
+        return httpx.Response(404)
+
+    http, client = _client(handler)
+
+    # Act
+    with http:
+        result = client.lookup(FINDING, "maven", "commons-text", "1.9")
+
+    # Assert
+    assert result.outcome == "resolved"
+    assert result.lowest_fixed_version == "1.10.0"
+    assert result.sources[-1] == "github:CVE-2021-23337"
+
+
 def test_osv_record_for_another_package_needs_a_person():
     """Osv record for another package needs a person."""
     # Arrange
