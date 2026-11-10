@@ -516,6 +516,10 @@ def locate_gradle(
                 lockfile=None,
                 direct=True,
             )
+        if not coordinate:
+            plugin_version = _plugin_version(text, name)
+            if plugin_version:
+                return _gradle_hit(root, path, name, plugin_version)
     if coordinate:
         for path in files:
             if path.name != "libs.versions.toml":
@@ -532,7 +536,36 @@ def locate_gradle(
                     lockfile=None,
                     direct=True,
                 )
+    if not coordinate:
+        for path in files:
+            if path.name not in {"settings.gradle", "settings.gradle.kts"}:
+                continue
+            plugin_version = _plugin_version(
+                path.read_text(encoding="utf-8", errors="replace"), name
+            )
+            if plugin_version:
+                return _gradle_hit(root, path, name, plugin_version)
+        for path in files:
+            if path.name != "libs.versions.toml":
+                continue
+            hit = _toml_plugin_version(path, name)
+            if hit:
+                return _gradle_hit(root, path, name, hit[0])
     return None
+
+
+def _gradle_hit(root: Path, path: Path, name: str, version: str) -> PackageHit:
+    """Return a direct Gradle hit for one coordinate or plugin id."""
+    return PackageHit(
+        ecosystem="Maven",
+        manager="gradle",
+        name=name,
+        version=version,
+        spec=version,
+        manifest=_rel(root, path),
+        lockfile=None,
+        direct=True,
+    )
 
 
 def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None:
@@ -926,6 +959,8 @@ def update_gradle_version(
     if count != 1:
         updated, count = _replace_gradle_map(text, package, version)
         if count != 1:
+            updated, count = _replace_plugin(text, package, version)
+        if count != 1:
             return False
     _write(path, updated)
     return True
@@ -933,7 +968,9 @@ def update_gradle_version(
 
 def _update_toml_version(path: Path, coordinate: str, version: str) -> bool:
     """Replace only a supported catalog entry or its version reference."""
-    hit = _toml_library_version(path, coordinate)
+    hit = _toml_library_version(path, coordinate) or _toml_plugin_version(
+        path, coordinate
+    )
     if hit is None:
         return False
     _current, ref = hit
@@ -952,6 +989,11 @@ def _update_toml_version(path: Path, coordinate: str, version: str) -> bool:
                     rf'name\s*=\s*"{re.escape(artifact)}"\s*,\s*version\s*=\s*")[^"]+(")'
                 )
             )
+        patterns.append(
+            re.compile(
+                rf'(id\s*=\s*"{re.escape(coordinate)}"\s*,\s*version\s*=\s*")[^"]+(")'
+            )
+        )
     else:
         patterns = [re.compile(rf'(?m)^({re.escape(ref)}\s*=\s*")[^"]+(")')]
     updated, count = text, 0
@@ -989,6 +1031,50 @@ def _gradle_map_version(text: str, package: str) -> str | None:
         return None
     match = pattern.search(text)
     return match.group(5) if match else None
+
+
+def _plugin_pattern(plugin_id: str) -> re.Pattern[str]:
+    """Match one Gradle ``plugins`` id and the quote that opens its version."""
+    return re.compile(
+        rf"""(id\s*(?:\(\s*)?(['\"]){re.escape(plugin_id)}\2(?:\s*\))?\s+"""
+        rf"""version\s+(['\"]))([^'\"]+)"""
+    )
+
+
+def _plugin_version(text: str, plugin_id: str) -> str | None:
+    """Return the version from a Gradle plugins declaration, when one exists."""
+    match = _plugin_pattern(plugin_id).search(text)
+    return match.group(4) if match else None
+
+
+def _replace_plugin(text: str, plugin_id: str, version: str) -> tuple[str, int]:
+    """Replace one Gradle plugin version and leave every other plugin alone."""
+    return _plugin_pattern(plugin_id).subn(
+        lambda match: f"{match.group(1)}{version}", text, count=1
+    )
+
+
+def _toml_plugin_version(path: Path, plugin_id: str) -> tuple[str, str] | None:
+    """Return a catalog plugin version and ``inline`` or its version ref."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return None
+    try:
+        data = tomllib.loads(_read(path))
+    except tomllib.TOMLDecodeError:
+        return None
+    for library in (data.get("plugins") or {}).values():
+        if not isinstance(library, dict) or library.get("id") != plugin_id:
+            continue
+        declared = library.get("version")
+        if isinstance(declared, str):
+            return declared, "inline"
+        ref = declared.get("ref") if isinstance(declared, dict) else None
+        versions = data.get("versions") or {}
+        if isinstance(ref, str) and isinstance(versions.get(ref), str):
+            return versions[ref], ref
+    return None
 
 
 def _replace_gradle_map(text: str, package: str, version: str) -> tuple[str, int]:

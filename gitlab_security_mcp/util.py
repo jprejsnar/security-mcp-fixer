@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
+from urllib.parse import quote
 
 import httpx
 
@@ -130,8 +131,12 @@ def redact(text: str, secrets: list[str | None]) -> str:
     """Remove known secrets from text that may be logged or returned."""
     redacted = text
     for secret in secrets:
-        if secret and secret in redacted:
-            redacted = redacted.replace(secret, "[REDACTED]")
+        if not secret:
+            continue
+        redacted = redacted.replace(secret, "[REDACTED]")
+        encoded = quote(secret, safe="")
+        if encoded != secret:
+            redacted = redacted.replace(encoded, "[REDACTED]")
     return redacted
 
 

@@ -5,7 +5,7 @@ from datetime import date
 
 import pytest
 
-from gitlab_security_mcp.commands import CommandRunner, assert_allowed
+from gitlab_security_mcp.commands import CommandRunner, _child_env, assert_allowed
 from gitlab_security_mcp.git_ops import branch_name_for, meaningful_status
 
 
@@ -545,3 +545,42 @@ def test_audit_log_stores_hashes_and_truncates(repo):
     assert record["stdout_sha256"] == result.stdout_sha256
     assert "stdout" not in record
     assert record["truncated"] is True
+
+
+def test_child_environment_drops_server_credentials(monkeypatch):
+    """Keep registry credentials and drop the tokens this server uses."""
+    # Arrange
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-server-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-server-token")
+    monkeypatch.setenv("GH_TOKEN", "ghp-alias-token")
+    monkeypatch.setenv("NVD_API_KEY", "nvd-server-key")
+    monkeypatch.setenv("GITLAB_PERSONAL_ACCESS_TOKEN", "glpat-alias")
+    monkeypatch.setenv("NPM_TOKEN", "npm-registry-token")
+
+    # Act
+    env = _child_env(["npm", "ci", "--ignore-scripts"])
+
+    # Assert
+    assert "GITLAB_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
+    assert "NVD_API_KEY" not in env
+    assert "GITLAB_PERSONAL_ACCESS_TOKEN" not in env
+    assert env["NPM_TOKEN"] == "npm-registry-token"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_redact_removes_percent_encoded_secrets():
+    """Remove a token both as stored and as it appears in an encoded URL."""
+    # Arrange
+    from gitlab_security_mcp.util import redact
+
+    secret = "glpat-abc/def"
+
+    # Act
+    text = redact("token=glpat-abc/def url=glpat-abc%2Fdef", [secret])
+
+    # Assert
+    assert "glpat-abc/def" not in text
+    assert "glpat-abc%2Fdef" not in text
+    assert text.count("[REDACTED]") == 2

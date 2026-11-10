@@ -423,3 +423,60 @@ def test_maven_and_gradle_builds_are_both_validated(tmp_path):
     assert "mvn" in tools
     assert "gradle" in tools
     assert result["status"] == "VALIDATION_COMPLETE"
+
+
+def test_gradle_plugin_version_updates_one_declaration(tmp_path):
+    """Bump one Gradle plugin and leave a neighboring plugin unchanged."""
+    # Arrange
+    from gitlab_security_mcp.manifests import locate_package, update_gradle_version
+
+    settings = tmp_path / "settings.gradle.kts"
+    settings.write_text(
+        'plugins { id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0" }\n',
+        encoding="utf-8",
+    )
+    build = tmp_path / "build.gradle"
+    build.write_text(
+        "plugins {\n"
+        "    id 'org.springframework.boot' version '3.2.0'\n"
+        "    id 'io.spring.dependency-management' version '1.1.4'\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    catalog = tmp_path / "gradle" / "libs.versions.toml"
+    catalog.parent.mkdir()
+    catalog.write_text(
+        '[versions]\nspring-boot = "3.2.0"\n\n'
+        "[plugins]\n"
+        'spring-boot = { id = "org.springframework.boot", version.ref = "spring-boot" }\n',
+        encoding="utf-8",
+    )
+
+    # Act
+    located, _truncated = locate_package(tmp_path, "org.springframework.boot")
+    build_updated = update_gradle_version(
+        tmp_path, "build.gradle", "org.springframework.boot", "3.3.5"
+    )
+    catalog_updated = update_gradle_version(
+        tmp_path,
+        "gradle/libs.versions.toml",
+        "org.springframework.boot",
+        "3.3.5",
+    )
+    settings_updated = update_gradle_version(
+        tmp_path,
+        "settings.gradle.kts",
+        "org.gradle.toolchains.foojay-resolver-convention",
+        "0.9.0",
+    )
+
+    # Assert
+    assert located is not None and located.version == "3.2.0"
+    assert build_updated is True
+    text = build.read_text(encoding="utf-8")
+    assert "id 'org.springframework.boot' version '3.3.5'" in text
+    assert "id 'io.spring.dependency-management' version '1.1.4'" in text
+    assert catalog_updated is True
+    assert 'spring-boot = "3.3.5"' in catalog.read_text(encoding="utf-8")
+    assert settings_updated is True
+    assert 'version "0.9.0"' in settings.read_text(encoding="utf-8")

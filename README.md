@@ -71,7 +71,7 @@ flowchart TB
   server -->|"Record consulted sites even when records are missing"| securityPages
   server -->|"Live text bars via MCP progress notifications"| host
   server -->|"Inspect and apply supported local edits"| checkout
-  server -->|"Allowlisted Git and product checks"| commands["Local subprocesses"]
+  server -->|"Allowlisted checks; server API tokens removed from the child environment"| commands["Local subprocesses"]
   commands --> checkout
   commands -->|"Fast-forward pulls and branch-name lookup"| origin["Git origin"]
   commands -->|"Post-pull pnpm clean/install, then final batch build and all tests"| product["Installed toolchains and package managers"]
@@ -322,7 +322,11 @@ because each page needs the previous cursor. OSV, GitHub, and NVD stay in that
 order. The command runner still runs one child at a time. Its stdout and stderr
 readers publish through a lock so their records cannot interleave. Readers are
 daemon threads so a reader that ignores its stop signal cannot keep the process
-alive after the join timeout.
+alive after the join timeout. Child processes do not receive `GITLAB_TOKEN`,
+`GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `NVD_API_KEY`.
+Other environment variables, including a private-registry token the build
+needs, are copied. Logged and returned text also redacts those secrets after
+percent-encoding.
 
 Advisory responses larger than 2 MB are refused. The cache holds at most 256
 records and is cleared on shutdown. GitLab error text keeps the first 500
@@ -344,6 +348,10 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
 ### Prerequisites
 
 - Python 3.11 or newer and Git on Windows, macOS, or Linux.
+- Runtime floors: `mcp[cli]>=2.3,<3`, `httpx>=0.28.1`, `packaging>=25`,
+  and `ruamel.yaml>=0.18.16,<0.19`. Development floors are `pytest>=9` and
+  `ruff>=0.17.4,<1`. `ruamel.yaml` stays below 0.19 because that release
+  changes its optional accelerator packaging.
 - A GitLab token with `read_api` and access to the project's vulnerability report.
 - The GitLab project path or numeric ID and a local checkout of its `main` branch.
 - The package managers and toolchains required by the target application.
@@ -1303,7 +1311,7 @@ until your normal publication and scanning process updates them.
 | Strategy | When | Score |
 | --- | --- | --- |
 | Lockfile refresh | The declared npm, pnpm, or Yarn range already allows the fixed version | 1 |
-| Manifest bump | `package.json`, `pom.xml`, Gradle, `libs.versions.toml`, or a NuGet `PackageReference` | 2 |
+| Manifest bump | `package.json`, `pom.xml`, a Gradle coordinate, a Gradle plugin id, `libs.versions.toml`, or a NuGet `PackageReference` | 2 |
 | Override or direct pin | A transitive npm, pnpm, Yarn, or NuGet package | 3 |
 | Image tag | An unpinned `FROM image:tag` whose name matches the finding. Digest-pinned references stay unchanged. | 3 |
 | Cited configuration line | The current line is `server_tokens on`, `autoindex on`, obsolete TLS in `ssl_protocols`, or a documented GitLab security-disable variable set to true | 2 |
@@ -1314,6 +1322,8 @@ A configuration edit changes only the cited line and keeps its line ending.
 Unsupported edits and breaking upgrades remain for manual review.
 
 Lockfile refreshes use the package manager already selected by the repo (`npm`, `pnpm`, or `yarn`) and pass `--ignore-scripts` on that refresh. Validation then runs the project's own install and test commands.
+
+A Gradle plugin edit changes one `id ... version` declaration in `build.gradle`, `build.gradle.kts`, `settings.gradle`, or `settings.gradle.kts`, or the matching `[plugins]` entry in `libs.versions.toml`. A version catalog reference updates the `[versions]` key and leaves the plugin id in place. Neighboring plugin declarations stay unchanged.
 
 ## Validation
 

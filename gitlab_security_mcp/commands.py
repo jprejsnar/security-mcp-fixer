@@ -951,9 +951,24 @@ def _close_pipes(process: subprocess.Popen[str]) -> None:
             pipe.close()
 
 
+_SECRET_ENV = frozenset(
+    {
+        "GITLAB_TOKEN",
+        "GITLAB_PERSONAL_ACCESS_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "NVD_API_KEY",
+    }
+)
+
+
 def _child_env(argv: list[str] | None = None) -> dict[str, str]:
-    """Copy the environment and stop git or package managers from prompting."""
-    env = dict(os.environ)
+    """Copy the environment and stop git or package managers from prompting.
+
+    This server's GitLab, GitHub, and NVD credentials are removed. Package
+    managers do not need them, and a build script must not receive them.
+    """
+    env = {key: value for key, value in os.environ.items() if key not in _SECRET_ENV}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
     env["CI"] = env.get("CI") or "1"
