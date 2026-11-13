@@ -15,8 +15,27 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
+**Current release: 1.0.9.** In either VS Code/Copilot or Cursor Agent chat, use:
+
+```text
+run gitlab-security on this repo
+```
+
+This is one chat request, not a terminal command. The host AI analyzes findings
+and source, applies eligible fixes, validates the batch, and calls
+`complete_security_run` for optional human checkbox approval followed by the
+final report. A separate `review_false_positives` request is not needed.
+Only explicitly selected findings are dismissed in GitLab.
+
+Start with [installation](#installing-the-local-mcp-server), choose your
+[host configuration](#mcp-configuration), then follow the
+[VS Code/Copilot run guide](#running-within-vs-code-and-github-copilot) or
+[Cursor run guide](#running-within-cursor). Existing users should follow
+[the upgrade guide](#updating-the-mcp-server-in-vs-code-and-cursor).
+
 ## Contents
 
+- [Changes delivered on November 13, 2026](#changes-delivered-on-november-13-2026)
 - [Architecture](#architecture)
 - [Workflow](#workflow)
 - [Safety boundaries](#safety-boundaries)
@@ -24,14 +43,44 @@ the optional human-approved false-positive dismissal flow described below.
 - [Building the local MCP server](#building-the-local-mcp-server)
 - [Installing the local MCP server](#installing-the-local-mcp-server)
 - [MCP configuration](#mcp-configuration)
+- [Updating the MCP server in VS Code and Cursor](#updating-the-mcp-server-in-vs-code-and-cursor)
+- [Running within VS Code and GitHub Copilot](#running-within-vs-code-and-github-copilot)
 - [Running within Cursor](#running-within-cursor)
-- [Reading output in Cursor](#reading-output-in-cursor)
+- [Reading output in VS Code and Cursor](#reading-output-in-vs-code-and-cursor)
 - [Run gitlab-security on this repo](#run-gitlab-security-on-this-repo)
 - [Running remediation](#running-remediation)
 - [Supported fixes](#supported-fixes)
 - [Validation](#validation)
 - [Development and tests](#development-and-tests)
 - [Troubleshooting](#troubleshooting)
+
+## Changes delivered on November 13, 2026
+
+This summary covers today's changes through 1.0.9. Earlier wheels do not contain
+all of these changes; updating source files does not update an installed wheel.
+
+| Area | Current behavior |
+| --- | --- |
+| One-request completion | `complete_security_run` performs human false-positive review and then reporting, reusing current assessments without another scan. Standalone review/report tools remain available; there are thirteen tools. |
+| Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations, tracing relevant callers, inputs, includes and controls. It submits a separate full-byte-hash-bound assessment for each finding. Missing source or an advisory miss never proves a false positive. |
+| Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
+| Human-only GitLab dismissal | Eligible assessments appear as initially unchecked form fields. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
+| Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports show pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
+| Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
+| Same-day branch reuse | Today's exact security branch can be reused after reviewing prior security logs. Errors preserve evidence and stop reuse. Cleanup removes only recognized generated untracked/ignored security artifacts, not tracked files, policies, configuration or unrelated work. |
+| VPN and dependency preparation | Corporate DNS is checked before work, each pull and pnpm preparation. The server runs `pnpm clean` then `pnpm install` once per pnpm root; reused branches are prepared after their checkout. |
+| Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in existing console/notification/transcript channels. Retries retain their finding's position. |
+| Advisory robustness | Ordered OSV/GitHub fallback, shared NVD pacing and bounded transient retries respect `Retry-After`. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. Unavailable advisory data remains explicit. |
+| Dependency edits | The minimal qualified plan may refresh only the lockfile, bump the owning `package.json`, or add a pnpm override in `pnpm-workspace.yaml` when present. Compatibility/license checks and final production build/all-unit-test validation still apply. |
+| Bounded fan-out | Independent documentation/advisory reads use at most eight workers per batch, bounded submissions, isolated request contexts and input-ordered results. Ready workers are refilled without waiting for an earlier slow result. Checkout edits, validation/rollback and dismissals stay serialized. |
+| Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
+| Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
+| Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
+
+The 1.0.9 code validation completed with **721 passed, 3 skipped**; **135 tests**
+also passed against the built wheel. These are offline regression results, not
+live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
+leak resources. The documentation-only refresh does not change server behavior.
 
 ## Architecture
 
@@ -52,13 +101,17 @@ flowchart TB
   reviewer["Human reviewer"] --> host["MCP host and AI agent"]
   host <-->|"MCP requests and results over stdio"| server["Local Python MCP process"]
   host -->|"Read exact-version package docs and compatibility guides"| publisher["Official publisher documentation"]
-  host -->|"Review package, image, and cited-line edits"| checkout["One or more application checkouts"]
+  host -->|"Read complete source and trace callers, inputs and controls"| checkout["One or more application checkouts"]
+  host -->|"Submit per-finding review with full-byte hashes"| server
+  server -->|"Unchecked approval form through host elicitation"| reviewer
+  reviewer -->|"Explicit checkbox selections only"| approval["Human-approved false-positive dismissal"]
+  approval -->|"Fixed GitLab mutation and exact assessment reason"| gitlab
 
-  subgraph remoteServices["Remote read services"]
-    gitlab["GitLab GraphQL vulnerability report"]
+  subgraph remoteServices["Remote services: reads and explicit approved dismissals"]
+    gitlab["GitLab vulnerability report and approved dismissals"]
     osv["OSV identifiers, requested together"]
     github["GitHub Advisory identifiers, requested together"]
-    nvd["NVD, one CVE after earlier sources miss"]
+    nvd["NVD fallback with shared pacing and bounded retries"]
     publisherPages["Required publisher and directive documentation"]
     securityPages["Informational CVE, CWE, NSA and NIST references"]
   end
@@ -67,17 +120,18 @@ flowchart TB
   server -->|"Try OSV, then GitHub, then NVD"| osv
   server -->|"Same source order; earliest GitHub id still wins"| github
   server -->|"Only when OSV and GitHub have no record"| nvd
-  server -->|"Before every edit: required pages together, at most 8 at once"| publisherPages
+  server -->|"Before every edit: bounded batches, at most 8 workers each"| publisherPages
   server -->|"Record consulted sites even when records are missing"| securityPages
   server -->|"Live text bars via MCP progress notifications"| host
   server -->|"Inspect and apply supported local edits"| checkout
   server -->|"Allowlisted checks; server API tokens removed from the child environment"| commands["Local subprocesses"]
   commands --> checkout
-  commands -->|"Fast-forward pulls and branch-name lookup"| origin["Git origin"]
+  commands -->|"Resolved origin selects project path; trusted API stays configured"| origin["Git origin"]
+  commands -->|"Two fast-forward pulls and guarded same-day branch reuse"| checkout
   commands -->|"Post-pull pnpm clean/install, then final batch build and all tests"| product["Installed toolchains and package managers"]
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
-  server -->|"Write snapshots, audit and reports"| artifacts["Target checkout: .security-mcp"]
+  server -->|"After approval outcome: final reports, snapshots and audit"| artifacts["Target checkout: .security-mcp"]
   artifacts --> reviewer
   checkout -->|"Review diff and publish manually"| reviewer
 ```
@@ -113,7 +167,8 @@ runs one allowlisted command at a time.
 flowchart TB
   launcher["Root server.py: source launcher"] --> tools["Package server.py: thirteen MCP tools and error boundary"]
   tools --> progress["Request-scoped progress middleware"]
-  progress --> hostDisplay["Host progress display, with stderr fallback"]
+  progress --> hostDisplay["Severity positions, Windows console, notifications and bounded transcript"]
+  progress --> progressCleanup["Bounded drain; cancel and await sender; reject late callbacks"]
   tools --> registry["Checkout registry: one engine per resolved path"]
   registry --> engine["engine.py: phase gates and finding decisions"]
 
@@ -121,10 +176,12 @@ flowchart TB
     gitlabClient["gitlab_client.py: GraphQL filtering and cursor pagination"]
     advisoryClient["advisory.py: ordered sources, parallel identifiers, 256-record cache"]
     officialDocs["official_docs.py: required publishers and optional security references"]
-    fanout["fanout.py: ordered reads, at most 8 workers"]
+    fanout["fanout.py: bounded submissions, at most 8 workers, copied request context"]
     manifests["manifests.py: discovery, parsing and local package evidence"]
     versions["versions.py: affected ranges and version comparison"]
     configFindings["config_findings.py: cited nginx and GitLab CI lines"]
+    sourceFindings["source_findings.py: source workflows, hash-bound review and stale-evidence checks"]
+    sourceEvidence["ai_source_review.py: bounded complete cited source for host AI"]
   end
 
   engine --> gitlabClient
@@ -136,6 +193,11 @@ flowchart TB
   advisoryClient --> versions
   engine --> versions
   engine --> configFindings
+  engine --> sourceFindings
+  tools --> sourceEvidence
+  sourceEvidence --> hostReview["Calling host AI traces source; no MCP sampling"]
+  hostReview -->|"Submit source_review for each finding"| tools
+  engine --> artifactsReview["security_artifacts.py: inspect logs before guarded cleanup"]
   engine --> qualification["qualification.py: review, approvals, snapshots and check evidence"]
   engine --> remediation["remediate.py: scored plans and supported edits"]
   remediation --> configFindings
@@ -149,12 +211,16 @@ flowchart TB
   qualification --> runner
   remediation --> runner
   validation --> runner
-  runner --> processes["Git, package managers and product toolchains"]
+  runner --> processes["Owned command trees, stdout/stderr readers and full logs"]
+  processes --> processCleanup["Timeout, cancellation or exit: reap descendants and close handles"]
   runner -->|"Fresh Jest suite discovery and completed test counts"| progress
   officialDocs -->|"Completed document request counts"| progress
 
   engine --> state["state.py: active RunState and inspection snapshot"]
   engine --> report["report.py: security table, validation and batch isolation evidence"]
+  tools --> completion["complete_security_run: human review followed by report"]
+  completion --> dismissal["Engine checks identity, source freshness and selected dismissal intent"]
+  dismissal --> report
   state --> atomic["util.py: repository boundaries and atomic file publication"]
   report --> atomic
   manifests --> atomic
@@ -176,12 +242,13 @@ safe fix are recorded and may be followed by other eligible findings.
 ```mermaid
 flowchart TD
   startRun["Host starts or selects one checkout run"] --> prechecks["run_prechecks repo_root: clean main or today's security branch; no Git operation in progress"]
-  prechecks --> precheckGate{"Prechecks passed?"}
+  prechecks --> dns["Resolve corporate DNS and review prior logs for branch reuse"]
+  dns --> precheckGate{"Prechecks passed?"}
   precheckGate -->|"No"| stopRun["Stop that checkout and report the failure"]
   precheckGate -->|"Yes"| pulls["pull_main_twice: git pull --ff-only twice"]
   pulls --> pullGate{"Both pulls passed and tree remains clean?"}
   pullGate -->|"No"| stopRun
-  pullGate -->|"Yes"| pnpmGate{"Any pnpm projects or workspaces?"}
+  pullGate -->|"Yes"| pnpmGate{"New branch run with pnpm roots?"}
   pnpmGate -->|"Yes"| clean["pnpm clean at each pnpm project or workspace root"]
   clean --> cleanGate{"Clean succeeded?"}
   cleanGate -->|"No: PREPARATION_FAILED"| stopRun
@@ -189,16 +256,23 @@ flowchart TD
   install --> installGate{"Every preparation command succeeded?"}
   installGate -->|"No: PREPARATION_FAILED"| stopRun
   installGate -->|"Yes"| branch["create_security_branch: create or safely reuse today's exact dated branch"]
-  pnpmGate -->|"No: preparation not applicable"| branch
-  branch --> branchGate{"Branch created?"}
+  pnpmGate -->|"No: skip or defer preparation"| branch
+  branch --> reusePrep["For reuse: review logs, guarded cleanup, then pnpm clean/install on reused branch"]
+  reusePrep --> branchGate{"Branch and applicable preparation passed?"}
   branchGate -->|"No"| stopRun
-  branchGate -->|"Yes"| listing["list_security_findings: active report on tracked main"]
+  branchGate -->|"Yes"| listing["list_security_findings: infer project from trusted origin, retrieve tracked-main findings"]
   listing --> retrievalGate{"Retrieval succeeded without truncation?"}
   retrievalGate -->|"No"| stopRun
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
   moreFindings -->|"No"| postChecks["run_validation_matrix: one final production build, all unit tests and policy checks"]
-  moreFindings -->|"Yes"| verify["verify_security_finding: local evidence, advisory, and config rules"]
+  moreFindings -->|"Yes"| verify["verify_security_finding: source workflow or local package/advisory evidence"]
   verify --> decisionGate{"Decision?"}
+  decisionGate -->|"SOURCE_REVIEW_REQUIRED"| sourceReview["Host AI reads complete source and relevant callers/configuration"]
+  sourceReview --> sourceGate{"Sufficient evidence available?"}
+  sourceGate -->|"Yes: submit hash-bound source_review"| verify
+  sourceGate -->|"No: explicit blocker"| unresolved
+  decisionGate -->|"CONFIRMED_VULNERABILITY without a supported plan"| sourceDefect["Host-led source fix and regression validation, separate from package edits"]
+  sourceDefect --> unresolved
   decisionGate -->|"FALSE_POSITIVE"| retained["Retain evidence and continue"]
   decisionGate -->|"MANUAL_REVIEW or NO_SAFE_FIX"| unresolved["Retain unresolved reason and continue"]
   decisionGate -->|"REPRODUCTION_REQUIRED"| reproduction["Host-led approved local fuzzing reproduction, not a package fix"]
@@ -207,8 +281,8 @@ flowchart TD
   unresolved --> moreFindings
   decisionGate -->|"CHANGE_REQUIRED"| editKind{"What kind of edit?"}
   editKind -->|"Package update"| qualify["Review package docs and policy, then qualify_package_update"]
-  qualify --> qualifiedGate{"Review, lint capture and policy evidence complete?"}
-  qualifiedGate -->|"No"| unresolved
+  qualify --> qualifiedGate{"Exact-target review and required policy accepted?"}
+  qualifiedGate -->|"No: incomplete target review or required policy"| unresolved
   qualifiedGate -->|"Yes"| readDocs["Server reads required publisher pages together"]
   editKind -->|"Image tag or cited nginx or GitLab CI line"| readDocs
   readDocs --> docsGate{"Every required page read?"}
@@ -221,10 +295,17 @@ flowchart TD
   appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
   regression --> moreFindings
   postChecks --> validationGate{"VALIDATION_COMPLETE?"}
-  validationGate -->|"Yes"| reports["complete_security_run: human approval, then report and validation evidence"]
+  validationGate -->|"Yes"| reports["complete_security_run: reuse current assessments"]
   validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
   rollbackGate -->|"Retain green subset or report blocked recovery"| reports
-  reports --> reviewDiff["Human reviews reports and git diff; commit and push manually"]
+  reports --> eligible{"Eligible false positives and host form support?"}
+  eligible -->|"Yes"| form["Human receives initially unchecked checkbox form"]
+  form --> selected{"Human submitted checked selections?"}
+  selected -->|"Yes"| dismiss["Validate identity and fresh source; dismiss only selected findings with exact reasons"]
+  selected -->|"No: decline, cancel or unchecked"| finalReport["Generate final report with actual approval and validation outcomes"]
+  eligible -->|"No: include the blocker or no-candidate status"| finalReport
+  dismiss --> finalReport
+  finalReport --> reviewDiff["Human reviews reports and git diff; commit and push manually"]
 ```
 
 ### Tool reference
@@ -239,7 +320,7 @@ checkout is active.
 | `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. For a new branch, run pnpm clean/install afterward; for a reused branch, defer preparation until its checkout. |
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
-| `verify_security_finding(finding_id, repo_root=None)` | Record evidence, decision, proposed plan, and any review prompt. Config proposals also record the publisher pages read for that rule. |
+| `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return complete cited source for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
 | `apply_minimal_fix(finding_id, repo_root=None)` | Read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
 | `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
@@ -522,7 +603,11 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   `ruff>=0.17.4,<1`. `ruamel.yaml` stays below 0.19 because that release
   changes its optional accelerator packaging.
 - A GitLab token with `read_api` and access to the project's vulnerability report.
-- The GitLab project path or numeric ID and a local checkout of its `main` branch.
+  Optional false-positive dismissal requires `api` write scope and a GitLab role
+  permitted to dismiss the finding; a read-only token does not enable writes.
+- A local checkout with tracked `main` and an origin matching the configured
+  trusted GitLab API host. The server discovers the project path from Git;
+  an explicit project path or numeric ID is an optional override, not a prerequisite.
 - The package managers and toolchains required by the target application.
 - Meaningful lint/build/unit-test checks and documented license review; independently
   approved corporate policy only when required/configured for your organization.
@@ -616,11 +701,13 @@ Inspect every failure and rollback result; later edits require manual cleanup.
 ```mermaid
 sequenceDiagram
   actor Approver as Corporate approver
+  actor Reviewer as Human reviewer
   participant Policy as Controlled policy file
   participant Host as MCP host agent
   participant Docs as Official publisher docs
   participant MCP as MCP engine
   participant Repo as Target checkout and product checks
+  participant GitLab as GitLab vulnerability API
 
   Approver->>Policy: Provision exact-version approvals and mandatory checks
   Host->>MCP: run_prechecks then pull_main_twice
@@ -681,8 +768,22 @@ sequenceDiagram
     MCP->>Repo: Verify final passing subset, or restored baseline if all rejected
     MCP-->>Host: Retained updates, rejected updates and isolation trials, or blocked recovery
   end
-  Host->>MCP: generate_local_report
-  MCP-->>Host: Security Validation Sites in issues table, validation and isolation evidence
+  Host->>MCP: complete_security_run for this checkout
+  opt Eligible false positives and host form support
+    MCP-->>Host: Initially unchecked finding approvals with exact reasons
+    Host-->>Reviewer: Display unchecked finding approvals
+    Reviewer-->>Host: Submit selected items, decline or cancel
+    Host->>MCP: Return the human response unchanged
+    alt Human submits checked findings
+      MCP->>Repo: Recheck all reviewed source hashes
+      MCP->>GitLab: Validate identity and dismiss selected findings with exact reasons
+      GitLab-->>MCP: Confirmed dismissal or explicit failure/unknown outcome
+    else Declined, cancelled or all unchecked
+      MCP-->>Host: No new GitLab changes
+    end
+  end
+  MCP->>Repo: Save final report with actual approval outcomes
+  MCP-->>Host: Finding Assessments, pending approvals, validation and isolation evidence
   end
 ```
 
@@ -924,11 +1025,11 @@ already exist, install dependencies, check the source, and build:
 ### Windows build
 
 ```powershell
-python -m venv .venv
+py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m ruff check gitlab_security_mcp server.py tests
 .\.venv\Scripts\python.exe -m ruff format --check gitlab_security_mcp server.py tests
-.\.venv\Scripts\python.exe -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+.\.venv\Scripts\python.exe -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnraisableExceptionWarning -W error::pytest.PytestUnhandledThreadExceptionWarning
 .\.venv\Scripts\python.exe -m pip wheel --no-deps --wheel-dir dist .
 Get-ChildItem .\dist\*.whl
 ```
@@ -940,7 +1041,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m ruff check gitlab_security_mcp server.py tests
 .venv/bin/python -m ruff format --check gitlab_security_mcp server.py tests
-.venv/bin/python -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+.venv/bin/python -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnraisableExceptionWarning -W error::pytest.PytestUnhandledThreadExceptionWarning
 .venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
 ls dist/*.whl
 ```
@@ -954,14 +1055,30 @@ Building does not install the wheel or start an MCP process.
 
 ## Installing the local MCP server
 
-Run these commands from this MCP project's directory, not the application
-checkout. The source launcher needs the runtime dependencies; it does not need
-an installed copy of this project.
+This is a Python stdio MCP server, not a VSIX extension or a Cursor-specific
+plugin installer. The same installed server works with either host. Choose
+**one** deployment method per connection:
+
+| Deployment | Best for | Launcher | How updates take effect |
+| --- | --- | --- | --- |
+| Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
+| Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
+
+For distribution, share `gitlab_security_mcp-1.0.9-py3-none-any.whl` and
+[Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
+in a ZIP. Extract them before installing. Do not share virtual environments,
+tokens, application source, or `.security-mcp` reports/logs as part of the installer.
+The wheel is not an offline dependency bundle: initial installation may need
+approved access to Python package indexes.
+
+The source commands below run from this MCP project's directory, not the
+application checkout. Wheel users can skip directly to
+[Installing a built wheel](#installing-a-built-wheel).
 
 ### Source installation on Windows
 
 ```powershell
-python -m venv .venv
+py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -998,13 +1115,28 @@ an interrupted upgrade and checks dependencies. Use `-InstallDirectory` for a
 different environment, or `-WhatIf` for a preflight-only preview.
 Follow your organization's execution policy for downloaded scripts.
 
+For a first installation or upgrade on macOS/Linux, after stopping the host's
+server connection, use the equivalent dedicated environment:
+
+```bash
+python3 -m venv "$HOME/Tools/gitlab-security-mcp"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.9-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
+```
+
+Configure the host to launch
+`$HOME/Tools/gitlab-security-mcp/bin/gitlab-security-mcp` using its actual
+absolute path. Installing a wheel requires no clone of this MCP repository.
+
 `Ignoring invalid distribution ~itlab-security-mcp` indicates temporary package
 directories left by an interrupted pip operation, not a finding or MCP error.
 The helper reports any remaining exact paths without deleting recovery files.
 The notice about a newer pip release is informational and does not cause the lock.
 Direct pip commands do not run this precheck and retain pip's own error messages.
 
-For an installed-package deployment, first create the virtual environment and
+For developers installing a wheel into this source checkout's `.venv` instead
+of the helper's dedicated environment, first create the virtual environment and
 install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
@@ -1029,19 +1161,22 @@ has not changed. `--no-deps` relies on the runtime-dependency setup above; do
 not skip it. Update runtime requirements when dependencies change. The installed
 entry point is `gitlab-security-mcp`, not the root source launcher.
 
-For Cursor, replace the source configuration's `command` and `args` with:
+For either IDE, an installed-package connection uses the installed entry point
+with no source-script argument. For the Windows helper's default location:
 
 ```json
 {
-  "command": "C:\\path\\to\\security-mcp-fixer\\.venv\\Scripts\\gitlab-security-mcp.exe",
+  "command": "C:\\Users\\YOUR_USER\\Tools\\gitlab-security-mcp\\Scripts\\gitlab-security-mcp.exe",
   "args": []
 }
 ```
 
-This is a fragment inside the existing `mcpServers.gitlab-security` object;
-retain its `env` settings. On macOS/Linux, use the absolute path to
-`.venv/bin/gitlab-security-mcp`. Do not pass `server.py` to this entry point.
-Restart Cursor's MCP server after installation. Wheel deployments require
+Replace `YOUR_USER`; JSON does not expand PowerShell's `$HOME`. This is a
+fragment inside the selected host's `gitlab-security` object; retain its
+environment and host-specific fields. On macOS/Linux, use the dedicated
+environment's absolute `bin/gitlab-security-mcp` path. Do not pass `server.py`
+to this entry point. Restart the correct IDE/harness connection after installation.
+Wheel deployments require
 rebuilding, reinstalling and restarting for code updates; source deployments
 require only restarting for source-only updates. Use one launch method per
 connection, not both.
@@ -1052,20 +1187,89 @@ The MCP host launches and owns the server process. Do not also run a separate
 `python server.py` terminal instance for that connection. Stdout is reserved for
 MCP messages; the server does not open a port.
 
+Configuration depends on the IDE **and the selected agent harness**:
+
+| Host | Personal configuration | Workspace configuration | Top-level server key |
+| --- | --- | --- | --- |
+| Current VS Code Copilot harness | `%USERPROFILE%\.copilot\mcp-config.json`, or `mcp-config.json` under `COPILOT_HOME` when set | `.mcp.json` at the application workspace root | `mcpServers` |
+| VS Code editor-managed/legacy Local configuration | User-profile `mcp.json`, opened through the editor's MCP controls | `.vscode/mcp.json` | `servers`; editor-managed `inputs` are supported here |
+| Cursor | `%USERPROFILE%\.cursor\mcp.json` | `.cursor/mcp.json` | `mcpServers` |
+
+On macOS/Linux, personal locations use `~/.copilot` or `~/.cursor`. For Remote
+SSH/WSL/Dev Containers, install the runtime and configure paths and credentials
+where the selected harness actually runs. Do not register duplicate connections
+to the same installation unintentionally.
+
+The examples below use the Windows helper's installed entry point. For a source
+deployment, replace only `command` and `args` with:
+
+```json
+{
+  "command": "C:\\path\\to\\security-mcp-fixer\\.venv\\Scripts\\python.exe",
+  "args": ["C:\\path\\to\\security-mcp-fixer\\server.py"]
+}
+```
+
+Keep the enclosing host-specific format and environment. Supply credentials
+through your approved secret-management process to the host **before it starts**;
+a terminal opened afterward does not update an already-running IDE's environment.
+Never paste real tokens into agent chat or commit them in configuration files.
+
 ### VS Code
 
-Add the following to the target project's `.vscode/mcp.json`. Replace the local
-paths. The project is inferred from that checkout's Git origin. The password input keeps the token out of the JSON
-example; enter it through VS Code's input prompt, not through agent chat. Keep
-actual credential storage consistent with your organization's policy.
+#### Current Copilot harness
+
+1. Open the application repository and select **Copilot** as the chat session
+   target/harness.
+2. Run **Chat: Open Customizations**, then select **MCP Servers** and **Add Server**.
+   Choose **Command (stdio)**. For personal setup choose **Global > Copilot Global**.
+   Alternatively, edit the personal `mcp-config.json` or workspace-root `.mcp.json`.
+3. Use the configuration below, replacing the executable and application paths.
+   `${GITLAB_TOKEN}` is a native Copilot environment reference, not a VS Code input
+   prompt. Provide that variable securely to the host first.
+
+```json
+{
+  "mcpServers": {
+    "gitlab-security": {
+      "type": "stdio",
+      "command": "C:\\Users\\YOUR_USER\\Tools\\gitlab-security-mcp\\Scripts\\gitlab-security-mcp.exe",
+      "args": [],
+      "tools": ["*"],
+      "env": {
+        "GITLAB_TOKEN": "${GITLAB_TOKEN}",
+        "GITLAB_API_URL": "https://gitlab.com/api/v4",
+        "REPO_ROOT": "C:\\path\\to\\application-repo"
+      }
+    }
+  }
+}
+```
+
+4. Review the trust request and enable the tools. In that session's MCP controls,
+   start `gitlab-security`; inspect its output if startup fails.
+5. Continue with [Running within VS Code and GitHub Copilot](#running-within-vs-code-and-github-copilot).
+
+Native Copilot configuration does not accept editor-only `inputs` or
+`${input:gitlabToken}` secret prompts. Workspace-root configuration forms may
+restrict variable entry; use **Other Properties** to edit the JSON reference
+when necessary. Organization policies and available actions can vary by version.
+
+#### Editor-managed or legacy VS Code configuration
+
+Existing `.vscode/mcp.json` setups use the editor-managed `servers` format.
+Use this example only for that configuration path, not native Copilot files.
+The password input keeps the token out of the JSON; enter it in the editor's
+prompt, not agent chat. Forwarding to a Copilot harness has compatibility
+restrictions, especially for prompted inputs: do not assume it works unchanged.
 
 ```json
 {
   "servers": {
     "gitlab-security": {
       "type": "stdio",
-      "command": "C:\\path\\to\\security-mcp-fixer\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\path\\to\\security-mcp-fixer\\server.py"],
+      "command": "C:\\Users\\YOUR_USER\\Tools\\gitlab-security-mcp\\Scripts\\gitlab-security-mcp.exe",
+      "args": [],
       "env": {
         "GITLAB_TOKEN": "${input:gitlabToken}",
         "REPO_ROOT": "C:\\path\\to\\application-repo"
@@ -1076,16 +1280,20 @@ actual credential storage consistent with your organization's policy.
     {
       "id": "gitlabToken",
       "type": "promptString",
-      "description": "GitLab read_api token",
+      "description": "GitLab token; api scope is needed only for approved dismissals",
       "password": true
     }
   ]
 }
 ```
 
-Start/restart the server using VS Code's MCP server controls and enable its tools
-for the agent. Review any host trust prompt before permitting execution. On
-macOS/Linux, use `/path/to/security-mcp-fixer/.venv/bin/python` and POSIX paths.
+Start/restart the editor-managed server using its MCP controls and enable its
+tools for the agent. On macOS/Linux, use the matching absolute interpreter,
+entry-point and application paths.
+
+See the official [VS Code MCP configuration reference](https://code.visualstudio.com/docs/agents/reference/mcp-configuration)
+and [server management guide](https://code.visualstudio.com/docs/agents/run/manage-mcp-servers)
+for current harness-specific actions and forwarding restrictions.
 
 ### Cursor
 
@@ -1101,10 +1309,9 @@ or use an uncommitted user configuration according to corporate policy.
 {
   "mcpServers": {
     "gitlab-security": {
-      "command": "C:\\path\\to\\security-mcp-fixer\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\path\\to\\security-mcp-fixer\\server.py"
-      ],
+      "type": "stdio",
+      "command": "C:\\Users\\YOUR_USER\\Tools\\gitlab-security-mcp\\Scripts\\gitlab-security-mcp.exe",
+      "args": [],
       "env": {
         "GITLAB_API_URL": "https://gitlab.com/api/v4",
         "REPO_ROOT": "C:\\path\\to\\the\\repo\\to\\fix"
@@ -1120,8 +1327,9 @@ or use an uncommitted user configuration according to corporate policy.
 {
   "mcpServers": {
     "gitlab-security": {
-      "command": "/path/to/security-mcp-fixer/.venv/bin/python",
-      "args": ["/path/to/security-mcp-fixer/server.py"],
+      "type": "stdio",
+      "command": "/home/YOUR_USER/Tools/gitlab-security-mcp/bin/gitlab-security-mcp",
+      "args": [],
       "env": {
         "GITLAB_API_URL": "https://gitlab.com/api/v4",
         "REPO_ROOT": "/path/to/the/repo/to/fix"
@@ -1131,9 +1339,18 @@ or use an uncommitted user configuration according to corporate policy.
 }
 ```
 
-Reload MCP servers using Cursor's MCP settings/refresh control and enable
-`gitlab-security`. Configuration formats differ between hosts: VS Code uses
-`servers`; Cursor uses `mcpServers`. Do not interchange the two examples.
+Open Cursor's **Customize** page or its MCP settings area, locate
+`gitlab-security`, and enable/reload it. Labels vary by release. The Command
+Palette does not itself open MCP settings; use the relevant MCP/Customize
+command if offered, or navigate through Cursor settings.
+Cursor and native Copilot both use `mcpServers`, but variable syntax and
+additional fields differ. The editor-managed VS Code format uses `servers`.
+Do not paste the legacy VS Code `inputs` example into Cursor.
+
+The examples inherit the token from Cursor's environment. If using an explicit
+Cursor environment reference instead, use `"GITLAB_TOKEN": "${env:GITLAB_TOKEN}"`,
+not Copilot's `${GITLAB_TOKEN}` syntax. See the official
+[Cursor MCP documentation](https://cursor.com/docs/mcp).
 
 Use a literal absolute `REPO_ROOT` in user-level Cursor configuration. Do not
 assume `${workspaceFolder}` is expanded: a server launched outside the active
@@ -1173,7 +1390,7 @@ requirements into the configured virtual environment before restarting.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `GITLAB_TOKEN` | yes | Personal access token. `GITLAB_PERSONAL_ACCESS_TOKEN` is also accepted. |
+| `GITLAB_TOKEN` | yes for retrieval | Personal access token with report access and `read_api`; optional approved dismissals require `api` and sufficient GitLab permissions. `GITLAB_PERSONAL_ACCESS_TOKEN` is also accepted. |
 | `GITLAB_PROJECT_ID` | no | Optional fixed project override: `group/project` or a numeric ID. Leave unset to select the project from each checkout's Git origin. |
 | `REPO_ROOT` | set explicitly in the host | Absolute path of the git repo to remediate. Defaults to the process working directory. |
 | `GITLAB_API_URL` | no | REST base URL. Defaults to `https://gitlab.com/api/v4`. GraphQL is derived from it. |
@@ -1181,6 +1398,7 @@ requirements into the configured virtual environment before restarting.
 | `NVD_API_KEY` | no | Raises the NVD rate limit. OSV is tried first and does not need a key. |
 | `VALIDATION_TIMEOUT_SEC` | no | Per validation command. Defaults to 600. |
 | `PACKAGE_UPDATE_POLICY` | optional | Enforce corporate exact-version approvals and checks at this absolute path. Existing default `.security-mcp/package-update-policy.json` also enables enforcement. If neither exists, use documented license review and lint/build/unit checks. |
+| `PROGRESS_CONSOLE` | no | Windows live progress: `auto` by default, `on` to force a console, or `off` for CI/headless runs. Restart the connection after changes. |
 
 For a self-hosted GitLab instance, set `GITLAB_API_URL` to `https://gitlab.example.com/api/v4`.
 
@@ -1215,21 +1433,166 @@ does not prove authentication or project access. Configure
 `VALIDATION_TIMEOUT_SEC` as a positive integer. Configure `PACKAGE_UPDATE_POLICY`
 only when using independently provisioned corporate approval/check requirements.
 
+## Updating the MCP server in VS Code and Cursor
+
+Update **between runs**, not while a tool, source review or checkbox form is
+pending. Restarting resets in-memory assessments; snapshots do not resume a run,
+and restarting does not undo edits or confirmed GitLab dismissals.
+
+### Deployment-specific update commands
+
+| What the connection launches | Update procedure |
+| --- | --- |
+| Installed `gitlab-security-mcp` entry point | Obtain the new trusted wheel; stop all connections using that environment; install the wheel into that exact environment; check version/dependencies; start the connection again. Updating the source clone alone has no effect. |
+| Virtualenv Python plus the absolute source `server.py` | Obtain reviewed source changes in that clone; install changed runtime requirements into its configured virtualenv if needed; stop/start the connection. Source-only changes need no wheel build or reinstall. |
+
+For Windows wheel deployments, close all VS Code/Cursor windows, including
+Agents/background windows, and use **standalone PowerShell**:
+
+```powershell
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.9-py3-none-any.whl"
+& "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
+& "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
+```
+
+These are separate commands. Do not concatenate a `venv` command and a quoted
+pip path into one expression. The helper creates the environment when needed,
+so no separate `venv` command is necessary. For an existing custom environment,
+add `-InstallDirectory "C:\path\to\the\configured\environment"` to the helper
+invocation and use that environment's Python for the checks.
+
+For macOS/Linux wheel deployments, stop the connections and use the dedicated
+environment commands in [Installing a built wheel](#installing-a-built-wheel).
+For source deployments with changed dependencies, run the matching command
+from the MCP source clone, not the application repository:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip check
+```
+
+Use `.venv/bin/python` on macOS/Linux. Do not run these source commands against
+an unrelated environment or install the application into the MCP environment.
+
+### VS Code and Copilot upgrade steps
+
+1. In the intended Copilot session, open **Chat: Open Customizations > MCP Servers**.
+   Select `gitlab-security`, use **Stop Server**, and temporarily disable it if
+   necessary to prevent automatic restarts. **MCP: List Servers** is an alternative
+   route. An editor-managed connection and a Copilot-runtime connection can be
+   separate processes; stop every connection using the installation.
+2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
+   running the shared update commands above. The helper detects locks but
+   **does not stop servers or kill applications for you**.
+3. Apply the deployment-specific update and verify installed version **1.0.9**
+   (or the newer wheel you intentionally selected) and a successful `pip check`.
+4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
+   For a native Copilot connection, stop/start is the restart operation; for an
+   editor-managed connection, use **Restart Server** when available.
+5. Check that tool discovery includes `complete_security_run` and
+   `review_false_positives` among the thirteen tools. Run the read-only status
+   check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
+   A fresh process normally reports `NOT_STARTED`; review any existing local
+   edits before requesting a new run.
+
+### Cursor upgrade steps
+
+1. Finish or cancel the current run/form, then open Cursor's **Customize/MCP**
+   controls and disable or stop `gitlab-security` in every affected workspace.
+2. For Windows wheel upgrades, close all Cursor and VS Code windows, including
+   Agents/background windows. Run the shared update commands from standalone
+   PowerShell; do not install over a running launcher.
+3. Verify that the configured `command` points to the environment you updated.
+   A wheel connection uses `gitlab-security-mcp` with `args: []`; a source
+   connection uses its virtualenv Python with the absolute `server.py` argument.
+4. Reopen Cursor and enable/reload the server. Review connection logs and trust
+   prompts. If a conversation still has a stale tool list after restarting,
+   start a fresh Agent chat; do not treat an old chat response as tool discovery.
+5. Confirm the thirteen tools include `complete_security_run` and
+   `review_false_positives`, then run the read-only status check below. Start a
+   new remediation run only after reviewing preserved edits and prechecks.
+
+An IDE upgrade, MCP package upgrade and model change are different operations.
+Updating this package does not update the IDE, enable form support, grant
+GitLab permissions or clear the host's internal conversation errors.
+
+## Running within VS Code and GitHub Copilot
+
+1. Open the **application repository**, not this server's installation folder.
+   Connect to corporate VPN and ensure clean `main` or today's allowed security
+   branch, GitLab access and the application's required toolchains.
+2. Follow the [VS Code configuration](#vs-code) for the actual selected harness.
+   Provide credentials securely before starting the host. Leave
+   `GITLAB_PROJECT_ID` unset for origin-based selection.
+3. Open an agent-capable Copilot chat, select the intended model, and enable
+   `gitlab-security` and its tools. Review startup trust and tool approvals.
+   The host AI performs source and compatibility review; there is no separate
+   server-side model or deprecated sampling call.
+4. Verify the connection with this low-impact request, replacing the path:
+
+   ```text
+   Use only gitlab-security.get_run_status with
+   repo_root="C:\path\to\application-repo". Show status, branch and counts.
+   Do not pull, list findings, edit files or run product commands yet.
+   ```
+
+   Confirm an actual MCP tool response, not just an AI statement. For a fresh
+   process, `NOT_STARTED` and zero findings are normal. This does not test GitLab
+   authentication or prove that a remediation run will pass.
+5. In that Agent chat, enter:
+
+   ```text
+   run gitlab-security on this repo
+   ```
+
+   For multiple workspaces, specify the absolute application checkout; the AI
+   must pass the same `repo_root` on subsequent calls.
+6. Follow tool progress and approval prompts. The calling AI must finish
+   `HOST_REVIEW_REQUIRED` source analysis and submit hash-bound assessments,
+   not hand that task to the user. At completion, select only the false positives
+   you want dismissed in the human form. Do not authorize the AI to answer it.
+7. Review the final Finding Assessments, actual dismissal outcomes, unresolved
+   findings, build/test evidence and local diff. Commit/push manually if accepted.
+   No second `review_false_positives` chat request is needed.
+
+**If the Command Palette does not show MCP controls:** use the Chat view's
+**Open Customizations > MCP Servers** navigation when available. Check the
+selected harness, installed/enabled Copilot features and organization policy.
+`Ctrl+Shift+P` only opens the palette; it does not itself open MCP settings.
+For editor-managed configurations, open the relevant `mcp.json` and use its
+available server actions. Do not switch JSON formats merely to hide a startup
+error; inspect the configured executable and server output first.
+
+If a host cannot display the required human form, completion returns
+`APPROVAL_UNAVAILABLE` and still generates a report. No findings are dismissed
+by that call; use a form-capable host or the GitLab UI.
+
 ## Running within Cursor
 
 1. Open the application repository to remediate in Cursor, not just this MCP
   project's folder. Confirm `REPO_ROOT` points to that application checkout.
 2. Add the [Cursor configuration](#cursor) to the project or user MCP config.
   Choose either the absolute source launcher or installed console entry point.
-3. Supply GitLab credentials securely to the Cursor process and set the project
-  ID. Configure the independently provisioned policy before package updates.
-4. In Cursor's MCP settings, enable/reload `gitlab-security`. Review startup
+3. Supply GitLab credentials securely to the Cursor process. Leave
+  `GITLAB_PROJECT_ID` unset for origin-based discovery; set the trusted
+  `GITLAB_API_URL` once for self-hosted GitLab. Provision corporate policy only
+  when it is configured/present or required by your organization.
+4. In Cursor's Customize/MCP settings, enable/reload `gitlab-security`. Review startup
   errors there if it does not connect; UI labels vary by Cursor release.
 5. Open Agent chat and enable the server's tools. Review tool approval prompts
   according to your organization's policy.
 6. First use the read-only status request below to verify the connection.
-7. Prepare clean `main`, approvals and product checks, then use the
-  [remediation request](#running-remediation) to run the gated workflow.
+7. Connect to corporate VPN, prepare clean `main` or today's allowed branch and
+  product checks, then enter `run gitlab-security on this repo` in Agent chat.
+  Cursor's selected host model performs source/input-flow review; deprecated MCP
+  sampling is not used. Do not stop at `HOST_REVIEW_REQUIRED`.
+8. Complete the optional human checkbox form within the same request. The AI
+  must not select boxes for you. `complete_security_run` reports confirmed
+  outcomes and writes the final report; no second review request is needed.
+  If the host cannot show the form, `APPROVAL_UNAVAILABLE` means no new dismissals.
+9. Review the reports, unresolved reasons, final validation and local diff.
+  Publish reviewed changes manually; the MCP never commits, pushes or opens a
+  merge request.
 
 Connection check in Agent chat:
 
@@ -1244,7 +1607,10 @@ This confirms a tool response, not GitLab access or successful remediation.
 Cursor starts the server itself; no separate terminal server or URL is needed.
 Do not restart in the middle of a run, because active state is not resumed.
 
-## Reading output in Cursor
+## Reading output in VS Code and Cursor
+
+These result fields and local artifacts are the same in either IDE. The host
+controls chat rendering, form layout and notification visibility.
 
 ### Tool results and agent summary
 
@@ -1256,11 +1622,12 @@ than relying only on a short natural-language success message.
 | Result | Fields to inspect |
 | --- | --- |
 | Finding retrieval | `count`, `truncated`, `findings`, and pipeline provenance. A truncated list is incomplete. |
-| Finding verification | `decision`, `reason`, `evidence`, `proposed_fix`, and `qualification_required`. Config evidence includes each publisher page name, URL, and SHA-256. |
+| Finding verification | `decision`, `reason`, `evidence`, `proposed_fix`, `qualification_required`, and `ai_source_review`. `HOST_REVIEW_REQUIRED` includes complete cited source for continued AI analysis, not a finished verdict. |
 | Package qualification | `status`, approval evidence, `baseline_results`, or the blocking `reason`. |
 | Fix application | `status`, `change.files`, `change.detail`, `change.documentation`, and `change.qualification_status`. `DOCS_REQUIRED` means nothing was written. `APPLIED` is not validated. |
 | Validation | Overall `status` and each row in `results`, including `required`, command, status and detail. |
 | Report generation | `human_report`, `json_report`, `unresolved_issues`, and `unresolved_issues_table`. Saved JSON also contains `batch_isolation` trials. |
+| Combined completion | `false_positive_review` holds the form/dismissal status; report `false_positive_approval` distinguishes pending and confirmed outcomes from local `review_status`. A completed source assessment alone does not mean GitLab was changed. |
 | Current status | `status`, `stop_stage`, counts, `report_path`, and `package_updates`. |
 
 ### Live progress and HTTP timings
@@ -1300,6 +1667,12 @@ It closes when the server exits. Set `PROGRESS_CONSOLE=off` in the MCP server's
 environment for CI/headless runs, `on` to force the Windows console, or leave
 the default `auto` to retain ordinary terminal output when stderr is interactive.
 Restart the MCP server after changing code or this setting.
+
+Completed tools drain queued MCP progress for at most one second. If a host
+stops acknowledging notifications, the server logs the timeout, cancels and
+awaits its sender task, and retains the bounded transcript in the result.
+Late progress from a worker whose request has ended is ignored. This is separate
+from the product-command timeout and does not change validation success.
 
 Every tool call that emits progress also returns its most recent 64 messages
 in `progress_output`, with each message capped at 2,000 characters. MCP text
@@ -1433,9 +1806,12 @@ checkout root and passes it as `repo_root`; it must not select the MCP server's
 installation directory. A nested `frontend` is discovered automatically.
 When multiple repositories are open, identify the intended checkout explicitly.
 
-The host runs prechecks, two pulls, then automatic `pnpm clean` followed by
-`pnpm install` for each pnpm project/workspace before branching or security
-checks. Non-pnpm checkouts skip that preparation. A failed pull, missing pnpm or
+The host runs prechecks and two pulls. For a fresh security branch, the server
+runs `pnpm clean` followed by `pnpm install` for each pnpm project/workspace
+after the pulls and before branching. For today's reused branch, it defers those
+commands until that branch is checked out and prior logs pass review; preparation
+uses the reused branch's own manifests. Finding checks start after applicable
+preparation. Non-pnpm checkouts skip that preparation. A failed pull, missing pnpm or
 clean script, or failed clean/install stops the run; no deletion workaround or
 duplicate host-issued preparation is needed.
 
@@ -1453,7 +1829,8 @@ a command-line replacement for the agent request above.
 
 1. Install runtime dependencies and configure your MCP host.
 2. Review exact-target license terms and provide lint/build/unit checks; provision corporate approvals/checks if configured or required by your organization.
-3. Check out clean `main` in `REPO_ROOT`; finish any in-progress Git operation.
+3. Use clean `main` or today's allowed security branch in `REPO_ROOT`; finish
+   any in-progress Git operation. Prior errors block same-day reuse.
 4. Start/reload `gitlab-security` and enable its tools.
 5. Ask the host agent to follow the workflow below.
 6. Review the returned unresolved table, validation/isolation evidence, local reports, and `git diff`.
@@ -1499,7 +1876,9 @@ all candidates were rejected and the baseline proved green. Otherwise
 stop on run-level failures, incomplete validation or unsafe rollback. Retain finding-level
 manual-review and no-safe-fix reasons; continue only with eligible findings.
 Do not commit, push, or claim pending edits are resolved. Dismiss false positives
-only through review_false_positives with explicit human checkbox approval.
+only through the review_false_positives stage inside complete_security_run,
+with explicit human checkbox approval. Do not make a separate review/report
+call in this standard workflow.
 ```
 
 ### Reports and local artifacts
@@ -1558,20 +1937,37 @@ unless the human approves false-positive dismissal through
 
 Source-code findings such as **Regular expression with non-literal value** are
 not package-advisory findings. `verify_security_finding` returns
-`SOURCE_REVIEW_REQUIRED` with `source_workflow`, the cited source excerpt and
-its full-byte SHA256. The host must read that source and trace configuration,
+`SOURCE_REVIEW_REQUIRED` with `source_workflow`; the MCP tool additionally returns
+the complete cited source and full-byte SHA256 in
+`ai_source_review.cited_source`, with `status: "HOST_REVIEW_REQUIRED"`.
+The calling host AI must read that source and trace configuration,
 callers, mutation paths and possible untrusted inputs. Neither a test filename,
 missing source nor missing CVE proves safety.
 
 For a proven false positive, call `verify_security_finding` again with
 `source_review` containing `decision: "FALSE_POSITIVE"`, `reason`, `input_origin`,
-`pattern_analysis`, `reachability_analysis`, and `reviewed_files` entries with
+`finding_analysis` (legacy `pattern_analysis` is accepted),
+`reachability_analysis`, and `reviewed_files` entries with
 `path`, current full-byte `sha256`, and `assessment`. Include the cited source
 and every configuration/caller file relied on. The server validates file
 boundaries, hashes and review completeness; the reasoning remains an audited
 host attestation, not automatic data-flow proof. Status/report refresh retracts
 false positives if reviewed files change. These decisions alone do not dismiss
-GitLab findings; the separate human approval form is required.
+GitLab findings; the human approval form inside `complete_security_run` is
+required. The AI continues analysis and records the review in the same user
+request, without deprecated sampling.
+
+| Source or configuration | What the host AI must inspect |
+| --- | --- |
+| Java 17+ and .NET/C# | Cited code, actual inputs, callers, framework/runtime configuration and relevant controls. |
+| TypeScript/Node.js, JavaScript and Python | Complete cited code and callers/configuration, including input origin, mutation and reachability. |
+| Dockerfile variants | Build stages, final image, runtime controls and the exact scanner-cited issue. |
+| nginx.conf and recognized include files | Includes, directive inheritance, active server/location and actual exposure. |
+
+These are source-review paths, not a promise of arbitrary automatic source
+rewrites or package upgrades for every language. Each finding needs its own
+reason and evidence. Uncertainty becomes `MANUAL_REVIEW`, not a guessed
+false positive.
 
 For a reproduced defect, the host applies a scoped source fix and regression
 test separately from package updates, then runs the same reproduction, boundary
@@ -1597,6 +1993,28 @@ A configuration edit changes only the cited line and keeps its line ending.
 Unsupported edits and breaking upgrades remain for manual review.
 
 Lockfile refreshes use the package manager already selected by the repo (`npm`, `pnpm`, or `yarn`) and pass `--ignore-scripts` on that refresh. Validation then runs the project's own install and test commands.
+
+### Node and pnpm security version updates
+
+When a concrete security target is available and the local package matches, the
+server chooses the smallest supported qualified plan. It does **not** always
+edit both a manifest and a workspace file:
+
+| Situation | File or field that may change |
+| --- | --- |
+| The declared direct dependency range already allows the fixed version | Only the applicable lockfile may need refreshing; `package.json` and `pnpm-workspace.yaml` can remain unchanged. |
+| A direct dependency needs a supported version-range bump | Its owning component's dependency entry in `package.json`, plus its lockfile when applicable. |
+| A pnpm transitive override is required and the owning component has `pnpm-workspace.yaml` | The top-level `overrides` mapping in that workspace file, plus the applicable lockfile. Comments and unrelated overrides are preserved. |
+| A pnpm override is required without that workspace file | `pnpm.overrides` in the owning `package.json`, plus the applicable lockfile. |
+| An npm or Yarn transitive override is required | npm `overrides` or Yarn `resolutions` in the owning `package.json`, plus the applicable lockfile. |
+| No compatible supported plan or sufficient evidence exists | Keep the finding unresolved with its exact reason; do not fabricate a version or rewrite unsupported declarations. |
+
+An available version alone does not authorize an edit. Exact-target
+compatibility/license review, any configured corporate policy, fresh publisher
+documentation and final production build/all-unit-test validation still apply.
+The host must not modify production or unit-test APIs to make a package upgrade
+pass. Review `change.files`, qualification evidence, lockfile diff and final
+validation before publishing.
 
 A Gradle plugin edit changes one `id ... version` declaration in `build.gradle`, `build.gradle.kts`, `settings.gradle`, or `settings.gradle.kts`, or the matching `[plugins]` entry in `libs.versions.toml`. A version catalog reference updates the `[versions]` key and leaves the plugin id in place. Neighboring plugin declarations stay unchanged.
 
@@ -1667,7 +2085,7 @@ Run development commands from this MCP project's root. Use the equivalent
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m ruff check gitlab_security_mcp server.py tests
 .\.venv\Scripts\python.exe -m ruff format --check gitlab_security_mcp server.py tests
-.\.venv\Scripts\python.exe -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+.\.venv\Scripts\python.exe -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnraisableExceptionWarning -W error::pytest.PytestUnhandledThreadExceptionWarning
 ```
 
 ### Python and AAA standards
@@ -1771,5 +2189,17 @@ for deployment and restart differences.
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
+| An installed wheel still shows old behavior or fewer than thirteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
+| `WinError 32` during installation | Close all VS Code/Cursor windows, including Agents/background windows, and retry the helper from standalone PowerShell. It detects a lock before pip changes the installation; it never terminates applications automatically. |
+| `Unexpected token 'install'` or a quoted pip path in PowerShell | Use the installer helper as one command, or run venv creation and pip installation as separate commands. An executable path in quotes needs PowerShell's `&` invocation operator. Do not join the two examples into one expression. |
+| `Ignoring invalid distribution ~itlab-security-mcp` | An interrupted install left recovery directories. The helper reports exact leftover paths without deleting them; resolve the file lock and repair the installation before manually reviewing any leftovers. A newer-pip notice is informational. |
+| Copilot cannot use a `.vscode/mcp.json` example | Check the selected harness. Native Copilot uses `mcpServers` in its user `mcp-config.json` or workspace `.mcp.json`; the editor-managed file uses `servers` and has separate compatibility/forwarding rules. |
+| `Ctrl+Shift+P` does not open MCP settings | It opens the Command Palette only. In VS Code use **Chat: Open Customizations > MCP Servers** or **MCP: List Servers** when available; in Cursor use Customize/MCP settings. Verify the IDE features and organization policy. |
+| `APPROVAL_UNAVAILABLE` | The host did not advertise form support or could not open the form. No new findings are dismissed by that call. Use a form-capable host or the GitLab UI; do not generate AI approval values or repeatedly reopen a declined form. |
+| No eligible false-positive assessments | Inspect `SOURCE_REVIEW_REQUIRED`, `ASSESSMENT_REQUIRED` or `ALREADY_DISMISSED` and the excluded-finding blockers. The host AI must finish source review and submit valid current evidence first; a scanner flag alone is insufficient. Do not relist or rescan merely to open approvals. |
+| `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI must read the supplied complete source, trace inputs/callers/configuration and submit `source_review` within the same request. This is not a request for the user to analyze code. Deprecated sampling is intentionally disabled. |
+| Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval` and completion's `false_positive_review`. Only checked human submissions with confirmed successful mutations establish dismissal. Pending, failed or unknown outcomes remain explicit; do not automatically retry unknown writes. |
+| NVD returns 429/503 or times out | Review recorded errors and pacing/retry progress. Bounded retries honor shared cooldowns and `Retry-After`; long cooldowns fail explicitly. Do not bypass rate limits or treat an outage as proof of safety. |
+| Windows command containment cannot be established | The command fails explicitly before its suspended child resumes; owned resources are cleaned up. Inspect the error and host/job/security-policy restrictions with your administrator rather than disabling containment or launching an uncontained fallback. |
 | Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |
 | `SOURCE_REVIEW_REQUIRED` | Read `source_workflow`, trace the cited source and input origins, and supply source-bound review evidence or reproduce/fix/validate the source defect. Missing advisories are not a SAST disposition. |
