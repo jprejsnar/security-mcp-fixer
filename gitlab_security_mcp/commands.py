@@ -123,6 +123,8 @@ def _git_ok(args: list[str]) -> bool:
     if not args or args[0] in FORBIDDEN_GIT:
         return False
     command, rest = args[0], args[1:]
+    if command == "remote":
+        return rest == ["get-url", "--all", "origin"]
     if command == "rev-parse":
         return rest in (
             ["--is-inside-work-tree"],
@@ -147,7 +149,29 @@ def _git_ok(args: list[str]) -> bool:
     if command == "pull":
         return rest == ["--ff-only"]
     if command == "checkout":
-        return len(rest) == 2 and rest[0] == "-b" and _security_branch(rest[1])
+        return (
+            (len(rest) == 1 and (rest[0] == "main" or _security_branch(rest[0])))
+            or (len(rest) == 2 and rest[0] == "-b" and _security_branch(rest[1]))
+            or (
+                len(rest) == 4
+                and rest[0] == "-b"
+                and _security_branch(rest[1])
+                and rest[2:] == ["--track", f"origin/{rest[1]}"]
+            )
+        )
+    if command == "fetch":
+        if len(rest) != 2 or rest[0] != "origin":
+            return False
+        source, separator, target = rest[1].partition(":")
+        name = source.removeprefix("refs/heads/")
+        return (
+            bool(separator)
+            and source == f"refs/heads/{name}"
+            and _security_branch(name)
+            and target == f"refs/remotes/origin/{name}"
+        )
+    if command == "ls-files":
+        return rest == ["--cached", "-z", "--", ".security-mcp"]
     if command == "ls-remote":
         return (
             len(rest) == 3

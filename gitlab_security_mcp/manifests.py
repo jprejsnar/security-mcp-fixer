@@ -473,6 +473,10 @@ def _split_maven_name(name: str) -> tuple[str | None, str | None]:
     if ":" in name:
         group, artifact = name.split(":", 1)
         return group, artifact
+    if name.count("/") == 1 and not name.startswith("@"):
+        group, artifact = name.split("/", 1)
+        if group and artifact:
+            return group, artifact
     return None, name
 
 
@@ -481,7 +485,7 @@ def locate_gradle(
 ) -> PackageHit | None:
     """Locate a Gradle coordinate in build files or a version catalog."""
     group, artifact = _split_maven_name(name)
-    coordinate = name if group else None
+    coordinate = f"{group}:{artifact}" if group else None
     patterns = []
     if coordinate:
         patterns.append(

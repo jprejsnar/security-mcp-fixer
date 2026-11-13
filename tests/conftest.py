@@ -8,6 +8,38 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def corporate_dns(monkeypatch):
+    """Keep corporate DNS deterministic and offline unless a test overrides it."""
+    from unittest.mock import Mock
+
+    resolver = Mock(return_value=[(2, 1, 6, "", ("192.0.2.1", 443))])
+    monkeypatch.setattr("gitlab_security_mcp.engine.getaddrinfo", resolver)
+    return resolver
+
+
+@pytest.fixture(autouse=True)
+def nvd_clock(monkeypatch, request):
+    """Virtualize offline NVD timing without bypassing opt-in live API limits."""
+    from gitlab_security_mcp import advisory
+
+    if request.node.path.name == "test_patient_web_live.py":
+        return None
+    now = [0.0]
+    waits = []
+
+    def wait(seconds):
+        """Advance the virtual rate-limit clock instead of sleeping."""
+        waits.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(advisory, "monotonic", lambda: now[0])
+    monkeypatch.setattr(advisory, "sleep", wait)
+    monkeypatch.setattr(advisory, "_nvd_last_request", None)
+    monkeypatch.setattr(advisory, "_nvd_retry_until", 0.0)
+    return now, waits
+
+
 def pytest_addoption(parser):
     """Keep private GitLab integration requests explicitly opt-in."""
     parser.addoption(

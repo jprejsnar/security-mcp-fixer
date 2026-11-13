@@ -16,9 +16,13 @@ from typing import Any
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+from mcp.server.mcpserver import Context
+from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import Field, create_model
 
 from gitlab_security_mcp import __version__
+from gitlab_security_mcp.ai_source_review import SourceEvidence, review_with_host_ai
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
 
@@ -30,16 +34,55 @@ Local-only GitLab security remediation. Call the tools in this order:
     the active application's path when the host starts this server elsewhere.
     Unresolved ${workspaceFolder} values are not repository paths. Each checkout
     keeps its own run. Pass that same repo_root to later tools when more than
-    one checkout is active.
+    one checkout is active. Corporate DNS must resolve nexus.ert.com before
+    work starts, each Git pull, and pnpm preparation. On DNS failure, tell the
+    user to connect to corporate VPN first and rerun run_prechecks; stop the run.
+    Start on clean main or today's exact security-fixes-Month-dd-YYYY branch.
+    Existing same-day branches require scanning prior security logs. Runtime
+    errors or unverifiable logs stop the run and preserve prior artifacts.
 2. pull_main_twice. After both successful pulls this tool automatically runs
     pnpm clean followed by pnpm install in each pnpm project/workspace root,
     before branching or any security checks. Do not issue duplicate host commands.
-    Any preparation failure stops the run; fix it before continuing. Non-pnpm
+    If today's branch is being reused, preparation is deferred until that branch
+    is checked out, so its own manifests are installed. Any preparation failure
+    stops the run; fix it before continuing. Non-pnpm
     repositories skip pnpm preparation. The repository must provide its own
     clean script; do not invent one or replace it with a directory deletion.
-3. create_security_branch
-4. list_security_findings
+3. create_security_branch. Reuse today's exact local/origin branch if it exists.
+    Before cleanup, scan every security log. If clean, delete only known generated
+    untracked files inside .security-mcp; preserve tracked files, policies,
+    configuration and unrelated files. Runtime errors stop the run with files
+    preserved. Never run git clean or delete the metadata root. Older dated
+    branches are not reused. A fresh run re-verifies findings; old assessments
+    are not resumed.
+4. list_security_findings. Omit project_id to infer namespace/project from the
+    active checkout's Git origin when GITLAB_PROJECT_ID is unset. Do not guess
+    a numeric ID or reuse another checkout's project. The origin must match the
+    configured trusted GITLAB_API_URL host (gitlab.com by default); never infer
+    credentials or change the trusted API destination from repository metadata.
 5. verify_security_finding for every finding
+    Source/configuration SAST and IaC findings return SOURCE_REVIEW_REQUIRED with source_workflow,
+    not a package-advisory miss. Read the cited source and trace its input origins.
+    For a proven false positive, call verify_security_finding again with source_review
+    containing decision="FALSE_POSITIVE", reason, input_origin, pattern_analysis,
+    reachability_analysis, and reviewed_files [{path, sha256, assessment}].
+    Review every file relied on and use its current full-byte SHA256. These are
+    audited host attestations, not automatic proof. Test filenames do not prove safety.
+    SOURCE_REVIEW_REQUIRED is unfinished work, not a terminal assessment. Complete
+    the source_workflow and record each finding's evidence before the final report.
+    Use finding_analysis for the actual rule; legacy pattern_analysis is accepted.
+    Record confirmed defects as CONFIRMED_VULNERABILITY and uncertainty as
+    MANUAL_REVIEW using the same source_review evidence fields. Never label every
+    endpoint or Unicode operation a false positive without individual analysis.
+    The tool requests connected-host AI sampling when supported. If it returns
+    ai_source_review.status=HOST_REVIEW_REQUIRED, YOU are the reviewing AI:
+    examine its full cited_source, use your code tools to trace callers, inputs
+    and controls, then resubmit source_review within this same user request.
+    Do not ask the user to perform the code analysis or end with the pending
+    placeholder. If access, host consent or sufficient evidence is unavailable,
+    report that exact blocker and keep the finding unresolved.
+    For a reproduced defect, apply reviewed source/regression fixes through the host,
+    separately from package updates, and validate before claiming resolution.
     API and coverage fuzzing return REPRODUCTION_REQUIRED with fuzzing_workflow.
     Read its scanner_evidence (request URL/body, response body/status and
     supporting exchanges) and scanner_details captured through GraphQL before
@@ -146,16 +189,29 @@ Local-only GitLab security remediation. Call the tools in this order:
     rollback cannot be proved safe or later edits need manual cleanup: stop
     editing and report the blocker. Never adapt production/tests to make a fix
     pass. At the end list every unapplied/rejected fix and its exact reason.
-11. generate_local_report, showing qualification and unresolved findings.
-    Display the returned final_summary_markdown verbatim at the end of the final
+11. When eligible false positives exist, call review_false_positives BEFORE the
+    final report to offer the human an optional unchecked approval form. Do not
+    merely tell the user to call it later or wait for a second dismissal request.
+    Only the human may answer; never generate or infer approval. Decline/cancel
+    or lack of host form support means no remote changes. Markdown checkboxes
+    alone are not actionable. Surface the exact blocker if the host cannot show
+    the form. Never retry a mutation whose remote outcome may be unknown.
+12. generate_local_report, showing qualification and unresolved findings.
+    Display the returned final_summary_markdown once at the end of the final
     response, not just report paths. The tool's text content is this complete
     Markdown block, not a JSON wrapper. Copy it into the final assistant message;
     do not summarize it away or replace it with a report link.
+    Do not repeat table rows or regenerate the same report while presenting it.
     Preserve the final table columns: Severity, Package, Version, Issue,
     Reason Not Addressed, Security Validation Sites. List the actual consulted
     site URLs even when the lookup failed; never fabricate verification sites.
-Do not commit, push, open a merge request, or dismiss GitLab findings.
-This server refuses those actions. Missing/failed OSV, GitHub Advisory Database,
+    Check false_positive_approval separately from review_status: completed source
+    review does not mean findings were dismissed in GitLab. The checkbox form
+    dismisses only selected assessments as FALSE_POSITIVE, with the exact displayed
+    reason as the GitLab comment. Report actual confirmed outcomes, not intentions.
+Do not commit, push, or open a merge request.
+Only review_false_positives may dismiss findings, after human form approval.
+Missing/failed OSV, GitHub Advisory Database,
 NVD, CVE, CWE or NSA data does not block a concrete GitLab-recommended update
 for a locally matched dependency. Continue to qualification, application and
 build/all-unit-test validation; reject and restore fixes that fail those checks.
@@ -395,14 +451,17 @@ def _run(
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Run prechecks", read_only_hint=True, open_world_hint=False
+        title="Run prechecks", read_only_hint=True, open_world_hint=True
     )
 )
 def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
-    """Select the absolute application checkout; require clean main and no merge.
+    """Require corporate DNS and clean main or today's exact security branch.
 
+    DNS must resolve nexus.ert.com; otherwise connect to corporate VPN first.
     Pass the active workspace path explicitly when REPO_ROOT is unset or contains
     an unresolved host placeholder. Another checkout can run at the same time.
+    Before same-day reuse, scan prior security logs; errors preserve artifacts
+    and stop the run without overwriting the old run snapshot.
     """
     return _run("run_prechecks", repo_root=repo_root)
 
@@ -418,24 +477,34 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
 def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
     """Phase 1. Pull twice, then run pnpm clean followed by pnpm install.
 
+    Recheck nexus.ert.com DNS before each pull and before pnpm preparation.
+    DNS failure stops the run and requires connecting to corporate VPN first.
     Preparation runs once per pnpm project/workspace root before any security
     checks. Any pull or preparation failure stops that checkout's run. Missing
     clean scripts or unavailable pnpm are blockers, never silently skipped.
     Non-pnpm repositories do not run pnpm preparation.
+    Starting on today's branch first checks out main without force. When reusing
+    today's branch, preparation is deferred to create_security_branch after checkout.
     """
     return _run("pull_main_twice", repo_root=repo_root)
 
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Create security branch",
+        title="Create or reuse today's security branch",
         read_only_hint=False,
-        destructive_hint=False,
-        open_world_hint=False,
+        destructive_hint=True,
+        open_world_hint=True,
     )
 )
 def create_security_branch(repo_root: str | None = None) -> dict[str, Any]:
-    """Phase 2. Create security-fixes-Month-dd-YYYY. Stop if that name already exists."""
+    """Create today's branch or safely reuse its exact dated name.
+
+    Review all prior security logs first. Runtime errors or unverifiable logs
+    preserve artifacts and stop. If clean, remove only known generated untracked
+    .security-mcp outputs, never policies/configuration, tracked or unrelated
+    files. Prepare pnpm on the reused branch before fetching findings.
+    """
     return _run("create_security_branch", repo_root=repo_root)
 
 
@@ -447,7 +516,7 @@ def create_security_branch(repo_root: str | None = None) -> dict[str, Any]:
 def list_security_findings(
     project_id: str | None = None, repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Phase 3. Read the still-detected GitLab vulnerability report on main."""
+    """Phase 3. Read GitLab findings on main; infer project from origin unless overridden."""
     return _run("list_security_findings", project_id, repo_root=repo_root)
 
 
@@ -456,11 +525,100 @@ def list_security_findings(
         title="Verify security finding", read_only_hint=True, open_world_hint=True
     )
 )
-def verify_security_finding(
-    finding_id: str, repo_root: str | None = None
+async def verify_security_finding(
+    finding_id: str,
+    ctx: Context,
+    repo_root: str | None = None,
+    source_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Phase 4. Verify one finding with local evidence and online advisories before any edit."""
-    return _run("verify_security_finding", finding_id, repo_root=repo_root)
+    """Assess source SAST locally and package findings with advisory evidence.
+
+    Source/configuration SAST and IaC automatically request a source/input-flow review from the connected
+    host AI when it supports MCP sampling. Read-only evidence requests can examine
+    complete source files and locate callers. No separate AI service/key is used.
+    Java, C#, TypeScript, JavaScript, Python, Dockerfiles and nginx configurations
+    use the same evidence-bound review. Documented configuration edits require
+    a confirmed-vulnerability review before planning or writing.
+    If sampling is unavailable, the host AI must analyze the returned full cited
+    source and callers, then resubmit a source_review; this is not a final verdict.
+    SOURCE_REVIEW_REQUIRED always means unfinished AI work. To record a
+    reviewed conclusion, supply source_review with decision="FALSE_POSITIVE",
+    "CONFIRMED_VULNERABILITY", or "MANUAL_REVIEW", reason, input_origin,
+    finding_analysis (legacy pattern_analysis is accepted), reachability_analysis, and
+    reviewed_files [{path, sha256, assessment}]. Read the full cited source and
+    all input-origin files; use their current full-byte hashes. This audits the
+    host's assessment, not an independent proof. Never infer safety from a test
+    filename, absent CVE, missing source or scanner flag alone.
+    """
+    result = await asyncio.to_thread(
+        _run,
+        "verify_security_finding",
+        finding_id,
+        repo_root=repo_root,
+        source_review=source_review,
+    )
+    if source_review is not None or result.get("decision") != "SOURCE_REVIEW_REQUIRED":
+        return result
+    if not (result.get("source_workflow") or {}).get("source"):
+        result["ai_source_review"] = {"status": "FAILED", "reason": result["reason"]}
+        return result
+    selected = _engine_for(repo_root)
+    evidence = SourceEvidence(selected.repo_root)
+    try:
+        request = result["source_review_request"]
+        cited = await asyncio.to_thread(evidence.read, request["location"]["file"])
+        capabilities = ctx.session.client_capabilities
+        if capabilities is None or capabilities.sampling is None:
+            reason = (
+                "The connected MCP host does not advertise AI sampling. The host AI "
+                "must examine the full cited_source, trace callers/inputs with its "
+                "code tools, and call verify_security_finding with source_review. "
+                "No false-positive conclusion has been recorded."
+            )
+            result.update(
+                await asyncio.to_thread(
+                    selected.record_source_review_blocker, finding_id, reason
+                )
+            )
+            result["ai_source_review"] = {
+                "status": "HOST_REVIEW_REQUIRED",
+                "reason": reason,
+                "cited_source": cited,
+                "next_tool": "verify_security_finding",
+            }
+            return result
+        review = await review_with_host_ai(
+            ctx.session, evidence, request, ctx.request_id
+        )
+        result = await asyncio.to_thread(
+            _run,
+            "verify_security_finding",
+            finding_id,
+            repo_root=repo_root,
+            source_review=review,
+        )
+        result["ai_source_review"] = {
+            "status": "COMPLETE"
+            if result.get("decision")
+            in {"FALSE_POSITIVE", "CONFIRMED_VULNERABILITY", "MANUAL_REVIEW"}
+            else "INVALID",
+            "model_source": "connected MCP host",
+        }
+        return result
+    except (MCPError, OSError, ValueError, TimeoutError) as exc:
+        reason = (
+            f"AI source review could not complete: {selected.gitlab._clean(str(exc))}. "
+            "The host AI must examine the source and submit an evidence-backed "
+            "source_review. No false-positive conclusion or GitLab change was made."
+        )
+        logger.warning("AI source review blocked for %s: %s", finding_id, reason)
+        result.update(
+            await asyncio.to_thread(
+                selected.record_source_review_blocker, finding_id, reason
+            )
+        )
+        result["ai_source_review"] = {"status": "FAILED", "reason": reason}
+        return result
 
 
 @mcp.tool(
@@ -553,6 +711,126 @@ def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Finding Assessments: approve false-positive dismissals",
+        read_only_hint=False,
+        destructive_hint=True,
+        open_world_hint=True,
+    )
+)
+async def review_false_positives(
+    ctx: Context, repo_root: str | None = None
+) -> dict[str, Any]:
+    """Show unchecked human approvals; submit selected assessments to GitLab.
+
+    Requires a host supporting MCP form elicitation and a GitLab API-write token
+    belonging to a user allowed to change vulnerability status. No approval
+    arguments are accepted from the AI. Declining or cancelling writes nothing.
+    """
+    selected = _engine_for(repo_root)
+    snapshot = await asyncio.to_thread(selected.false_positive_candidates)
+    if snapshot["status"] != "OK":
+        return snapshot
+    candidates = snapshot["candidates"]
+    queue = snapshot["source_review_queue"]
+    if not candidates:
+        excluded = snapshot["excluded"]
+        already_dismissed = sum(
+            item["reason"] == "ALREADY_DISMISSED" for item in excluded
+        )
+        if excluded and already_dismissed == len(excluded):
+            status = "ALREADY_DISMISSED"
+            message = (
+                f"All {already_dismissed} findings were previously confirmed dismissed "
+                "in GitLab. No repeat approval is needed. No GitLab changes were made by this call."
+            )
+        elif queue["finding_count"]:
+            status = "SOURCE_REVIEW_REQUIRED"
+            message = (
+                f"{queue['finding_count']} SAST findings still require host AI code review. "
+                "Source excerpts were collected, but no false-positive conclusion can "
+                "be inferred from them. Follow source_review_queue, record evidence, "
+                "then request approval again. No GitLab changes were made by this call."
+            )
+        else:
+            status = "ASSESSMENT_REQUIRED"
+            message = (
+                "No eligible false-positive assessments to approve. "
+                f"{already_dismissed} findings were previously confirmed dismissed. "
+                "See excluded for each finding's blocker and next action. "
+                "No GitLab changes were made by this call."
+            )
+            if not excluded:
+                message = (
+                    "No findings are loaded. List and verify findings in this process "
+                    "before requesting approval. No GitLab changes were made by this call."
+                )
+        return {
+            "status": status,
+            "repo_root": str(selected.repo_root),
+            "results": [],
+            "excluded": excluded,
+            "source_review_queue": queue,
+            "message": message,
+        }
+    capabilities = ctx.session.client_capabilities
+    if (
+        capabilities is None
+        or capabilities.elicitation is None
+        or capabilities.elicitation.form is None
+    ):
+        return {
+            "status": "APPROVAL_UNAVAILABLE",
+            "reason": "This MCP host does not advertise form elicitation. No GitLab changes were made. Use a form-capable host or dismiss manually in GitLab.",
+            "source_review_queue": queue,
+        }
+    schema = create_model(
+        "FalsePositiveApprovals",
+        **{
+            f"finding_{index}": (
+                bool,
+                Field(
+                    default=False,
+                    strict=True,
+                    title=f"{item['id']}: {item['title']}",
+                    description=f"Location: {item['location']}\nDismiss as FALSE_POSITIVE with comment:\n{item['reason']}",
+                ),
+            )
+            for index, item in enumerate(candidates)
+        },
+    )
+    try:
+        response = await ctx.elicit(
+            f"Human approval required for {selected.repo_root} ({candidates[0]['project_path']}). "
+            "Select only the false positives you approve. Submit to immediately dismiss selected GitLab vulnerabilities with the displayed reasons. Unchecked findings stay unchanged.",
+            schema,
+        )
+    except ValueError as exc:
+        logger.warning("Invalid false-positive approval response: %s", exc)
+        return {
+            "status": "APPROVAL_INVALID",
+            "reason": str(exc),
+            "message": "No GitLab changes were made. Submit a valid human checkbox form.",
+        }
+    if response.action != "accept" or response.data is None:
+        return {
+            "status": "CANCELLED",
+            "results": [],
+            "message": "No GitLab changes were made.",
+        }
+    approvals = response.data.model_dump()
+    approved = [
+        item
+        for index, item in enumerate(candidates)
+        if approvals.get(f"finding_{index}") is True
+    ]
+    result = await asyncio.to_thread(selected.dismiss_false_positives, approved)
+    result["source_review_queue"] = queue
+    result["excluded"] = snapshot["excluded"]
+    return result
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Generate local report",
         read_only_hint=False,
         destructive_hint=False,
@@ -560,9 +838,11 @@ def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
     )
 )
 def generate_local_report(repo_root: str | None = None) -> CallToolResult:
-    """Write reports and display final_summary_markdown verbatim, not only paths.
+    """Write reports and display final_summary_markdown once, not only paths.
 
-    The final block contains unresolved issues, reasons and consulted security sites.
+    Every finding has an ID/location, decision and reason, including false positives.
+    The final block retains unresolved issues and consulted security sites. Do not
+    repeat rows or call this tool repeatedly just to present the same report.
     """
     result = _run("generate_local_report", repo_root=repo_root)
     return CallToolResult(

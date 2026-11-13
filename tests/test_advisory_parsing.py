@@ -13,6 +13,146 @@ from gitlab_security_mcp.versions import (
 FINDING = {"identifiers": ["CVE-2021-23337"], "title": "lodash"}
 
 
+@pytest.mark.parametrize("failure", [429, 503, "timeout"])
+def test_nvd_recovers_transient_failures_without_caching_them(failure, nvd_clock):
+    """Retry the archive's transient NVD failures and cache only a valid recovery."""
+    # Arrange
+    requests = []
+
+    def handler(request):
+        """Fail once, then return a complete record without external traffic."""
+        requests.append(request)
+        if len(requests) == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("fixture timeout", request=request)
+            return httpx.Response(failure, headers={"Retry-After": "9"})
+        return httpx.Response(
+            200, json={"vulnerabilities": [{"cve": {"id": "CVE-2021-23337"}}]}
+        )
+
+    errors, sources = [], []
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            # Act
+            result = client._nvd("CVE-2021-23337", errors, sources)
+            cached = client._nvd("CVE-2021-23337", errors, sources)
+
+    # Assert
+    assert result == cached == {"cve": {"id": "CVE-2021-23337"}}
+    assert errors == []
+    assert len(requests) == 2
+    assert sum(nvd_clock[1]) >= (6.1 if failure == "timeout" else 9)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 503])
+def test_nvd_failure_is_bounded_and_never_cached_as_success(status, nvd_clock):
+    """Keep outages unresolved and avoid retrying denied access or missing records."""
+    # Arrange
+    requests = []
+
+    def handler(request):
+        """Return the same persistent status for each actual attempt."""
+        requests.append(request)
+        return httpx.Response(status)
+
+    errors, sources = [], []
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            # Act
+            result = client._nvd("CVE-2021-23337", errors, sources)
+            cache = dict(client._cache)
+
+    # Assert
+    assert result is None
+    assert len(requests) == (3 if status in {429, 503} else 1)
+    assert bool(errors) is (status != 404)
+    assert sources == []
+    assert cache == (
+        {"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2021-23337": None}
+        if status == 404
+        else {}
+    )
+
+
+@pytest.mark.parametrize("key, minimum", [(None, 6), ("fixture-api-key", 0.6)])
+def test_nvd_rate_limit_is_shared_across_checkout_clients(nvd_clock, key, minimum):
+    """Respect NVD request spacing even when different repositories use separate clients."""
+    # Arrange
+    starts = []
+
+    def handler(request):
+        """Record virtual request start times instead of calling NVD."""
+        starts.append(nvd_clock[0][0])
+        return httpx.Response(200, json={"vulnerabilities": []})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with (
+            AdvisoryClient(http=http, nvd_api_key=key) as first,
+            AdvisoryClient(http=http, nvd_api_key=key) as second,
+        ):
+            # Act
+            first._nvd("CVE-2021-23337", [], [])
+            second._nvd("CVE-2021-23338", [], [])
+
+    # Assert
+    assert len(starts) == 2
+    assert starts[1] - starts[0] >= minimum
+
+
+def test_nvd_does_not_retry_before_a_long_server_cooldown(nvd_clock):
+    """Stop unresolved rather than ignoring Retry-After beyond the bounded wait."""
+    # Arrange
+    requests = []
+
+    def handler(request):
+        """Require a longer server cooldown than this tool call may wait."""
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "120"})
+
+    errors = []
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            # Act
+            result = client._nvd("CVE-2021-23337", errors, [])
+            next_result = client._nvd("CVE-2021-23338", errors, [])
+
+    # Assert
+    assert result is None
+    assert next_result is None
+    assert errors
+    assert len(requests) == 1
+    assert nvd_clock[1] == []
+
+
+def test_nvd_retry_honors_http_date_headers(nvd_clock):
+    """Translate a server's HTTP-date cooldown into the bounded retry clock."""
+    # Arrange
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    requests = []
+    after = format_datetime(datetime.now(UTC) + timedelta(seconds=20), usegmt=True)
+
+    def handler(request):
+        """Recover only after the supplied server retry date."""
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(503, headers={"Retry-After": after})
+        return httpx.Response(
+            200, json={"vulnerabilities": [{"cve": {"id": "CVE-2021-23337"}}]}
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            # Act
+            result = client._nvd("CVE-2021-23337", [], [])
+
+    # Assert
+    assert result is not None
+    assert len(requests) == 2
+    assert 18 <= sum(nvd_clock[1]) <= 20
+
+
 @pytest.mark.parametrize(
     "events, expected_fixed",
     [

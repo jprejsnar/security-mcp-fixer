@@ -1,6 +1,6 @@
 [project]
 name = "gitlab-security-mcp"
-version = "1.0.0"
+version = "1.0.7"
 description = "Local-only MCP server that verifies GitLab security findings and applies minimal fixes."
 readme = "README.md"
 requires-python = ">=3.11"

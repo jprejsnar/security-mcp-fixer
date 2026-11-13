@@ -48,6 +48,26 @@ def _finding(file_name, line, **extra):
     return finding
 
 
+def _review(engine, finding_id="config"):
+    """Provide explicit source-bound confirmation before testing documented edits."""
+    finding = next(item for item in engine.state.findings if item["id"] == finding_id)
+    path = engine.repo_root / finding["location"]["file"]
+    return {
+        "decision": "CONFIRMED_VULNERABILITY",
+        "reason": "The reviewed fixture's active configuration contains the reported insecure directive.",
+        "input_origin": "Reviewed the complete fixture configuration and its literal directive values.",
+        "finding_analysis": "The cited directive matches the fixture finding; its documented replacement addresses that directive.",
+        "reachability_analysis": "The fixture configuration is active and has no overriding include or runtime control.",
+        "reviewed_files": [
+            {
+                "path": finding["location"]["file"],
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "assessment": "Read the entire fixture and confirmed the reported configuration.",
+            }
+        ],
+    }
+
+
 def test_nginx_server_tokens_changes_only_the_cited_line(tmp_path):
     """Turn server_tokens off after the nginx module page still documents it."""
     # Arrange
@@ -64,7 +84,7 @@ def test_nginx_server_tokens_changes_only_the_cited_line(tmp_path):
     )
 
     # Act
-    decision = engine.verify_security_finding("config")
+    decision = engine.verify_security_finding("config", source_review=_review(engine))
     applied = engine.apply_minimal_fix("config")
     updated = (tmp_path / "nginx.conf").read_bytes()
 
@@ -79,6 +99,75 @@ def test_nginx_server_tokens_changes_only_the_cited_line(tmp_path):
         == b"events {}\r\nhttp {\r\n    server_tokens off;\r\n    server_tokens on;\r\n}\r\n"
     )
     assert "rewrite the file" not in updated.decode("utf-8")
+    assert (
+        engine.state.changes[0]["source_review"]["decision"]
+        == "CONFIRMED_VULNERABILITY"
+    )
+    assert engine.get_run_status()["source_review_queue"]["finding_count"] == 0
+    assert engine.apply_minimal_fix("config")["status"] == "VALIDATION_REQUIRED"
+
+
+@pytest.mark.parametrize("category", ["sast", "iac_scanning"])
+def test_documented_configuration_line_still_requires_ai_review(tmp_path, category):
+    """Do not treat a matching directive as sufficient proof of a real defect."""
+    # Arrange
+    text = "server_tokens on;\n"
+    engine = _ready(
+        tmp_path,
+        _finding("nginx.conf", 1, category=category),
+        documentation_client(),
+        "nginx.conf",
+        text,
+    )
+
+    # Act
+    result = engine.verify_security_finding("config")
+    applied = engine.apply_minimal_fix("config")
+
+    # Assert
+    assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert result["proposed_fix"] is None
+    assert applied["status"] == "SOURCE_REVIEW_REQUIRED"
+    assert (tmp_path / "nginx.conf").read_text(encoding="utf-8") == text
+
+
+def test_reviewed_configuration_cannot_be_edited_after_related_evidence_changes(
+    tmp_path,
+):
+    """Revalidate all reviewed configuration, not just the scanner-cited line."""
+    # Arrange
+    text = "server_tokens on;\n"
+    engine = _ready(
+        tmp_path,
+        _finding("nginx.conf", 1),
+        documentation_client({_NGINX_CORE: "Syntax server_tokens on | off"}),
+        "nginx.conf",
+        text,
+    )
+    included = tmp_path / "nginx" / "conf.d" / "site.conf"
+    included.parent.mkdir(parents=True)
+    included.write_text("autoindex off;\n", encoding="utf-8")
+    review = _review(engine)
+    review["reviewed_files"].append(
+        {
+            "path": "nginx/conf.d/site.conf",
+            "sha256": hashlib.sha256(included.read_bytes()).hexdigest(),
+            "assessment": "Reviewed the active included server configuration.",
+        }
+    )
+    assert (
+        engine.verify_security_finding("config", source_review=review)["decision"]
+        == "CHANGE_REQUIRED"
+    )
+    included.write_text("autoindex on;\n", encoding="utf-8")
+
+    # Act
+    applied = engine.apply_minimal_fix("config")
+
+    # Assert
+    assert applied["status"] == "SOURCE_REVIEW_REQUIRED"
+    assert (tmp_path / "nginx.conf").read_text(encoding="utf-8") == text
+    assert engine.state.changes == []
 
 
 def test_nginx_autoindex_and_obsolete_tls_follow_the_module_pages(tmp_path):
@@ -96,10 +185,10 @@ def test_nginx_autoindex_and_obsolete_tls_follow_the_module_pages(tmp_path):
     engine.state.findings.append(second)
 
     # Act
-    autoindex = engine.verify_security_finding("config")
+    autoindex = engine.verify_security_finding("config", source_review=_review(engine))
     applied_autoindex = engine.apply_minimal_fix("config")
     validated_autoindex = engine.run_validation_matrix()
-    tls = engine.verify_security_finding("tls")
+    tls = engine.verify_security_finding("tls", source_review=_review(engine, "tls"))
     applied_tls = engine.apply_minimal_fix("tls")
     updated = (tmp_path / "nginx.conf").read_text(encoding="utf-8")
 
@@ -120,7 +209,7 @@ def test_failed_configuration_fix_rolls_back_without_overwriting_later_edits(
     original = "server_tokens on;\n"
     docs = documentation_client({_NGINX_CORE: "Syntax server_tokens on | off"})
     engine = _ready(tmp_path, _finding("nginx.conf", 1), docs, "nginx.conf", original)
-    engine.verify_security_finding("config")
+    engine.verify_security_finding("config", source_review=_review(engine))
     applied = engine.apply_minimal_fix("config")
     path = tmp_path / "nginx.conf"
     if later_edit:
@@ -170,9 +259,11 @@ def test_gitlab_ci_reenables_only_the_cited_security_scanner(tmp_path):
     engine.state.findings.append(other)
 
     # Act
-    decision = engine.verify_security_finding("config")
+    decision = engine.verify_security_finding("config", source_review=_review(engine))
     applied = engine.apply_minimal_fix("config")
-    quality = engine.verify_security_finding("quality")
+    quality = engine.verify_security_finding(
+        "quality", source_review=_review(engine, "quality")
+    )
     updated = (tmp_path / ".gitlab-ci.yml").read_text(encoding="utf-8")
 
     # Assert
@@ -198,7 +289,7 @@ def test_dockerfile_finding_is_not_rewritten_without_a_documented_line(tmp_path)
     )
 
     # Act
-    decision = engine.verify_security_finding("config")
+    decision = engine.verify_security_finding("config", source_review=_review(engine))
 
     # Assert
     assert decision["decision"] == "MANUAL_REVIEW"
@@ -209,8 +300,8 @@ def test_dockerfile_finding_is_not_rewritten_without_a_documented_line(tmp_path)
     assert config_kind("nginx/conf.d/site.conf") == "nginx"
 
 
-def test_missing_nginx_file_is_a_false_positive_and_escape_is_not(tmp_path):
-    """Treat a missing config as absent and refuse a path outside the checkout."""
+def test_missing_or_outside_nginx_file_requires_evidence_not_a_false_positive(tmp_path):
+    """Keep missing and outside files unresolved instead of declaring safety."""
     # Arrange
     missing = _finding("nginx.conf", 1, id="missing")
     escaped = _finding("../nginx.conf", 1, id="escape")
@@ -229,9 +320,9 @@ def test_missing_nginx_file_is_a_false_positive_and_escape_is_not(tmp_path):
     outside = engine.verify_security_finding("escape")
 
     # Assert
-    assert absent["decision"] == "FALSE_POSITIVE"
-    assert outside["decision"] == "MANUAL_REVIEW"
-    assert "outside the repository" in outside["reason"]
+    assert absent["decision"] == outside["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert "not an existing file inside the checkout" in outside["reason"]
+    assert engine.state.false_positives == []
 
 
 @pytest.mark.parametrize("status", [404, 503])
@@ -255,7 +346,7 @@ def test_missing_security_reference_pages_do_not_block_code_edits(tmp_path, stat
 
     # Act
     review = docs.read_before_fix(finding)
-    decision = engine.verify_security_finding("config")
+    decision = engine.verify_security_finding("config", source_review=_review(engine))
     applied = engine.apply_minimal_fix("config")
 
     # Assert
@@ -285,7 +376,7 @@ def test_incomplete_documentation_blocks_the_configuration_edit(tmp_path):
     engine = _ready(tmp_path, _finding("nginx.conf", 1), docs, "nginx.conf", text)
 
     # Act
-    decision = engine.verify_security_finding("config")
+    decision = engine.verify_security_finding("config", source_review=_review(engine))
 
     # Assert
     assert decision["decision"] == "MANUAL_REVIEW"
@@ -328,7 +419,12 @@ def test_apply_reads_documentation_again_before_writing(tmp_path):
             """Injected clients do not own a connection."""
 
     engine = _ready(tmp_path, _finding("nginx.conf", 1), Once(), "nginx.conf", text)
-    assert engine.verify_security_finding("config")["decision"] == "CHANGE_REQUIRED"
+    assert (
+        engine.verify_security_finding("config", source_review=_review(engine))[
+            "decision"
+        ]
+        == "CHANGE_REQUIRED"
+    )
 
     # Act
     applied = engine.apply_minimal_fix("config")

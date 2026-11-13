@@ -5,15 +5,15 @@ It retrieves active findings, verifies installed dependencies against public
 advisories, qualifies compatible package updates, applies supported minimal edits,
 and produces local Markdown and JSON reports.
 
-The MCP host starts this Python process and calls its eleven tools over stdio.
+The MCP host starts this Python process and calls its twelve tools over stdio.
 One process can hold several application checkouts at once. Each checkout keeps
 its own run, and later calls select it with `repo_root` when more than one is
 active. There is no HTTP listener. "Local" describes execution and where edits
 are kept, not offline operation: GitLab, advisory, and publisher-page reads,
 Git pulls, and product checks can use the network. Before every edit the server
 reads the current required publisher pages. It does not commit, push, open merge
-requests, dismiss findings, or write to the GitLab security API. You review and
-publish changes.
+requests, or publish code changes. GitLab findings remain read-only except for
+the optional human-approved false-positive dismissal flow described below.
 
 ## Contents
 
@@ -111,7 +111,7 @@ runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
-  launcher["Root server.py: source launcher"] --> tools["Package server.py: eleven MCP tools and error boundary"]
+  launcher["Root server.py: source launcher"] --> tools["Package server.py: twelve MCP tools and error boundary"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Host progress display, with stderr fallback"]
   tools --> registry["Checkout registry: one engine per resolved path"]
@@ -175,7 +175,7 @@ safe fix are recorded and may be followed by other eligible findings.
 
 ```mermaid
 flowchart TD
-  startRun["Host starts or selects one checkout run"] --> prechecks["run_prechecks repo_root: clean main and no Git operation in progress"]
+  startRun["Host starts or selects one checkout run"] --> prechecks["run_prechecks repo_root: clean main or today's security branch; no Git operation in progress"]
   prechecks --> precheckGate{"Prechecks passed?"}
   precheckGate -->|"No"| stopRun["Stop that checkout and report the failure"]
   precheckGate -->|"Yes"| pulls["pull_main_twice: git pull --ff-only twice"]
@@ -188,7 +188,7 @@ flowchart TD
   cleanGate -->|"Yes"| install["pnpm install in the same directory"]
   install --> installGate{"Every preparation command succeeded?"}
   installGate -->|"No: PREPARATION_FAILED"| stopRun
-  installGate -->|"Yes"| branch["create_security_branch: dated name must be unused locally and on origin"]
+  installGate -->|"Yes"| branch["create_security_branch: create or safely reuse today's exact dated branch"]
   pnpmGate -->|"No: preparation not applicable"| branch
   branch --> branchGate{"Branch created?"}
   branchGate -->|"No"| stopRun
@@ -235,9 +235,9 @@ checkout is active.
 
 | Tool | Responsibility and gate |
 | --- | --- |
-| `run_prechecks(repo_root=None)` | Select the absolute application checkout; require clean `main`; reject merge, rebase, cherry-pick, revert or bisect in progress. |
-| `pull_main_twice(repo_root=None)` | Require successful prechecks; perform two fast-forward-only pulls, then `pnpm clean` followed by `pnpm install` in each pnpm project/workspace root before any security checks. Any failure stops the run. |
-| `create_security_branch(repo_root=None)` | Require successful pulls; create `security-fixes-Month-dd-YYYY`, for example `security-fixes-November-03-2026`. |
+| `run_prechecks(repo_root=None)` | Require clean `main` or today's exact security branch; reject Git operations in progress. Prior runtime errors block same-day reuse without overwriting the previous snapshot. |
+| `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. For a new branch, run pnpm clean/install afterward; for a reused branch, defer preparation until its checkout. |
+| `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None)` | Record evidence, decision, proposed plan, and any review prompt. Config proposals also record the publisher pages read for that rule. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
@@ -246,6 +246,35 @@ checkout is active.
 | `run_validation_matrix(repo_root=None)` | Validate the complete batch once. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
 | `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
+
+### Reusing today's security branch
+
+Only the exact branch name matching the server's current local date is reused.
+An existing local branch is checked out without force; an origin-only branch is
+fetched and checked out with its upstream. A clean checkout is required. Starting
+on today's branch temporarily checks out `main` for the two fast-forward pulls;
+the existing branch's commits are not reset, merged, rebased or overwritten.
+Dependency preparation then runs on the reused branch's manifests.
+
+Before any old snapshot is overwritten, all `.log`/`.jsonl` files under
+`.security-mcp` are checked for nonzero command exits, failed HTTP requests,
+timeouts, exception tracebacks and error-level output. Prior failed/incomplete
+run states and uncertain GitLab dismissal outcomes also block cleanup. Expected
+advisory 404 misses and prose such as "0 errors" are not runtime failures.
+Malformed/unreadable logs, links/reparse points, or artifacts changing during
+review are blockers, never proof that the run was clean.
+
+If errors are found, the run stops and preserves prior artifacts. Resolve the
+reported failures and manually archive the reviewed error logs outside
+`.security-mcp` before retrying; the server does not erase failure evidence.
+If clean, branch creation removes only generated **untracked/ignored** audit/HTTP
+logs, command stdout/stderr logs, run state, lint outputs and generated remediation
+reports. Git-tracked/staged files, policies, configuration, unknown files, and
+unrelated untracked work are never deleted. Cleanup unlinks individual files;
+it never runs `git clean` or recursively deletes the metadata root.
+
+The new run starts fresh: it retrieves and re-verifies findings instead of loading
+old assessments or approvals. New logs/state are written as the run continues.
 
 ### GitLab report filters
 
@@ -279,7 +308,7 @@ because its identifier was present.
 
 Unknown reachability is not treated as a false positive. Secret detection and DAST findings are reported for you to handle. They are not rewritten. SAST findings are not patched by guessing at source changes.
 
-A cited nginx or GitLab CI line can change only when the current line still matches the plan and the live publisher page still contains the documented phrase. Supported line edits are `server_tokens on` to `off`, `autoindex on` to `off`, removal of `TLSv1` and `TLSv1.1` from `ssl_protocols` when `TLSv1.2` or `TLSv1.3` remains, and these GitLab CI variables when set to `true`, `1`, or `yes`: `SAST_DISABLED`, `DEPENDENCY_SCANNING_DISABLED`, `CONTAINER_SCANNING_DISABLED`, `SECRET_DETECTION_DISABLED`, and `DAST_DISABLED`. The replacement is `"false"`. `CODE_QUALITY_DISABLED` is left unchanged. Comments and unmatched lines stay on manual review. A missing configuration file can be a false positive. A path outside the checkout cannot.
+A cited nginx or GitLab CI line can change only after a source-bound AI review confirms the finding, the current line still matches the plan, and the live publisher page still contains the documented phrase. Supported line edits are `server_tokens on` to `off`, `autoindex on` to `off`, removal of `TLSv1` and `TLSv1.1` from `ssl_protocols` when `TLSv1.2` or `TLSv1.3` remains, and these GitLab CI variables when set to `true`, `1`, or `yes`: `SAST_DISABLED`, `DEPENDENCY_SCANNING_DISABLED`, `CONTAINER_SCANNING_DISABLED`, `SECRET_DETECTION_DISABLED`, and `DAST_DISABLED`. The replacement is `"false"`. `CODE_QUALITY_DISABLED` is left unchanged. Comments and unmatched lines stay on manual review. Missing configuration files and paths outside the checkout remain unresolved; neither establishes a false positive.
 
 Container-scanning Dockerfile findings stay on the image-tag path. Other Dockerfile lines, including `USER root`, are not rewritten unless a later rule names one documented one-line edit. The current Docker reference does not authorize an automatic `ADD` to `COPY` change.
 
@@ -288,7 +317,109 @@ Container-scanning Dockerfile findings stay on the image-tag path. Other Dockerf
 The command runner allows specific argument forms, not arbitrary shell commands.
 Direct `git add`, `commit`, `push`, `merge`, `rebase`, `reset`, and unrelated
 branch checkouts are rejected. Allowed Git mutations are the fast-forward pulls
-and creation of the dated security branch. GitLab calls retrieve data only.
+and creation of the dated security branch. GitLab calls retrieve data only,
+except `review_false_positives`, which requires explicit human checkbox approval
+before dismissing selected vulnerabilities with their recorded reasons.
+
+### Approving false positives in Finding Assessments
+
+After verification, the host workflow is instructed to call
+`review_false_positives(repo_root=...)` for eligible false positives before the
+final report, offering optional human approval without requiring a second request.
+If the host omits that step, explicitly ask it to run the tool. Reports expose
+`false_positive_approval` separately from source `review_status`: `COMPLETE`
+means the source-review queue is empty, not that GitLab findings were dismissed.
+Pending approval is highlighted before the assessment table with the count of
+local false positives lacking a confirmed dismissal.
+In hosts supporting **MCP form elicitation**, it displays one initially unchecked
+boolean/checkbox per eligible false-positive assessment, including finding ID,
+location and exact reason. Select the findings you approve and submit the form.
+Submission immediately dismisses only selected findings in GitLab with
+`dismissalReason: FALSE_POSITIVE` and the displayed reason as `comment`, using
+[`vulnerabilityDismiss`](https://docs.gitlab.com/api/graphql/reference/mutations/#vulnerabilitydismiss).
+The host controls the exact form appearance. Only the human should answer it;
+the AI must never synthesize approvals.
+
+Declining, cancelling, or leaving all boxes unchecked makes no remote changes.
+Hosts without advertised form support return `APPROVAL_UNAVAILABLE`; use a
+form-capable host or the GitLab UI. Static Markdown report checkboxes cannot
+execute API calls. The tool accepts no AI-supplied approval list.
+
+If all findings were previously confirmed dismissed, the tool returns
+`ALREADY_DISMISSED` instead of opening another form. Otherwise an empty approval
+list returns `ASSESSMENT_REQUIRED`, with each excluded finding's blocker and next
+action (missing assessment, invalid reason, or missing GitLab vulnerability ID).
+These responses make no new GitLab changes; they do not recheck remote status.
+
+For source/configuration SAST and IaC, reading the cited excerpt is only evidence collection, not a verdict.
+`SOURCE_REVIEW_REQUIRED` returns a `source_review_queue`, grouped by file, through
+the approval tool, run status, and reports. The host AI must read the source and
+relevant callers/configuration, assess each finding separately, and call
+`verify_security_finding` with `source_review` before asking for dismissal approval.
+Reports explicitly mark unfinished source review rather than implying all findings
+were fully assessed.
+
+`verify_security_finding` now requests an AI source review through the connected
+host's MCP **sampling** capability when available. It supplies the complete cited
+source, not just an excerpt. The AI can request bounded source/configuration reads,
+file discovery, and literal searches to trace callers, inputs and controls. The
+server validates that reviewed files were actually supplied in full and checks
+their hashes again before recording the conclusion. No separate AI account, API
+key, provider endpoint, or autonomous GitLab dismissal is added. Host permission
+and model selection remain controlled by VS Code/Cursor.
+Sampling is optional and deprecated in the installed MCP SDK; it is used only
+when the host advertises it. The calling-AI path below remains necessary for hosts
+without that capability.
+
+If the host does not advertise sampling, `ai_source_review.status` is
+`HOST_REVIEW_REQUIRED`: the calling Copilot/Cursor AI receives the full cited
+source and must finish the code/input-flow analysis with its own code tools, then
+submit `source_review` in the same workflow. This is unfinished AI work, not a
+request for the user to analyze code. Denied/failed requests, missing/oversized
+files, invalid results, or changed source stay unresolved with an explicit reason.
+Automatic sampling uses at most 12 AI requests and 256,000 bytes of complete-file
+evidence per finding, with a 180-second review timeout. Searches are bounded and
+mark incomplete results; they never prove absence. The Python server does not
+contain an independent language model, and AI assessments are not formal proofs.
+
+The same evidence-bound review supports Java, .NET/C#, TypeScript/Node.js,
+JavaScript, Python, Dockerfiles (including named variants), and nginx
+configurations (including recognized include files). The connected AI examines
+actual local files, not just scanner descriptions. For nginx it must consider
+includes, inheritance and the active server/location; for Dockerfiles, build
+stages, the final image and runtime controls. Matching a directive does not
+bypass AI review. A confirmed configuration defect may retain a supported
+documented one-line fix; all reviewed hashes are rechecked before editing.
+Its pre-fix review is archived with the applied change, not treated as a verdict
+about the modified file. Container image/package advisories retain their
+existing dependency-verification path; secrets, DAST and findings lacking
+sufficient evidence stay unresolved rather than receiving invented verdicts.
+
+Source reviews accept `FALSE_POSITIVE`, `CONFIRMED_VULNERABILITY`, or `MANUAL_REVIEW`,
+with `reason`, `input_origin`, rule-specific `finding_analysis`, `reachability_analysis`,
+and `reviewed_files` containing `path`, full-byte `sha256`, and `assessment`.
+Legacy `pattern_analysis` remains supported for regex reviews. Only evidenced
+`FALSE_POSITIVE` outcomes can enter the checkbox form; confirmed defects and
+uncertainty stay unresolved. Changed reviewed files invalidate all source-review
+outcomes. An endpoint listing, scanner flag, missing advisory, or Unicode operation
+alone never establishes a false positive.
+
+`GITLAB_TOKEN` must have `api` scope and belong to a user permitted to change
+vulnerability status; read-only tokens cannot dismiss findings. Never place
+tokens in reports or form fields. Retrieval and assessment never dismiss
+findings on their own. Restart/reconnect the MCP server after installing this
+update, and list/verify findings in that process: old snapshots are not reloaded.
+
+Before writing, the server rechecks source-review hashes, rejects assessments
+changed while the form was open, and checks the remote vulnerability global ID,
+finding UUID, project and active state. It records each pending attempt before
+the request and each result afterward in the run snapshot. Requests are not
+retried automatically. Partial failures are returned per finding, and a lost
+response may leave the remote outcome unknown: inspect GitLab before retrying.
+Confirmed dismissals are excluded from later approval forms in the same run.
+Regenerate the report after approval to include `gitlab_dismissals` and the
+confirmed/failed outcomes. Source changes can retract a local assessment but
+do not automatically reopen a previously dismissed GitLab vulnerability.
 
 The allowlist is **not an operating-system sandbox**. Product scripts, package
 installation hooks, and repository wrappers can execute their own code and use
@@ -308,6 +439,24 @@ that directory. They are local inspection artifacts, not approval credentials
 or proof that GitLab considers a finding resolved.
 
 ### Robustness
+
+NVD requests share a process-wide rate limiter across checkouts: at least 6.1
+seconds between anonymous requests, or 0.61 seconds for requests using
+`NVD_API_KEY`, reflecting [NVD's published API limits](https://nvd.nist.gov/developers/start-here).
+Transient timeouts, connection failures and HTTP 429/500/502/503/504 responses
+receive at most three total attempts with backoff and `Retry-After` support
+(seconds or HTTP date). A server cooldown longer than 60 seconds is reported
+explicitly and blocks further NVD requests until it can be honored; it is not
+silently ignored. Pacing is visible in progress output. Successful records and
+ordinary 404 misses are cached; failed reads are not cached as valid evidence.
+Persistent outages remain unresolved unless an independently verified GitLab
+target can proceed through the normal qualification/validation gates.
+
+GitLab Maven package names in either `group:artifact` or `group/artifact`
+format are matched to canonical Maven/Gradle coordinates, including version
+catalogs. Artifact names from a different group are not treated as a match.
+Packages that are genuinely absent or only transitively referenced still need
+dependency-tree evidence; coordinate normalization does not invent a local match.
 
 Each checkout's tools are serialized with that engine's lock. Two checkouts in
 the same process do not share that lock. Shutdown copies the registry, then
@@ -778,7 +927,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.0-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.7-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -809,12 +958,38 @@ global Python installation cannot select the wrong server.
 
 ### Installing a built wheel
 
+**Windows upgrades:** close **all instances of VS Code and Cursor**, including
+Agents/background windows, before installing. Use a standalone PowerShell window.
+A running `gitlab-security-mcp.exe` is locked by Windows (`WinError 32`); the
+executable cannot intercept an external pip install to shut itself down.
+
+Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside the
+wheel and run it instead of the raw pip command:
+
+```powershell
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.7-py3-none-any.whl"
+```
+
+The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
+if needed, and checks for a locked launcher **before** pip can alter the
+installation. A lock produces the explicit close-all-windows message; the helper
+never kills applications or server processes. It reinstalls the package to repair
+an interrupted upgrade and checks dependencies. Use `-InstallDirectory` for a
+different environment, or `-WhatIf` for a preflight-only preview.
+Follow your organization's execution policy for downloaded scripts.
+
+`Ignoring invalid distribution ~itlab-security-mcp` indicates temporary package
+directories left by an interrupted pip operation, not a finding or MCP error.
+The helper reports any remaining exact paths without deleting recovery files.
+The notice about a newer pip release is informational and does not cause the lock.
+Direct pip commands do not run this precheck and retain pip's own error messages.
+
 For an installed-package deployment, first create the virtual environment and
 install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.0-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.7-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -823,7 +998,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.0-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.7-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -859,8 +1034,8 @@ MCP messages; the server does not open a port.
 
 ### VS Code
 
-Add the following to the target project's `.vscode/mcp.json`. Replace both local
-paths and `group/project`. The password input keeps the token out of the JSON
+Add the following to the target project's `.vscode/mcp.json`. Replace the local
+paths. The project is inferred from that checkout's Git origin. The password input keeps the token out of the JSON
 example; enter it through VS Code's input prompt, not through agent chat. Keep
 actual credential storage consistent with your organization's policy.
 
@@ -873,7 +1048,6 @@ actual credential storage consistent with your organization's policy.
       "args": ["C:\\path\\to\\security-mcp-fixer\\server.py"],
       "env": {
         "GITLAB_TOKEN": "${input:gitlabToken}",
-        "GITLAB_PROJECT_ID": "group/project",
         "REPO_ROOT": "C:\\path\\to\\application-repo"
       }
     }
@@ -912,7 +1086,6 @@ or use an uncommitted user configuration according to corporate policy.
         "C:\\path\\to\\security-mcp-fixer\\server.py"
       ],
       "env": {
-        "GITLAB_PROJECT_ID": "group/project",
         "GITLAB_API_URL": "https://gitlab.com/api/v4",
         "REPO_ROOT": "C:\\path\\to\\the\\repo\\to\\fix"
       }
@@ -930,7 +1103,6 @@ or use an uncommitted user configuration according to corporate policy.
       "command": "/path/to/security-mcp-fixer/.venv/bin/python",
       "args": ["/path/to/security-mcp-fixer/server.py"],
       "env": {
-        "GITLAB_PROJECT_ID": "group/project",
         "GITLAB_API_URL": "https://gitlab.com/api/v4",
         "REPO_ROOT": "/path/to/the/repo/to/fix"
       }
@@ -982,7 +1154,7 @@ requirements into the configured virtual environment before restarting.
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `GITLAB_TOKEN` | yes | Personal access token. `GITLAB_PERSONAL_ACCESS_TOKEN` is also accepted. |
-| `GITLAB_PROJECT_ID` | yes | Path such as `group/project`, or a numeric id. |
+| `GITLAB_PROJECT_ID` | no | Optional fixed project override: `group/project` or a numeric ID. Leave unset to select the project from each checkout's Git origin. |
 | `REPO_ROOT` | set explicitly in the host | Absolute path of the git repo to remediate. Defaults to the process working directory. |
 | `GITLAB_API_URL` | no | REST base URL. Defaults to `https://gitlab.com/api/v4`. GraphQL is derived from it. |
 | `GITHUB_TOKEN` or `GH_TOKEN` | no | Raises the GitHub Advisory rate limit. |
@@ -991,6 +1163,31 @@ requirements into the configured virtual environment before restarting.
 | `PACKAGE_UPDATE_POLICY` | optional | Enforce corporate exact-version approvals and checks at this absolute path. Existing default `.security-mcp/package-update-policy.json` also enables enforcement. If neither exists, use documented license review and lint/build/unit checks. |
 
 For a self-hosted GitLab instance, set `GITLAB_API_URL` to `https://gitlab.example.com/api/v4`.
+
+### Automatic per-repository project selection
+
+- Remove any old `GITLAB_PROJECT_ID` setting once, then restart the MCP server.
+- Have the agent pass the active checkout's absolute `repo_root` on tool calls.
+  This overrides a fixed `REPO_ROOT`; no configuration edits are needed when
+  switching checkouts.
+- The server uses `git remote get-url --all origin`, not direct `.git/config`
+  parsing. Linked worktrees, submodules, config includes and Git URL rewrites
+  are supported. HTTPS and SSH origins can include nested subgroups.
+- Git metadata normally contains the namespace/project path, **not the numeric
+  GitLab project ID**. GitLab accepts the path directly, so no numeric ID entry
+  or extra project-ID lookup is needed.
+- Configure your token separately, and configure the trusted `GITLAB_API_URL`
+  once for self-hosted GitLab. Origin must match that host; HTTPS origins must
+  also match the scheme, port and any installation prefix, such as `/gitlab`.
+  SSH transport ports may differ; SSH host aliases must use a canonical host
+  or an explicit project override. Git metadata cannot redirect the API token.
+- Missing, local-file, unsupported, mismatched or multiple origin URLs return an
+  actionable error rather than selecting a different repository. No credentials
+  are inferred from Git URLs or credential stores.
+- Selection precedence is the tool's explicit `project_id`, then
+  `GITLAB_PROJECT_ID`, then the selected checkout's origin. Explicit overrides
+  intentionally bypass origin discovery; do not retain a fixed project setting
+  if you want automatic selection across repositories.
 
 Use the server's actual process environment, not only a terminal opened after
 the host started. GitLab credentials are required for retrieval; startup alone
@@ -1055,6 +1252,16 @@ review, lint/policy checks, official documentation, application, and post-update
 validation. Tool start/finish messages include the outcome and elapsed time;
 unexpected exceptions produce a failure message. The host AI's own reasoning
 and browsing between tool calls are not visible to this server.
+
+Finding updates include per-severity positions, for example
+`Processing 5 of 21 criticals`. Criticals, highs, mediums, lows and infos are
+counted separately in the order distinct findings are first processed, not their
+position in the retrieved list. Repeated steps and source-review retries retain
+the finding's original position. Counts are scoped to the checkout and reset on
+a successful fresh finding list. They indicate processing position, not completed
+remediation; totals describe retrieved findings and may be partial when retrieval
+is flagged as truncated. These messages appear in the Windows progress console,
+stderr, MCP notifications and returned progress transcripts.
 
 Long commands also emit live text bars through MCP `notifications/progress`
 when the client supplies a progress token, with the same command messages on
@@ -1163,7 +1370,8 @@ Example output-review request:
 Show the report paths and validation status. Display unresolved_issues_table
 from generate_local_report verbatim at the end of your response. Include
 pending package updates, failed/incomplete required checks and unverified
-findings. Do not claim GitLab findings were changed, and do not commit or push.
+findings. Claim GitLab findings were changed only for confirmed human-approved
+dismissals in gitlab_dismissals, and do not commit or push.
 ```
 
 For startup or transport failures, inspect Cursor's MCP connection details/log
@@ -1173,6 +1381,13 @@ debugging to the server's protocol stdout. Audit output hashes are not raw
 command transcripts, and absence of an audit record does not prove a fix passed.
 
 ## Run gitlab-security on this repo
+
+Connect to corporate VPN first. Before any precheck work, before each Git pull,
+and before pnpm clean/install preparation, the server requires DNS resolution of
+`nexus.ert.com`. If DNS fails, it stops and tells you to connect to corporate VPN
+first; reconnect and rerun `run_prechecks`. DNS resolution is a prerequisite,
+not proof that VPN, Nexus authentication, or downloads are working. Earlier
+successful pulls are not undone if DNS subsequently fails.
 
 1. Open the application repository you want to scan in your MCP-enabled editor.
 2. Configure and enable the `gitlab-security` MCP server and its tools using
@@ -1255,7 +1470,8 @@ If validation returns FIX_REJECTED with continue_with_next_finding true,
 all candidates were rejected and the baseline proved green. Otherwise
 stop on run-level failures, incomplete validation or unsafe rollback. Retain finding-level
 manual-review and no-safe-fix reasons; continue only with eligible findings.
-Do not commit, push, dismiss findings, or claim pending edits are resolved.
+Do not commit, push, or claim pending edits are resolved. Dismiss false positives
+only through review_false_positives with explicit human checkbox approval.
 ```
 
 ### Reports and local artifacts
@@ -1281,7 +1497,10 @@ The report includes these review categories:
 
 Those skipped findings are also returned by `verify_security_finding` and `apply_minimal_fix` as `MANUAL_REVIEW` / `SKIPPED_USER_PROMPT`. Tell the agent how you want them handled. The server uses an explicit, locally matched GitLab recommendation when public advisory metadata is incomplete, but does not guess a version when neither GitLab nor public advisories supply one.
 
-The final report block starts with an **Unresolved Security Issues** table: severity, package,
+The final report block starts with **Finding Assessments**: every unique finding's
+ID, source location, decision and reason, including evidence-backed false positives
+and unverified findings. This prevents identical titles from becoming indistinguishable
+rows. It ends with an **Unresolved Security Issues** table: severity, package,
 installed version, issue identifiers/title, the reason no package or code
 update was applied, and **Security Validation Sites**. The new column lists
 distinct URLs for advisory/security-reference and publisher sites actually
@@ -1295,7 +1514,7 @@ awaiting validation. Rejected fixes include the failed check and rollback reason
 result returns the complete `final_summary_markdown` as literal MCP text, not
 an escaped field inside JSON. Machine-readable structured content retains
 `unresolved_issues`, `final_summary_markdown`, batch isolation evidence and report paths.
-The host must reproduce the tool text at the end of its final assistant response;
+The host must reproduce the tool text once at the end of its final assistant response;
 it must not replace the text with a report link. The `unresolved_issues_table`
 field contains only the security table and must be displayed in full. Unverified findings remain
 listed separately; they are not assumed to be resolved or unfixable.
@@ -1304,7 +1523,35 @@ Report generation is not a validation gate: `REPORT_GENERATED` does not mean
 `VALIDATION_COMPLETE`. Inspect the saved validation status and per-package
 qualification evidence. Later source or policy changes retract validated
 package results when status/report is refreshed. GitLab findings stay unchanged
-until your normal publication and scanning process updates them.
+unless the human approves false-positive dismissal through
+`review_false_positives`, or your normal publication/scanning process updates them.
+
+### Source SAST findings
+
+Source-code findings such as **Regular expression with non-literal value** are
+not package-advisory findings. `verify_security_finding` returns
+`SOURCE_REVIEW_REQUIRED` with `source_workflow`, the cited source excerpt and
+its full-byte SHA256. The host must read that source and trace configuration,
+callers, mutation paths and possible untrusted inputs. Neither a test filename,
+missing source nor missing CVE proves safety.
+
+For a proven false positive, call `verify_security_finding` again with
+`source_review` containing `decision: "FALSE_POSITIVE"`, `reason`, `input_origin`,
+`pattern_analysis`, `reachability_analysis`, and `reviewed_files` entries with
+`path`, current full-byte `sha256`, and `assessment`. Include the cited source
+and every configuration/caller file relied on. The server validates file
+boundaries, hashes and review completeness; the reasoning remains an audited
+host attestation, not automatic data-flow proof. Status/report refresh retracts
+false positives if reviewed files change. These decisions alone do not dismiss
+GitLab findings; the separate human approval form is required.
+
+For a reproduced defect, the host applies a scoped source fix and regression
+test separately from package updates, then runs the same reproduction, boundary
+cases, lint, production build and all unit tests. `apply_minimal_fix` does not
+rewrite arbitrary source code. Do not blanket-escape intentional regular
+expressions or replace test assertions merely to remove a scanner warning.
+Unreviewed source findings remain unresolved with an actionable reason in the
+summary, not a misleading package-advisory failure.
 
 ## Supported fixes
 
@@ -1483,9 +1730,9 @@ for deployment and restart differences.
 | Server does not start | Check absolute launcher/Python paths, installed runtime dependencies, and host logs. Stdout must contain only MCP messages. |
 | Retrieval fails or tracked main is unavailable | Check token scope/access, exact project path, GitLab URL and tracked branch. Do not use an unfiltered fallback. |
 | `truncated: true` | Treat retrieval/discovery as incomplete; do not claim all findings or absent packages were verified. |
-| `PRECHECK_FAILED` | Return to clean `main` and finish Git operations manually. The MCP does not discard your work. |
+| `PRECHECK_FAILED` | Use clean `main` or today's exact security branch and finish Git operations manually. If prior logs block reuse, resolve and archive their errors first. The MCP does not discard your work. |
 | `PREPARATION_FAILED` | Inspect post-pull `pnpm clean` / `pnpm install` results and full command logs. Provide the repository's existing clean script and pnpm on PATH; resolve failures before security checks. Do not invent a clean script or delete directories as a workaround. |
-| Dated branch already exists | Review, rename or remove it manually; the server refuses to reuse another run's branch name. |
+| Dated branch already exists | Today's exact branch is reused after error-free log review and guarded cleanup; other dated branches are not reused. Runtime errors preserve artifacts and stop the run. |
 | `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability, a package-name mismatch, or an undocumented configuration line does not prove a false positive. |
 | `DOCS_REQUIRED` | The required publisher pages were not read completely. Nothing was written. Retry when those pages can be fetched. Do not apply the edit from memory. |
 | More than one repository is active | Pass `repo_root` on every tool call. Omitting it is valid only while one checkout is active. |
@@ -1495,3 +1742,5 @@ for deployment and restart differences.
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
+| Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |
+| `SOURCE_REVIEW_REQUIRED` | Read `source_workflow`, trace the cited source and input origins, and supply source-bound review evidence or reproduce/fix/validate the source defect. Missing advisories are not a SAST disposition. |

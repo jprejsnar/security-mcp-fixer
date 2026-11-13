@@ -37,6 +37,8 @@ class RunState:
     lint_baseline: dict | None = None
     manual_cleanup_required: bool = False
     batch_isolation: list[dict] = field(default_factory=list)
+    gitlab_project_path: str | None = None
+    gitlab_dismissals: list[dict] = field(default_factory=list)
 
     def save(self, repo_root: Path) -> None:
         """Write ``.security-mcp/run-state.json`` without leaving a half-written file."""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from gitlab_security_mcp.source_findings import pending_source_reviews
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import atomic_write_text
 
@@ -13,6 +14,17 @@ def _table_cell(value: object) -> str:
     """Escape pipes and line breaks so evidence stays in one table cell."""
     return " ".join(str(value if value is not None else "N/A").splitlines()).replace(
         "|", "\\|"
+    )
+
+
+def _finding_label(finding: dict) -> str:
+    """Keep same-title findings distinct by identifier and scanner location."""
+    location = finding.get("location") or {}
+    source = location.get("file") or location.get("path")
+    if source and location.get("startLine"):
+        source = f"{source}:{location['startLine']}"
+    return f"{finding.get('id')}: {finding.get('title') or 'Untitled finding'}" + (
+        f" ({source})" if source else ""
     )
 
 
@@ -53,7 +65,14 @@ def _unresolved_issues(state: RunState) -> list[dict]:
             or qualification.get("status") == "REJECTED"
         )
         if (
-            decision not in {"NO_SAFE_FIX", "MANUAL_REVIEW", "REPRODUCTION_REQUIRED"}
+            decision
+            not in {
+                "NO_SAFE_FIX",
+                "MANUAL_REVIEW",
+                "REPRODUCTION_REQUIRED",
+                "SOURCE_REVIEW_REQUIRED",
+                "CONFIRMED_VULNERABILITY",
+            }
             and finding_id not in reasons
             and not failed
             and not pending
@@ -98,6 +117,30 @@ def render(
     index state is unknown instead of claiming that nothing is staged.
     """
     cached_empty = None if staged is None else staged == []
+    review_queue = pending_source_reviews(state.findings, state.decisions)
+    assessed_false_positives = {
+        finding["id"]
+        for finding in state.findings
+        if state.decisions.get(finding["id"], {}).get("decision") == "FALSE_POSITIVE"
+    }
+    dismissed = {
+        item["id"]
+        for item in state.gitlab_dismissals
+        if item.get("status") == "DISMISSED"
+    }
+    pending_dismissals = assessed_false_positives - dismissed
+    dismissal_review = {
+        "status": "PENDING_HUMAN_REVIEW" if pending_dismissals else "NONE_PENDING",
+        "assessed_false_positives": len(assessed_false_positives),
+        "previously_confirmed_dismissals": len(assessed_false_positives & dismissed),
+        "not_confirmed_dismissed": len(pending_dismissals),
+        "next_tool": "review_false_positives" if pending_dismissals else None,
+    }
+    approval_notice = (
+        f"{len(pending_dismissals)} locally assessed false positives have no confirmed GitLab dismissal. "
+        "Call review_false_positives to present the unchecked human approval form. "
+        "Local assessment is not dismissal; only the human can approve remote changes."
+    )
     unverified = [
         item.get("id")
         for item in state.findings
@@ -125,7 +168,8 @@ def render(
             for identifier in item["identifiers"]
             if identifier.upper().startswith(("CVE-", "GHSA-"))
         )
-        issue = f"{identifiers}: {item['title']}" if identifiers else item["title"]
+        label = _finding_label(item)
+        issue = f"{identifiers}: {label}" if identifiers else label
         cells = [
             item["severity"],
             item["component"],
@@ -142,12 +186,70 @@ def render(
         if unresolved
         else "No verified findings are currently recorded as unresolved. Unverified findings, if any, are listed above."
     )
+    unresolved_by_id = {item["id"]: item for item in unresolved}
+    false_positives_by_id = {item["id"]: item for item in state.false_positives}
+    latest_changes = {
+        item.get("finding_id"): item
+        for item in state.changes
+        if item.get("status") != "TEST_ADDED"
+    }
+    assessments = []
+    seen = set()
+    for finding in state.findings:
+        finding_id = finding.get("id")
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        assessment = (
+            unresolved_by_id.get(finding_id)
+            or state.decisions.get(finding_id)
+            or finding.get("assessment")
+            or {}
+        )
+        decision = assessment.get("decision") or "NOT_VERIFIED"
+        reason = (
+            assessment.get("reason")
+            or false_positives_by_id.get(finding_id, {}).get("reason")
+            or "No verification evidence recorded; not established as resolved."
+        )
+        change = latest_changes.get(finding_id) or {}
+        if finding_id not in unresolved_by_id and change.get("status") == "APPLIED":
+            decision = "APPLIED"
+            reason = change.get("detail") or (
+                "Applied locally; consult the recorded validation results. "
+                "GitLab finding status was not changed."
+            )
+        assessments.append(
+            {
+                "id": finding_id,
+                "issue": _finding_label(finding),
+                "severity": finding.get("severity") or "unknown",
+                "decision": decision,
+                "reason": reason,
+            }
+        )
+    assessment_lines = [
+        "| Finding / Location | Severity | Decision | Reason |",
+        "|---|---|---|---|",
+        *(
+            "| "
+            + " | ".join(
+                _table_cell(item[key])
+                for key in ("issue", "severity", "decision", "reason")
+            )
+            + " |"
+            for item in assessments
+        ),
+    ]
+    assessments_table = "\n".join(assessment_lines) if assessments else "No findings."
     payload = {
         "run_status": state.status,
         "stop_stage": state.stop_stage,
         "branch": state.branch_name,
         "pipeline": state.pipeline,
         "findings_total": len(state.findings),
+        "review_status": review_queue["status"],
+        "source_review_queue": review_queue,
         "http_timings_file": ".security-mcp/http-timings.jsonl",
         "findings_truncated": state.findings_truncated,
         "security_validation_sites": {
@@ -203,6 +305,21 @@ def render(
             for finding in state.findings
             if finding.get("fuzzingWorkflow")
         },
+        "source_workflows": {
+            finding.get("id"): finding["sourceWorkflow"]
+            for finding in state.findings
+            if finding.get("sourceWorkflow")
+        },
+        "source_reviews": {
+            finding.get("id"): finding["sourceReview"]
+            for finding in state.findings
+            if finding.get("sourceReview")
+        },
+        "finding_assessments": assessments,
+        "finding_assessments_table": assessments_table,
+        "gitlab_dismissals": state.gitlab_dismissals,
+        "false_positive_review_tool": "review_false_positives",
+        "false_positive_approval": dismissal_review,
         "unresolved_issues": unresolved,
         "unresolved_issues_table": unresolved_table,
         "git_diff_cached_empty": cached_empty,
@@ -213,7 +330,7 @@ def render(
             "Review the unstaged diff. This server did not run git add, commit, or push.",
             "Confirm the validation results.",
             "Manually stage, commit, and push if the diff is acceptable.",
-            "Update GitLab findings yourself if you want them dismissed or resolved. This server does not mutate them.",
+            "Use review_false_positives for human-approved false-positive dismissals, or update GitLab manually. Local assessments alone do not change GitLab.",
         ],
     }
     lines = [
@@ -237,9 +354,14 @@ def render(
             else []
         ),
         "",
-        "This run is local only. Nothing was staged, committed, pushed, or changed in GitLab.",
+        (
+            "Nothing was staged, committed, or pushed. GitLab dismissal attempts and confirmed outcomes are listed below."
+            if state.gitlab_dismissals
+            else "This run is local only. Nothing was staged, committed, pushed, or changed in GitLab."
+        ),
         "",
         "## False positives",
+        *([approval_notice, ""] if pending_dismissals else []),
         *false_positive_bullets,
         "",
         "## Issues with no solution at this time",
@@ -337,6 +459,51 @@ def render(
                         lines.append(f"  {key}: {failure[key]}")
     payload["final_summary_markdown"] = "\n".join(
         [
+            *(
+                ["## False-Positive Approval Pending", approval_notice, ""]
+                if pending_dismissals
+                else []
+            ),
+            *(
+                [
+                    "## Source Review Incomplete",
+                    f"{review_queue['finding_count']} SAST findings still require host AI code review. "
+                    "Reading scanner-cited excerpts is not a completed assessment. "
+                    "No false-positive decision or dismissal approval exists for these findings.",
+                    review_queue["action"],
+                    "",
+                ]
+                if review_queue["finding_count"]
+                else []
+            ),
+            "## Finding Assessments",
+            payload["finding_assessments_table"],
+            "",
+            "To approve false-positive dismissals, call `review_false_positives` and submit its checkbox form. Markdown reports do not submit approvals.",
+            *(
+                [
+                    "",
+                    "## GitLab False-Positive Dismissals",
+                    *(
+                        f"- {_table_cell(item['id'])}: {_table_cell(item['status'])}; "
+                        f"{_table_cell(item['reason'])}"
+                        + (
+                            f" Error: {_table_cell(item['error'])}"
+                            if item.get("error")
+                            else ""
+                        )
+                        + (
+                            " Check GitLab before retrying; the remote outcome may be unknown."
+                            if item["status"] != "DISMISSED"
+                            else ""
+                        )
+                        for item in state.gitlab_dismissals
+                    ),
+                ]
+                if state.gitlab_dismissals
+                else []
+            ),
+            "",
             "## Unresolved Security Issues",
             payload["unresolved_issues_table"],
         ]
@@ -387,6 +554,8 @@ def write_report(
     atomic_write_text(human_path, markdown)
     return {
         "status": "REPORT_GENERATED",
+        "review_status": payload["review_status"],
+        "source_review_queue": payload["source_review_queue"],
         "final_summary_markdown": payload["final_summary_markdown"],
         "human_report": str(human_path),
         "json_report": str(json_path),
@@ -396,6 +565,11 @@ def write_report(
         "user_prompt_skipped": payload["user_prompt_skipped"],
         "unresolved_issues": payload["unresolved_issues"],
         "unresolved_issues_table": payload["unresolved_issues_table"],
+        "finding_assessments": payload["finding_assessments"],
+        "finding_assessments_table": payload["finding_assessments_table"],
+        "gitlab_dismissals": payload["gitlab_dismissals"],
+        "false_positive_review_tool": payload["false_positive_review_tool"],
+        "false_positive_approval": payload["false_positive_approval"],
         "lint_baseline": payload["lint_baseline"],
         "lint_issues_path": str(root / ".security-mcp" / "lint-issues.json")
         if state.lint_baseline is not None

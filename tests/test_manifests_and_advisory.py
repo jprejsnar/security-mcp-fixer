@@ -951,6 +951,47 @@ def test_osv_lookup_marks_version_affected():
     assert result.lowest_fixed_version == "4.17.21"
 
 
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        (
+            "pom.xml",
+            "<project><dependencies><dependency><groupId>org.example</groupId><artifactId>library</artifactId><version>1.0.0</version></dependency></dependencies></project>",
+        ),
+        (
+            "build.gradle",
+            'dependencies { implementation "org.example:library:1.0.0" }\n',
+        ),
+        (
+            "build.gradle.kts",
+            'dependencies { implementation("org.example:library:1.0.0") }\n',
+        ),
+        (
+            "libs.versions.toml",
+            '[libraries]\nlibrary = { module = "org.example:library", version = "1.0.0" }\n',
+        ),
+    ],
+)
+def test_gitlab_slash_coordinates_resolve_to_canonical_maven_packages(
+    tmp_path, name, text
+):
+    """Resolve GitLab group/artifact names to the same exact local Maven coordinate."""
+    # Arrange
+    (tmp_path / name).write_text(text, encoding="utf-8")
+
+    # Act
+    hit, truncated = locate_package(tmp_path, "org.example/library", "1.0.0")
+    wrong_group, _ = locate_package(tmp_path, "org.other/library", "1.0.0")
+
+    # Assert
+    assert hit is not None
+    assert hit.name == "org.example:library"
+    assert hit.version == "1.0.0"
+    assert hit.manifest == name
+    assert not truncated
+    assert wrong_group is None
+
+
 def test_maven_pom_gradle_and_nuget_edits(tmp_path):
     """Maven pom gradle and nuget edits."""
     # Arrange

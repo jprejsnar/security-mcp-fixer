@@ -6,6 +6,7 @@ import sys
 import threading
 from datetime import date
 from pathlib import Path
+from socket import SOCK_STREAM, gaierror
 
 import pytest
 
@@ -18,6 +19,77 @@ from gitlab_security_mcp.commands import (
 )
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.git_ops import branch_name_for
+
+
+def test_corporate_dns_failure_blocks_prechecks_without_work(tmp_path, corporate_dns):
+    """Fail before Git or file changes, then allow retry after VPN connects."""
+    # Arrange
+    from unittest.mock import Mock
+
+    engine = Engine(tmp_path, gitlab=Mock(), advisory=Mock())
+    engine.git = Mock()
+    corporate_dns.side_effect = gaierror("DNS unavailable")
+
+    # Act
+    failed = engine.run_prechecks()
+
+    # Assert
+    corporate_dns.assert_called_once_with("nexus.ert.com", 443, type=SOCK_STREAM)
+    assert failed["status"] == "PRECHECK_FAILED"
+    assert "Connect to corporate VPN first" in failed["reason"]
+    assert failed["no_changes_attempted"]
+    assert engine.state.stop_stage == "corporate_dns"
+    assert engine.git.mock_calls == []
+    assert not (tmp_path / ".security-mcp").exists()
+    assert engine.pull_main_twice()["status"] == "PULL_FAILED"
+    corporate_dns.side_effect = None
+    engine.git.current_branch.return_value = "main"
+    engine.git.in_progress_operation.return_value = None
+    engine.git.dirty_lines.return_value = []
+
+    recovered = engine.run_prechecks()
+
+    assert recovered["status"] == "PRECHECK_PASSED"
+    assert engine.state.stop_stage is None
+
+
+@pytest.mark.parametrize("failed_check", [1, 2, 3])
+def test_dns_loss_blocks_pulls_or_pnpm_preparation(
+    tmp_path, corporate_dns, failed_check
+):
+    """Recheck DNS after prechecks and prevent any subsequent preparation."""
+    # Arrange
+    from unittest.mock import Mock
+
+    engine = Engine(tmp_path, gitlab=Mock(), advisory=Mock())
+    engine.state.status = "PRECHECK_PASSED"
+    engine.git = Mock()
+    engine.git.current_branch.return_value = "main"
+    engine.git.head.return_value = "unchanged"
+    engine.git.dirty_lines.return_value = []
+    engine.git.run.return_value = CommandResult(
+        ["git", "pull", "--ff-only"], 0, "ok", "", 0, False, "out", "err"
+    )
+    engine._prepare_pnpm = Mock()
+    corporate_dns.side_effect = [
+        *[corporate_dns.return_value for _ in range(failed_check - 1)],
+        gaierror("VPN disconnected"),
+    ]
+
+    # Act
+    result = engine.pull_main_twice()
+
+    # Assert
+    assert result["status"] == (
+        "PREPARATION_FAILED" if failed_check == 3 else "PULL_FAILED"
+    )
+    assert "Connect to corporate VPN first" in result["reason"]
+    assert len(result["results"]) == failed_check - 1
+    assert engine.git.run.call_count == failed_check - 1
+    engine._prepare_pnpm.assert_not_called()
+    engine.gitlab.fetch.assert_not_called()
+    assert engine.state.stop_stage == "corporate_dns"
+    assert engine.create_security_branch()["status"] == "BRANCH_CREATION_FAILED"
 
 
 def test_repository_override_recovers_unresolved_host_placeholder(repo, monkeypatch):
@@ -353,7 +425,7 @@ def test_engine_close_waits_for_active_tool(tmp_path):
 
     gitlab.fetch = fetch
     worker = threading.Thread(
-        target=lambda: results.append(engine.list_security_findings())
+        target=lambda: results.append(engine.list_security_findings("group/app"))
     )
     closer = threading.Thread(target=close)
 
@@ -527,6 +599,151 @@ def test_fuzzing_requires_reproduction_not_package_advisories(
     assert "## Fuzzing findings requiring reproduction" in markdown
     assert applied["status"] == "REPRODUCTION_REQUIRED"
     assert engine.state.changes == []
+
+
+def _source_review_case(root):
+    """Create a dynamic regex with a fixed local configuration input."""
+    from unittest.mock import Mock
+
+    source = root / "watcher.spec.ts"
+    source.write_text(
+        "const pattern = config.beginsPattern;\nconst begins = new RegExp(pattern);\n",
+        encoding="utf-8",
+    )
+    config = root / "tasks.json"
+    config.write_text('{"beginsPattern":"^Watching$"}', encoding="utf-8")
+    finding = _finding("sast-regex", None, "detect-non-literal-regexp", None)
+    finding.update(category="sast", title="Regular expression with non-literal value")
+    finding["location"] = {"file": source.name, "startLine": "2"}
+    advisory = Mock()
+    engine = Engine(root, gitlab=Mock(), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+    review = {
+        "decision": "FALSE_POSITIVE",
+        "reason": "The constructor uses the fixed ^Watching$ pattern from local tasks.json.",
+        "input_origin": "The local test fixture loads the checked-in tasks.json.",
+        "pattern_analysis": "Anchored literal text; no nested or ambiguous repetition.",
+        "reachability_analysis": "Test-only config input; no request-controlled pattern.",
+        "reviewed_files": [
+            {
+                "path": path.name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "assessment": "Traced the constructor and its fixed configuration input.",
+            }
+            for path in (source, config)
+        ],
+    }
+    return engine, review, config
+
+
+def test_sast_regex_requires_source_review_then_reports_evidenced_false_positive(
+    tmp_path,
+):
+    """Read source without advisories and retain reviewed false positives in summaries."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+
+    engine, review, _config = _source_review_case(tmp_path)
+
+    # Act
+    pending = engine.verify_security_finding("sast-regex")
+    blocked = engine.apply_minimal_fix("sast-regex")
+    verified = engine.verify_security_finding("sast-regex", source_review=review)
+    payload, _markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    assert pending["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert pending["source_workflow"]["source"]["line"] == 2
+    assert "new RegExp(pattern)" in pending["source_workflow"]["source"]["cited_text"]
+    assert not pending["eligible_for_auto_fix"]
+    assert blocked["status"] == "SOURCE_REVIEW_REQUIRED"
+    engine.advisory.lookup.assert_not_called()
+    assert verified["decision"] == "FALSE_POSITIVE"
+    assert not verified["qualification_required"]
+    assert engine.state.skipped_user_prompt == []
+    assert payload["source_reviews"]["sast-regex"] == review
+    assert payload["unresolved_issues"] == []
+    assert "FALSE_POSITIVE" in payload["final_summary_markdown"]
+    assert review["reason"] in payload["final_summary_markdown"]
+    assert "watcher.spec.ts:2" in payload["final_summary_markdown"]
+
+
+@pytest.mark.parametrize(
+    "invalid", ["sha", "origin", "cited-file", "outside", "missing"]
+)
+def test_sast_false_positive_review_rejects_incomplete_or_stale_evidence(
+    tmp_path, invalid
+):
+    """Do not let attestations bypass current source files and complete analysis."""
+    # Arrange
+    engine, review, config = _source_review_case(tmp_path)
+    if invalid == "sha":
+        config.write_text('{"beginsPattern":"(a+)+$"}', encoding="utf-8")
+    elif invalid == "origin":
+        review.pop("input_origin")
+    elif invalid == "cited-file":
+        review["reviewed_files"] = review["reviewed_files"][1:]
+    elif invalid == "outside":
+        review["reviewed_files"][1]["path"] = "../outside.json"
+    else:
+        (tmp_path / "watcher.spec.ts").unlink()
+
+    # Act
+    result = engine.verify_security_finding("sast-regex", source_review=review)
+
+    # Assert
+    assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert "could not be accepted" in result["reason"]
+    assert engine.state.false_positives == []
+    engine.advisory.lookup.assert_not_called()
+
+
+def test_source_false_positive_is_retracted_when_reviewed_config_changes(tmp_path):
+    """Invalidate a source assessment if any input file changed after review."""
+    # Arrange
+    engine, review, config = _source_review_case(tmp_path)
+    assert (
+        engine.verify_security_finding("sast-regex", source_review=review)["decision"]
+        == "FALSE_POSITIVE"
+    )
+
+    # Act
+    config.write_text('{"beginsPattern":"(a+)+$"}', encoding="utf-8")
+    status = engine.get_run_status()
+
+    # Assert
+    assert status["false_positives_count"] == 0
+    assert status["source_review_required_count"] == 1
+    assert "sourceReview" not in engine.state.findings[0]
+    assert "changed" in engine.state.decisions["sast-regex"]["reason"]
+
+
+def test_same_title_findings_have_distinct_summary_rows(tmp_path):
+    """Avoid indistinguishable table rows that triggered Cursor's loop detector."""
+    # Arrange
+    from copy import deepcopy
+
+    from gitlab_security_mcp.report import render
+
+    engine, _review, _config = _source_review_case(tmp_path)
+    first = engine.state.findings[0]
+    second = deepcopy(first)
+    second["id"] = "second-regex"
+    second["location"]["startLine"] = "1"
+    engine.state.findings.append(second)
+
+    # Act
+    for finding in engine.state.findings:
+        engine.verify_security_finding(finding["id"])
+    payload, _markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    rows = payload["unresolved_issues_table"].splitlines()[2:]
+    assert len(rows) == len(set(rows)) == 2
+    assert "sast-regex:" in rows[0] and "watcher.spec.ts:2" in rows[0]
+    assert "second-regex:" in rows[1] and "watcher.spec.ts:1" in rows[1]
+    assert len(payload["finding_assessments"]) == 2
 
 
 class FakeGitLab:
@@ -820,7 +1037,7 @@ def test_report_tool_delivers_security_report_as_mcp_text(repo, monkeypatch):
     assert isinstance(result, CallToolResult)
     text = result.content[0].text
     assert text == result.structured_content["final_summary_markdown"]
-    assert text.startswith("## Unresolved Security Issues")
+    assert text.startswith("## Finding Assessments")
     assert text.rstrip().endswith(result.structured_content["unresolved_issues_table"])
 
 
@@ -875,6 +1092,99 @@ def test_finding_progress_identifies_item_and_steps(tmp_path, caplog, monkeypatc
     assert any(
         "progress-item" in text and "CHANGE_REQUIRED" in text for text in messages
     )
+
+
+@pytest.mark.parametrize(
+    ("severity", "label"),
+    [
+        ("critical", "criticals"),
+        ("HIGH", "highs"),
+        ("medium", "mediums"),
+        ("low", "lows"),
+        ("info", "infos"),
+        ("informational", "infos"),
+        (None, "unknown-severity findings"),
+    ],
+)
+def test_console_counts_findings_per_severity_in_processing_order(
+    tmp_path, monkeypatch, severity, label
+):
+    """Show distinct-item positions live without counting retries or other severities."""
+    # Arrange
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import server
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"lodash": "4.17.20"}}), encoding="utf-8"
+    )
+    findings = [
+        {
+            **_finding(f"item-{index}", "lodash", "CVE-FIX", "4.17.20"),
+            "severity": severity,
+        }
+        for index in range(21)
+    ]
+    other = {
+        **_finding("other", "lodash", "CVE-FIX", "4.17.20"),
+        "severity": "low" if severity != "low" else "critical",
+    }
+    engine = Engine(tmp_path, gitlab=FakeGitLab(findings), advisory=ScriptedAdvisory())
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [*findings, other]
+    console = Mock()
+    monkeypatch.setattr(server, "_progress_console", console)
+    notifications = []
+
+    async def report(progress, total, message):
+        """Capture the same messages delivered to the MCP host."""
+        notifications.append(message)
+
+    async def exercise(finding_id):
+        """Run real finding verification through the console/progress middleware."""
+
+        async def call_next(context):
+            """Propagate the request sink to the serialized engine worker."""
+            return await asyncio.to_thread(engine.verify_security_finding, finding_id)
+
+        context = SimpleNamespace(
+            method="tools/call", session=SimpleNamespace(report_progress=report)
+        )
+        return await server._progress_middleware(context, call_next)
+
+    # Act
+    results = [
+        asyncio.run(exercise(fid))
+        for fid in (
+            "item-20",
+            "other",
+            "item-1",
+            "item-7",
+            "item-5",
+            "item-0",
+            "item-0",
+        )
+    ]
+    invalid = asyncio.run(exercise("not-a-finding"))
+
+    # Assert
+    for result, ordinal in zip(
+        (results[0], *results[2:]), (1, 2, 3, 4, 5, 5), strict=True
+    ):
+        assert result["decision"] == "CHANGE_REQUIRED"
+        assert all(
+            f"Processing {ordinal} of 21 {label}" in text
+            for text in result["progress_output"]
+        )
+    other_label = "lows" if severity != "low" else "criticals"
+    assert all(
+        f"Processing 1 of 1 {other_label}" in text
+        for text in results[1]["progress_output"]
+    )
+    assert all("Processing " not in text for text in invalid["progress_output"])
+    assert [call.args[0] for call in console.write.call_args_list] == notifications
 
 
 @pytest.mark.parametrize(
@@ -1101,6 +1411,11 @@ def test_report_ends_with_unresolved_security_issues_table(tmp_path):
         "failed",
     ]
     assert payload["unresolved_issues"] == result["unresolved_issues"]
+    summaries = {item["id"]: item for item in result["finding_assessments"]}
+    assert summaries["applied"]["decision"] == "APPLIED"
+    assert summaries["false-positive"]["decision"] == "FALSE_POSITIVE"
+    assert summaries["not-verified"]["decision"] == "NOT_VERIFIED"
+    assert len(summaries) == len(result["finding_assessments"]) == 6
     assert result["final_summary_markdown"] == payload["final_summary_markdown"]
     assert markdown.rstrip().endswith(result["final_summary_markdown"])
     assert result["final_summary_markdown"].endswith(result["unresolved_issues_table"])
@@ -1815,8 +2130,8 @@ def test_pnpm_preparation_runs_after_both_pulls_before_security_checks(
         assert len(result["preparation"]) == 2
 
 
-def test_existing_branch_name_stops_the_run(cloned_repo):
-    """Existing branch name stops the run."""
+def test_existing_branch_name_is_reused_after_log_review(cloned_repo):
+    """Reuse today's branch instead of stopping when its prior logs are clean."""
     # Arrange
     engine = Engine(
         cloned_repo,
@@ -1832,11 +2147,193 @@ def test_existing_branch_name_stops_the_run(cloned_repo):
     git(cloned_repo, "branch", branch_name_for(date(2026, 11, 1)))
 
     # Act
-    failed = engine.create_security_branch()
+    reused = engine.create_security_branch()
 
     # Assert
-    assert failed["status"] == "BRANCH_CREATION_FAILED"
-    assert "already exists" in failed["reason"]
+    assert reused["status"] == "BRANCH_CREATED"
+    assert reused["reused"]
+    assert reused["security_artifacts"]["cleanup_performed"]
+    assert engine.git.current_branch() == branch_name_for(date(2026, 11, 1))
+
+
+def test_current_today_branch_reuses_its_own_dependencies_and_preserves_policies(
+    cloned_repo,
+):
+    """Pull main safely, then prepare the reused branch rather than main's manifests."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from tests.conftest import commit_all, git
+
+    day = date(2026, 11, 1)
+    name = branch_name_for(day)
+    root = cloned_repo / ".security-mcp"
+    root.mkdir()
+    policy = root / "package-update-policy.json"
+    policy.write_text('{"keep":"policy"}', encoding="utf-8")
+    tracked = root / "reports" / "security-remediation-report-tracked.md"
+    tracked.parent.mkdir()
+    tracked.write_text("Tracked evidence.", encoding="utf-8")
+    commit_all(cloned_repo)
+    git(cloned_repo, "checkout", "-b", name)
+    (cloned_repo / "package.json").write_text(
+        '{"packageManager":"pnpm@12.15.0","scripts":{"clean":"fixture"}}',
+        encoding="utf-8",
+    )
+    commit_all(cloned_repo)
+    head = git(cloned_repo, "rev-parse", "HEAD").stdout.strip()
+    old = root / "reports" / "security-remediation-report-old.md"
+    old.write_text("Old generated output.", encoding="utf-8")
+    unknown = root / "custom-settings.json"
+    unknown.write_text('{"keep":"settings"}', encoding="utf-8")
+    executed = []
+    real_runner = CommandRunner(cloned_repo)
+
+    def execute(argv, **kwargs):
+        """Only stub pnpm; exercise real Git branch, inventory and cleanup commands."""
+        if argv[0] == "pnpm":
+            executed.append(
+                (argv, git(cloned_repo, "branch", "--show-current").stdout.strip())
+            )
+            return CommandResult(argv, 0, "ok", "", 0, False, "out", "err")
+        return real_runner.run(argv, **kwargs)
+
+    runner = Mock()
+    runner.run.side_effect = execute
+    engine = Engine(
+        cloned_repo,
+        runner=runner,
+        gitlab=FakeGitLab([]),
+        advisory=ScriptedAdvisory(),
+        which=lambda tool: tool,
+        today=day,
+    )
+
+    # Act
+    precheck = engine.run_prechecks()
+    pulls = engine.pull_main_twice()
+    result = engine.create_security_branch()
+
+    # Assert
+    assert precheck["status"] == "PRECHECK_PASSED"
+    assert precheck["reuse_branch"] == name
+    assert pulls["status"] == "PULLS_SUCCEEDED"
+    assert pulls["preparation_deferred_to_reused_branch"]
+    assert result["status"] == "BRANCH_CREATED"
+    assert result["reused"]
+    assert executed == [(["pnpm", "clean"], name), (["pnpm", "install"], name)]
+    assert engine.git.head() == head
+    assert not old.exists()
+    assert tracked.read_text(encoding="utf-8") == "Tracked evidence."
+    assert policy.read_text(encoding="utf-8") == '{"keep":"policy"}'
+    assert unknown.read_text(encoding="utf-8") == '{"keep":"settings"}'
+    assert engine.list_security_findings("group/app")["status"] == "OK"
+
+
+@pytest.mark.parametrize("stage", ["prechecks", "branch"])
+def test_branch_reuse_runtime_errors_preserve_prior_run_artifacts(cloned_repo, stage):
+    """Never overwrite the saved run or remove reports after a prior log failure."""
+    # Arrange
+    from tests.conftest import git
+
+    day = date(2026, 11, 1)
+    name = branch_name_for(day)
+    git(cloned_repo, "branch", name)
+    engine = Engine(
+        cloned_repo, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory(), today=day
+    )
+    if stage == "branch":
+        assert engine.run_prechecks()["status"] == "PRECHECK_PASSED"
+        assert engine.pull_main_twice()["status"] == "PULLS_SUCCEEDED"
+    root = cloned_repo / ".security-mcp"
+    log = root / "command-logs" / "previous.stderr.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        "Traceback (most recent call last):\nRuntimeError: failed\n", encoding="utf-8"
+    )
+    state = root / "run-state.json"
+    state.write_text('{"previous":"evidence"}', encoding="utf-8")
+    old_report = root / "reports" / "security-remediation-report-old.md"
+    old_report.parent.mkdir(exist_ok=True)
+    old_report.write_text("Preserve for diagnosis.", encoding="utf-8")
+
+    # Act
+    result = (
+        engine.run_prechecks()
+        if stage == "prechecks"
+        else engine.create_security_branch()
+    )
+
+    # Assert
+    assert result["status"] == (
+        "PRECHECK_FAILED" if stage == "prechecks" else "BRANCH_CREATION_FAILED"
+    )
+    assert result["security_artifacts"]["error_count"] > 0
+    assert result["security_artifacts"]["deleted_files"] == []
+    assert state.read_text(encoding="utf-8") == '{"previous":"evidence"}'
+    assert old_report.read_text(encoding="utf-8") == "Preserve for diagnosis."
+    assert log.exists()
+    assert engine.list_security_findings()["status"] == "ERROR"
+
+
+def test_origin_only_today_branch_is_reused(cloned_repo):
+    """Fetch the exact remote dated branch without creating unrelated refs."""
+    # Arrange
+    from tests.conftest import git
+
+    day = date(2026, 11, 1)
+    name = branch_name_for(day)
+    origin = cloned_repo.parent / "origin"
+    git(origin, "branch", name, "main")
+    git(origin, "push", "origin", name)
+    engine = Engine(
+        cloned_repo, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory(), today=day
+    )
+
+    # Act
+    precheck = engine.run_prechecks()
+    pulls = engine.pull_main_twice()
+    result = engine.create_security_branch()
+
+    # Assert
+    assert precheck["status"] == "PRECHECK_PASSED"
+    assert pulls["status"] == "PULLS_SUCCEEDED"
+    assert result["status"] == "BRANCH_CREATED"
+    assert result["reused"]
+    assert engine.git.current_branch() == name
+    assert (
+        git(
+            cloned_repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
+        ).stdout.strip()
+        == f"origin/{name}"
+    )
+
+
+def test_branch_reuse_rechecks_date_after_server_crosses_midnight(
+    cloned_repo, monkeypatch
+):
+    """Do not reuse yesterday's branch after a long-lived server changes dates."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import engine as engine_module
+    from tests.conftest import git
+
+    clock = Mock(wraps=date)
+    clock.today.return_value = date(2026, 11, 1)
+    monkeypatch.setattr(engine_module, "date", clock)
+    git(cloned_repo, "branch", branch_name_for(date(2026, 11, 1)))
+    engine = Engine(cloned_repo, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
+    assert engine.run_prechecks()["status"] == "PRECHECK_PASSED"
+    clock.today.return_value = date(2026, 11, 2)
+
+    # Act
+    result = engine.pull_main_twice()
+
+    # Assert
+    assert result["status"] == "PULL_FAILED"
+    assert "date changed" in result["reason"]
+    assert engine.git.current_branch() == "main"
 
 
 def test_image_bump_and_aaa_test(repo):
@@ -1957,8 +2454,8 @@ def test_path_outside_the_repo_is_not_a_false_positive(repo):
     decision = engine.verify_security_finding("escape")
 
     # Assert
-    assert decision["decision"] == "MANUAL_REVIEW"
-    assert "outside the repository" in decision["reason"]
+    assert decision["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert "inside the checkout" in decision["reason"]
 
 
 def test_listing_again_keeps_existing_decisions(repo):
@@ -2131,6 +2628,7 @@ def test_tools_are_registered():
         "apply_minimal_fix",
         "generate_aaa_test",
         "run_validation_matrix",
+        "review_false_positives",
         "generate_local_report",
         "get_run_status",
     }

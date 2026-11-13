@@ -14,8 +14,11 @@ from dataclasses import fields
 from datetime import date
 from inspect import signature
 from pathlib import Path
+from socket import SOCK_STREAM, gaierror, getaddrinfo
 from time import monotonic
 from urllib.parse import urlsplit
+
+import httpx
 
 from gitlab_security_mcp.aaa import generate_aaa_test
 from gitlab_security_mcp.advisory import (
@@ -51,6 +54,8 @@ from gitlab_security_mcp.qualification import (
 )
 from gitlab_security_mcp.remediate import Plan, apply_plan, plan_remediation
 from gitlab_security_mcp.report import write_report
+from gitlab_security_mcp.security_artifacts import review_security_artifacts
+from gitlab_security_mcp.source_findings import assess_source, pending_source_reviews
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import atomic_write_text, resolve_inside
 from gitlab_security_mcp.validate import lint_rule_inventory, run_validation
@@ -72,6 +77,23 @@ AFTER_BRANCH = {
     "VALIDATION_FAILED",
     "REPORT_GENERATED",
 }
+
+PROGRESS_SEVERITIES = {
+    "critical": "criticals",
+    "high": "highs",
+    "medium": "mediums",
+    "low": "lows",
+    "info": "infos",
+    "unknown": "unknown-severity findings",
+}
+
+
+def _progress_severity(finding: dict) -> str:
+    """Group display counts without changing the scanner's severity."""
+    severity = str(finding.get("severity") or "unknown").strip().lower()
+    if severity == "informational":
+        severity = "info"
+    return severity if severity in PROGRESS_SEVERITIES else "unknown"
 
 
 def _serialized(method):
@@ -212,20 +234,28 @@ class Engine:
                     )
             raise
         self.which = which if which is not None else shutil.which
-        self.today = today or date.today()
+        self._today_override = today
+        self._run_day: date | None = None
         self.project_id = project_id
         self.validation_timeout = validation_timeout
         self.state = RunState()
+        self._finding_progress: dict[str, tuple[str, int]] = {}
         self._files: list[Path] | None = None
         self._files_truncated = False
         self._product_baseline: dict | None = None
         self._closed = False
+        self._reuse_branch_name: str | None = None
 
     def _documentation(self) -> OfficialDocs:
         """Return the injected documentation client or open one on first use."""
         if self.docs is None:
             self.docs = OfficialDocs(http_log_path=self.http_log_path)
         return self.docs
+
+    @property
+    def today(self) -> date:
+        """Use the current local date, including after a long-lived server crosses midnight."""
+        return self._today_override or date.today()
 
     def close(self) -> None:
         """Wait for active tools and close each owned HTTP client once.
@@ -301,9 +331,35 @@ class Engine:
         """Invalidate cached file discovery after local changes."""
         self._files = None
 
+    def _check_corporate_dns(self, failure_status: str) -> dict | None:
+        """Stop in memory if corporate DNS is unavailable, without changing files."""
+        self._progress(None, "Checking corporate DNS for nexus.ert.com")
+        try:
+            if not getaddrinfo("nexus.ert.com", 443, type=SOCK_STREAM):
+                raise gaierror("No DNS addresses returned")
+        except OSError as exc:
+            reason = (
+                "Cannot resolve nexus.ert.com. Connect to corporate VPN first, "
+                "then rerun run_prechecks."
+            )
+            self._progress(None, reason)
+            self.state.status = failure_status
+            self.state.stop_stage = "corporate_dns"
+            return {
+                "status": failure_status,
+                "reason": reason,
+                "error": str(exc),
+                "action": "Connect to corporate VPN first, then rerun run_prechecks.",
+                "hostname": "nexus.ert.com",
+            }
+        return None
+
     @_serialized
     def run_prechecks(self) -> dict:
-        """Fail closed unless the tree is on a clean main with no merge in progress."""
+        """Require DNS and a clean main/today branch; preserve failed prior runs."""
+        dns_failure = self._check_corporate_dns("PRECHECK_FAILED")
+        if dns_failure is not None:
+            return {**dns_failure, "no_changes_attempted": True}
         try:
             self.git.ensure_work_tree()
         except Exception as exc:
@@ -323,16 +379,28 @@ class Engine:
             }
         try:
             branch = self.git.current_branch()
-            if branch != "main":
+            run_day = self.today
+            name = branch_name_for(run_day)
+            if branch not in {"main", name}:
                 return self._stop(
                     "PRECHECK_FAILED",
                     "precheck",
                     {
                         "status": "PRECHECK_FAILED",
-                        "reason": f"Not on main (current: {branch or 'detached'}). Switch to main first.",
+                        "reason": f"Not on main or today's security branch (current: {branch or 'detached'}). Switch to main first.",
                         "no_changes_attempted": True,
                     },
                 )
+            exists = (
+                branch == name
+                or self.git.branch_exists_locally(name)
+                or self.git.branch_exists_on_origin(name)
+            )
+            self._reuse_branch_name = name if exists else None
+            if exists:
+                review = review_security_artifacts(self.repo_root)
+                if review["status"] != "OK":
+                    return self._security_log_failure("PRECHECK_FAILED", review)
             in_progress = self.git.in_progress_operation()
             if in_progress:
                 return self._stop(
@@ -368,12 +436,14 @@ class Engine:
                 },
             )
         self.state.status = "PRECHECK_PASSED"
+        self._run_day = run_day
         self.state.stop_stage = None
         self._remember()
         return {
             "status": "PRECHECK_PASSED",
             "repo_root": str(self.repo_root),
-            "branch": "main",
+            "branch": branch,
+            "reuse_branch": self._reuse_branch_name,
             "clean": True,
         }
 
@@ -382,8 +452,41 @@ class Engine:
         """Fast-forward main twice, then clean/install pnpm before security checks."""
         if self.state.status != "PRECHECK_PASSED":
             return {"status": "PULL_FAILED", "reason": "Precheck not passed"}
+        if self._run_day is not None and self._run_day != self.today:
+            return self._stop(
+                "PULL_FAILED",
+                "run_date",
+                {
+                    "status": "PULL_FAILED",
+                    "reason": "The local date changed after prechecks. Rerun run_prechecks before selecting a security branch.",
+                },
+            )
+        if (
+            self._reuse_branch_name
+            and self.git.current_branch() == self._reuse_branch_name
+        ):
+            if self.git.dirty_lines() or self.git.in_progress_operation():
+                return self._stop(
+                    "PULL_FAILED",
+                    "pull_clean",
+                    {
+                        "status": "PULL_FAILED",
+                        "reason": "Working tree or Git operation changed after prechecks; no branch switch was attempted.",
+                    },
+                )
+            try:
+                self.git.run(["checkout", "main"])
+            except (OSError, RuntimeError) as exc:
+                return self._stop(
+                    "PULL_FAILED",
+                    "pull_main",
+                    {"status": "PULL_FAILED", "error": str(exc)},
+                )
         results = []
         for number in (1, 2):
+            dns_failure = self._check_corporate_dns("PULL_FAILED")
+            if dns_failure is not None:
+                return {**dns_failure, "results": results}
             try:
                 if self.git.current_branch() != "main":
                     return self._stop(
@@ -442,8 +545,11 @@ class Engine:
             )
         self.state.pulls = results
         self._drop_snapshot()
+        dns_failure = self._check_corporate_dns("PREPARATION_FAILED")
+        if dns_failure is not None:
+            return {**dns_failure, "results": results}
         try:
-            preparation = self._prepare_pnpm()
+            preparation = [] if self._reuse_branch_name else self._prepare_pnpm()
         except (OSError, ValueError, RuntimeError) as exc:
             self._drop_snapshot()
             return self._stop(
@@ -474,6 +580,22 @@ class Engine:
             "status": "PULLS_SUCCEEDED",
             "results": results,
             "preparation": preparation,
+            "preparation_deferred_to_reused_branch": bool(self._reuse_branch_name),
+        }
+
+    def _security_log_failure(self, status: str, review: dict) -> dict:
+        """Stop in memory without overwriting prior artifacts that explain failure."""
+        self.state.status = status
+        self.state.stop_stage = "security_log_review"
+        logger.error(
+            "Security log review blocked branch reuse: %s error(s)",
+            review["error_count"],
+        )
+        return {
+            "status": status,
+            "reason": "Prior security logs contain runtime errors or could not be fully verified. All remaining security artifacts were preserved.",
+            "security_artifacts": review,
+            "action": "Review the reported log files and resolve the errors before retrying. No automatic log cleanup is permitted while errors remain.",
         }
 
     def _prepare_pnpm(self) -> list[dict]:
@@ -529,7 +651,7 @@ class Engine:
 
     @_serialized
     def create_security_branch(self) -> dict:
-        """Create the dated security branch only when that name is unused."""
+        """Create today's branch, or reuse it after safe error-free log cleanup."""
         if self.state.status == "BRANCH_CREATED" and self.state.branch_name:
             return {
                 "status": "BRANCH_CREATED",
@@ -538,26 +660,68 @@ class Engine:
             }
         if self.state.status != "PULLS_SUCCEEDED":
             return {"status": "BRANCH_CREATION_FAILED", "reason": "Pulls not succeeded"}
+        if self._run_day is not None and self._run_day != self.today:
+            return self._stop(
+                "BRANCH_CREATION_FAILED",
+                "run_date",
+                {
+                    "status": "BRANCH_CREATION_FAILED",
+                    "reason": "The local date changed after prechecks. Rerun run_prechecks before selecting a security branch.",
+                },
+            )
         name = branch_name_for(self.today)
+        reused = False
+        cleanup = None
+        preparation = []
         try:
-            if self.git.branch_exists_locally(name) or self.git.branch_exists_on_origin(
-                name
-            ):
-                return self._stop(
-                    "BRANCH_CREATION_FAILED",
-                    "branch",
-                    {
-                        "status": "BRANCH_CREATION_FAILED",
-                        "reason": f"Branch {name} already exists. Delete or rename it manually.",
-                        "branch": name,
-                    },
-                )
-            self.git.run(["checkout", "-b", name])
+            local = self.git.branch_exists_locally(name)
+            remote = False if local else self.git.branch_exists_on_origin(name)
+            reused = local or remote
+            if reused:
+                if self.git.dirty_lines() or self.git.in_progress_operation():
+                    raise RuntimeError(
+                        "Cannot reuse a branch with a dirty working tree or Git operation in progress"
+                    )
+                if local:
+                    self.git.run(["checkout", name])
+                else:
+                    self.git.run(
+                        [
+                            "fetch",
+                            "origin",
+                            f"refs/heads/{name}:refs/remotes/origin/{name}",
+                        ]
+                    )
+                    self.git.run(["checkout", "-b", name, "--track", f"origin/{name}"])
+            else:
+                self.git.run(["checkout", "-b", name])
             current = self.git.current_branch()
             if current != name:
                 raise RuntimeError(
                     f"Checkout verification failed. Current branch is {current}."
                 )
+            if reused:
+                tracked = self.git.tracked_security_paths()
+                cleanup = review_security_artifacts(self.repo_root, tracked)
+                if cleanup["status"] != "OK":
+                    return self._security_log_failure("BRANCH_CREATION_FAILED", cleanup)
+                self._drop_snapshot()
+                dns_failure = self._check_corporate_dns("PREPARATION_FAILED")
+                if dns_failure is not None:
+                    return dns_failure
+                preparation = self._prepare_pnpm()
+                self._drop_snapshot()
+                if preparation and preparation[-1]["exit_code"] != 0:
+                    return self._stop(
+                        "PREPARATION_FAILED",
+                        "pnpm_preparation",
+                        {
+                            "status": "PREPARATION_FAILED",
+                            "reason": "pnpm preparation on the reused branch failed; security checks were not started.",
+                            "preparation": preparation,
+                            "failed_command": preparation[-1]["argv"],
+                        },
+                    )
         except Exception as exc:
             return self._stop(
                 "BRANCH_CREATION_FAILED",
@@ -567,7 +731,13 @@ class Engine:
         self.state.branch_name = name
         self.state.status = "BRANCH_CREATED"
         self._remember()
-        return {"status": "BRANCH_CREATED", "branch": name}
+        return {
+            "status": "BRANCH_CREATED",
+            "branch": name,
+            "reused": reused,
+            "security_artifacts": cleanup,
+            "preparation": preparation,
+        }
 
     @_serialized
     def list_security_findings(self, project_id: str | None = None) -> dict:
@@ -580,10 +750,24 @@ class Engine:
                 "reason": "Findings were already verified or changed. Listing again would discard those decisions.",
             }
         pid = project_id or self.project_id
-        fetched = self.gitlab.fetch(pid or "")
+        project_source = "explicit" if pid else "git_origin"
+        if not pid:
+            try:
+                pid = self.git.gitlab_project_path(self.gitlab.api_url)
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("GitLab project discovery failed: %s", exc)
+                return {
+                    "status": "ERROR",
+                    "stage": "project_discovery",
+                    "reason": str(exc),
+                    "action": "Check the selected repo_root and Git origin. For automatic per-repository selection, leave GITLAB_PROJECT_ID unset and configure only the trusted GitLab API host and your own token.",
+                }
+        fetched = self.gitlab.fetch(pid)
         if not fetched.ok:
             return {"status": "ERROR", "reason": fetched.error}
         self.state.findings = fetched.findings
+        self._finding_progress.clear()
+        self.state.gitlab_project_path = fetched.project_path
         self.state.findings_truncated = fetched.truncated
         self.state.pipeline = fetched.pipeline
         self.state.excluded_findings = fetched.excluded or {}
@@ -599,14 +783,17 @@ class Engine:
             "truncated": fetched.truncated,
             "excluded": fetched.excluded or {},
             "project_path": fetched.project_path,
+            "project_source": project_source,
             "pipeline": fetched.pipeline,
             "findings": fetched.findings,
             "note": "Read-only GraphQL from the project vulnerability report. Filters: Needs triage or Confirmed; tracked branch main; Still detected. Pipeline provenance is recorded per finding.",
         }
 
     @_serialized
-    def verify_security_finding(self, finding_id: str) -> dict:
-        """Compare one finding with the tree and with public advisories."""
+    def verify_security_finding(
+        self, finding_id: str, *, source_review: dict | None = None
+    ) -> dict:
+        """Assess source findings locally, or compare dependencies with advisories."""
         if self.state.status not in AFTER_BRANCH:
             return {"status": "ERROR", "reason": "Findings have not been listed yet"}
         finding = self._finding(finding_id)
@@ -619,9 +806,12 @@ class Engine:
                 "status": "ERROR",
                 "reason": "Retain the applied package's original evidence; run post-update validation instead",
             }
+        finding.pop("sourceWorkflow", None)
         try:
             self._progress(finding_id, "Assessing scanner category and local evidence")
-            decision, reason, evidence, proposed, prompt = self._decide(finding)
+            decision, reason, evidence, proposed, prompt = self._decide(
+                finding, source_review
+            )
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             reason = f"Finding evidence could not be read safely: {exc}"
             decision, evidence, proposed = "MANUAL_REVIEW", [reason], None
@@ -633,6 +823,11 @@ class Engine:
         finding["proposedFix"] = proposed
         finding.pop("packageQualification", None)
         finding["evidence"] = evidence
+        finding.pop("sourceReview", None)
+        if isinstance(source_review, dict) and (
+            finding.get("sourceWorkflow") or {}
+        ).get("status") == source_review.get("decision"):
+            finding["sourceReview"] = deepcopy(source_review)
         self.state.decisions[finding_id] = assessment
         component = finding.get("component")
         if decision == "FALSE_POSITIVE":
@@ -648,7 +843,7 @@ class Engine:
             self.state.no_solution.append(
                 {"id": finding_id, "component": component, "reason": reason}
             )
-        elif decision == "MANUAL_REVIEW":
+        elif decision in {"MANUAL_REVIEW", "CONFIRMED_VULNERABILITY"}:
             self.state.skipped_user_prompt.append(
                 {
                     "id": finding_id,
@@ -674,6 +869,37 @@ class Engine:
             "proposed_fix": proposed,
             "user_prompt": prompt,
             "fuzzing_workflow": finding.get("fuzzingWorkflow"),
+            "source_workflow": finding.get("sourceWorkflow"),
+            "source_review_request": {
+                key: deepcopy(finding.get(key))
+                for key in ("id", "title", "description", "identifiers", "location")
+            }
+            if decision == "SOURCE_REVIEW_REQUIRED"
+            else None,
+        }
+
+    @_serialized
+    def record_source_review_blocker(self, finding_id: str, reason: str) -> dict:
+        """Persist why AI review is incomplete instead of reporting a verdict."""
+        finding = self._finding(finding_id)
+        assessment = self.state.decisions.get(finding_id)
+        if (
+            finding is None
+            or not assessment
+            or assessment["decision"] != "SOURCE_REVIEW_REQUIRED"
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Source assessment changed while AI review was running",
+            }
+        assessment["reason"] = reason
+        assessment["evidence"].append(reason)
+        finding["assessment"] = deepcopy(assessment)
+        self._remember()
+        return {
+            "decision": assessment["decision"],
+            "reason": reason,
+            "evidence": deepcopy(assessment["evidence"]),
         }
 
     @_serialized
@@ -824,6 +1050,23 @@ class Engine:
                 "reason": "Fuzzing requires reviewed local reproduction and host-applied source fixes, not an automatic package edit.",
                 "fuzzing_workflow": finding.get("fuzzingWorkflow"),
             }
+        reviewed_config_fix = (
+            (finding.get("sourceReview") or {}).get("decision")
+            == "CONFIRMED_VULNERABILITY"
+            and (finding.get("sourceWorkflow") or {}).get("status")
+            == "CONFIRMED_VULNERABILITY"
+            and finding.get("remediationDecision") == "CHANGE_REQUIRED"
+            and (finding.get("proposedFix") or {}).get("strategy") == "config_line"
+        )
+        if finding.get("sourceWorkflow") and not reviewed_config_fix:
+            return {
+                "status": "SKIPPED"
+                if finding.get("remediationDecision") == "FALSE_POSITIVE"
+                else "SOURCE_REVIEW_REQUIRED",
+                "finding_id": finding_id,
+                "reason": (finding.get("assessment") or {}).get("reason"),
+                "source_workflow": finding["sourceWorkflow"],
+            }
         if any(item["id"] == finding_id for item in self.state.skipped_user_prompt):
             prompt = next(
                 item["prompt"]
@@ -965,6 +1208,21 @@ class Engine:
             finding_id,
             "Applying reviewed dependency/configuration edit and lockfile refresh",
         )
+        if reviewed_config_fix:
+            source_review = finding["sourceReview"]
+            if (
+                assess_source(self.repo_root, finding, source_review)["decision"]
+                != "CONFIRMED_VULNERABILITY"
+            ):
+                refreshed = self.verify_security_finding(
+                    finding_id, source_review=source_review
+                )
+                return {
+                    "status": "SOURCE_REVIEW_REQUIRED",
+                    "finding_id": finding_id,
+                    "reason": refreshed["reason"],
+                    "source_workflow": refreshed["source_workflow"],
+                }
         if not package_update:
             finding["localFixAttempt"] = {
                 "tree": tree_snapshot(self.repo_root),
@@ -1002,6 +1260,9 @@ class Engine:
         self.state.changes.append(change)
         self._drop_snapshot()
         if outcome["status"] == "APPLIED":
+            if reviewed_config_fix:
+                change["source_review"] = finding.pop("sourceReview")
+                change["source_workflow"] = finding.pop("sourceWorkflow")
             self.state.status = "FIXES_IN_PROGRESS"
             self.state.validation_status = None
             if package_update:
@@ -1585,8 +1846,142 @@ class Engine:
         return outcome
 
     @_serialized
+    def false_positive_candidates(self) -> dict:
+        """Snapshot current, evidenced false positives for human approval."""
+        self._refresh_source_reviews()
+        if self.state.status not in AFTER_BRANCH or not self.state.gitlab_project_path:
+            return {
+                "status": "ERROR",
+                "reason": "List and verify findings in this process before requesting approval",
+            }
+        dismissed = {
+            item["id"]
+            for item in self.state.gitlab_dismissals
+            if item["status"] == "DISMISSED"
+        }
+        candidates = []
+        excluded = []
+        for finding in self.state.findings:
+            assessment = self.state.decisions.get(finding["id"]) or {}
+            reason = assessment.get("reason")
+            if finding["id"] in dismissed:
+                exclusion = "ALREADY_DISMISSED"
+                action = "Previously confirmed dismissed in GitLab; no repeat approval is needed."
+            elif assessment.get("decision") == "SOURCE_REVIEW_REQUIRED":
+                exclusion = "SOURCE_REVIEW_REQUIRED"
+                action = "The host AI must complete the local code review and submit source_review through verify_security_finding; reading an excerpt alone is not an assessment."
+            elif assessment.get("decision") != "FALSE_POSITIVE":
+                exclusion = "ASSESSMENT_REQUIRED"
+                action = (
+                    "Call verify_security_finding for this finding in this process. "
+                    "Only an evidenced FALSE_POSITIVE assessment is eligible."
+                )
+            elif (
+                not isinstance(reason, str) or not reason.strip() or len(reason) > 50000
+            ):
+                exclusion = "INVALID_REASON"
+                action = "Reassess with a nonempty reason of at most 50,000 characters."
+            elif not finding.get("vulnerabilityId"):
+                exclusion = "MISSING_VULNERABILITY_ID"
+                action = (
+                    "This finding lacks its GitLab vulnerability global ID. "
+                    "Retrieve and verify findings in a fresh run with the updated server."
+                )
+            else:
+                candidates.append(
+                    {
+                        "id": finding["id"],
+                        "vulnerability_id": finding["vulnerabilityId"],
+                        "project_path": self.state.gitlab_project_path,
+                        "title": finding.get("title"),
+                        "location": finding.get("location") or {},
+                        "reason": reason,
+                        "assessment": deepcopy(assessment),
+                        "source_review": deepcopy(finding.get("sourceReview")),
+                    }
+                )
+                continue
+            excluded.append(
+                {
+                    "id": finding["id"],
+                    "reason": exclusion,
+                    "decision": assessment.get("decision"),
+                    "action": action,
+                }
+            )
+        return {
+            "status": "OK",
+            "candidates": candidates,
+            "excluded": excluded,
+            "source_review_queue": pending_source_reviews(
+                self.state.findings, self.state.decisions
+            ),
+        }
+
+    @_serialized
+    def dismiss_false_positives(self, approved: list[dict]) -> dict:
+        """Apply only unchanged, individually approved assessment snapshots."""
+        current = self.false_positive_candidates()
+        if current["status"] != "OK":
+            return current
+        candidates = {item["id"]: item for item in current["candidates"]}
+        if len({item["id"] for item in approved}) != len(approved) or any(
+            candidates.get(item["id"]) != item for item in approved
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Assessments changed while approval was open; request a fresh approval form",
+            }
+        results = []
+        for item in approved:
+            record = {
+                "id": item["id"],
+                "vulnerability_id": item["vulnerability_id"],
+                "project_path": item["project_path"],
+                "reason": item["reason"],
+                "dismissal_reason": "FALSE_POSITIVE",
+                "status": "PENDING",
+            }
+            self.state.gitlab_dismissals.append(record)
+            self._remember()
+            try:
+                outcome = self.gitlab.dismiss_false_positive(
+                    item["vulnerability_id"],
+                    item["id"],
+                    item["project_path"],
+                    item["reason"],
+                )
+                record.update(outcome)
+            except (
+                httpx.HTTPError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                AttributeError,
+            ) as exc:
+                record.update(
+                    status="ERROR",
+                    error=self.gitlab._clean(str(exc)),
+                    action="Check GitLab before retrying; a failed response does not prove no remote change occurred.",
+                )
+                logger.warning(
+                    "GitLab false-positive dismissal failed for %s: %s",
+                    item["id"],
+                    record["error"],
+                )
+            self._remember()
+            results.append(deepcopy(record))
+        return {
+            "status": "PARTIAL_FAILURE"
+            if any(item["status"] != "DISMISSED" for item in results)
+            else "OK",
+            "results": results,
+        }
+
+    @_serialized
     def generate_local_report(self) -> dict:
         """Write the markdown and JSON reports under .security-mcp/reports."""
+        self._refresh_source_reviews()
         self._refresh_package_validation()
         staged: list[str] | None = None
         diff_stat = ""
@@ -1615,6 +2010,7 @@ class Engine:
     @_serialized
     def get_run_status(self) -> dict:
         """Return current counts and retract stale package-validation results."""
+        self._refresh_source_reviews()
         self._refresh_package_validation()
         return {
             "status": self.state.status,
@@ -1626,6 +2022,13 @@ class Engine:
             "false_positives_count": len(self.state.false_positives),
             "no_solution_count": len(self.state.no_solution),
             "skipped_user_prompt_count": len(self.state.skipped_user_prompt),
+            "source_review_required_count": sum(
+                item.get("decision") == "SOURCE_REVIEW_REQUIRED"
+                for item in self.state.decisions.values()
+            ),
+            "source_review_queue": pending_source_reviews(
+                self.state.findings, self.state.decisions
+            ),
             "report_path": self.state.report_path,
             "lint_issues_path": str(
                 self.repo_root / ".security-mcp" / "lint-issues.json"
@@ -1645,6 +2048,15 @@ class Engine:
                 for change in self._package_changes()
             ],
         }
+
+    def _refresh_source_reviews(self) -> None:
+        """Retract source conclusions when reviewed files change or disappear."""
+        for finding in self.state.findings:
+            review = finding.get("sourceReview")
+            if review and assess_source(self.repo_root, finding, review)[
+                "decision"
+            ] != review.get("decision"):
+                self.verify_security_finding(finding["id"], source_review=review)
 
     def _capture_lint_baseline(
         self, finding_id: str | None, results: list[dict], *, applicable: bool = True
@@ -1738,7 +2150,7 @@ class Engine:
                 self.state.status = "VALIDATION_INCOMPLETE"
 
     def _decide(
-        self, finding: dict
+        self, finding: dict, source_review: dict | None = None
     ) -> tuple[str, str, list[str], dict | None, str | None]:
         """Combine local evidence and advisories without guessing safe edits.
 
@@ -1751,6 +2163,34 @@ class Engine:
         ]
         category = finding.get("category") or ""
         component = finding.get("component")
+        location_file = (finding.get("location") or {}).get("file")
+        kind = config_kind(location_file if isinstance(location_file, str) else None)
+        if category == "sast" or (kind and category == "iac_scanning"):
+            self._progress(
+                finding.get("id"), "Reading cited source/configuration evidence"
+            )
+            assessment = assess_source(self.repo_root, finding, source_review)
+            finding["sourceWorkflow"] = assessment["workflow"]
+            if kind and assessment["decision"] == "CONFIRMED_VULNERABILITY":
+                return self._decide_config(finding, assessment["evidence"])
+            return (
+                assessment["decision"],
+                assessment["reason"],
+                assessment["evidence"],
+                None,
+                " ".join(assessment["workflow"]["steps"])
+                if assessment["decision"]
+                in {
+                    "SOURCE_REVIEW_REQUIRED",
+                    "MANUAL_REVIEW",
+                    "CONFIRMED_VULNERABILITY",
+                }
+                else None,
+            )
+        if source_review is not None:
+            raise ValueError(
+                "source_review is only supported for source/configuration SAST or IaC findings"
+            )
         if category in {"api_fuzzing", "coverage_fuzzing"}:
             reason = (
                 "Fuzzing describes observed application behavior, not a package advisory. "
@@ -1809,7 +2249,6 @@ class Engine:
             evidence.append(
                 "GitLab marked falsePositive=true. That flag alone is not sufficient; local evidence is required."
             )
-        location_file = (finding.get("location") or {}).get("file")
         if location_file and category in {"sast", "secret_detection"}:
             resolved = resolve_inside(self.repo_root, location_file)
             if resolved is None:
@@ -1825,11 +2264,15 @@ class Engine:
             if not resolved.is_file():
                 evidence.append(f"{location_file} is not in the working tree.")
                 return (
-                    "FALSE_POSITIVE",
-                    f"{location_file} is not present in the repository.",
+                    "MANUAL_REVIEW",
+                    f"{location_file} is not present in the repository. Missing source alone does not establish a false positive.",
                     evidence,
                     None,
-                    None,
+                    self._prompt(
+                        finding,
+                        None,
+                        "The cited source is missing; the finding remains unresolved.",
+                    ),
                 )
 
         if category in {"secret_detection", "dast"}:
@@ -1841,7 +2284,6 @@ class Engine:
                 None,
                 self._prompt(finding, None, reason),
             )
-        kind = config_kind(location_file if isinstance(location_file, str) else None)
         if kind and category != "container_scanning":
             return self._decide_config(finding, evidence)
         if kind == "dockerfile":
@@ -2108,7 +2550,14 @@ class Engine:
         assessment = assess_config(self.repo_root, finding)
         evidence.append(assessment.reason)
         if assessment.decision == "missing":
-            return "FALSE_POSITIVE", assessment.reason, evidence, None, None
+            return (
+                "MANUAL_REVIEW",
+                assessment.reason
+                + " A missing configuration file alone does not establish a false positive.",
+                evidence,
+                None,
+                self._prompt(finding, None, assessment.reason),
+            )
         if assessment.decision != "plan" or assessment.plan is None:
             return (
                 "MANUAL_REVIEW",
@@ -2171,6 +2620,22 @@ class Engine:
         package = " ".join(str((finding or {}).get("component") or "N/A").split())[:200]
         repository = " ".join(str(self.repo_root).split())[:500]
         step = " ".join(step.split())[:500]
+        if (
+            finding_id is not None
+            and finding is not None
+            and self.state.status in AFTER_BRANCH
+        ):
+            severity = _progress_severity(finding)
+            if finding_id not in self._finding_progress:
+                ordinal = 1 + sum(
+                    group == severity for group, _ in self._finding_progress.values()
+                )
+                self._finding_progress[finding_id] = (severity, ordinal)
+            severity, ordinal = self._finding_progress[finding_id]
+            total = sum(
+                _progress_severity(item) == severity for item in self.state.findings
+            )
+            step = f"Processing {ordinal} of {total} {PROGRESS_SEVERITIES[severity]} | {step}"
         logger.info(
             "Progress repo=%s finding=%s package=%s: %s",
             repository,

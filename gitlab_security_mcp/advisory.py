@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
+from time import monotonic, sleep
 
 import httpx
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
+from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.fanout import map_ordered
 from gitlab_security_mcp.util import redact, timed_http_stream
 from gitlab_security_mcp.versions import (
@@ -33,6 +38,69 @@ GITHUB_ADVISORIES = "https://api.github.com/advisories"
 NVD_CVE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MAX_CACHE_ENTRIES = 256
 _MAX_ADVISORY_BYTES = 2_000_000
+_NVD_LOCK = threading.Lock()
+_nvd_last_request: float | None = None
+_nvd_retry_until = 0.0
+_NVD_ATTEMPTS = 3
+_MAX_NVD_RETRY_WAIT = 60.0
+logger = logging.getLogger("gitlab_security_mcp")
+
+
+def _nvd_wait(has_key: bool) -> None:
+    """Space NVD requests across checkout clients, including retries, in this process."""
+    global _nvd_last_request
+    with _NVD_LOCK:
+        interval = 0.61 if has_key else 6.1
+        earliest = max(
+            _nvd_retry_until,
+            (_nvd_last_request + interval) if _nvd_last_request is not None else 0,
+        )
+        delay = earliest - monotonic()
+        if delay > _MAX_NVD_RETRY_WAIT:
+            raise httpx.RequestError(
+                f"NVD server cooldown requires {delay:.1f}s; retry this lookup later. "
+                "The per-call wait limit is 60s; no request was sent."
+            )
+        if delay > 0:
+            message = f"NVD API pacing: waiting {delay:.1f}s before the next request."
+            logger.info(message)
+            sink = progress_sink.get()
+            if sink is not None:
+                try:
+                    sink(message)
+                except Exception:
+                    logger.warning(
+                        "Could not publish NVD pacing progress", exc_info=True
+                    )
+            sleep(delay)
+        _nvd_last_request = monotonic()
+
+
+def _nvd_retry_delay(error: httpx.HTTPError, attempt: int) -> float | None:
+    """Retry transient reads only; honor bounded Retry-After seconds or HTTP dates."""
+    if isinstance(error, httpx.HTTPStatusError):
+        if error.response.status_code not in {429, 500, 502, 503, 504}:
+            return None
+        header = error.response.headers.get("Retry-After")
+        if header:
+            try:
+                delay = float(int(header))
+            except ValueError:
+                try:
+                    date = parsedate_to_datetime(header)
+                    if date.tzinfo is None:
+                        date = date.replace(tzinfo=UTC)
+                    delay = (date - datetime.now(UTC)).total_seconds()
+                except (ValueError, TypeError, OverflowError):
+                    delay = -1
+            if delay >= 0:
+                return delay
+    elif not isinstance(
+        error, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+    ):
+        return None
+    return float(2**attempt)
+
 
 ECOSYSTEMS = {
     "npm": "npm",
@@ -324,10 +392,36 @@ class AdvisoryClient:
         return ident, payload, None
 
     def _nvd(self, cve: str, errors: list[str], sources: list[str]) -> dict | None:
-        """Fetch the first matching NVD CVE record or record a lookup error."""
+        """Recover bounded transient NVD failures or explicitly retain the final error."""
+        global _nvd_retry_until
         headers = {"apiKey": self.nvd_api_key} if self.nvd_api_key else {}
         try:
-            payload = self._get_json(NVD_CVE, params={"cveId": cve}, headers=headers)
+            for attempt in range(_NVD_ATTEMPTS):
+                try:
+                    payload = self._get_json(
+                        NVD_CVE, params={"cveId": cve}, headers=headers
+                    )
+                    break
+                except httpx.HTTPError as exc:
+                    delay = _nvd_retry_delay(exc, attempt)
+                    if delay is not None:
+                        with _NVD_LOCK:
+                            _nvd_retry_until = max(
+                                _nvd_retry_until, monotonic() + delay
+                            )
+                        if delay > _MAX_NVD_RETRY_WAIT:
+                            raise httpx.RequestError(
+                                f"NVD requested a {delay:.1f}s Retry-After cooldown; "
+                                "retry this lookup later rather than ignoring the server limit."
+                            ) from exc
+                    if delay is None or attempt == _NVD_ATTEMPTS - 1:
+                        raise
+                    logger.warning(
+                        "NVD transient request failure (%s); retrying attempt %s of %s.",
+                        type(exc).__name__,
+                        attempt + 2,
+                        _NVD_ATTEMPTS,
+                    )
         except Exception as exc:
             errors.append(self._clean(f"nvd:{cve}: {exc}"))
             return None
@@ -368,6 +462,8 @@ class AdvisoryClient:
             )
             if key in self._cache:
                 return self._cache[key]
+        if url == NVD_CVE:
+            _nvd_wait(bool(self.nvd_api_key))
         with timed_http_stream(
             self.http,
             "GET",

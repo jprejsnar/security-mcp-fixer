@@ -1,4 +1,4 @@
-"""Read-only GitLab client. Findings come from GraphQL. Nothing is mutated."""
+"""GitLab finding reads and narrowly scoped, explicitly approved dismissals."""
 
 from __future__ import annotations
 
@@ -113,6 +113,23 @@ query SecurityTrackedRefs($fullPath: ID!, $after: String) {
 }
 """.strip()
 
+DISMISS_FALSE_POSITIVE = """
+mutation DismissFalsePositive($id: VulnerabilityID!, $comment: String!) {
+    vulnerabilityDismiss(input: {
+        id: $id, dismissalReason: FALSE_POSITIVE, comment: $comment
+    }) {
+        errors
+        vulnerability { id state }
+    }
+}
+""".strip()
+
+DISMISSAL_TARGET_QUERY = """
+query DismissalTarget($id: VulnerabilityID!) {
+    vulnerability(id: $id) { id uuid state project { fullPath } }
+}
+""".strip()
+
 _TITLE_PACKAGE = re.compile(r"\bin\s+([A-Za-z0-9_@./+-]+)\s*$")
 KEEP_STATES = {"detected", "confirmed"}
 
@@ -134,7 +151,7 @@ class FetchResult:
 
 
 class GitLabClient:
-    """GraphQL-only finding retrieval. POST is used because GitLab GraphQL requires it.
+    """GraphQL retrieval and a separate approved false-positive dismissal operation.
 
     The client keeps one HTTP connection pool for the life of the process.
     Call ``close`` when the server shuts down. An injected ``http`` client
@@ -197,7 +214,9 @@ class GitLabClient:
         if not self.token:
             return FetchResult(ok=False, error="GITLAB_TOKEN is required")
         if not project_id:
-            return FetchResult(ok=False, error="GITLAB_PROJECT_ID is required")
+            return FetchResult(
+                ok=False, error="A GitLab project path or numeric ID is required"
+            )
         if (
             "mutation" in FINDINGS_QUERY.lower()
             or "mutation" in TRACKED_REFS_QUERY.lower()
@@ -243,6 +262,70 @@ class GitLabClient:
                 )
             return path
         return unquote(project_id).strip("/")
+
+    def dismiss_false_positive(
+        self, vulnerability_id: str, finding_id: str, project_path: str, reason: str
+    ) -> dict:
+        """Check target identity and active state, then dismiss with the exact reason.
+
+        The caller must obtain human approval for this specific assessment first.
+        No retries are made: a lost response may follow a successful remote write.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("GitLab client is closed")
+            if not self.token:
+                raise ValueError("GITLAB_TOKEN with API write permission is required")
+            if not re.fullmatch(
+                r"gid://gitlab/Vulnerability/[1-9][0-9]*", vulnerability_id
+            ):
+                raise ValueError(
+                    "A GitLab Vulnerability global ID is required, not a finding UUID"
+                )
+            if (
+                not finding_id
+                or not project_path
+                or not reason.strip()
+                or len(reason) > 50000
+            ):
+                raise ValueError(
+                    "Finding, project and a reason of 1-50,000 characters are required"
+                )
+            payload = self._graphql(DISMISSAL_TARGET_QUERY, {"id": vulnerability_id})
+            target = (payload.get("data") or {}).get("vulnerability") or {}
+            if (
+                target.get("id") != vulnerability_id
+                or target.get("uuid") != finding_id
+                or (target.get("project") or {}).get("fullPath") != project_path
+                or target.get("state") not in {"DETECTED", "CONFIRMED"}
+            ):
+                raise RuntimeError(
+                    "GitLab target changed, is not active, or does not match the approved finding/project"
+                )
+            payload = self._request(
+                "POST",
+                self._graphql_url(),
+                json_body={
+                    "query": DISMISS_FALSE_POSITIVE,
+                    "variables": {"id": vulnerability_id, "comment": reason},
+                },
+            )
+            result = (payload.get("data") or {}).get("vulnerabilityDismiss") or {}
+            if result.get("errors") != []:
+                raise RuntimeError(
+                    self._clean(
+                        f"GitLab dismissal failed: {result.get('errors', 'missing mutation result')}"
+                    )
+                )
+            vulnerability = result.get("vulnerability") or {}
+            if (
+                vulnerability.get("id") != vulnerability_id
+                or vulnerability.get("state") != "DISMISSED"
+            ):
+                raise RuntimeError(
+                    "GitLab did not confirm the requested dismissal; inspect GitLab before retrying"
+                )
+            return {"status": "DISMISSED", "vulnerability_id": vulnerability_id}
 
     def _main_tracked_ref(self, full_path: str) -> str:
         """Resolve tracked main with bounded, advancing pagination.
@@ -467,6 +550,7 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
         or node.get("id")
         or node.get("title")
         or "unknown-finding",
+        "vulnerabilityId": node.get("id"),
         "title": node.get("title"),
         "description": node.get("description"),
         "scanner": (node.get("scanner") or {}).get("name"),
