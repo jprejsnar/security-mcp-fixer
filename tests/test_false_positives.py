@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -12,7 +13,7 @@ import pytest
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.tools.base import Tool
 from mcp.shared.exceptions import MCPError
-from mcp.types import ClientCapabilities, CreateMessageResult, TextContent
+from mcp.types import ClientCapabilities
 
 from gitlab_security_mcp import server
 from gitlab_security_mcp.engine import Engine
@@ -162,6 +163,150 @@ def test_checkbox_submission_is_the_only_write_gate(
         assert engine.state.gitlab_dismissals == []
 
 
+@pytest.mark.parametrize(
+    ("action", "checked", "supported", "writes"),
+    [
+        ("accept", True, True, 1),
+        ("accept", False, True, 0),
+        ("decline", True, True, 0),
+        ("cancel", True, True, 0),
+        ("accept", True, False, 0),
+    ],
+)
+def test_combined_completion_reviews_once_then_persists_final_report(
+    tmp_path, monkeypatch, action, checked, supported, writes
+):
+    """Finish in one MCP call without rescanning or bypassing human selection."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context(action, checked, supported)
+    tool = Tool.from_function(server.complete_security_run)
+
+    # Act
+    result = asyncio.run(
+        tool.run({"repo_root": str(tmp_path)}, ctx, convert_result=True)
+    )
+    payload = result.structured_content
+    saved = json.loads(Path(payload["json_report"]).read_text(encoding="utf-8"))
+
+    # Assert
+    assert not result.is_error
+    assert payload["status"] == "REPORT_GENERATED"
+    assert ctx.elicit.await_count == (1 if supported else 0)
+    assert engine.gitlab.dismiss_false_positive.call_count == writes
+    assert len(saved["gitlab_dismissals"]) == writes
+    assert result.content[-1].text == payload["final_summary_markdown"]
+    assert saved["final_summary_markdown"] == payload["final_summary_markdown"]
+    assert payload["false_positive_review"]["status"] == (
+        "APPROVAL_UNAVAILABLE"
+        if not supported
+        else "CANCELLED"
+        if action != "accept"
+        else "OK"
+    )
+    engine.advisory.lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["form", "mutation"])
+def test_combined_completion_reports_approval_errors_without_losing_report(
+    tmp_path, monkeypatch, failure
+):
+    """Surface a form or mutation failure while preserving the local report."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context()
+    if failure == "form":
+        ctx.elicit.side_effect = MCPError(-32601, "Host cannot open the form")
+    else:
+        engine.gitlab.dismiss_false_positive.side_effect = RuntimeError("Response lost")
+
+    # Act
+    result = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+
+    # Assert
+    assert Path(result.structured_content["json_report"]).is_file()
+    assert result.structured_content["false_positive_review"]["status"] == (
+        "APPROVAL_UNAVAILABLE" if failure == "form" else "PARTIAL_FAILURE"
+    )
+    assert result.is_error is (failure == "mutation")
+    assert ctx.elicit.await_count == 1
+    if failure == "form":
+        engine.gitlab.dismiss_false_positive.assert_not_called()
+        assert "Host cannot open the form" in result.content[0].text
+    else:
+        assert len(result.structured_content["gitlab_dismissals"]) == 1
+
+
+def test_combined_completion_does_not_prompt_without_eligible_false_positives(
+    tmp_path, monkeypatch
+):
+    """Generate the report directly when no finding can be offered for approval."""
+    # Arrange
+    engine = _engine(tmp_path)
+    engine.state.decisions["finding-1"] = {
+        "decision": "MANUAL_REVIEW",
+        "reason": "Incomplete evidence.",
+    }
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context()
+
+    # Act
+    result = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+
+    # Assert
+    assert result.structured_content["status"] == "REPORT_GENERATED"
+    assert (
+        result.structured_content["false_positive_review"]["status"]
+        == "ASSESSMENT_REQUIRED"
+    )
+    ctx.elicit.assert_not_called()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_combined_completion_keeps_checkout_selected_before_the_form(
+    tmp_path, monkeypatch
+):
+    """Do not switch repositories if another checkout becomes active during approval."""
+    # Arrange
+    first_root, other_root = tmp_path / "first", tmp_path / "other"
+    first_root.mkdir()
+    other_root.mkdir()
+    first, other = _engine(first_root), _engine(other_root)
+    active = [first]
+
+    def select(root):
+        """Model a changed default checkout while honoring explicit repository paths."""
+        return (
+            active[0]
+            if root is None
+            else first
+            if Path(root).resolve() == first_root
+            else other
+        )
+
+    monkeypatch.setattr(server, "_engine_for", select)
+    ctx = _context()
+    original = ctx.elicit.side_effect
+
+    async def elicit(message, schema):
+        """Switch the host's default repository while the form is displayed."""
+        active[0] = other
+        return await original(message, schema)
+
+    ctx.elicit.side_effect = elicit
+
+    # Act
+    result = asyncio.run(server.complete_security_run(ctx))
+
+    # Assert
+    assert Path(result.structured_content["json_report"]).is_relative_to(first_root)
+    first.gitlab.dismiss_false_positive.assert_called_once()
+    other.gitlab.dismiss_false_positive.assert_not_called()
+    assert not (other_root / ".security-mcp").exists()
+
+
 def test_repeat_review_explains_previously_confirmed_dismissals(tmp_path, monkeypatch):
     """Report completed dismissals rather than a misleading empty assessment list."""
     # Arrange
@@ -270,24 +415,14 @@ def _source_engine(tmp_path):
     return engine, source, review
 
 
-def _sampling_context(actions, supported=True):
-    """Provide an actual SDK context with a host-controlled model response stream."""
+def _source_context(sampling=False):
+    """Provide an SDK context that forbids deprecated sampling requests."""
     session = Mock()
     session.client_capabilities = ClientCapabilities.model_validate(
-        {"sampling": {}} if supported else {}
+        {"sampling": {}} if sampling else {}
     )
     session.create_message = AsyncMock(
-        side_effect=[
-            action
-            if isinstance(action, Exception)
-            else CreateMessageResult(
-                role="assistant",
-                content=TextContent(type="text", text=json.dumps(action)),
-                model="host-test-model",
-                stop_reason="endTurn",
-            )
-            for action in actions
-        ]
+        side_effect=AssertionError("Deprecated sampling must not be used")
     )
     return Context(
         request_context=SimpleNamespace(session=session, request_id="verification")
@@ -328,33 +463,22 @@ def test_sdk_reviews_all_supported_source_and_configuration_types(
             "assessment": "Read the full cited fixture; it does not implement the reported Spring endpoint.",
         }
     ]
-    ctx = _sampling_context(
-        [{"review": review}] if sampling else [], supported=sampling
-    )
+    ctx = _source_context(sampling=sampling)
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     tool = Tool.from_function(server.verify_security_finding)
 
     # Act
     initial = asyncio.run(tool.run({"finding_id": "finding-1"}, ctx))
-    if sampling:
-        result = initial
-    else:
-        result = asyncio.run(
-            tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
-        )
+    result = asyncio.run(
+        tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
+    )
 
     # Assert
     assert result["decision"] == "FALSE_POSITIVE"
-    if sampling:
-        assert initial["ai_source_review"]["status"] == "COMPLETE"
-        cited = json.loads(
-            ctx.session.create_message.call_args.args[0][0].content.text
-        )["cited_source"]
-    else:
-        assert initial["decision"] == "SOURCE_REVIEW_REQUIRED"
-        assert initial["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
-        cited = initial["ai_source_review"]["cited_source"]
-        ctx.session.create_message.assert_not_called()
+    assert initial["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert initial["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
+    cited = initial["ai_source_review"]["cited_source"]
+    ctx.session.create_message.assert_not_called()
     assert cited["content"] == source.read_bytes().decode("utf-8")
     assert cited["sha256"] == review["reviewed_files"][0]["sha256"]
     engine.gitlab.dismiss_false_positive.assert_not_called()
@@ -397,33 +521,33 @@ def test_sdk_verification_requests_ai_source_and_input_flow_review(
             "assessment": "Traced the caller's literal route.",
         }
     )
-    ctx = _sampling_context(
-        [
-            {"search_text": "route"},
-            {"read_files": [caller.name]},
-            {"review": review},
-        ]
-    )
+    ctx = _source_context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     tool = Tool.from_function(server.verify_security_finding)
 
     # Act
-    result = asyncio.run(
+    pending = asyncio.run(
         tool.run({"finding_id": "finding-1", "repo_root": str(tmp_path)}, ctx)
+    )
+    result = asyncio.run(
+        tool.run(
+            {
+                "finding_id": "finding-1",
+                "repo_root": str(tmp_path),
+                "source_review": review,
+            },
+            ctx,
+        )
     )
 
     # Assert
     assert result["decision"] == decision
-    assert result["ai_source_review"]["status"] == "COMPLETE"
+    assert pending["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
     assert engine.state.findings[0]["sourceReview"] == review
-    calls = ctx.session.create_message.call_args_list
-    assert len(calls) == 3
-    request = json.loads(calls[0].args[0][0].content.text)
-    assert request["cited_source"]["content"] == source.read_bytes().decode("utf-8")
-    evidence = json.loads(calls[2].args[0][-1].content.text)
-    assert evidence["files"][0]["content"] == caller.read_bytes().decode("utf-8")
-    assert calls[0].kwargs["include_context"] == "none"
-    assert calls[0].kwargs["related_request_id"] == "verification"
+    assert pending["ai_source_review"]["cited_source"][
+        "content"
+    ] == source.read_bytes().decode("utf-8")
+    ctx.session.create_message.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
     assert bool(engine.false_positive_candidates()["candidates"]) is (
         decision == "FALSE_POSITIVE"
@@ -436,7 +560,7 @@ def test_host_without_sampling_receives_full_source_and_must_record_review(
     """Give the calling AI actual source, not a generic terminal placeholder."""
     # Arrange
     engine, source, review = _source_engine(tmp_path)
-    ctx = _sampling_context([], supported=False)
+    ctx = _source_context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     tool = Tool.from_function(server.verify_security_finding)
 
@@ -457,119 +581,86 @@ def test_host_without_sampling_receives_full_source_and_must_record_review(
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
-def test_source_review_uses_real_sdk_sampling_request(tmp_path, monkeypatch):
-    """Exercise the SDK's native sampling request before recording a source verdict."""
+def test_source_review_never_uses_deprecated_sampling(tmp_path, monkeypatch):
+    """Keep SDK back-channel requests unused even when sampling is advertised."""
     # Arrange
-    from mcp.server.session import ServerSession
-
     engine, _source, review = _source_engine(tmp_path)
-    ctx = _sampling_context([])
-    ctx.session.send_request = AsyncMock(
-        return_value=CreateMessageResult(
-            role="assistant",
-            content=TextContent(type="text", text=json.dumps({"review": review})),
-            model="host-test-model",
-        )
-    )
-    ctx.session.create_message = ServerSession.create_message.__get__(
-        ctx.session, ServerSession
-    )
+    ctx = _source_context(sampling=True)
+    ctx.session.send_request = AsyncMock()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act
-    result = asyncio.run(
+    pending = asyncio.run(
         Tool.from_function(server.verify_security_finding).run(
             {"finding_id": "finding-1"}, ctx
+        )
+    )
+    result = asyncio.run(
+        Tool.from_function(server.verify_security_finding).run(
+            {"finding_id": "finding-1", "source_review": review}, ctx
         )
     )
 
     # Assert
     assert result["decision"] == "FALSE_POSITIVE"
-    request = ctx.session.send_request.call_args.kwargs["request"]
-    assert request.method == "sampling/createMessage"
-    assert "class Endpoint" in request.params.messages[0].content.text
-    assert request.params.include_context == "none"
+    assert pending["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
+    ctx.session.send_request.assert_not_called()
+    ctx.session.create_message.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "failure", ["declined", "unread-file", "outside", "invalid-action"]
+    "failure", ["declined", "invalid-hash", "outside", "invalid-review"]
 )
 def test_ai_review_failures_cannot_become_false_positives(
     tmp_path, monkeypatch, failure
 ):
-    """Fail closed on denied sampling, fabricated receipts, or unsafe requests."""
+    """Keep declined, stale, out-of-checkout and invalid host reviews unresolved."""
     # Arrange
     engine, _source, review = _source_engine(tmp_path)
-    if failure == "declined":
-        actions = [MCPError(-32603, "User declined AI review")]
-    elif failure == "unread-file":
-        unread = tmp_path / "Unread.java"
-        unread.write_text("class Unread {}\n", encoding="utf-8")
-        review["reviewed_files"].append(
-            {
-                "path": unread.name,
-                "sha256": hashlib.sha256(unread.read_bytes()).hexdigest(),
-                "assessment": "Invented read receipt.",
-            }
-        )
-        actions = [{"review": review}]
+    if failure == "invalid-hash":
+        review["reviewed_files"][0]["sha256"] = "0" * 64
     elif failure == "outside":
-        actions = [{"read_files": ["../outside.java"]}]
-    else:
-        actions = [{"execute": "arbitrary command"}]
-    ctx = _sampling_context(actions)
+        review["reviewed_files"][0]["path"] = "../outside.java"
+    elif failure == "invalid-review":
+        review = {"execute": "arbitrary command"}
+    ctx = _source_context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act
-    result = asyncio.run(
-        Tool.from_function(server.verify_security_finding).run(
-            {"finding_id": "finding-1"}, ctx
+    tool = Tool.from_function(server.verify_security_finding)
+    result = asyncio.run(tool.run({"finding_id": "finding-1"}, ctx))
+    if failure != "declined":
+        result = asyncio.run(
+            tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
         )
-    )
     saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
 
     # Assert
     assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
-    assert result["ai_source_review"]["status"] == "FAILED"
-    assert (
-        "AI source review could not complete"
-        in saved["decisions"]["finding-1"]["reason"]
-    )
+    assert saved["decisions"]["finding-1"]["decision"] == "SOURCE_REVIEW_REQUIRED"
+    ctx.session.create_message.assert_not_called()
     assert engine.false_positive_candidates()["candidates"] == []
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
-def test_ai_review_rejects_source_changed_during_sampling(tmp_path, monkeypatch):
-    """Recheck full-byte evidence before storing a model's conclusion."""
+def test_ai_review_rejects_source_changed_during_host_review(tmp_path, monkeypatch):
+    """Recheck full-byte evidence before storing the calling AI's conclusion."""
     # Arrange
     engine, source, review = _source_engine(tmp_path)
-    ctx = _sampling_context([])
-
-    async def change_source(*args, **kwargs):
-        """Simulate a checkout edit before the host returns its old review."""
-        source.write_text(
-            "class Endpoint { String route = external; }\n", encoding="utf-8"
-        )
-        return CreateMessageResult(
-            role="assistant",
-            content=TextContent(type="text", text=json.dumps({"review": review})),
-            model="host-test-model",
-        )
-
-    ctx.session.create_message.side_effect = change_source
+    ctx = _source_context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act
+    tool = Tool.from_function(server.verify_security_finding)
+    asyncio.run(tool.run({"finding_id": "finding-1"}, ctx))
+    source.write_text("class Endpoint { String route = external; }\n", encoding="utf-8")
     result = asyncio.run(
-        Tool.from_function(server.verify_security_finding).run(
-            {"finding_id": "finding-1"}, ctx
-        )
+        tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
     )
 
     # Assert
     assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
-    assert result["ai_source_review"]["status"] == "INVALID"
     assert "changed" in result["reason"]
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -587,7 +678,7 @@ def test_missing_or_oversized_source_is_not_sent_for_ai_review(
         source.unlink()
     else:
         source.write_bytes(b"x" * (MAX_REVIEW_BYTES + 1))
-    ctx = _sampling_context([])
+    ctx = _source_context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act

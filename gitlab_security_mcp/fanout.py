@@ -7,7 +7,9 @@ call and is shut down before return, so worker threads are not left behind.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextvars import copy_context
+from itertools import islice
 from typing import TypeVar
 
 MAX_WORKERS = 8
@@ -25,9 +27,29 @@ def map_ordered(
     from function propagates after the pool finishes work it already started
     and cancels work it has not started.
     """
-    sequence = list(items)
+    remaining = iter(items)
+    sequence = list(islice(remaining, MAX_WORKERS))
     if len(sequence) <= 1:
         return [function(item) for item in sequence]
     workers = min(MAX_WORKERS, len(sequence))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(function, sequence))
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="security-io"
+    ) as pool:
+        pending: dict[Future[Result], int] = {}
+        results: dict[int, Result] = {}
+        submitted = len(sequence)
+        try:
+            for index, item in enumerate(sequence):
+                pending[pool.submit(copy_context().run, function, item)] = index
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = pending.pop(future)
+                    results[index] = future.result()
+                for item in islice(remaining, len(completed)):
+                    pending[pool.submit(copy_context().run, function, item)] = submitted
+                    submitted += 1
+            return [results[index] for index in range(submitted)]
+        finally:
+            for future in pending:
+                future.cancel()

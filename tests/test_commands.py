@@ -1,6 +1,7 @@
 """Verify command boundaries, child cleanup, pipe readers, and audit hashes."""
 
 import json
+import os
 from datetime import date
 
 import pytest
@@ -50,15 +51,21 @@ def test_exact_pnpm_preparation_commands_are_allowlisted(tmp_path, step):
 
 
 @pytest.mark.parametrize("failed_start", [1, 2])
-def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_start):
-    """Reader start failure cleans up process."""
+@pytest.mark.parametrize("after_start", [False, True])
+def test_reader_start_failure_cleans_up_process(
+    tmp_path, monkeypatch, failed_start, after_start
+):
+    """Reap children and join readers even if start raises after launching a thread."""
     # Arrange
+    import time
+
     from gitlab_security_mcp import commands
 
     processes = []
     started_threads = []
     real_popen = commands.subprocess.Popen
     real_start = commands.threading.Thread.start
+    real_read = commands._read_capped
     attempts = 0
 
     def recording_popen(*args, **kwargs):
@@ -72,13 +79,23 @@ def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_st
         """Fail one reader start while tracking successfully started threads."""
         nonlocal attempts
         attempts += 1
-        if attempts == failed_start:
+        if attempts == failed_start and not after_start:
             raise RuntimeError("Cannot start reader")
         real_start(thread)
         started_threads.append(thread)
+        if attempts == failed_start:
+            raise RuntimeError("Cannot start reader")
+
+    def delayed_read(pipe, limit, stop, **kwargs):
+        """Keep launched readers alive long enough to expose missing joins."""
+        stop.wait(timeout=2)
+        time.sleep(0.1)
+        return real_read(pipe, limit, stop, **kwargs)
 
     monkeypatch.setattr(commands.subprocess, "Popen", recording_popen)
     monkeypatch.setattr(commands.threading.Thread, "start", failing_start)
+    if after_start:
+        monkeypatch.setattr(commands, "_read_capped", delayed_read)
     runner = CommandRunner(tmp_path)
 
     # Act
@@ -86,11 +103,399 @@ def test_reader_start_failure_cleans_up_process(tmp_path, monkeypatch, failed_st
         runner.run(["git", "rev-parse", "--is-inside-work-tree"], timeout=30)
 
     # Assert
-    assert len(processes) == 1
-    assert processes[0].poll() is not None
-    assert processes[0].stdout.closed
-    assert processes[0].stderr.closed
-    assert all(not thread.is_alive() for thread in started_threads)
+    try:
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert processes[0].stdout.closed
+        assert processes[0].stderr.closed
+        assert all(not thread.is_alive() for thread in started_threads)
+    finally:
+        for thread in started_threads:
+            thread.join(timeout=3)
+
+
+def test_progress_cancellation_reaps_child_before_readers_start(tmp_path, monkeypatch):
+    """Cancel initial progress without leaving a live child or open pipes."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp import commands
+
+    children = []
+    real_popen = commands.subprocess.Popen
+
+    def launch(argv, **kwargs):
+        """Substitute a long-lived real process for the Git probe."""
+        if argv[0] != "git":
+            return real_popen(argv, **kwargs)
+        child = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"], **kwargs
+        )
+        children.append(child)
+        return child
+
+    def cancel(text):
+        """Interrupt the command before output readers have been constructed."""
+        raise KeyboardInterrupt("cancel progress")
+
+    monkeypatch.setattr(commands.subprocess, "Popen", launch)
+    runner = CommandRunner(tmp_path, progress_callback=cancel)
+
+    # Act
+    try:
+        with pytest.raises(KeyboardInterrupt, match="cancel progress"):
+            runner.run(["git", "rev-parse", "HEAD"], timeout=30)
+
+        # Assert
+        assert children[0].poll() is not None
+        assert children[0].stdout.closed
+        assert children[0].stderr.closed
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            commands._close_pipes(child)
+
+
+@pytest.mark.parametrize("failure", ["disk", "cancel"])
+def test_reader_failure_stops_child_without_waiting_for_timeout(
+    tmp_path, monkeypatch, failure
+):
+    """Reader exceptions and cancellation stop the producer before its timeout."""
+    # Arrange
+    import sys
+    import time
+
+    from gitlab_security_mcp import commands
+
+    children = []
+    real_popen = commands.subprocess.Popen
+    real_open = commands.Path.open
+    log_handles = []
+
+    def launch(argv, **kwargs):
+        """Run a real child which would otherwise remain alive for a minute."""
+        if argv[0] != "pnpm":
+            return real_popen(argv, **kwargs)
+        output = (
+            "print('Tests: 1 passed, 1 total', flush=True); "
+            if failure == "cancel"
+            else ""
+        )
+        child = real_popen(
+            [sys.executable, "-c", f"import time; {output}time.sleep(60)"],
+            **kwargs,
+        )
+        children.append(child)
+        return child
+
+    def fail_log(path, *args, **kwargs):
+        """Reproduce a disk failure in an output reader."""
+        if path.suffix == ".log" and failure == "disk":
+            raise OSError("log disk unavailable")
+        handle = real_open(path, *args, **kwargs)
+        if path.suffix == ".log":
+            log_handles.append(handle)
+        return handle
+
+    def cancel_progress(text):
+        """Reproduce cancellation raised by a reader's progress callback."""
+        if failure == "cancel" and "1/1 tests" in text:
+            raise KeyboardInterrupt("cancel reader")
+
+    monkeypatch.setattr(commands.subprocess, "Popen", launch)
+    monkeypatch.setattr(commands.Path, "open", fail_log)
+    runner = CommandRunner(tmp_path, progress_callback=cancel_progress)
+    started = time.monotonic()
+
+    # Act
+    with pytest.raises(RuntimeError, match="Could not read command output"):
+        runner.run(["pnpm", "test"], timeout=4)
+
+    # Assert
+    assert time.monotonic() - started < 3
+    assert children[0].poll() is not None
+    assert children[0].stdout.closed
+    assert children[0].stderr.closed
+    assert all(handle.closed for handle in log_handles)
+
+
+def _test_pid_running(pid):
+    """Inspect a descendant without sending Windows' destructive signal zero."""
+    import os
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel.WaitForSingleObject(handle, 0) == 258
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    from pathlib import Path
+
+    stat = Path(f"/proc/{pid}/stat")
+    return not stat.exists() or stat.read_text().split(") ", 1)[1][0] != "Z"
+
+
+@pytest.mark.parametrize("outcome", ["exit", "immediate-exit", "timeout", "cancel"])
+def test_command_cleanup_stops_inherited_pipe_descendants(
+    tmp_path, monkeypatch, outcome
+):
+    """Stop a real descendant even when its direct parent exits successfully."""
+    # Arrange
+    import os
+    import signal
+    import sys
+    import time
+
+    from gitlab_security_mcp import commands
+
+    gate = tmp_path / "start"
+    pid_file = tmp_path / "descendant"
+    wait_for_gate = (
+        "\nwhile not gate.exists(): time.sleep(0.01)\n"
+        if outcome != "immediate-exit"
+        else "\n"
+    )
+    script = (
+        "import pathlib, subprocess, sys, time; "
+        f"gate = pathlib.Path({str(gate)!r}); {wait_for_gate}"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"path = pathlib.Path({str(pid_file)!r}); pending = path.with_suffix('.pending'); "
+        "pending.write_text(str(child.pid)); pending.replace(path); "
+        + ("time.sleep(60)" if outcome in {"timeout", "cancel"} else "")
+    )
+    real_popen = commands.subprocess.Popen
+    real_wait = commands.subprocess.Popen.wait
+    children = []
+    cancelled = False
+
+    def launch(argv, **kwargs):
+        """Launch a parent which waits until the runner has established ownership."""
+        if argv[0] != "git":
+            return real_popen(argv, **kwargs)
+        child = real_popen([sys.executable, "-c", script], **kwargs)
+        children.append(child)
+        return child
+
+    def wait(process, *args, **kwargs):
+        """Interrupt only the main wait after the descendant is demonstrably alive."""
+        nonlocal cancelled
+        if outcome == "cancel" and process in children and not cancelled:
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            cancelled = True
+            raise KeyboardInterrupt("cancel wait")
+        return real_wait(process, *args, **kwargs)
+
+    monkeypatch.setattr(commands.subprocess, "Popen", launch)
+    monkeypatch.setattr(real_popen, "wait", wait)
+    if os.name == "nt" and outcome == "immediate-exit":
+        real_attach = commands._WindowsJob.attach
+
+        def delayed_attach(job, process):
+            """Expose children escaping the job if the root starts unsuspended."""
+            time.sleep(0.25)
+            real_attach(job, process)
+
+        monkeypatch.setattr(commands._WindowsJob, "attach", delayed_attach)
+    runner = CommandRunner(tmp_path, progress_callback=lambda text: gate.touch())
+
+    # Act
+    try:
+        if outcome == "cancel":
+            with pytest.raises(KeyboardInterrupt, match="cancel wait"):
+                runner.run(["git", "rev-parse", "HEAD"], timeout=10)
+        else:
+            result = runner.run(
+                ["git", "rev-parse", "HEAD"],
+                timeout=1 if outcome == "timeout" else 10,
+                check=False,
+            )
+            assert result.exit_code == (124 if outcome == "timeout" else 0)
+        descendant = int(pid_file.read_text())
+        deadline = time.monotonic() + 3
+        while _test_pid_running(descendant) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Assert
+        assert not _test_pid_running(descendant)
+        assert children[0].poll() is not None
+        assert children[0].stdout.closed
+        assert children[0].stderr.closed
+    finally:
+        if pid_file.exists():
+            descendant = int(pid_file.read_text())
+            if _test_pid_running(descendant):
+                os.kill(descendant, signal.SIGTERM)
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            commands._close_pipes(child)
+
+
+def test_negative_output_cap_is_rejected(tmp_path):
+    """Reject negative caps which otherwise grow the tail buffer without bound."""
+    # Arrange
+    limit = -2
+
+    # Act
+    with pytest.raises(ValueError, match="max_output"):
+        CommandRunner(tmp_path, max_output=limit)
+
+    # Assert
+    assert not (tmp_path / ".security-mcp").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job ownership")
+def test_job_resume_failure_closes_job_and_child_handles(tmp_path, monkeypatch):
+    """Release the Windows job and suspended child when resuming fails."""
+    # Arrange
+    import ctypes
+    import sys
+    from ctypes import wintypes
+
+    from gitlab_security_mcp import commands
+
+    real_popen = commands.subprocess.Popen
+    children = []
+    jobs = []
+    handles = []
+
+    def launch(argv, **kwargs):
+        """Track the real suspended child without replacing taskkill helpers."""
+        if argv[0] != "git":
+            return real_popen(argv, **kwargs)
+        child = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"], **kwargs
+        )
+        children.append(child)
+        return child
+
+    def fail_resume(job, pid):
+        """Fail after assignment while the child remains suspended."""
+        jobs.append(job)
+        handles.append(job._handle)
+        raise OSError("resume failed")
+
+    monkeypatch.setattr(commands.subprocess, "Popen", launch)
+    monkeypatch.setattr(commands._WindowsJob, "_resume", fail_resume)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetHandleInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel.GetHandleInformation.restype = wintypes.BOOL
+    flags = wintypes.DWORD()
+
+    # Act
+    with pytest.raises(OSError, match="resume failed"):
+        CommandRunner(tmp_path).run(["git", "rev-parse", "HEAD"], timeout=30)
+
+    # Assert
+    assert jobs[0]._handle is None
+    assert not kernel.GetHandleInformation(handles[0], ctypes.byref(flags))
+    assert ctypes.get_last_error() == 6  # ERROR_INVALID_HANDLE
+    assert children[0].poll() is not None
+    assert children[0].stdout.closed
+    assert children[0].stderr.closed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job ownership")
+def test_job_assignment_denial_reaps_suspended_child_and_releases_handles(
+    tmp_path, monkeypatch
+):
+    """Fail closed on assignment denial, releasing the job and assignment handles."""
+    # Arrange
+    import ctypes
+    import sys
+    from ctypes import wintypes
+
+    from gitlab_security_mcp import commands
+
+    real_popen = commands.subprocess.Popen
+    real_init = commands._WindowsJob.__init__
+    real_resume = commands._WindowsJob._resume
+    children = []
+    jobs = []
+    handles = []
+    resumed = []
+    executed = tmp_path / "executed"
+    script = (
+        f"from pathlib import Path; Path({str(executed)!r}).touch(); "
+        "import time; time.sleep(60)"
+    )
+
+    def launch(argv, **kwargs):
+        """Track the suspended command, leaving PID-specific cleanup unchanged."""
+        if argv[0] != "git":
+            return real_popen(argv, **kwargs)
+        assert kwargs["creationflags"] & 0x00000004  # CREATE_SUSPENDED
+        child = real_popen([sys.executable, "-c", script], **kwargs)
+        children.append(child)
+        return child
+
+    def deny_assignment(job_handle, process_handle):
+        """Simulate a restrictive host job refusing nested containment."""
+        handles.extend([job_handle, process_handle])
+        ctypes.set_last_error(5)  # ERROR_ACCESS_DENIED
+        return False
+
+    def initialize(job):
+        """Use a real native job and process handle, denying only assignment."""
+        real_init(job)
+        jobs.append(job)
+        monkeypatch.setattr(job._kernel, "AssignProcessToJobObject", deny_assignment)
+
+    def resume(job, pid):
+        """Record any attempt to run an uncontained child."""
+        resumed.append(pid)
+        real_resume(job, pid)
+
+    monkeypatch.setattr(commands.subprocess, "Popen", launch)
+    monkeypatch.setattr(commands._WindowsJob, "__init__", initialize)
+    monkeypatch.setattr(commands._WindowsJob, "_resume", resume)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetHandleInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel.GetHandleInformation.restype = wintypes.BOOL
+    flags = wintypes.DWORD()
+
+    # Act
+    with pytest.raises(OSError) as raised:
+        CommandRunner(tmp_path).run(["git", "rev-parse", "HEAD"], timeout=1)
+
+    # Assert
+    assert raised.value.winerror == 5
+    assert len(children) == len(jobs) == 1
+    assert resumed == []
+    assert not executed.exists()
+    assert jobs[0]._handle is None
+    assert children[0].poll() is not None
+    assert children[0].stdout.closed
+    assert children[0].stderr.closed
+    assert len(handles) == 2
+    for handle in handles:
+        assert not kernel.GetHandleInformation(handle, ctypes.byref(flags))
+        assert ctypes.get_last_error() == 6  # ERROR_INVALID_HANDLE
 
 
 def test_fixture_git_processes_have_timeouts(tmp_path, monkeypatch):

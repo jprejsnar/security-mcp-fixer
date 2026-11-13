@@ -920,6 +920,63 @@ def test_progress_is_returned_when_host_drops_notifications():
     assert progress_sink.get() is None
 
 
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_progress_cleanup_does_not_hang_on_an_unresponsive_host(cancelled, caplog):
+    """Bound notification draining and reclaim the sender even after cancellation."""
+    # Arrange
+    import asyncio
+    from types import SimpleNamespace
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    publishers = []
+
+    async def exercise():
+        """Block host notifications forever, then finish or cancel the tool."""
+        reporting = asyncio.Event()
+
+        async def report(*args):
+            """Model a connected client that never acknowledges progress."""
+            reporting.set()
+            await asyncio.Event().wait()
+
+        async def call_next(context):
+            """Publish once and optionally wait for the caller's cancellation."""
+            publish = progress_sink.get()
+            publishers.append(publish)
+            publish("Checking findings")
+            await reporting.wait()
+            if cancelled:
+                await asyncio.Event().wait()
+            return {"status": "DONE"}
+
+        context = SimpleNamespace(
+            method="tools/call", session=SimpleNamespace(report_progress=report)
+        )
+        task = asyncio.create_task(server._progress_middleware(context, call_next))
+        await reporting.wait()
+        if cancelled:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            result = None
+        else:
+            result = await asyncio.wait_for(task, 2)
+        assert not (asyncio.all_tasks() - {asyncio.current_task()})
+        return result
+
+    # Act
+    result = asyncio.run(exercise())
+    publishers[0]("A cancelled worker finished after its event loop closed")
+
+    # Assert
+    assert "progress delivery timed out" in caplog.text
+    assert progress_sink.get() is None
+    if not cancelled:
+        assert result["progress_output"] == ["Checking findings"]
+
+
 def test_windows_progress_console_is_isolated_and_cleaned_up(monkeypatch, capsys):
     """Open a separate console without mixing human output into MCP stdout."""
     # Arrange
@@ -2630,5 +2687,6 @@ def test_tools_are_registered():
         "run_validation_matrix",
         "review_false_positives",
         "generate_local_report",
+        "complete_security_run",
         "get_run_status",
     }

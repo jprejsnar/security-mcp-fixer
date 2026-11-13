@@ -5,7 +5,7 @@ It retrieves active findings, verifies installed dependencies against public
 advisories, qualifies compatible package updates, applies supported minimal edits,
 and produces local Markdown and JSON reports.
 
-The MCP host starts this Python process and calls its twelve tools over stdio.
+The MCP host starts this Python process and calls its thirteen tools over stdio.
 One process can hold several application checkouts at once. Each checkout keeps
 its own run, and later calls select it with `repo_root` when more than one is
 active. There is no HTTP listener. "Local" describes execution and where edits
@@ -111,7 +111,7 @@ runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
-  launcher["Root server.py: source launcher"] --> tools["Package server.py: twelve MCP tools and error boundary"]
+  launcher["Root server.py: source launcher"] --> tools["Package server.py: thirteen MCP tools and error boundary"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Host progress display, with stderr fallback"]
   tools --> registry["Checkout registry: one engine per resolved path"]
@@ -221,7 +221,7 @@ flowchart TD
   appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
   regression --> moreFindings
   postChecks --> validationGate{"VALIDATION_COMPLETE?"}
-  validationGate -->|"Yes"| reports["generate_local_report: security table and validation evidence"]
+  validationGate -->|"Yes"| reports["complete_security_run: human approval, then report and validation evidence"]
   validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
   rollbackGate -->|"Retain green subset or report blocked recovery"| reports
   reports --> reviewDiff["Human reviews reports and git diff; commit and push manually"]
@@ -244,6 +244,8 @@ checkout is active.
 | `apply_minimal_fix(finding_id, repo_root=None)` | Read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
 | `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
 | `run_validation_matrix(repo_root=None)` | Validate the complete batch once. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
+| `review_false_positives(repo_root=None)` | Standalone human checkbox approval for eligible assessments. Only selected findings are dismissed; no AI approval argument is accepted. |
+| `complete_security_run(repo_root=None)` | Standard single-request completion: offer the human checkbox form, then write the final report with actual outcomes. Does not rescan or rerun verification. |
 | `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
@@ -318,15 +320,21 @@ The command runner allows specific argument forms, not arbitrary shell commands.
 Direct `git add`, `commit`, `push`, `merge`, `rebase`, `reset`, and unrelated
 branch checkouts are rejected. Allowed Git mutations are the fast-forward pulls
 and creation of the dated security branch. GitLab calls retrieve data only,
-except `review_false_positives`, which requires explicit human checkbox approval
-before dismissing selected vulnerabilities with their recorded reasons.
+except `review_false_positives` and the combined `complete_security_run` that
+invokes it. Both require explicit human checkbox approval before dismissing
+selected vulnerabilities with their recorded reasons.
 
 ### Approving false positives in Finding Assessments
 
-After verification, the host workflow is instructed to call
-`review_false_positives(repo_root=...)` for eligible false positives before the
-final report, offering optional human approval without requiring a second request.
-If the host omits that step, explicitly ask it to run the tool. Reports expose
+After verification and validation, the host calls
+`complete_security_run(repo_root=...)`. This one finishing tool invokes
+`review_false_positives`, waits for optional human approval, and then generates
+the final report, including actual dismissal outcomes. Decline/cancel or an
+unsupported/failed host form still produces a report with the exact approval
+outcome; no remote changes are implied. Do not separately call the review or
+report tool in the standard workflow or reopen a declined form automatically.
+Standalone review/report tools remain available for explicit follow-up requests.
+Reports expose
 `false_positive_approval` separately from source `review_status`: `COMPLETE`
 means the source-review queue is empty, not that GitLab findings were dismissed.
 Pending approval is highlighted before the assessment table with the count of
@@ -359,28 +367,22 @@ relevant callers/configuration, assess each finding separately, and call
 Reports explicitly mark unfinished source review rather than implying all findings
 were fully assessed.
 
-`verify_security_finding` now requests an AI source review through the connected
-host's MCP **sampling** capability when available. It supplies the complete cited
-source, not just an excerpt. The AI can request bounded source/configuration reads,
-file discovery, and literal searches to trace callers, inputs and controls. The
-server validates that reviewed files were actually supplied in full and checks
-their hashes again before recording the conclusion. No separate AI account, API
-key, provider endpoint, or autonomous GitLab dismissal is added. Host permission
-and model selection remain controlled by VS Code/Cursor.
-Sampling is optional and deprecated in the installed MCP SDK; it is used only
-when the host advertises it. The calling-AI path below remains necessary for hosts
-without that capability.
-
-If the host does not advertise sampling, `ai_source_review.status` is
-`HOST_REVIEW_REQUIRED`: the calling Copilot/Cursor AI receives the full cited
+`verify_security_finding` uses `ai_source_review.status=HOST_REVIEW_REQUIRED`:
+the calling Copilot/Cursor AI receives the complete cited source, not an excerpt.
+The deprecated MCP sampling API is never called, even if a host advertises it.
+No separate AI account, API key, provider endpoint, or autonomous GitLab dismissal
+is added. Host permission and model selection remain controlled by VS Code/Cursor.
+The calling AI receives the full cited
 source and must finish the code/input-flow analysis with its own code tools, then
 submit `source_review` in the same workflow. This is unfinished AI work, not a
-request for the user to analyze code. Denied/failed requests, missing/oversized
-files, invalid results, or changed source stay unresolved with an explicit reason.
-Automatic sampling uses at most 12 AI requests and 256,000 bytes of complete-file
-evidence per finding, with a 180-second review timeout. Searches are bounded and
-mark incomplete results; they never prove absence. The Python server does not
-contain an independent language model, and AI assessments are not formal proofs.
+request for the user to analyze code. The returned complete-file evidence is
+limited to 256,000 bytes; the host reads relevant callers with its own code tools.
+The server rechecks full-byte hashes and requires a separate assessment for every
+finding before recording conclusions. These are audited host attestations, not
+proof that the host actually read the files. Denied access, missing/oversized files,
+invalid reviews, or changed source stay unresolved with an explicit reason.
+The Python server does not contain an independent language model, and AI
+assessments are not formal proofs.
 
 The same evidence-bound review supports Java, .NET/C#, TypeScript/Node.js,
 JavaScript, Python, Dockerfiles (including named variants), and nginx
@@ -464,14 +466,32 @@ closes every owned client after its in-flight read finishes, and later calls
 are rejected. Tool results are detached snapshots rather than live state.
 
 Independent documentation pages and advisory identifiers are fetched together,
-at most eight at a time, and returned in request order. A single request stays
+at most eight at a time per batch, and returned in request order. Submission is
+bounded too: large inputs do not create an unbounded queue of futures. Workers
+inherit an isolated copy of the active request context, including its progress
+callback. Pending work is cancelled on failure and running workers are joined
+before the call returns. A single request stays
 on the caller thread. One page or identifier failure is recorded without
 dropping the other results from that batch. GitLab pagination stays sequential
 because each page needs the previous cursor. OSV, GitHub, and NVD stay in that
-order. The command runner still runs one child at a time. Its stdout and stderr
+order. Required Git pulls, edits, validation/rollback, and human-approved GitLab
+mutations stay serialized; parallelizing those steps could corrupt evidence or
+the checkout. Host AI instructions permit bounded fan-out of independent
+read-only evidence work and reuse of complete-file reads, never verdicts.
+MCP notification draining is limited to one second after tool completion.
+Unresponsive hosts cannot indefinitely hold a completed tool open; sender tasks
+are cancelled and awaited, and the bounded transcript remains in the result.
+Late progress from a cancelled worker is ignored after request cleanup.
+The command runner still runs one child at a time. Its stdout and stderr
 readers publish through a lock so their records cannot interleave. Readers are
 daemon threads so a reader that ignores its stop signal cannot keep the process
-alive after the join timeout. Child processes do not receive `GITLAB_TOKEN`,
+alive after the join timeout. On Windows, children start suspended and enter an
+owned kill-on-close job before running. Descendants are terminated even after a
+successful parent exit, rather than surviving to retain pipes or file locks.
+Cancellation and partial reader startup also terminate and reap the owned
+process tree and release its pipes, logs and job handle. Containment failures
+are explicit errors, not an uncontained fallback.
+Child processes do not receive `GITLAB_TOKEN`,
 `GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `NVD_API_KEY`.
 Other environment variables, including a private-registry token the build
 needs, are copied. Logged and returned text also redacts those secrets after
@@ -927,7 +947,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.7-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.9-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -967,7 +987,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.7-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.9-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -989,7 +1009,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.7-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.9-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -998,7 +1018,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.7-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.9-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -1400,6 +1420,13 @@ successful pulls are not undone if DNS subsequently fails.
 run gitlab-security on this repo
 ```
 
+That single request includes false-positive review: after analysis, fixes and
+validation, `complete_security_run` opens the eligible checkbox approvals and
+writes the final report after your response. You do not need a second
+`run review_false_positives` message. It reuses the current assessments instead
+of rescanning; it saves the extra interaction, not the required analysis or
+human approval time. No findings are dismissed without your selected checkboxes.
+
 This is a natural-language request to the MCP host, not a PowerShell, Bash or
 standalone CLI command. The host resolves the active application's absolute Git
 checkout root and passes it as `repo_root`; it must not select the MCP server's
@@ -1463,7 +1490,8 @@ and retains a passing combination. Reject incompatible updates and interactions.
 Require a green final build and all unit tests, even when every update is
 rejected and the original baseline is restored. Never claim a broken baseline
 is recovered. Do not retry rejected targets blindly or adapt source/tests.
-Generate the local report and display final_summary_markdown verbatim at the
+Finish with complete_security_run to offer human checkbox approval and generate
+the local report. Display final_summary_markdown verbatim at the
 end of your final response: the six-column security issues table. Inspect
 isolation_trials, retained_updates and rejected_updates after recovery.
 If validation returns FIX_REJECTED with continue_with_next_finding true,
@@ -1626,7 +1654,8 @@ previews preserve final summaries. Rejection details include the failed command,
 exit code, final diagnostics and log paths. A failure reproduced on the original
 baseline is not evidence that a proposed package alone caused it.
 
-`generate_local_report` returns `final_summary_markdown`: display the complete
+`complete_security_run` (or standalone `generate_local_report`) returns
+`final_summary_markdown`: display the complete
 security table at the end of the final response, not only file paths.
 
 ## Development and tests

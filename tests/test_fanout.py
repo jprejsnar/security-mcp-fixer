@@ -443,3 +443,120 @@ def test_one_item_stays_on_the_caller_and_keeps_order():
     assert single == [7]
     assert calls[0] == threading.get_ident()
     assert ordered == [1, 2, 3]
+
+
+def test_fanout_preserves_request_context_without_sharing_worker_changes():
+    """Keep progress callbacks request-local when work enters pool threads."""
+    # Arrange
+    from contextvars import ContextVar
+
+    marker = ContextVar("request_marker", default="unset")
+    marker.set("request")
+
+    def work(item):
+        """Read the caller context, then modify only this worker's copy."""
+        before = marker.get()
+        marker.set(str(item))
+        return before, threading.current_thread()
+
+    # Act
+    results = map_ordered(work, range(4))
+
+    # Assert
+    assert [value for value, _thread in results] == ["request"] * 4
+    assert marker.get() == "request"
+    assert all(not thread.is_alive() for _value, thread in results)
+
+
+def test_fanout_bounds_queued_work_as_the_input_is_consumed(monkeypatch):
+    """Never materialize a large iterable or queue more than the worker bound."""
+    # Arrange
+    from gitlab_security_mcp import fanout
+
+    monkeypatch.setattr(fanout, "MAX_WORKERS", 2)
+    lock = threading.Lock()
+    produced = completed = 0
+
+    def items():
+        """Reject eager consumption beyond the bounded in-flight window."""
+        nonlocal produced
+        for item in range(20):
+            with lock:
+                produced += 1
+                assert produced - completed <= 2
+            yield item
+
+    def work(item):
+        """Account for completion before returning ordered output."""
+        nonlocal completed
+        with lock:
+            completed += 1
+        return item
+
+    # Act
+    result = map_ordered(work, items())
+
+    # Assert
+    assert result == list(range(20))
+    assert produced == completed == 20
+
+
+def test_fanout_failure_joins_workers_and_does_not_consume_more_input(monkeypatch):
+    """Reclaim running workers and propagate failures without starting the tail."""
+    # Arrange
+    from gitlab_security_mcp import fanout
+
+    monkeypatch.setattr(fanout, "MAX_WORKERS", 2)
+    entered = threading.Event()
+    release = threading.Event()
+    threads = []
+    produced = []
+
+    def items():
+        """Record how far the work source was consumed."""
+        for item in range(20):
+            produced.append(item)
+            yield item
+
+    def work(item):
+        """Fail the first job while the other job is already running."""
+        threads.append(threading.current_thread())
+        if item == 0:
+            assert entered.wait(2)
+            release.set()
+            raise ValueError("lookup failed")
+        entered.set()
+        assert release.wait(2)
+        return item
+
+    # Act
+    with pytest.raises(ValueError, match="lookup failed"):
+        map_ordered(work, items())
+
+    # Assert
+    assert produced == [0, 1]
+    assert all(not thread.is_alive() for thread in threads)
+
+
+def test_fanout_refills_workers_without_waiting_for_the_first_result(monkeypatch):
+    """Keep spare workers busy while an earlier ordered result is still pending."""
+    # Arrange
+    from gitlab_security_mcp import fanout
+
+    monkeypatch.setattr(fanout, "MAX_WORKERS", 2)
+    last_started = threading.Event()
+
+    def work(item):
+        """Require the third job to start before the first can finish."""
+        if item == 0:
+            assert last_started.wait(2)
+        if item == 2:
+            last_started.set()
+        return item
+
+    # Act
+    result = map_ordered(work, range(3))
+
+    # Assert
+    assert result == [0, 1, 2]
+    assert last_started.is_set()

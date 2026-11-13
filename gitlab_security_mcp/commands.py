@@ -542,7 +542,8 @@ class CommandRunner:
 
     A lock serializes runs so audit lines cannot interleave. Stdout and stderr
     are read on two threads so a full pipe cannot deadlock the child, and each
-    stream is capped so a noisy build cannot fill memory.
+    stream is capped so a noisy build cannot fill memory. Process groups and
+    Windows jobs also stop descendants when their direct parent exits.
     """
 
     def __init__(
@@ -553,7 +554,13 @@ class CommandRunner:
         audit_path: Path | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ):
-        """Configure the repository boundary, output cap, and local audit path."""
+        """Configure the repository boundary, output cap, and local audit path.
+
+        Progress callbacks run on output readers and must return promptly to
+        permit bounded reader shutdown.
+        """
+        if max_output < 0:
+            raise ValueError("max_output must be non-negative")
         self.repo_root = repo_root
         self.max_output = max_output
         self.audit_path = audit_path or (repo_root / ".security-mcp" / "audit.jsonl")
@@ -615,21 +622,6 @@ class CommandRunner:
                 name: directory / f"{identifier}.{name}.log"
                 for name in ("stdout", "stderr")
             }
-        # stdin is the MCP JSON-RPC stream. A child that inherits it could
-        # consume protocol bytes, so it gets an empty stdin instead.
-        process = subprocess.Popen(
-            argv,
-            cwd=workdir,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            env=_child_env(argv),
-            **_process_group_options(),
-        )
         sink = progress_sink.get()
 
         def notify(text: str) -> None:
@@ -638,37 +630,80 @@ class CommandRunner:
             if sink is not None:
                 sink(text)
 
-        self._command_progress = CommandProgress(
-            subprocess.list2cmdline([tool_name(argv[0]), *argv[1:]]),
-            notify,
-            total_suites=total_suites,
-            test_output=any(
-                arg in {"test", "test:unit", "test:ci", "verify"} for arg in argv[1:]
-            ),
-        )
         captured: dict[str, tuple[str, bool]] = {}
         errors: list[BaseException] = []
         threads: list[threading.Thread] = []
         output_lock = threading.Lock()
         stop_readers = threading.Event()
         timed_out = False
+        process = None
+        job = None
         try:
+            if os.name == "nt":
+                job = _WindowsJob()
+            # stdin is the MCP JSON-RPC stream, not input for child commands.
+            process = subprocess.Popen(
+                argv,
+                cwd=workdir,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+                env=_child_env(argv),
+                **_process_group_options(),
+            )
+            if job is not None:
+                job.attach(process)
+            self._command_progress = CommandProgress(
+                subprocess.list2cmdline([tool_name(argv[0]), *argv[1:]]),
+                notify,
+                total_suites=total_suites,
+                test_output=any(
+                    arg in {"test", "test:unit", "test:ci", "verify"}
+                    for arg in argv[1:]
+                ),
+            )
             self._start_readers(
                 process, captured, errors, threads, stop_readers, output_lock
             )
-            exit_code = process.wait(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    exit_code = process.wait(
+                        timeout=max(0, min(0.1, deadline - time.monotonic()))
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    with output_lock:
+                        if errors:
+                            raise RuntimeError(
+                                "Could not read command output"
+                            ) from errors[0]
+                    if time.monotonic() >= deadline:
+                        raise
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_tree(process)
             exit_code = -1
         finally:
-            if process.poll() is None:
-                _kill_tree(process)
-            stop_readers.set()
-            for thread in threads:
-                thread.join(timeout=5)
-            if not any(thread.is_alive() for thread in threads):
-                _close_pipes(process)
+            try:
+                try:
+                    if job is not None:
+                        job.close()
+                finally:
+                    if process is not None:
+                        _kill_tree(process)
+            finally:
+                stop_readers.set()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(timeout=5)
+                if process is not None and not any(
+                    thread.is_alive() for thread in threads
+                ):
+                    _close_pipes(process)
         if any(thread.is_alive() for thread in threads):
             raise RuntimeError("Command output readers did not stop")
         if errors:
@@ -757,6 +792,8 @@ class CommandRunner:
         """
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("Command pipes were not opened")
+        log_paths = self._command_log_paths
+        progress = self._command_progress
 
         def read_stream(name: str, pipe) -> None:
             """Capture a capped stream or record its reader exception."""
@@ -765,12 +802,12 @@ class CommandRunner:
                     pipe,
                     self.max_output,
                     stop,
-                    log_path=self._command_log_paths.get(name),
-                    on_output=(lambda block: self._command_progress.feed(name, block))
-                    if self._command_progress is not None
+                    log_path=log_paths.get(name),
+                    on_output=(lambda block: progress.feed(name, block))
+                    if progress is not None
                     else None,
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 with output_lock:
                     errors.append(exc)
                 return
@@ -786,8 +823,8 @@ class CommandRunner:
             ),
         ]
         for thread in threads:
-            thread.start()
             started.append(thread)
+            thread.start()
 
     def _finish(
         self,
@@ -1009,13 +1046,160 @@ def _child_env(argv: list[str] | None = None) -> dict[str, str]:
 def _process_group_options() -> dict:
     """Start the child in its own group so a timeout can stop its children too."""
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        # Assign the suspended process to its job before it can spawn children.
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000004}
     return {"start_new_session": True}
+
+
+class _WindowsJob:
+    """Own descendants after their parent exits, using kill-on-close containment."""
+
+    def __init__(self) -> None:
+        """Create a Windows job and close its handle if configuration fails."""
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            """Match JOBOBJECT_BASIC_LIMIT_INFORMATION on either pointer width."""
+
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimits(ctypes.Structure):
+            """Match JOBOBJECT_EXTENDED_LIMIT_INFORMATION, including IO counters."""
+
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits),
+                ("IoInfo", ctypes.c_ulonglong * 6),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self._kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        self._kernel.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        self._kernel.SetInformationJobObject.restype = wintypes.BOOL
+        self._kernel.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        ]
+        self._kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        self._kernel.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        self._kernel.OpenProcess.restype = wintypes.HANDLE
+        self._kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel.CloseHandle.restype = wintypes.BOOL
+        self._handle = self._kernel.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            limits = ExtendedLimits()
+            limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+            if not self._kernel.SetInformationJobObject(
+                self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException:
+            self.close()
+            raise
+
+    def attach(self, process: subprocess.Popen[str]) -> None:
+        """Contain the child with a temporary process handle, then resume it."""
+        import ctypes
+
+        # AssignProcessToJobObject requires PROCESS_SET_QUOTA | PROCESS_TERMINATE.
+        handle = self._kernel.OpenProcess(0x0100 | 0x0001, False, process.pid)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not self._kernel.AssignProcessToJobObject(self._handle, handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self._kernel.CloseHandle(handle)
+        self._resume(process.pid)
+
+    def _resume(self, pid: int) -> None:
+        """Resume the sole initial thread, releasing snapshot and thread handles."""
+        import ctypes
+        from ctypes import wintypes
+
+        class ThreadEntry(ctypes.Structure):
+            """Match THREADENTRY32 for the documented Tool Help thread iterator."""
+
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        kernel = self._kernel
+        kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        for name in ("Thread32First", "Thread32Next"):
+            function = getattr(kernel, name)
+            function.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+            function.restype = wintypes.BOOL
+        kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenThread.restype = wintypes.HANDLE
+        kernel.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel.ResumeThread.restype = wintypes.DWORD
+        snapshot = kernel.CreateToolhelp32Snapshot(0x00000004, 0)  # SNAPTHREAD
+        if snapshot == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entry = ThreadEntry()
+            entry.dwSize = ctypes.sizeof(entry)
+            found = kernel.Thread32First(snapshot, ctypes.byref(entry))
+            while found:
+                if entry.th32OwnerProcessID == pid:
+                    thread = kernel.OpenThread(0x0002, False, entry.th32ThreadID)
+                    if not thread:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    try:
+                        if kernel.ResumeThread(thread) == 0xFFFFFFFF:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                    finally:
+                        kernel.CloseHandle(thread)
+                    return
+                found = kernel.Thread32Next(snapshot, ctypes.byref(entry))
+            raise RuntimeError("Could not find suspended command thread")
+        finally:
+            kernel.CloseHandle(snapshot)
+
+    def close(self) -> None:
+        """Kill assigned processes and release the owned Windows handle once."""
+        if self._handle is not None:
+            self._kernel.CloseHandle(self._handle)
+            self._handle = None
 
 
 def _kill_tree(process: subprocess.Popen[str]) -> None:
     """Stop the child and everything it started, then reap the child."""
-    if process.poll() is None:
+    if os.name != "nt" or process.poll() is None:
         if os.name == "nt":
             # npm.cmd and gradlew.bat run under cmd.exe, so killing only the
             # direct child would leave node or java running.

@@ -22,14 +22,17 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field, create_model
 
 from gitlab_security_mcp import __version__
-from gitlab_security_mcp.ai_source_review import SourceEvidence, review_with_host_ai
+from gitlab_security_mcp.ai_source_review import SourceEvidence
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
 
 logger = logging.getLogger("gitlab_security_mcp")
 
 INSTRUCTIONS = """
-Local-only GitLab security remediation. Call the tools in this order:
+Local-only GitLab security remediation. A request to "run gitlab-security on this
+repo" means this entire workflow in ONE user request, including the optional
+false-positive approval form and final report. Do not ask the user to issue a
+second review_false_positives request. Call the tools in this order:
 1. run_prechecks(repo_root=<absolute application checkout path>). Always pass
     the active application's path when the host starts this server elsewhere.
     Unresolved ${workspaceFolder} values are not repository paths. Each checkout
@@ -61,6 +64,10 @@ Local-only GitLab security remediation. Call the tools in this order:
     configured trusted GITLAB_API_URL host (gitlab.com by default); never infer
     credentials or change the trusted API destination from repository metadata.
 5. verify_security_finding for every finding
+    Fan out independent read-only evidence work in bounded batches (at most
+    eight concurrent requests). Reuse full-file reads for findings in the same
+    file, not verdicts. Do not parallelize edits, validation/rollback, or GitLab
+    dismissals within one checkout.
     Source/configuration SAST and IaC findings return SOURCE_REVIEW_REQUIRED with source_workflow,
     not a package-advisory miss. Read the cited source and trace its input origins.
     For a proven false positive, call verify_security_finding again with source_review
@@ -74,7 +81,7 @@ Local-only GitLab security remediation. Call the tools in this order:
     Record confirmed defects as CONFIRMED_VULNERABILITY and uncertainty as
     MANUAL_REVIEW using the same source_review evidence fields. Never label every
     endpoint or Unicode operation a false positive without individual analysis.
-    The tool requests connected-host AI sampling when supported. If it returns
+    The tool does not use deprecated MCP sampling. When it returns
     ai_source_review.status=HOST_REVIEW_REQUIRED, YOU are the reviewing AI:
     examine its full cited_source, use your code tools to trace callers, inputs
     and controls, then resubmit source_review within this same user request.
@@ -189,14 +196,17 @@ Local-only GitLab security remediation. Call the tools in this order:
     rollback cannot be proved safe or later edits need manual cleanup: stop
     editing and report the blocker. Never adapt production/tests to make a fix
     pass. At the end list every unapplied/rejected fix and its exact reason.
-11. When eligible false positives exist, call review_false_positives BEFORE the
-    final report to offer the human an optional unchecked approval form. Do not
-    merely tell the user to call it later or wait for a second dismissal request.
+11. complete_security_run(repo_root=the same checkout). This single finishing
+    tool calls review_false_positives, waits for the optional unchecked human
+    approval form, and then generates the local report with actual outcomes.
+    Do not call review_false_positives or generate_local_report separately in
+    the standard workflow, and do not rescan/reverify just to request approval.
     Only the human may answer; never generate or infer approval. Decline/cancel
-    or lack of host form support means no remote changes. Markdown checkboxes
-    alone are not actionable. Surface the exact blocker if the host cannot show
-    the form. Never retry a mutation whose remote outcome may be unknown.
-12. generate_local_report, showing qualification and unresolved findings.
+    or lack of host form support means no remote changes, but a report is still
+    generated. Inspect false_positive_review for the outcome/blocker and do not
+    automatically repeat the form after it was declined or cancelled.
+    Markdown checkboxes alone are not actionable. Never retry a mutation whose
+    remote outcome may be unknown.
     Display the returned final_summary_markdown once at the end of the final
     response, not just report paths. The tool's text content is this complete
     Markdown block, not a JSON wrapper. Copy it into the final assistant message;
@@ -313,9 +323,12 @@ async def _progress_middleware(
     loop = asyncio.get_running_loop()
     messages: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
     transcript: deque[str] = deque(maxlen=64)
+    finished = threading.Event()
 
     def enqueue(text: str) -> None:
         """Keep the most recent updates if a client consumes notifications slowly."""
+        if finished.is_set():
+            return
         transcript.append(text)
         if messages.full():
             messages.get_nowait()
@@ -324,10 +337,15 @@ async def _progress_middleware(
 
     def publish(text: str) -> None:
         """Schedule updates from either command reader thread onto the MCP loop."""
+        if finished.is_set():
+            return
         text = str(text)[:2000]
         if _progress_console is not None:
             _progress_console.write(text)
-        loop.call_soon_threadsafe(enqueue, text)
+        try:
+            loop.call_soon_threadsafe(enqueue, text)
+        except RuntimeError:
+            logger.warning("Could not queue progress: the MCP event loop has closed.")
 
     async def deliver() -> None:
         """Send monotonic notification sequence numbers with count-based text bars."""
@@ -348,13 +366,19 @@ async def _progress_middleware(
         result = await call_next(context)
     finally:
         progress_sink.reset(token)
-        drained = loop.create_future()
-        loop.call_soon(drained.set_result, None)
-        await drained
-        await messages.join()
-        sender.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sender
+        try:
+            async with asyncio.timeout(1):
+                await asyncio.sleep(0)
+                await messages.join()
+        except TimeoutError:
+            logger.warning(
+                "MCP progress delivery timed out; the bounded tool transcript remains available."
+            )
+        finally:
+            finished.set()
+            sender.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sender
     if transcript:
         output = list(transcript)
         if isinstance(result, dict):
@@ -533,14 +557,14 @@ async def verify_security_finding(
 ) -> dict[str, Any]:
     """Assess source SAST locally and package findings with advisory evidence.
 
-    Source/configuration SAST and IaC automatically request a source/input-flow review from the connected
-    host AI when it supports MCP sampling. Read-only evidence requests can examine
-    complete source files and locate callers. No separate AI service/key is used.
+    Source/configuration SAST and IaC return complete cited source for the calling
+    host AI to examine and trace with its code tools. Deprecated MCP sampling is
+    not used. No separate AI service/key is used.
     Java, C#, TypeScript, JavaScript, Python, Dockerfiles and nginx configurations
     use the same evidence-bound review. Documented configuration edits require
     a confirmed-vulnerability review before planning or writing.
-    If sampling is unavailable, the host AI must analyze the returned full cited
-    source and callers, then resubmit a source_review; this is not a final verdict.
+    The host AI must analyze the returned full cited source and callers, then
+    resubmit a source_review within this request; this is not a final verdict.
     SOURCE_REVIEW_REQUIRED always means unfinished AI work. To record a
     reviewed conclusion, supply source_review with decision="FALSE_POSITIVE",
     "CONFIRMED_VULNERABILITY", or "MANUAL_REVIEW", reason, input_origin,
@@ -562,47 +586,27 @@ async def verify_security_finding(
     if not (result.get("source_workflow") or {}).get("source"):
         result["ai_source_review"] = {"status": "FAILED", "reason": result["reason"]}
         return result
-    selected = _engine_for(repo_root)
+    selected = await asyncio.to_thread(_engine_for, repo_root)
     evidence = SourceEvidence(selected.repo_root)
     try:
         request = result["source_review_request"]
         cited = await asyncio.to_thread(evidence.read, request["location"]["file"])
-        capabilities = ctx.session.client_capabilities
-        if capabilities is None or capabilities.sampling is None:
-            reason = (
-                "The connected MCP host does not advertise AI sampling. The host AI "
-                "must examine the full cited_source, trace callers/inputs with its "
-                "code tools, and call verify_security_finding with source_review. "
-                "No false-positive conclusion has been recorded."
-            )
-            result.update(
-                await asyncio.to_thread(
-                    selected.record_source_review_blocker, finding_id, reason
-                )
-            )
-            result["ai_source_review"] = {
-                "status": "HOST_REVIEW_REQUIRED",
-                "reason": reason,
-                "cited_source": cited,
-                "next_tool": "verify_security_finding",
-            }
-            return result
-        review = await review_with_host_ai(
-            ctx.session, evidence, request, ctx.request_id
+        reason = (
+            "The host AI must examine the full cited_source, trace callers/inputs "
+            "with its code tools, and call verify_security_finding with source_review "
+            "within this user request. Deprecated MCP sampling is not used. "
+            "No false-positive conclusion has been recorded."
         )
-        result = await asyncio.to_thread(
-            _run,
-            "verify_security_finding",
-            finding_id,
-            repo_root=repo_root,
-            source_review=review,
+        result.update(
+            await asyncio.to_thread(
+                selected.record_source_review_blocker, finding_id, reason
+            )
         )
         result["ai_source_review"] = {
-            "status": "COMPLETE"
-            if result.get("decision")
-            in {"FALSE_POSITIVE", "CONFIRMED_VULNERABILITY", "MANUAL_REVIEW"}
-            else "INVALID",
-            "model_source": "connected MCP host",
+            "status": "HOST_REVIEW_REQUIRED",
+            "reason": reason,
+            "cited_source": cited,
+            "next_tool": "verify_security_finding",
         }
         return result
     except (MCPError, OSError, ValueError, TimeoutError) as exc:
@@ -726,7 +730,7 @@ async def review_false_positives(
     belonging to a user allowed to change vulnerability status. No approval
     arguments are accepted from the AI. Declining or cancelling writes nothing.
     """
-    selected = _engine_for(repo_root)
+    selected = await asyncio.to_thread(_engine_for, repo_root)
     snapshot = await asyncio.to_thread(selected.false_positive_candidates)
     if snapshot["status"] != "OK":
         return snapshot
@@ -811,6 +815,14 @@ async def review_false_positives(
             "reason": str(exc),
             "message": "No GitLab changes were made. Submit a valid human checkbox form.",
         }
+    except MCPError as exc:
+        logger.warning("False-positive approval form unavailable: %s", exc)
+        return {
+            "status": "APPROVAL_UNAVAILABLE",
+            "reason": str(exc),
+            "message": "The host could not open the human approval form. No GitLab changes were made by this call.",
+            "source_review_queue": queue,
+        }
     if response.action != "accept" or response.data is None:
         return {
             "status": "CANCELLED",
@@ -854,6 +866,44 @@ def generate_local_report(repo_root: str | None = None) -> CallToolResult:
         ],
         structuredContent=result,
         isError=result.get("status") == "ERROR",
+    )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Complete security run: review false positives and report",
+        read_only_hint=False,
+        destructive_hint=True,
+        open_world_hint=True,
+    )
+)
+async def complete_security_run(
+    ctx: Context, repo_root: str | None = None
+) -> CallToolResult:
+    """Offer human checkbox approvals, then report once without rerunning assessment.
+
+    Call after verification, fixes and validation in the same user request.
+    Decline, cancel, no eligible findings or unavailable host forms still produce
+    a report. Only human-selected findings may change in GitLab. Both steps stay
+    bound to the initially selected checkout while the human answers the form.
+    """
+    selected_root = str((await asyncio.to_thread(_engine_for, repo_root)).repo_root)
+    review = await review_false_positives(ctx, repo_root=selected_root)
+    report = await asyncio.to_thread(generate_local_report, repo_root=selected_root)
+    if report.structured_content is None:
+        raise RuntimeError("The local report did not return structured report data")
+    note = f"False-positive review: {review['status']}."
+    for key in ("message", "reason"):
+        if review.get(key):
+            note += f"\n{review[key]}"
+    return CallToolResult(
+        content=[TextContent(text=note), *report.content],
+        structuredContent={
+            **report.structured_content,
+            "false_positive_review": review,
+        },
+        isError=report.is_error
+        or review["status"] in {"ERROR", "PARTIAL_FAILURE", "APPROVAL_INVALID"},
     )
 
 

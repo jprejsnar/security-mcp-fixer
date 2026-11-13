@@ -63,8 +63,8 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
             "MANUAL_REVIEW; reason; input_origin; finding_analysis; reachability_analysis; "
             "reviewed_files: [{path, sha256, assessment}]}. Hash full current file bytes. "
             "Do not stop at collecting excerpts or invent a false positive to clear "
-            "this queue. Once evidenced false positives exist, call review_false_positives "
-            "for human approval. Uncertain findings remain unresolved."
+            "this queue. Finish with complete_security_run for human approval and "
+            "the final report. Uncertain findings remain unresolved."
         )
         if count
         else None,
