@@ -42,6 +42,13 @@ REQUIRED_DOCS = (
         ".NET 10",
     ),
     ("typescript", "https://www.typescriptlang.org/docs/", "TypeScript"),
+    (
+        "javascript",
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+        "JavaScript",
+    ),
+    ("python", "https://docs.python.org/3/", "Python"),
+    ("csharp", "https://learn.microsoft.com/en-us/dotnet/csharp/", "C#"),
     ("cve", "https://www.cve.org/", "CVE"),
     ("cwe", "https://cwe.mitre.org/", "CWE"),
     ("nsa", "https://www.nsa.gov/Cybersecurity/", "Cybersecurity"),
@@ -54,6 +61,8 @@ ALLOWED_HOSTS = frozenset(
         "docs.gitlab.com",
         "docs.oracle.com",
         "nodejs.org",
+        "developer.mozilla.org",
+        "docs.python.org",
         "angular.dev",
         "crystal-lang.org",
         "learn.microsoft.com",
@@ -397,6 +406,22 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
             }
         )
     return pages
+
+
+def cited_security_pages_ok(review: DocReview, finding: dict) -> bool:
+    """Require each CVE or CWE named by the finding to have been read."""
+    text = " ".join(
+        str(part)
+        for part in (
+            finding.get("identifiers") or [],
+            finding.get("title"),
+            finding.get("description"),
+        )
+    )
+    needed = {f"cve:{item.upper()}" for item in _CVE.findall(text)}
+    needed.update(f"nist:{item.upper()}" for item in _CVE.findall(text))
+    needed.update(f"cwe:CWE-{int(item)}" for item in _CWE.findall(text))
+    return all(item.ok for item in review.sources if item.name in needed)
 
 
 def _unique(values: list[str]) -> list[str]:

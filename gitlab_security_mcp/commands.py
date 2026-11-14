@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from gitlab_security_mcp.util import safe_token
+from gitlab_security_mcp.util import log_task, safe_token
 
 FORBIDDEN_GIT = {
     "add",
@@ -591,7 +591,7 @@ class CommandRunner:
                 f"Refusing to run outside the repository: {workdir}"
             ) from exc
         assert_allowed(argv, self.repo_root)
-        with self._lock:
+        with self._lock, log_task(f"command:{tool_name(argv[0])}"):
             return self._run_locked(argv, timeout=timeout, check=check, workdir=workdir)
 
     def _run_locked(

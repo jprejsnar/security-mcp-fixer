@@ -62,7 +62,7 @@ all of these changes; updating source files does not update an installed wheel.
 | Area | Current behavior |
 | --- | --- |
 | One-request completion | `complete_security_run` performs human false-positive review and then reporting, reusing current assessments without another scan. Standalone review/report tools remain available; there are thirteen tools. |
-| Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations, tracing relevant callers, inputs, includes and controls. It submits a separate full-byte-hash-bound assessment for each finding. Missing source or an advisory miss never proves a false positive. |
+| Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
 | Human-only GitLab dismissal | Eligible assessments appear as initially unchecked form fields. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
 | Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports show pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
@@ -1636,8 +1636,13 @@ The server emits progress immediately to stderr, never protocol stdout. Each
 item log identifies the checkout, finding ID, package, and current step. Steps
 include local evidence, public advisories, target planning, compatibility/license
 review, lint/policy checks, official documentation, application, and post-update
-validation. Tool start/finish messages include the outcome and elapsed time;
-unexpected exceptions produce a failure message. The host AI's own reasoning
+validation. Tool start/finish messages include the outcome and elapsed time.
+Each tool call and allowlisted command also writes one stderr performance
+record: wall-clock duration, process CPU time and percent, working-set memory
+and its change, and garbage-collection counts, objects collected, and
+uncollectable objects for each generation. A logging failure does not fail
+the task. Child-process CPU is not included.
+Unexpected exceptions produce a failure message. The host AI's own reasoning
 and browsing between tool calls are not visible to this server.
 
 Finding updates include per-severity positions, for example

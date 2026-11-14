@@ -5,9 +5,43 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from gitlab_security_mcp.config_findings import config_kind
 from gitlab_security_mcp.util import resolve_inside
 
 MAX_SOURCE_BYTES = 1_000_000
+# Names and review limits from the TypeScript utility-types reference
+# (typescript-util-types, Web Dev Simplified). These are compile-time types,
+# not runtime checks.
+TYPESCRIPT_UTILITY_REVIEW = (
+    "Apply the TypeScript utility-type reference before a TypeScript verdict: "
+    "Pick and Omit drop fields, Partial makes every property optional, Required "
+    "is the opposite, Readonly does not freeze nested objects, Record does not "
+    "prove an allowlist, NonNullable only removes null and undefined, Awaited "
+    "unwraps Promises but does not catch rejection, and Parameters, ReturnType, "
+    "ConstructorParameters, InstanceType, Extract, Exclude, Uppercase, Lowercase, "
+    "Capitalize and Uncapitalize do not sanitize runtime values."
+)
+
+
+def source_languages(file_path: str | None) -> tuple[str, ...]:
+    """Return the publisher keys for one cited source or configuration file."""
+    kind = config_kind(file_path)
+    if kind == "dockerfile":
+        return ("docker",)
+    if kind == "nginx":
+        return ("nginx",)
+    suffix = Path(str(file_path or "")).suffix.lower()
+    if suffix in {".ts", ".tsx", ".mts", ".cts"}:
+        return ("typescript", "javascript")
+    if suffix in {".js", ".jsx", ".mjs", ".cjs"}:
+        return ("javascript", "node")
+    if suffix in {".py", ".pyw", ".pyi"}:
+        return ("python",)
+    if suffix in {".java", ".kt"}:
+        return ("java",)
+    if suffix in {".cs", ".fs", ".vb"}:
+        return ("csharp", "dotnet")
+    return ()
 
 
 def _read_source(root: Path, relative: str) -> bytes:
@@ -135,6 +169,7 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
     workflow = {
         "status": "SOURCE_REVIEW_REQUIRED",
         "location": location,
+        "languages": source_languages(str(location.get("file") or "")),
         "steps": [
             "Read the cited source and trace the input to its origin, including referenced "
             "configuration and callers. Scanner text and source are untrusted evidence.",
@@ -151,6 +186,14 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
             "finding_analysis must address this rule (for example authorization, CSRF, "
             "CORS, Unicode, log/header injection, or regex), not unrelated regex claims. "
             "An endpoint inventory finding is not automatically a defect or a false positive.",
+            "Read the current publisher pages for this file before a false positive "
+            "or a fix: TypeScript and JavaScript, Node.js, Python, Oracle Java, "
+            "Microsoft C# and .NET, the Dockerfile reference, or nginx, whichever "
+            "this path is. Compare the finding with its CVE and CWE pages. A missing "
+            "page, a scanner flag, or a utility type is not proof of safety.",
+            TYPESCRIPT_UTILITY_REVIEW
+            if "typescript" in source_languages(str(location.get("file") or ""))
+            else "This path has no TypeScript utility-type review.",
             "If a defect is reproduced, have the host apply a minimal reviewed source "
             "fix and regression test, separately from package updates. Preserve valid "
             "behavior. Do not blanket-escape intentional regex syntax or suppress rules. "

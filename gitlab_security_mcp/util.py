@@ -2,24 +2,149 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, process_time
 from urllib.parse import quote
 
 import httpx
 
 _HTTP_LOG_LOCK = threading.Lock()
 logger = logging.getLogger("gitlab_security_mcp")
+
+
+def _memory_bytes() -> int | None:
+    """Return this process's working set, or None when the OS will not report it."""
+    try:
+        if os.name == "nt":
+            return _windows_working_set()
+        import resource
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(rss) if sys.platform == "darwin" else int(rss) * 1024
+    except (OSError, AttributeError, ValueError, OverflowError):
+        return None
+
+
+def _windows_working_set() -> int | None:
+    """Read the Windows working set without failing the task when the API is absent."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _Counters(ctypes.Structure):
+        """Windows process-memory counters used only for the working-set field."""
+
+        _fields_ = (
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        )
+
+    counters = _Counters()
+    counters.cb = ctypes.sizeof(counters)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    query = getattr(kernel, "K32GetProcessMemoryInfo", None)
+    if query is None:
+        query = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+    query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+    query.restype = wintypes.BOOL
+    if not query(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        return None
+    return int(counters.WorkingSetSize)
+
+
+def _performance_sample() -> dict:
+    """Capture wall time, process CPU, memory and per-generation collection counts."""
+    stats = gc.get_stats()
+    return {
+        "wall": perf_counter(),
+        "cpu": process_time(),
+        "memory_bytes": _memory_bytes(),
+        "gc_collections": [int(item["collections"]) for item in stats],
+        "gc_collected": [int(item["collected"]) for item in stats],
+        "gc_uncollectable": [int(item["uncollectable"]) for item in stats],
+    }
+
+
+def _log_performance(name: str, before: dict) -> None:
+    """Write one performance record. A logging failure must not fail the task."""
+    try:
+        after = _performance_sample()
+        wall = after["wall"] - before["wall"]
+        cpu = after["cpu"] - before["cpu"]
+        error = sys.exc_info()[0]
+        record = {
+            "event": "task_performance",
+            "task": name,
+            "duration_ms": round(wall * 1000, 3),
+            "cpu_seconds": round(cpu, 6),
+            "cpu_percent": round((cpu / wall) * 100, 2) if wall else 0.0,
+            "memory_bytes": after["memory_bytes"],
+            "memory_delta_bytes": (
+                None
+                if after["memory_bytes"] is None or before["memory_bytes"] is None
+                else after["memory_bytes"] - before["memory_bytes"]
+            ),
+            "gc_collections": [
+                end - start
+                for start, end in zip(
+                    before["gc_collections"], after["gc_collections"], strict=False
+                )
+            ],
+            "gc_collected": [
+                end - start
+                for start, end in zip(
+                    before["gc_collected"], after["gc_collected"], strict=False
+                )
+            ],
+            "gc_uncollectable": [
+                end - start
+                for start, end in zip(
+                    before["gc_uncollectable"],
+                    after["gc_uncollectable"],
+                    strict=False,
+                )
+            ],
+            "error": None if error is None else error.__name__,
+            "worker": threading.current_thread().name,
+        }
+        logger.info("Task performance %s", json.dumps(record, ensure_ascii=True))
+    except Exception:
+        logger.warning("Could not write task performance log", exc_info=True)
+
+
+@contextmanager
+def log_task(name: str) -> Iterator[None]:
+    """Log how long a task took and the CPU, memory and GC it used.
+
+    The record is one stderr JSON line. It has no arguments, source, or secrets.
+    Process CPU can exceed one core when several threads run. Child-process CPU
+    is not included; the wall-clock duration still covers a waited-for command.
+    """
+    before = _performance_sample()
+    try:
+        yield
+    finally:
+        _log_performance(name, before)
 
 
 def _http_log_url(url: str | httpx.URL) -> str:

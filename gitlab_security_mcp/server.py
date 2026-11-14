@@ -85,6 +85,11 @@ second review_false_positives request. Call the tools in this order:
     ai_source_review.status=HOST_REVIEW_REQUIRED, YOU are the reviewing AI:
     examine its full cited_source, use your code tools to trace callers, inputs
     and controls, then resubmit source_review within this same user request.
+    Before that conclusion, use the current TypeScript, JavaScript, Node.js,
+    Python, Oracle Java, Microsoft C#/.NET, Dockerfile, or nginx page for the
+    cited file, and the finding's CVE and CWE pages. For TypeScript, apply the
+    utility-type limits in source_workflow (Partial, Pick, Omit, and the rest
+    do not prove a runtime control). A missing page blocks the conclusion.
     Do not ask the user to perform the code analysis or end with the pending
     placeholder. If access, host consent or sufficient evidence is unavailable,
     report that exact blocker and keep the finding unresolved.

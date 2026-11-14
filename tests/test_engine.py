@@ -616,7 +616,9 @@ def _source_review_case(root):
     finding.update(category="sast", title="Regular expression with non-literal value")
     finding["location"] = {"file": source.name, "startLine": "2"}
     advisory = Mock()
-    engine = Engine(root, gitlab=Mock(), advisory=advisory)
+    from tests.conftest import documentation_client
+
+    engine = Engine(root, gitlab=Mock(), advisory=advisory, docs=documentation_client())
     engine.state.status = "FINDINGS_LISTED"
     engine.state.findings = [finding]
     review = {

@@ -36,7 +36,11 @@ from gitlab_security_mcp.manifests import (
     locate_package,
     manifests_were_parsed,
 )
-from gitlab_security_mcp.official_docs import OfficialDocs
+from gitlab_security_mcp.official_docs import (
+    DocReview,
+    OfficialDocs,
+    cited_security_pages_ok,
+)
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
     backup_dependency_files,
@@ -57,7 +61,7 @@ from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.security_artifacts import review_security_artifacts
 from gitlab_security_mcp.source_findings import assess_source, pending_source_reviews
 from gitlab_security_mcp.state import RunState
-from gitlab_security_mcp.util import atomic_write_text, resolve_inside
+from gitlab_security_mcp.util import atomic_write_text, log_task, resolve_inside
 from gitlab_security_mcp.validate import lint_rule_inventory, run_validation
 from gitlab_security_mcp.versions import (
     is_major_upgrade,
@@ -117,7 +121,8 @@ def _serialized(method):
             started = monotonic()
             self._progress(finding_id, f"{method.__name__} started")
             try:
-                result = method(self, *args, **kwargs)
+                with log_task(method.__name__):
+                    result = method(self, *args, **kwargs)
             except BaseException as exc:
                 self._progress(
                     finding_id, f"{method.__name__} failed ({type(exc).__name__})"
@@ -2170,6 +2175,42 @@ class Engine:
                 finding.get("id"), "Reading cited source/configuration evidence"
             )
             assessment = assess_source(self.repo_root, finding, source_review)
+            config_confirm = bool(
+                kind and assessment["decision"] == "CONFIRMED_VULNERABILITY"
+            )
+            if (
+                source_review is not None
+                and assessment["decision"] == source_review.get("decision")
+                and not config_confirm
+            ):
+                doc_review = self._documentation().read_before_fix(finding, [])
+                publishers_ok = (
+                    isinstance(doc_review, DocReview) and doc_review.complete
+                )
+                cited_ok = isinstance(
+                    doc_review, DocReview
+                ) and cited_security_pages_ok(doc_review, finding)
+                assessment["evidence"].append(
+                    doc_review.reason()
+                    if isinstance(doc_review, DocReview)
+                    else "Official documentation was not read."
+                )
+                block = not publishers_ok or (
+                    assessment["decision"] == "FALSE_POSITIVE" and not cited_ok
+                )
+                if block:
+                    assessment["decision"] = "SOURCE_REVIEW_REQUIRED"
+                    assessment["reason"] = (
+                        "Language, Dockerfile, nginx, CVE, or CWE documentation "
+                        "was not read, so the source conclusion was not accepted."
+                    )
+                    assessment["workflow"] = {
+                        **assessment["workflow"],
+                        "status": "SOURCE_REVIEW_REQUIRED",
+                    }
+                assessment["workflow"]["documentation"] = (
+                    doc_review.as_list() if isinstance(doc_review, DocReview) else []
+                )
             finding["sourceWorkflow"] = assessment["workflow"]
             if kind and assessment["decision"] == "CONFIRMED_VULNERABILITY":
                 return self._decide_config(finding, assessment["evidence"])

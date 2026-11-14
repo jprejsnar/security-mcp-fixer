@@ -1,6 +1,8 @@
 """Verify command boundaries, child cleanup, pipe readers, and audit hashes."""
 
+import gc
 import json
+import logging
 import os
 from datetime import date
 
@@ -989,3 +991,46 @@ def test_redact_removes_percent_encoded_secrets():
     assert "glpat-abc/def" not in text
     assert "glpat-abc%2Fdef" not in text
     assert text.count("[REDACTED]") == 2
+
+
+def test_task_performance_logs_cpu_memory_time_and_gc(caplog):
+    """Record wall time, process CPU, working set and collection counts."""
+    # Arrange
+    from gitlab_security_mcp.util import log_task
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        with log_task("sample-task"):
+            gc.collect()
+    record = json.loads(caplog.records[-1].message.removeprefix("Task performance "))
+
+    # Assert
+    assert record["event"] == "task_performance"
+    assert record["task"] == "sample-task"
+    assert record["duration_ms"] >= 0
+    assert record["cpu_seconds"] >= 0
+    assert record["cpu_percent"] >= 0
+    assert isinstance(record["memory_bytes"], int)
+    assert isinstance(record["memory_delta_bytes"], int)
+    assert sum(record["gc_collections"]) >= 1
+    assert len(record["gc_collected"]) == 3
+    assert len(record["gc_uncollectable"]) == 3
+    assert record["error"] is None
+
+
+def test_task_performance_keeps_the_original_exception(caplog):
+    """Log the exception class and still raise it for the caller."""
+    # Arrange
+    from gitlab_security_mcp.util import log_task
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        with pytest.raises(ValueError):
+            with log_task("failing-task"):
+                raise ValueError("secret token glpat-hidden")
+    record = json.loads(caplog.records[-1].message.removeprefix("Task performance "))
+
+    # Assert
+    assert record["task"] == "failing-task"
+    assert record["error"] == "ValueError"
+    assert "glpat-hidden" not in caplog.records[-1].message

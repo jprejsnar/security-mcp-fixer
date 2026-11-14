@@ -24,6 +24,7 @@ from gitlab_security_mcp.gitlab_client import (
     normalize_finding,
 )
 from gitlab_security_mcp.report import render
+from tests.conftest import documentation_client
 
 GID = "gid://gitlab/Vulnerability/123"
 
@@ -387,6 +388,7 @@ def test_changed_or_unassessed_approval_cannot_write(tmp_path):
 def _source_engine(tmp_path):
     """Model the archive's Java findings without retaining its private source."""
     engine = _engine(tmp_path)
+    engine.docs = documentation_client()
     source = tmp_path / "Endpoint.java"
     source.write_text(
         'class Endpoint { String route = "/status"; }\n', encoding="utf-8"
