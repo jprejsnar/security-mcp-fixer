@@ -1,4 +1,4 @@
-mcp[cli]>=2.3,<3
+mcp[cli]>=2.3.0,<3
 httpx>=0.28.1
-packaging>=25
-ruamel.yaml>=0.18.16,<0.19
+packaging>=26.3
+ruamel.yaml>=0.19.1,<0.20

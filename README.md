@@ -598,10 +598,9 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
 ### Prerequisites
 
 - Python 3.11 or newer and Git on Windows, macOS, or Linux.
-- Runtime floors: `mcp[cli]>=2.3,<3`, `httpx>=0.28.1`, `packaging>=25`,
-  and `ruamel.yaml>=0.18.16,<0.19`. Development floors are `pytest>=9` and
-  `ruff>=0.17.4,<1`. `ruamel.yaml` stays below 0.19 because that release
-  changes its optional accelerator packaging.
+- Runtime floors: `mcp[cli]>=2.3.0,<3`, `httpx>=0.28.1`, `packaging>=26.3`,
+  and `ruamel.yaml>=0.19.1,<0.20`. Development floors are `pytest>=9.2.0` and
+  `ruff>=0.17.5,<1`.
 - A GitLab token with `read_api` and access to the project's vulnerability report.
   Optional false-positive dismissal requires `api` write scope and a GitLab role
   permitted to dismiss the finding; a read-only token does not enable writes.
