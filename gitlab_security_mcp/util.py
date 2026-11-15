@@ -132,6 +132,39 @@ def _log_performance(name: str, before: dict) -> None:
         logger.warning("Could not write task performance log", exc_info=True)
 
 
+def log_concurrency(kind: str, name: str, **fields: object) -> None:
+    """Record one lock, fan-out, or worker event without payloads or secrets."""
+    record = {
+        "event": "concurrency",
+        "kind": kind,
+        "name": name,
+        "thread": threading.current_thread().name,
+    }
+    record.update(fields)
+    try:
+        logger.info("Concurrency %s", json.dumps(record, ensure_ascii=True))
+    except Exception:
+        logger.warning("Could not write concurrency log", exc_info=True)
+
+
+@contextmanager
+def logged_lock(lock: threading.Lock | threading.RLock, name: str) -> Iterator[None]:
+    """Acquire a lock and log only when another thread already held it.
+
+    The wait is measured before the critical section. The record is written
+    after release so logging cannot extend the hold.
+    """
+    started = perf_counter()
+    lock.acquire()
+    waited_ms = (perf_counter() - started) * 1000
+    try:
+        yield
+    finally:
+        lock.release()
+        if waited_ms >= 1:
+            log_concurrency("lock_wait", name, wait_ms=round(waited_ms, 3))
+
+
 @contextmanager
 def log_task(name: str) -> Iterator[None]:
     """Log how long a task took and the CPU, memory and GC it used.

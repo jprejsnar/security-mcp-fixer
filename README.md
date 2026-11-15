@@ -1639,8 +1639,11 @@ validation. Tool start/finish messages include the outcome and elapsed time.
 Each tool call and allowlisted command also writes one stderr performance
 record: wall-clock duration, process CPU time and percent, working-set memory
 and its change, and garbage-collection counts, objects collected, and
-uncollectable objects for each generation. A logging failure does not fail
-the task. Child-process CPU is not included.
+uncollectable objects for each generation. Contended engine, command, and
+registry locks log their wait. Fan-out batches log worker count, item count,
+duration, and the exception class when a worker fails. Command-reader and
+uncaught thread failures log the exception class and thread name. A logging
+failure does not fail the task. Child-process CPU is not included.
 Unexpected exceptions produce a failure message. The host AI's own reasoning
 and browsing between tool calls are not visible to this server.
 

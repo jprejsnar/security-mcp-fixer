@@ -560,3 +560,39 @@ def test_fanout_refills_workers_without_waiting_for_the_first_result(monkeypatch
     # Assert
     assert result == [0, 1, 2]
     assert last_started.is_set()
+
+
+def test_fanout_logs_worker_count_duration_and_failure(caplog):
+    """Record a fan-out batch and the exception class when a worker fails."""
+
+    # Arrange
+    def succeed(item):
+        """Return the item unchanged."""
+        return item
+
+    def fail(item):
+        """Fail one worker with a message that must not be logged."""
+        if item == 1:
+            raise RuntimeError("secret glpat-hidden")
+        return item
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        assert map_ordered(succeed, range(3)) == [0, 1, 2]
+        with pytest.raises(RuntimeError):
+            map_ordered(fail, range(3))
+    records = [
+        json.loads(record.message.removeprefix("Concurrency "))
+        for record in caplog.records
+        if record.message.startswith("Concurrency ")
+        and '"kind": "fanout"' in record.message
+    ]
+
+    # Assert
+    assert records[0]["kind"] == "fanout"
+    assert records[0]["workers"] == 3
+    assert records[0]["items"] == 3
+    assert records[0]["duration_ms"] >= 0
+    assert records[0]["error"] is None
+    assert records[1]["error"] == "RuntimeError"
+    assert all("glpat-hidden" not in record.message for record in caplog.records)

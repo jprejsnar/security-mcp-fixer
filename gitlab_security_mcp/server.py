@@ -25,6 +25,7 @@ from gitlab_security_mcp import __version__
 from gitlab_security_mcp.ai_source_review import SourceEvidence
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
+from gitlab_security_mcp.util import logged_lock
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -279,13 +280,21 @@ class _ProgressConsole:
         """Close stdin to end the reader and reap the owned child on shutdown."""
         with self._lock:
             self._closed = True
+            process = self.process
+        if process.stdin is not None:
             with contextlib.suppress(OSError, ValueError):
-                self.process.stdin.close()
+                process.stdin.close()
         try:
-            self.process.wait(timeout=2)
+            process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=2)
+            with contextlib.suppress(OSError):
+                process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=2)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None and not pipe.closed:
+                with contextlib.suppress(OSError):
+                    pipe.close()
 
 
 def _open_progress_console() -> _ProgressConsole | None:
@@ -411,7 +420,7 @@ _registry_lock = threading.Lock()
 
 def _close_engine() -> None:
     """Close every checkout engine. A second call does nothing."""
-    with _registry_lock:
+    with logged_lock(_registry_lock, "registry"):
         engines = list(_engines.values())
         _engines.clear()
     failures: list[Exception] = []
@@ -434,7 +443,7 @@ def _engine_for(repo_root: str | None) -> Engine:
     The registry lock is not held while the tool runs. Each engine serializes
     its own checkout, and different checkouts do not share that lock.
     """
-    with _registry_lock:
+    with logged_lock(_registry_lock, "registry"):
         if repo_root is None:
             if len(_engines) > 1:
                 raise ValueError(
@@ -922,8 +931,20 @@ def get_run_status(repo_root: str | None = None) -> dict[str, Any]:
     return _run("get_run_status", repo_root=repo_root)
 
 
+def _thread_exception(args: threading.ExceptHookArgs) -> None:
+    """Record an exception that escaped a worker thread."""
+    if args.exc_type is SystemExit:
+        return
+    logger.error(
+        "Uncaught thread exception %s",
+        args.exc_type.__name__ if args.exc_type is not None else "unknown",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
 def _configure_logging() -> None:
     """Send this server's logs to stderr so they cannot corrupt MCP stdout."""
+    threading.excepthook = _thread_exception
     if logger.handlers:
         return
     handler = logging.StreamHandler(sys.stderr)

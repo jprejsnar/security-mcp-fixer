@@ -61,7 +61,12 @@ from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.security_artifacts import review_security_artifacts
 from gitlab_security_mcp.source_findings import assess_source, pending_source_reviews
 from gitlab_security_mcp.state import RunState
-from gitlab_security_mcp.util import atomic_write_text, log_task, resolve_inside
+from gitlab_security_mcp.util import (
+    atomic_write_text,
+    log_task,
+    logged_lock,
+    resolve_inside,
+)
 from gitlab_security_mcp.validate import lint_rule_inventory, run_validation
 from gitlab_security_mcp.versions import (
     is_major_upgrade,
@@ -112,7 +117,7 @@ def _serialized(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         """Reject calls after close and detach results while holding the lock."""
-        with self._lock:
+        with logged_lock(self._lock, "engine"):
             if self._closed:
                 return {"status": "ERROR", "reason": "Engine is closed"}
             finding_id = parameters.bind(self, *args, **kwargs).arguments.get(
@@ -268,7 +273,7 @@ class Engine:
         Injected clients stay open. Cleanup failures propagate after every
         owned client is attempted; later tool calls return an error.
         """
-        with self._lock:
+        with logged_lock(self._lock, "engine-close"):
             if self._closed:
                 return
             self._closed = True

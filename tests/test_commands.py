@@ -4,6 +4,7 @@ import gc
 import json
 import logging
 import os
+import threading
 from datetime import date
 
 import pytest
@@ -1034,3 +1035,110 @@ def test_task_performance_keeps_the_original_exception(caplog):
     assert record["task"] == "failing-task"
     assert record["error"] == "ValueError"
     assert "glpat-hidden" not in caplog.records[-1].message
+
+
+def test_contended_lock_logs_the_wait(caplog):
+    """Log a lock wait only after another thread has released it."""
+    # Arrange
+    import time
+
+    from gitlab_security_mcp.util import logged_lock
+
+    lock = threading.Lock()
+    lock.acquire()
+    started = threading.Event()
+
+    def wait_for_lock():
+        """Block until the test releases the lock."""
+        started.set()
+        with logged_lock(lock, "engine"):
+            return
+
+    thread = threading.Thread(target=wait_for_lock)
+    thread.start()
+    assert started.wait(2)
+    time.sleep(0.02)
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        lock.release()
+        thread.join(2)
+    record = json.loads(caplog.records[-1].message.removeprefix("Concurrency "))
+
+    # Assert
+    assert not thread.is_alive()
+    assert record["kind"] == "lock_wait"
+    assert record["name"] == "engine"
+    assert record["wait_ms"] >= 1
+
+
+def test_uncaught_thread_exception_is_logged(caplog):
+    """Record the class of an exception that escaped a worker thread."""
+    # Arrange
+    from types import SimpleNamespace
+
+    from gitlab_security_mcp.server import _thread_exception
+
+    exc = RuntimeError("secret glpat-hidden")
+    args = SimpleNamespace(
+        exc_type=type(exc),
+        exc_value=exc,
+        exc_traceback=exc.__traceback__,
+        thread=threading.current_thread(),
+    )
+
+    # Act
+    with caplog.at_level(logging.ERROR, logger="gitlab_security_mcp"):
+        _thread_exception(args)
+
+    # Assert
+    assert "RuntimeError" in caplog.records[-1].message
+    assert caplog.records[-1].exc_info[0] is RuntimeError
+
+
+def test_progress_console_close_survives_a_child_that_ignores_kill():
+    """Release the console child when both the wait and the kill wait time out."""
+    # Arrange
+    import subprocess
+
+    from gitlab_security_mcp.server import _ProgressConsole
+
+    class Pipe:
+        """Record whether cleanup closed this stream."""
+
+        def __init__(self):
+            """Start the stream open."""
+            self.closed = False
+
+        def close(self):
+            """Mark the stream closed."""
+            self.closed = True
+
+    class Child:
+        """Ignore both waits and record the kill."""
+
+        def __init__(self):
+            """Provide streams and start unkilled."""
+            self.stdin = Pipe()
+            self.stdout = Pipe()
+            self.stderr = None
+            self.killed = False
+
+        def wait(self, timeout):
+            """Time out so cleanup must not raise."""
+            raise subprocess.TimeoutExpired("console", timeout)
+
+        def kill(self):
+            """Record the forced stop."""
+            self.killed = True
+
+    child = Child()
+    console = _ProgressConsole(child)
+
+    # Act
+    console.close()
+
+    # Assert
+    assert child.killed
+    assert child.stdin.closed
+    assert child.stdout.closed

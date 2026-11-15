@@ -10,7 +10,10 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from itertools import islice
+from time import perf_counter
 from typing import TypeVar
+
+from gitlab_security_mcp.util import log_concurrency
 
 MAX_WORKERS = 8
 
@@ -32,12 +35,14 @@ def map_ordered(
     if len(sequence) <= 1:
         return [function(item) for item in sequence]
     workers = min(MAX_WORKERS, len(sequence))
+    started = perf_counter()
+    error = None
+    submitted = len(sequence)
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="security-io"
     ) as pool:
         pending: dict[Future[Result], int] = {}
         results: dict[int, Result] = {}
-        submitted = len(sequence)
         try:
             for index, item in enumerate(sequence):
                 pending[pool.submit(copy_context().run, function, item)] = index
@@ -50,6 +55,17 @@ def map_ordered(
                     pending[pool.submit(copy_context().run, function, item)] = submitted
                     submitted += 1
             return [results[index] for index in range(submitted)]
+        except Exception as exc:
+            error = type(exc).__name__
+            raise
         finally:
             for future in pending:
                 future.cancel()
+            log_concurrency(
+                "fanout",
+                "security-io",
+                workers=workers,
+                items=submitted,
+                duration_ms=round((perf_counter() - started) * 1000, 3),
+                error=error,
+            )
