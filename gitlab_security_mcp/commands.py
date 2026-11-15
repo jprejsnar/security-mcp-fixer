@@ -16,11 +16,16 @@ import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from gitlab_security_mcp.util import log_concurrency, log_task, logged_lock, safe_token
+from gitlab_security_mcp.util import (
+    log_concurrency,
+    log_task,
+    logged_lock,
+    safe_token,
+    utc_now_iso,
+)
 
 FORBIDDEN_GIT = {
     "add",
@@ -875,7 +880,7 @@ class CommandRunner:
         """Append command metadata and hashes without storing raw output."""
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "ts": datetime.now(UTC).isoformat(),
+            "ts": utc_now_iso(),
             "argv": result.argv,
             "cwd": str(cwd),
             "exit_code": result.exit_code,

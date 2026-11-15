@@ -236,6 +236,79 @@ API and coverage fuzzing require local reproduction instead of advisory lookup.
 Unknown reachability is not a false positive.
 """
 
+
+class _CurrentStderr:
+    """Write logs to whichever stderr the process is using now.
+
+    Cursor and VS Code Copilot both capture the process stderr pipe. A handler
+    bound to an earlier stream would keep writing to a buffer the host never
+    reads. Rich formatting is not used; control codes do not show up as log lines.
+    """
+
+    def write(self, text: str) -> int:
+        """Write one log record to the current stderr."""
+        return sys.stderr.write(text)
+
+    def flush(self) -> None:
+        """Push the line to the host before the next protocol message."""
+        sys.stderr.flush()
+
+
+def _thread_exception(args: threading.ExceptHookArgs) -> None:
+    """Record an exception that escaped a worker thread."""
+    if args.exc_type is SystemExit:
+        return
+    logger.error(
+        "Uncaught thread exception %s",
+        args.exc_type.__name__ if args.exc_type is not None else "unknown",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def _prepare_stderr() -> None:
+    """Make stderr UTF-8 and line-buffered for IDE pipes."""
+    try:
+        sys.stderr.reconfigure(
+            encoding="utf-8", errors="backslashreplace", line_buffering=True
+        )
+    except (AttributeError, OSError, ValueError):
+        return
+
+
+def _stderr_handler() -> logging.Handler:
+    """Build one plain-text handler that writes to the current stderr."""
+    handler = logging.StreamHandler(_CurrentStderr())
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    return handler
+
+
+def _configure_logging() -> None:
+    """Send this server's logs to stderr so they cannot corrupt MCP stdout.
+
+    The MCP SDK installs Rich on the root logger when that package is present.
+    That call is skipped once a handler exists. Both IDE output panels then
+    receive plain text lines. Level and propagate are applied on every call,
+    including when a handler is already attached.
+    """
+    threading.excepthook = _thread_exception
+    root = logging.getLogger()
+    if not any(isinstance(handler, logging.StreamHandler) for handler in root.handlers):
+        root.addHandler(_stderr_handler())
+    root.setLevel(logging.INFO)
+    if not logger.handlers:
+        logger.addHandler(_stderr_handler())
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def _install_host_logging() -> None:
+    """Prepare stderr, then attach handlers that write to that stream."""
+    _prepare_stderr()
+    _configure_logging()
+
+
+_install_host_logging()
+
 mcp = MCPServer(
     "gitlab-security-mcp",
     instructions=INSTRUCTIONS,
@@ -931,33 +1004,11 @@ def get_run_status(repo_root: str | None = None) -> dict[str, Any]:
     return _run("get_run_status", repo_root=repo_root)
 
 
-def _thread_exception(args: threading.ExceptHookArgs) -> None:
-    """Record an exception that escaped a worker thread."""
-    if args.exc_type is SystemExit:
-        return
-    logger.error(
-        "Uncaught thread exception %s",
-        args.exc_type.__name__ if args.exc_type is not None else "unknown",
-        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-    )
-
-
-def _configure_logging() -> None:
-    """Send this server's logs to stderr so they cannot corrupt MCP stdout."""
-    threading.excepthook = _thread_exception
-    if logger.handlers:
-        return
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-
 def main() -> None:
     """Serve MCP tools over stdio until the client disconnects."""
     global _progress_console
-    _configure_logging()
+    _install_host_logging()
+    logger.info("gitlab-security-mcp %s serving stdio", __version__)
     _progress_console = _open_progress_console()
     try:
         mcp.run(transport="stdio")

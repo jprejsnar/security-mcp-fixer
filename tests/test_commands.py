@@ -1142,3 +1142,21 @@ def test_progress_console_close_survives_a_child_that_ignores_kill():
     assert child.killed
     assert child.stdin.closed
     assert child.stdout.closed
+
+
+def test_utc_now_iso_is_the_shared_timestamp():
+    """Produce one UTC ISO 8601 string for every log timestamp."""
+    # Arrange
+    from datetime import UTC, datetime
+
+    from gitlab_security_mcp.util import utc_now_iso
+
+    before = datetime.now(UTC)
+
+    # Act
+    text = utc_now_iso()
+
+    # Assert
+    parsed = datetime.fromisoformat(text)
+    assert before <= parsed <= datetime.now(UTC)
+    assert parsed.utcoffset() == before.utcoffset()

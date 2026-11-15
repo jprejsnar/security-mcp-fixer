@@ -201,9 +201,11 @@ def test_two_repositories_run_at_the_same_time(tmp_path):
         server._close_engine()
 
 
-def test_server_logs_go_to_stderr():
+def test_server_logs_go_to_stderr(capsys):
     """Server logs go to stderr."""
     # Arrange
+    import logging
+
     from gitlab_security_mcp import server
 
     server.logger.handlers.clear()
@@ -211,10 +213,132 @@ def test_server_logs_go_to_stderr():
     # Act
     server._configure_logging()
     server._configure_logging()
+    server.logger.info("ide-log-marker")
 
     # Assert
     assert len(server.logger.handlers) == 1
-    assert server.logger.handlers[0].stream is sys.stderr
+    assert "ide-log-marker" in capsys.readouterr().err
+    assert not any(
+        type(handler).__name__ == "RichHandler"
+        for handler in logging.getLogger().handlers
+    )
+
+
+def test_configure_logging_sets_level_when_a_handler_exists():
+    """Apply level and propagate on a logger that already has a handler."""
+    # Arrange
+    import logging
+
+    from gitlab_security_mcp import server
+
+    saved_handlers = list(server.logger.handlers)
+    saved_level = server.logger.level
+    saved_propagate = server.logger.propagate
+    server.logger.handlers.clear()
+    server.logger.addHandler(logging.NullHandler())
+    server.logger.setLevel(logging.NOTSET)
+    server.logger.propagate = True
+
+    # Act
+    try:
+        server._configure_logging()
+
+        # Assert
+        assert server.logger.propagate is False
+        assert server.logger.level == logging.INFO
+        assert len(server.logger.handlers) == 1
+    finally:
+        server.logger.handlers.clear()
+        for handler in saved_handlers:
+            server.logger.addHandler(handler)
+        server.logger.setLevel(saved_level)
+        server.logger.propagate = saved_propagate
+
+
+def test_host_logging_prepares_stderr_before_handlers(monkeypatch):
+    """Prepare stderr before any logging handler is attached."""
+    # Arrange
+    from gitlab_security_mcp import server
+
+    order: list[str] = []
+    monkeypatch.setattr(server, "_prepare_stderr", lambda: order.append("prepare"))
+    monkeypatch.setattr(server, "_configure_logging", lambda: order.append("configure"))
+
+    # Act
+    server._install_host_logging()
+
+    # Assert
+    assert order == ["prepare", "configure"]
+
+
+def test_stdio_server_logs_for_cursor_and_copilot(tmp_path):
+    """Answer initialize from Cursor and VS Code Copilot and log on stderr."""
+    # Arrange
+    import os
+    import subprocess
+
+    clients = (
+        ("cursor", "2025-11-25"),
+        ("vscode-copilot", "2025-03-26"),
+    )
+
+    def session(client_name: str, protocol: str) -> tuple[str, str]:
+        """Run one stdio handshake and return stdout and stderr text."""
+        process = subprocess.Popen(
+            [sys.executable, "-m", "gitlab_security_mcp.server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PROGRESS_CONSOLE": "off"},
+            cwd=tmp_path,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol,
+                "capabilities": {},
+                "clientInfo": {"name": client_name, "version": "1.0"},
+            },
+        }
+        tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        try:
+            process.stdin.write(json.dumps(initialize) + "\n")
+            process.stdin.write(
+                json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                + "\n"
+            )
+            process.stdin.write(json.dumps(tools) + "\n")
+            process.stdin.close()
+            stdout = process.stdout.read()
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            process.wait(timeout=20)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        return stdout, stderr
+
+    # Act
+    results = [session(name, protocol) for name, protocol in clients]
+
+    # Assert
+    for stdout, stderr in results:
+        lines = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        assert lines[0]["id"] == 1
+        assert "protocolVersion" in lines[0]["result"]
+        listed = next(line for line in lines if line.get("id") == 2)
+        names = {tool["name"] for tool in listed["result"]["tools"]}
+        assert "get_run_status" in names
+        assert "complete_security_run" in names
+        assert "serving stdio" in stderr
+        assert "\x1b[" not in stderr
 
 
 def test_non_git_precheck_does_not_persist_run_state(tmp_path):

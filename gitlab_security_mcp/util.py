@@ -24,6 +24,14 @@ _HTTP_LOG_LOCK = threading.Lock()
 logger = logging.getLogger("gitlab_security_mcp")
 
 
+def utc_now_iso() -> str:
+    """Return the current UTC time as one ISO 8601 string.
+
+    Every log timestamp uses this function so the clock text has one definition.
+    """
+    return datetime.now(UTC).isoformat()
+
+
 def _memory_bytes() -> int | None:
     """Return this process's working set, or None when the OS will not report it."""
     try:
@@ -208,7 +216,7 @@ def timed_http_stream(
     Transport failures retain their exception class, never exception messages,
     request headers, payloads, query strings or response bodies.
     """
-    started_at = datetime.now(UTC).isoformat()
+    started_at = utc_now_iso()
     started = perf_counter()
     response = None
     error = None
@@ -227,7 +235,7 @@ def timed_http_stream(
             "url": _http_log_url(url),
             "final_url": _http_log_url(response.url) if response is not None else None,
             "started_at": started_at,
-            "finished_at": datetime.now(UTC).isoformat(),
+            "finished_at": utc_now_iso(),
             "duration_ms": duration_ms,
             "status_code": response.status_code if response is not None else None,
             "error": error,
