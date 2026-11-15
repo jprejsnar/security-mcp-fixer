@@ -120,7 +120,8 @@ def test_complete_assessment_report_distinguishes_pending_gitlab_approval(
     if not dismissed:
         assert "no confirmed GitLab dismissal" in markdown
         assert (
-            payload["false_positive_approval"]["next_tool"] == "review_false_positives"
+            payload["false_positive_approval"]["next_tool"]
+            == "submit_false_positive_approvals"
         )
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -145,7 +146,7 @@ def test_checkbox_submission_is_the_only_write_gate(
     ctx = _context(action, checked, supported)
 
     # Act
-    result = asyncio.run(server.review_false_positives(ctx, str(tmp_path)))
+    result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
 
     # Assert
     assert engine.gitlab.dismiss_false_positive.call_count == writes
@@ -164,24 +165,15 @@ def test_checkbox_submission_is_the_only_write_gate(
         assert engine.state.gitlab_dismissals == []
 
 
-@pytest.mark.parametrize(
-    ("action", "checked", "supported", "writes"),
-    [
-        ("accept", True, True, 1),
-        ("accept", False, True, 0),
-        ("decline", True, True, 0),
-        ("cancel", True, True, 0),
-        ("accept", True, False, 0),
-    ],
-)
-def test_combined_completion_reviews_once_then_persists_final_report(
-    tmp_path, monkeypatch, action, checked, supported, writes
+@pytest.mark.parametrize("supported", [True, False])
+def test_combined_completion_lists_candidates_without_opening_the_form(
+    tmp_path, monkeypatch, supported
 ):
-    """Finish in one MCP call without rescanning or bypassing human selection."""
+    """Finish the report immediately so verification is not held inside a form."""
     # Arrange
     engine = _engine(tmp_path)
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
-    ctx = _context(action, checked, supported)
+    ctx = _context(supported=supported)
     tool = Tool.from_function(server.complete_security_run)
 
     # Act
@@ -194,18 +186,20 @@ def test_combined_completion_reviews_once_then_persists_final_report(
     # Assert
     assert not result.is_error
     assert payload["status"] == "REPORT_GENERATED"
-    assert ctx.elicit.await_count == (1 if supported else 0)
-    assert engine.gitlab.dismiss_false_positive.call_count == writes
-    assert len(saved["gitlab_dismissals"]) == writes
+    assert ctx.elicit.await_count == 0
+    assert engine.gitlab.dismiss_false_positive.call_count == 0
+    assert saved["gitlab_dismissals"] == []
     assert result.content[-1].text == payload["final_summary_markdown"]
     assert saved["final_summary_markdown"] == payload["final_summary_markdown"]
     assert payload["false_positive_review"]["status"] == (
-        "APPROVAL_UNAVAILABLE"
-        if not supported
-        else "CANCELLED"
-        if action != "accept"
-        else "OK"
+        "APPROVAL_UNAVAILABLE" if not supported else "REVIEW_READY"
     )
+    if supported:
+        assert payload["false_positive_review"]["candidates"][0]["id"] == "finding-1"
+        assert (
+            payload["false_positive_review"]["next_tool"]
+            == "submit_false_positive_approvals"
+        )
     engine.advisory.lookup.assert_not_called()
 
 
@@ -224,20 +218,24 @@ def test_combined_completion_reports_approval_errors_without_losing_report(
         engine.gitlab.dismiss_false_positive.side_effect = RuntimeError("Response lost")
 
     # Act
-    result = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+    report = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+    result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
 
     # Assert
-    assert Path(result.structured_content["json_report"]).is_file()
-    assert result.structured_content["false_positive_review"]["status"] == (
+    assert Path(report.structured_content["json_report"]).is_file()
+    assert (
+        report.structured_content["false_positive_review"]["status"] == "REVIEW_READY"
+    )
+    assert report.is_error is False
+    assert result["status"] == (
         "APPROVAL_UNAVAILABLE" if failure == "form" else "PARTIAL_FAILURE"
     )
-    assert result.is_error is (failure == "mutation")
     assert ctx.elicit.await_count == 1
     if failure == "form":
         engine.gitlab.dismiss_false_positive.assert_not_called()
-        assert "Host cannot open the form" in result.content[0].text
+        assert "Host cannot open the form" in result["reason"]
     else:
-        assert len(result.structured_content["gitlab_dismissals"]) == 1
+        assert result["results"][0]["status"] == "ERROR"
 
 
 def test_combined_completion_does_not_prompt_without_eligible_false_positives(
@@ -299,10 +297,11 @@ def test_combined_completion_keeps_checkout_selected_before_the_form(
     ctx.elicit.side_effect = elicit
 
     # Act
-    result = asyncio.run(server.complete_security_run(ctx))
+    report = asyncio.run(server.complete_security_run(ctx))
+    asyncio.run(server.submit_false_positive_approvals(ctx))
 
     # Assert
-    assert Path(result.structured_content["json_report"]).is_relative_to(first_root)
+    assert Path(report.structured_content["json_report"]).is_relative_to(first_root)
     first.gitlab.dismiss_false_positive.assert_called_once()
     other.gitlab.dismiss_false_positive.assert_not_called()
     assert not (other_root / ".security-mcp").exists()
@@ -720,7 +719,8 @@ def test_archived_style_pending_reviews_continue_to_human_approval(
     pending = asyncio.run(server.review_false_positives(ctx, str(tmp_path)))
     payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
     engine.verify_security_finding(first["id"], source_review=review)
-    approved = asyncio.run(server.review_false_positives(ctx, str(tmp_path)))
+    ready = asyncio.run(server.review_false_positives(ctx, str(tmp_path)))
+    approved = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
 
     # Assert
     assert pending["status"] == "SOURCE_REVIEW_REQUIRED"
@@ -732,6 +732,7 @@ def test_archived_style_pending_reviews_continue_to_human_approval(
     assert payload["review_status"] == "SOURCE_REVIEW_REQUIRED"
     assert "## Source Review Incomplete" in markdown
     assert "157 SAST findings" in payload["final_summary_markdown"]
+    assert ready["status"] == "REVIEW_READY"
     assert ctx.elicit.await_count == 1
     engine.gitlab.dismiss_false_positive.assert_called_once()
     assert approved["results"][0]["status"] == "DISMISSED"
@@ -914,12 +915,18 @@ def test_mcp_tool_exposes_no_ai_approval_arguments():
     tools = asyncio.run(server.mcp.list_tools())
 
     # Act
-    tool = next(item for item in tools if item.name == "review_false_positives")
+    review = next(item for item in tools if item.name == "review_false_positives")
+    submit = next(
+        item for item in tools if item.name == "submit_false_positive_approvals"
+    )
 
     # Assert
-    assert set(tool.input_schema["properties"]) == {"repo_root"}
-    assert tool.annotations.destructive_hint is True
-    assert tool.annotations.read_only_hint is False
+    assert set(review.input_schema["properties"]) == {"repo_root"}
+    assert set(submit.input_schema["properties"]) == {"repo_root"}
+    assert review.annotations.destructive_hint is False
+    assert review.annotations.read_only_hint is True
+    assert submit.annotations.destructive_hint is True
+    assert submit.annotations.read_only_hint is False
 
 
 @pytest.mark.parametrize("selection", [True, False, "true"])
@@ -951,7 +958,7 @@ def test_real_sdk_form_dispatch_selects_only_the_checked_finding(
     ctx = Context(
         request_context=SimpleNamespace(session=session, request_id="approval")
     )
-    tool = Tool.from_function(server.review_false_positives)
+    tool = Tool.from_function(server.submit_false_positive_approvals)
 
     # Act
     result = asyncio.run(tool.run({"repo_root": str(tmp_path)}, ctx))

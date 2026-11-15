@@ -5,7 +5,7 @@ It retrieves active findings, verifies installed dependencies against public
 advisories, qualifies compatible package updates, applies supported minimal edits,
 and produces local Markdown and JSON reports.
 
-The MCP host starts this Python process and calls its thirteen tools over stdio.
+The MCP host starts this Python process and calls its fourteen tools over stdio.
 One process can hold several application checkouts at once. Each checkout keeps
 its own run, and later calls select it with `repo_root` when more than one is
 active. There is no HTTP listener. "Local" describes execution and where edits
@@ -23,8 +23,9 @@ run gitlab-security on this repo
 
 This is one chat request, not a terminal command. The host AI analyzes findings
 and source, applies eligible fixes, validates the batch, and calls
-`complete_security_run` for optional human checkbox approval followed by the
-final report. A separate `review_false_positives` request is not needed.
+`complete_security_run` to list eligible false positives and write the final
+report. Verification of those findings has no time limit. When you are ready
+to submit, `submit_false_positive_approvals` opens the checkbox form.
 Only explicitly selected findings are dismissed in GitLab.
 
 Start with [installation](#installing-the-local-mcp-server), choose your
@@ -61,10 +62,10 @@ all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
 | --- | --- |
-| One-request completion | `complete_security_run` performs human false-positive review and then reporting, reusing current assessments without another scan. Standalone review/report tools remain available; there are thirteen tools. |
+| One-request completion | `complete_security_run` lists eligible false positives and writes the report without opening a form, reusing current assessments without another scan. `submit_false_positive_approvals` opens the checkbox form only when you are ready to submit. There are fourteen tools. |
 | Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
-| Human-only GitLab dismissal | Eligible assessments appear as initially unchecked form fields. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
+| Human-only GitLab dismissal | Eligible assessments are listed for verification with no deadline. The checkbox form opens only when you call `submit_false_positive_approvals`. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
 | Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports show pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
 | Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
 | Same-day branch reuse | Today's exact security branch can be reused after reviewing prior security logs. Errors preserve evidence and stop reuse. Cleanup removes only recognized generated untracked/ignored security artifacts, not tracked files, policies, configuration or unrelated work. |
@@ -165,7 +166,7 @@ runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
-  launcher["Root server.py: source launcher"] --> tools["Package server.py: thirteen MCP tools and error boundary"]
+  launcher["Root server.py: source launcher"] --> tools["Package server.py: fourteen MCP tools and error boundary"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Severity positions, Windows console, notifications and bounded transcript"]
   progress --> progressCleanup["Bounded drain; cancel and await sender; reject late callbacks"]
@@ -218,7 +219,8 @@ flowchart TB
 
   engine --> state["state.py: active RunState and inspection snapshot"]
   engine --> report["report.py: security table, validation and batch isolation evidence"]
-  tools --> completion["complete_security_run: human review followed by report"]
+  tools --> completion["complete_security_run: candidate list and report"]
+  tools --> submit["submit_false_positive_approvals: checkbox form when ready"]
   completion --> dismissal["Engine checks identity, source freshness and selected dismissal intent"]
   dismissal --> report
   state --> atomic["util.py: repository boundaries and atomic file publication"]
@@ -325,8 +327,9 @@ checkout is active.
 | `apply_minimal_fix(finding_id, repo_root=None)` | Read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
 | `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
 | `run_validation_matrix(repo_root=None)` | Validate the complete batch once. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
-| `review_false_positives(repo_root=None)` | Standalone human checkbox approval for eligible assessments. Only selected findings are dismissed; no AI approval argument is accepted. |
-| `complete_security_run(repo_root=None)` | Standard single-request completion: offer the human checkbox form, then write the final report with actual outcomes. Does not rescan or rerun verification. |
+| `review_false_positives(repo_root=None)` | List eligible assessments for verification. Returns immediately and dismisses nothing. |
+| `submit_false_positive_approvals(repo_root=None)` | Open the checkbox form when the human is ready to submit. Only selected findings are dismissed; no AI approval argument is accepted. |
+| `complete_security_run(repo_root=None)` | Standard completion: list eligible false positives and write the final report. Does not open the form, rescan, or rerun verification. |
 | `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
@@ -401,33 +404,40 @@ The command runner allows specific argument forms, not arbitrary shell commands.
 Direct `git add`, `commit`, `push`, `merge`, `rebase`, `reset`, and unrelated
 branch checkouts are rejected. Allowed Git mutations are the fast-forward pulls
 and creation of the dated security branch. GitLab calls retrieve data only,
-except `review_false_positives` and the combined `complete_security_run` that
-invokes it. Both require explicit human checkbox approval before dismissing
-selected vulnerabilities with their recorded reasons.
+except `submit_false_positive_approvals`. That tool requires explicit human
+checkbox approval before dismissing selected vulnerabilities with their
+recorded reasons. `review_false_positives` and `complete_security_run` only
+list candidates and write the local report.
 
 ### Approving false positives in Finding Assessments
 
 After verification and validation, the host calls
-`complete_security_run(repo_root=...)`. This one finishing tool invokes
-`review_false_positives`, waits for optional human approval, and then generates
-the final report, including actual dismissal outcomes. Decline/cancel or an
-unsupported/failed host form still produces a report with the exact approval
-outcome; no remote changes are implied. Do not separately call the review or
-report tool in the standard workflow or reopen a declined form automatically.
+`complete_security_run(repo_root=...)`. This finishing tool lists eligible
+false positives and generates the final report. It does not open a form and
+does not wait, so verifying the findings is not limited by the host's tool-call
+deadline. When you are ready to check boxes and submit, call
+`submit_false_positive_approvals`. Decline/cancel or an unsupported/failed host
+form writes nothing remotely. Do not separately call the review or report tool
+in the standard workflow, and do not reopen a declined form automatically.
 Standalone review/report tools remain available for explicit follow-up requests.
 Reports expose
 `false_positive_approval` separately from source `review_status`: `COMPLETE`
 means the source-review queue is empty, not that GitLab findings were dismissed.
 Pending approval is highlighted before the assessment table with the count of
 local false positives lacking a confirmed dismissal.
-In hosts supporting **MCP form elicitation**, it displays one initially unchecked
+In hosts supporting **MCP form elicitation**, `submit_false_positive_approvals` displays one initially unchecked
 boolean/checkbox per eligible false-positive assessment, including finding ID,
 location and exact reason. Select the findings you approve and submit the form.
 Submission immediately dismisses only selected findings in GitLab with
 `dismissalReason: FALSE_POSITIVE` and the displayed reason as `comment`, using
 [`vulnerabilityDismiss`](https://docs.gitlab.com/api/graphql/reference/mutations/#vulnerabilitydismiss).
 The host controls the exact form appearance. Only the human should answer it;
-the AI must never synthesize approvals.
+the AI must never synthesize approvals. A source false positive is stored as an
+audit description: the cited file and line, the code analysis, input origin,
+reachability, each reviewed file, the publisher pages read for that file, and
+every CVE or CWE record GitLab named with whether that page was available.
+When GitLab names no CVE or CWE, the description says no issue-specific record
+page was available. A short label is not accepted.
 
 Declining, cancelling, or leaving all boxes unchecked makes no remote changes.
 Hosts without advertised form support return `APPROVAL_UNAVAILABLE`; use a
@@ -768,7 +778,11 @@ sequenceDiagram
     MCP-->>Host: Retained updates, rejected updates and isolation trials, or blocked recovery
   end
   Host->>MCP: complete_security_run for this checkout
-  opt Eligible false positives and host form support
+  MCP->>Repo: Save final report
+  MCP-->>Host: Candidate list and final report, with no form and no wait
+  Note over Reviewer,Host: Verify the candidates for as long as needed
+  opt Human is ready to submit and the host supports forms
+    Host->>MCP: submit_false_positive_approvals for this checkout
     MCP-->>Host: Initially unchecked finding approvals with exact reasons
     Host-->>Reviewer: Display unchecked finding approvals
     Reviewer-->>Host: Submit selected items, decline or cancel
@@ -781,8 +795,6 @@ sequenceDiagram
       MCP-->>Host: No new GitLab changes
     end
   end
-  MCP->>Repo: Save final report with actual approval outcomes
-  MCP-->>Host: Finding Assessments, pending approvals, validation and isolation evidence
   end
 ```
 
@@ -1489,7 +1501,7 @@ an unrelated environment or install the application into the MCP environment.
    For a native Copilot connection, stop/start is the restart operation; for an
    editor-managed connection, use **Restart Server** when available.
 5. Check that tool discovery includes `complete_security_run` and
-   `review_false_positives` among the thirteen tools. Run the read-only status
+   `review_false_positives` among the fourteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
    edits before requesting a new run.
@@ -1507,8 +1519,8 @@ an unrelated environment or install the application into the MCP environment.
 4. Reopen Cursor and enable/reload the server. Review connection logs and trust
    prompts. If a conversation still has a stale tool list after restarting,
    start a fresh Agent chat; do not treat an old chat response as tool discovery.
-5. Confirm the thirteen tools include `complete_security_run` and
-   `review_false_positives`, then run the read-only status check below. Start a
+5. Confirm the fourteen tools include `complete_security_run` and
+   `submit_false_positive_approvals`, then run the read-only status check below. Start a
    new remediation run only after reviewing preserved edits and prechecks.
 
 An IDE upgrade, MCP package upgrade and model change are different operations.
@@ -1549,10 +1561,11 @@ GitLab permissions or clear the host's internal conversation errors.
 6. Follow tool progress and approval prompts. The calling AI must finish
    `HOST_REVIEW_REQUIRED` source analysis and submit hash-bound assessments,
    not hand that task to the user. At completion, select only the false positives
-   you want dismissed in the human form. Do not authorize the AI to answer it.
+   you want dismissed. The report returns immediately. When you are ready to
+   submit, ask for `submit_false_positive_approvals` and use its checkbox form.
+   Do not authorize the AI to answer it.
 7. Review the final Finding Assessments, actual dismissal outcomes, unresolved
    findings, build/test evidence and local diff. Commit/push manually if accepted.
-   No second `review_false_positives` chat request is needed.
 
 **If the Command Palette does not show MCP controls:** use the Chat view's
 **Open Customizations > MCP Servers** navigation when available. Check the
@@ -1562,9 +1575,9 @@ For editor-managed configurations, open the relevant `mcp.json` and use its
 available server actions. Do not switch JSON formats merely to hide a startup
 error; inspect the configured executable and server output first.
 
-If a host cannot display the required human form, completion returns
-`APPROVAL_UNAVAILABLE` and still generates a report. No findings are dismissed
-by that call; use a form-capable host or the GitLab UI.
+If a host cannot display the required human form, `submit_false_positive_approvals`
+returns `APPROVAL_UNAVAILABLE`. The report is still generated. No findings are
+dismissed by that call; use a form-capable host or the GitLab UI.
 
 ## Running within Cursor
 
@@ -1585,10 +1598,10 @@ by that call; use a form-capable host or the GitLab UI.
   product checks, then enter `run gitlab-security on this repo` in Agent chat.
   Cursor's selected host model performs source/input-flow review; deprecated MCP
   sampling is not used. Do not stop at `HOST_REVIEW_REQUIRED`.
-8. Complete the optional human checkbox form within the same request. The AI
-  must not select boxes for you. `complete_security_run` reports confirmed
-  outcomes and writes the final report; no second review request is needed.
-  If the host cannot show the form, `APPROVAL_UNAVAILABLE` means no new dismissals.
+8. Read the candidate list and final report. Verification is not timed. When you
+  are ready to submit, ask for `submit_false_positive_approvals`. The AI must
+  not select boxes for you. If the host cannot show the form,
+  `APPROVAL_UNAVAILABLE` means no new dismissals.
 9. Review the reports, unresolved reasons, final validation and local diff.
   Publish reviewed changes manually; the MCP never commits, pushes or opens a
   merge request.
@@ -1800,12 +1813,12 @@ successful pulls are not undone if DNS subsequently fails.
 run gitlab-security on this repo
 ```
 
-That single request includes false-positive review: after analysis, fixes and
-validation, `complete_security_run` opens the eligible checkbox approvals and
-writes the final report after your response. You do not need a second
-`run review_false_positives` message. It reuses the current assessments instead
-of rescanning; it saves the extra interaction, not the required analysis or
-human approval time. No findings are dismissed without your selected checkboxes.
+That single request includes the candidate list and final report: after analysis,
+fixes and validation, `complete_security_run` returns immediately. Verify the
+false positives for as long as you need. When you are ready to submit, ask for
+`submit_false_positive_approvals`. That form is only the submit click, because
+the host cancels a tool call that stays open while a form is unanswered.
+No findings are dismissed without your selected checkboxes.
 
 This is a natural-language request to the MCP host, not a PowerShell, Bash or
 standalone CLI command. The host resolves the active application's absolute Git
@@ -1874,8 +1887,8 @@ and retains a passing combination. Reject incompatible updates and interactions.
 Require a green final build and all unit tests, even when every update is
 rejected and the original baseline is restored. Never claim a broken baseline
 is recovered. Do not retry rejected targets blindly or adapt source/tests.
-Finish with complete_security_run to offer human checkbox approval and generate
-the local report. Display final_summary_markdown verbatim at the
+Finish with complete_security_run to list false-positive candidates and generate
+the local report. Do not open the submit form during verification. Display final_summary_markdown verbatim at the
 end of your final response: the six-column security issues table. Inspect
 isolation_trials, retained_updates and rejected_updates after recovery.
 If validation returns FIX_REJECTED with continue_with_next_finding true,
@@ -1883,9 +1896,9 @@ all candidates were rejected and the baseline proved green. Otherwise
 stop on run-level failures, incomplete validation or unsafe rollback. Retain finding-level
 manual-review and no-safe-fix reasons; continue only with eligible findings.
 Do not commit, push, or claim pending edits are resolved. Dismiss false positives
-only through the review_false_positives stage inside complete_security_run,
-with explicit human checkbox approval. Do not make a separate review/report
-call in this standard workflow.
+only through submit_false_positive_approvals, after the human is ready to submit
+and checks the form. Do not open that form during verification, and do not make
+a separate review/report call in this standard workflow.
 ```
 
 ### Reports and local artifacts
@@ -1938,7 +1951,7 @@ Report generation is not a validation gate: `REPORT_GENERATED` does not mean
 qualification evidence. Later source or policy changes retract validated
 package results when status/report is refreshed. GitLab findings stay unchanged
 unless the human approves false-positive dismissal through
-`review_false_positives`, or your normal publication/scanning process updates them.
+`submit_false_positive_approvals`, or your normal publication/scanning process updates them.
 
 ### Source SAST findings
 
@@ -1960,8 +1973,8 @@ and every configuration/caller file relied on. The server validates file
 boundaries, hashes and review completeness; the reasoning remains an audited
 host attestation, not automatic data-flow proof. Status/report refresh retracts
 false positives if reviewed files change. These decisions alone do not dismiss
-GitLab findings; the human approval form inside `complete_security_run` is
-required. The AI continues analysis and records the review in the same user
+GitLab findings; `submit_false_positive_approvals` is required after the human
+finishes verification. The AI continues analysis and records the review in the same user
 request, without deprecated sampling.
 
 | Source or configuration | What the host AI must inspect |
@@ -2196,7 +2209,7 @@ for deployment and restart differences.
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
-| An installed wheel still shows old behavior or fewer than thirteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
+| An installed wheel still shows old behavior or fewer than fourteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
 | `WinError 32` during installation | Close all VS Code/Cursor windows, including Agents/background windows, and retry the helper from standalone PowerShell. It detects a lock before pip changes the installation; it never terminates applications automatically. |
 | `Unexpected token 'install'` or a quoted pip path in PowerShell | Use the installer helper as one command, or run venv creation and pip installation as separate commands. An executable path in quotes needs PowerShell's `&` invocation operator. Do not join the two examples into one expression. |
 | `Ignoring invalid distribution ~itlab-security-mcp` | An interrupted install left recovery directories. The helper reports exact leftover paths without deleting them; resolve the file lock and repair the installation before manually reviewing any leftovers. A newer-pip notice is informational. |

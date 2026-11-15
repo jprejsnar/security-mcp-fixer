@@ -121,3 +121,86 @@ def test_unread_cve_page_blocks_the_source_conclusion(tmp_path):
     # Assert
     assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
     assert "not accepted" in result["reason"]
+
+
+def test_false_positive_comment_records_source_and_missing_cve_cwe(tmp_path):
+    """Retain a source description and say when GitLab named no CVE or CWE."""
+    # Arrange
+    engine, review = _engine(tmp_path, "widget.py", "ready = True\n")
+
+    # Act
+    result = engine.verify_security_finding("source", source_review=review)
+
+    # Assert
+    assert result["decision"] == "FALSE_POSITIVE"
+    assert review["reason"] in result["reason"]
+    assert "widget.py:1" in result["reason"]
+    assert "Input origin:" in result["reason"]
+    assert "Code analysis:" in result["reason"]
+    assert "Reachability:" in result["reason"]
+    assert "no issue-specific CVE or CWE record page was available" in result["reason"]
+    assert "python: available at https://docs.python.org/3/" in result["reason"]
+
+
+def test_false_positive_comment_records_available_cve_and_cwe_pages(tmp_path):
+    """Record each GitLab CVE and CWE page that was actually retrieved."""
+    # Arrange
+    engine, review = _engine(
+        tmp_path,
+        "widget.py",
+        "ready = True\n",
+        identifiers=["CVE-2024-12345", "CWE-79"],
+    )
+    review["finding_analysis"] = (
+        "The cited line does not implement CVE-2024-12345 or CWE-79."
+    )
+    cwe_url = "https://cwe.mitre.org/data/definitions/79.html"
+    engine.docs = documentation_client({cwe_url: "CWE-79 definition"})
+
+    # Act
+    result = engine.verify_security_finding("source", source_review=review)
+
+    # Assert
+    assert result["decision"] == "FALSE_POSITIVE"
+    assert (
+        "cve:CVE-2024-12345: available at https://www.cve.org/CVERecord?id=CVE-2024-12345"
+        in result["reason"]
+    )
+    assert (
+        "nist:CVE-2024-12345: available at https://nvd.nist.gov/vuln/detail/CVE-2024-12345"
+        in result["reason"]
+    )
+    assert f"cwe:CWE-79: available at {cwe_url}" in result["reason"]
+
+
+def test_false_positive_without_the_named_cve_is_not_accepted(tmp_path):
+    """Refuse a description that never addresses the CVE GitLab named."""
+    # Arrange
+    engine, review = _engine(
+        tmp_path,
+        "widget.py",
+        "ready = True\n",
+        identifiers=["CVE-2024-12345"],
+    )
+
+    # Act
+    result = engine.verify_security_finding("source", source_review=review)
+
+    # Assert
+    assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert "CVE-2024-12345" in result["reason"]
+    assert "not accepted" in result["reason"]
+
+
+def test_short_false_positive_label_is_not_a_description(tmp_path):
+    """Refuse a label that does not describe the cited code."""
+    # Arrange
+    engine, review = _engine(tmp_path, "widget.py", "ready = True\n")
+    review["reason"] = "Not a bug."
+
+    # Act
+    result = engine.verify_security_finding("source", source_review=review)
+
+    # Assert
+    assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
+    assert "complete sentence" in result["reason"]

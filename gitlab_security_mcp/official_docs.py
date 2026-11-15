@@ -360,6 +360,25 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
         }
         for name, url, marker in REQUIRED_DOCS
     ]
+    pages.extend(cited_security_pages(finding))
+    for page in doc_pages:
+        markers = tuple(str(item) for item in page.get("markers") or () if str(item))
+        pages.append(
+            {
+                "name": str(page.get("name") or "rule"),
+                "url": str(page.get("url") or ""),
+                "markers": markers or ("",),
+            }
+        )
+    return pages
+
+
+def cited_security_pages(finding: dict) -> list[dict]:
+    """Return the CVE and CWE record pages named in one GitLab finding.
+
+    A finding with no CVE or CWE identifier has no issue-specific record page.
+    Catalog home pages are not a substitute for that record.
+    """
     text = " ".join(
         str(part)
         for part in (
@@ -368,6 +387,7 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
             finding.get("description"),
         )
     )
+    pages = []
     for ident in _unique(_CVE.findall(text))[:_MAX_IDENTIFIERS]:
         cve = ident.upper()
         pages.append(
@@ -394,15 +414,6 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
                 "required": False,
                 "url": f"https://cwe.mitre.org/data/definitions/{int(number)}.html",
                 "markers": (cwe,),
-            }
-        )
-    for page in doc_pages:
-        markers = tuple(str(item) for item in page.get("markers") or () if str(item))
-        pages.append(
-            {
-                "name": str(page.get("name") or "rule"),
-                "url": str(page.get("url") or ""),
-                "markers": markers or ("",),
             }
         )
     return pages

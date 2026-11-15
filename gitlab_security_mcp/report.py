@@ -134,11 +134,11 @@ def render(
         "assessed_false_positives": len(assessed_false_positives),
         "previously_confirmed_dismissals": len(assessed_false_positives & dismissed),
         "not_confirmed_dismissed": len(pending_dismissals),
-        "next_tool": "review_false_positives" if pending_dismissals else None,
+        "next_tool": "submit_false_positive_approvals" if pending_dismissals else None,
     }
     approval_notice = (
         f"{len(pending_dismissals)} locally assessed false positives have no confirmed GitLab dismissal. "
-        "Call review_false_positives to present the unchecked human approval form. "
+        "Verify them in this report with no time limit, then call submit_false_positive_approvals when ready to submit. "
         "Local assessment is not dismissal; only the human can approve remote changes."
     )
     unverified = [
@@ -318,7 +318,7 @@ def render(
         "finding_assessments": assessments,
         "finding_assessments_table": assessments_table,
         "gitlab_dismissals": state.gitlab_dismissals,
-        "false_positive_review_tool": "review_false_positives",
+        "false_positive_review_tool": "submit_false_positive_approvals",
         "false_positive_approval": dismissal_review,
         "unresolved_issues": unresolved,
         "unresolved_issues_table": unresolved_table,
@@ -330,7 +330,7 @@ def render(
             "Review the unstaged diff. This server did not run git add, commit, or push.",
             "Confirm the validation results.",
             "Manually stage, commit, and push if the diff is acceptable.",
-            "Use review_false_positives for human-approved false-positive dismissals, or update GitLab manually. Local assessments alone do not change GitLab.",
+            "Use submit_false_positive_approvals for human-approved false-positive dismissals, or update GitLab manually. Local assessments alone do not change GitLab.",
         ],
     }
     lines = [
@@ -479,7 +479,7 @@ def render(
             "## Finding Assessments",
             payload["finding_assessments_table"],
             "",
-            "To approve false-positive dismissals, call `review_false_positives` and submit its checkbox form. Markdown reports do not submit approvals.",
+            "To approve false-positive dismissals, verify this report, then call `submit_false_positive_approvals` when ready to submit its checkbox form. Markdown reports do not submit approvals.",
             *(
                 [
                     "",

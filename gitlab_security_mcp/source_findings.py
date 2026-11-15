@@ -6,7 +6,10 @@ import hashlib
 from pathlib import Path
 
 from gitlab_security_mcp.config_findings import config_kind
+from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_pages
 from gitlab_security_mcp.util import resolve_inside
+
+_MIN_AUDIT_SENTENCE = 24
 
 MAX_SOURCE_BYTES = 1_000_000
 # Names and review limits from the TypeScript utility-types reference
@@ -97,8 +100,9 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
             "MANUAL_REVIEW; reason; input_origin; finding_analysis; reachability_analysis; "
             "reviewed_files: [{path, sha256, assessment}]}. Hash full current file bytes. "
             "Do not stop at collecting excerpts or invent a false positive to clear "
-            "this queue. Finish with complete_security_run for human approval and "
-            "the final report. Uncertain findings remain unresolved."
+            "this queue. Finish with complete_security_run for the candidate list and "
+            "the final report. Call submit_false_positive_approvals only when the human "
+            "is ready to submit. Uncertain findings remain unresolved."
         )
         if count
         else None,
@@ -128,6 +132,12 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
         raise ValueError(
             "Source review requires finding_analysis (or legacy pattern_analysis)"
         )
+    if review.get("decision") == "FALSE_POSITIVE":
+        for key in ("reason", "input_origin", analysis_key, "reachability_analysis"):
+            if len(review[key].strip()) < _MIN_AUDIT_SENTENCE:
+                raise ValueError(
+                    f"False-positive {key} must be a complete sentence describing the cited code"
+                )
     reviewed = review.get("reviewed_files")
     if not isinstance(reviewed, list) or not reviewed or len(reviewed) > 100:
         raise ValueError("Source review requires 1 to 100 reviewed_files")
@@ -146,6 +156,13 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
         assessment = item.get("assessment")
         if not isinstance(assessment, str) or not assessment.strip():
             raise ValueError(f"Reviewed file assessment is missing: {relative}")
+        if (
+            review.get("decision") == "FALSE_POSITIVE"
+            and len(assessment.strip()) < _MIN_AUDIT_SENTENCE
+        ):
+            raise ValueError(
+                f"False-positive file assessment must describe {relative} in a complete sentence"
+            )
         paths.add(resolve_inside(root, relative))
         evidence.append(f"Reviewed {relative} SHA256={digest}: {assessment}")
     cited = resolve_inside(root, finding["location"]["file"])
@@ -190,7 +207,10 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
             "or a fix: TypeScript and JavaScript, Node.js, Python, Oracle Java, "
             "Microsoft C# and .NET, the Dockerfile reference, or nginx, whichever "
             "this path is. Compare the finding with its CVE and CWE pages. A missing "
-            "page, a scanner flag, or a utility type is not proof of safety.",
+            "page, a scanner flag, or a utility type is not proof of safety. "
+            "Write the reason, input origin, code analysis, reachability, and each "
+            "file assessment as complete sentences about this cited code. Address "
+            "every CVE and CWE GitLab named. Do not invent an identifier.",
             TYPESCRIPT_UTILITY_REVIEW
             if "typescript" in source_languages(str(location.get("file") or ""))
             else "This path has no TypeScript utility-type review.",
@@ -247,3 +267,92 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
         "evidence": [*evidence, reason],
         "workflow": workflow,
     }
+
+
+def audit_false_positive_comment(
+    finding: dict, review: dict, documentation: list[dict]
+) -> str:
+    """Build the audit comment from the source review and retrieved record pages.
+
+    The comment is what a reviewer and GitLab retain. It keeps the host analysis
+    and states whether each CVE or CWE page GitLab named was available.
+    """
+    location = finding.get("location") or {}
+    title = str(finding.get("title") or finding.get("id") or "untitled finding")
+    cited = f"{location.get('file') or 'unknown file'}:{location.get('startLine') or 'unknown line'}"
+    analysis_key = (
+        "finding_analysis" if "finding_analysis" in review else "pattern_analysis"
+    )
+    files = [
+        f"- {item.get('path')}: {str(item.get('assessment')).strip()} "
+        f"(SHA256 {item.get('sha256')})"
+        for item in review.get("reviewed_files") or []
+        if isinstance(item, dict)
+    ]
+    narrative = " ".join(
+        str(review.get(key) or "")
+        for key in ("reason", "input_origin", analysis_key, "reachability_analysis")
+    )
+    missing = [
+        page["name"].split(":", 1)[-1]
+        for page in cited_security_pages(finding)
+        if page["name"].split(":", 1)[-1].upper() not in narrative.upper()
+    ]
+    if missing:
+        raise ValueError(
+            "False-positive description does not address "
+            + ", ".join(dict.fromkeys(missing))
+        )
+    publishers = {
+        name: url
+        for name, url, _marker in REQUIRED_DOCS
+        if name in workflow_languages(finding)
+    }
+    by_name = {
+        item.get("name"): item for item in documentation if isinstance(item, dict)
+    }
+    publisher_lines = [
+        _page_line(name, url, by_name.get(name)) for name, url in publishers.items()
+    ]
+    named = cited_security_pages(finding)
+    if named:
+        record_lines = [
+            _page_line(page["name"], page["url"], by_name.get(page["name"]))
+            for page in named
+        ]
+    else:
+        record_lines = [
+            "GitLab did not cite a CVE or CWE identifier, so no issue-specific "
+            "CVE or CWE record page was available for this finding."
+        ]
+    return "\n".join(
+        [
+            f'False-positive source assessment for GitLab finding "{title}" at {cited}.',
+            f"Why this is not the flagged issue: {review['reason'].strip()}",
+            f"Input origin: {review['input_origin'].strip()}",
+            f"Code analysis: {review[analysis_key].strip()}",
+            f"Reachability: {review['reachability_analysis'].strip()}",
+            "Files reviewed:",
+            *files,
+            "Publisher pages for this file:",
+            *publisher_lines,
+            "CVE and CWE records:",
+            *record_lines,
+        ]
+    )
+
+
+def workflow_languages(finding: dict) -> tuple[str, ...]:
+    """Return the publisher keys for the finding's cited file."""
+    location = finding.get("location") or {}
+    return source_languages(str(location.get("file") or ""))
+
+
+def _page_line(name: str, url: str, fetched: dict | None) -> str:
+    """State whether one documentation page was available."""
+    if fetched and fetched.get("ok"):
+        return f"- {name}: available at {url} (SHA256 {fetched.get('sha256')})."
+    if fetched:
+        detail = fetched.get("error") or fetched.get("status_code")
+        return f"- {name}: not available at {url} ({detail})."
+    return f"- {name}: not retrieved from {url}."

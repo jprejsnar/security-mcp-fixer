@@ -59,7 +59,11 @@ from gitlab_security_mcp.qualification import (
 from gitlab_security_mcp.remediate import Plan, apply_plan, plan_remediation
 from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.security_artifacts import review_security_artifacts
-from gitlab_security_mcp.source_findings import assess_source, pending_source_reviews
+from gitlab_security_mcp.source_findings import (
+    assess_source,
+    audit_false_positive_comment,
+    pending_source_reviews,
+)
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import (
     atomic_write_text,
@@ -2216,6 +2220,22 @@ class Engine:
                 assessment["workflow"]["documentation"] = (
                     doc_review.as_list() if isinstance(doc_review, DocReview) else []
                 )
+                if assessment["decision"] == "FALSE_POSITIVE":
+                    try:
+                        assessment["reason"] = audit_false_positive_comment(
+                            finding,
+                            source_review,
+                            assessment["workflow"]["documentation"],
+                        )
+                    except ValueError as exc:
+                        assessment["decision"] = "SOURCE_REVIEW_REQUIRED"
+                        assessment["reason"] = (
+                            f"{exc}. The source conclusion was not accepted."
+                        )
+                        assessment["workflow"] = {
+                            **assessment["workflow"],
+                            "status": "SOURCE_REVIEW_REQUIRED",
+                        }
             finding["sourceWorkflow"] = assessment["workflow"]
             if kind and assessment["decision"] == "CONFIRMED_VULNERABILITY":
                 return self._decide_config(finding, assessment["evidence"])

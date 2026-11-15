@@ -2812,6 +2812,7 @@ def test_tools_are_registered():
         "generate_aaa_test",
         "run_validation_matrix",
         "review_false_positives",
+        "submit_false_positive_approvals",
         "generate_local_report",
         "complete_security_run",
         "get_run_status",

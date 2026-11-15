@@ -31,9 +31,11 @@ logger = logging.getLogger("gitlab_security_mcp")
 
 INSTRUCTIONS = """
 Local-only GitLab security remediation. A request to "run gitlab-security on this
-repo" means this entire workflow in ONE user request, including the optional
-false-positive approval form and final report. Do not ask the user to issue a
-second review_false_positives request. Call the tools in this order:
+repo" means this entire workflow in ONE user request through the final report.
+False-positive verification is read from that report and has no time limit.
+Do not open the submit form during verification. Call submit_false_positive_approvals
+only after the human says they are ready to check boxes and submit. Call the tools
+in this order:
 1. run_prechecks(repo_root=<absolute application checkout path>). Always pass
     the active application's path when the host starts this server elsewhere.
     Unresolved ${workspaceFolder} values are not repository paths. Each checkout
@@ -91,6 +93,12 @@ second review_false_positives request. Call the tools in this order:
     cited file, and the finding's CVE and CWE pages. For TypeScript, apply the
     utility-type limits in source_workflow (Partial, Pick, Omit, and the rest
     do not prove a runtime control). A missing page blocks the conclusion.
+    A false-positive reason, input_origin, finding_analysis, reachability_analysis,
+    and each file assessment must be complete sentences about the cited code.
+    When GitLab names a CVE or CWE, the analysis must address that identifier
+    and whether its record applies to this code. The stored description records
+    those sentences plus whether each record page was available. Do not invent
+    a CVE or CWE, and do not use a short label as the description.
     Do not ask the user to perform the code analysis or end with the pending
     placeholder. If access, host consent or sufficient evidence is unavailable,
     report that exact blocker and keep the finding unresolved.
@@ -202,17 +210,14 @@ second review_false_positives request. Call the tools in this order:
     rollback cannot be proved safe or later edits need manual cleanup: stop
     editing and report the blocker. Never adapt production/tests to make a fix
     pass. At the end list every unapplied/rejected fix and its exact reason.
-11. complete_security_run(repo_root=the same checkout). This single finishing
-    tool calls review_false_positives, waits for the optional unchecked human
-    approval form, and then generates the local report with actual outcomes.
-    Do not call review_false_positives or generate_local_report separately in
-    the standard workflow, and do not rescan/reverify just to request approval.
-    Only the human may answer; never generate or infer approval. Decline/cancel
-    or lack of host form support means no remote changes, but a report is still
-    generated. Inspect false_positive_review for the outcome/blocker and do not
-    automatically repeat the form after it was declined or cancelled.
-    Markdown checkboxes alone are not actionable. Never retry a mutation whose
-    remote outcome may be unknown.
+11. complete_security_run(repo_root=the same checkout). This finishing tool lists
+    eligible false positives and generates the local report. It does not open a
+    form and does not wait. Do not call review_false_positives or
+    generate_local_report separately in the standard workflow, and do not
+    rescan/reverify just to request approval. The human may take as long as
+    needed to verify the returned candidates. Hosts cancel an unanswered tool
+    call after a few minutes, so the submit form must not stay open during that
+    verification.
     Display the returned final_summary_markdown once at the end of the final
     response, not just report paths. The tool's text content is this complete
     Markdown block, not a JSON wrapper. Copy it into the final assistant message;
@@ -222,11 +227,18 @@ second review_false_positives request. Call the tools in this order:
     Reason Not Addressed, Security Validation Sites. List the actual consulted
     site URLs even when the lookup failed; never fabricate verification sites.
     Check false_positive_approval separately from review_status: completed source
-    review does not mean findings were dismissed in GitLab. The checkbox form
-    dismisses only selected assessments as FALSE_POSITIVE, with the exact displayed
-    reason as the GitLab comment. Report actual confirmed outcomes, not intentions.
+    review does not mean findings were dismissed in GitLab.
+12. submit_false_positive_approvals(repo_root=the same checkout), only when the
+    human says they are ready to submit. That tool opens the unchecked checkbox
+    form. Only the human may answer; never generate or infer approval.
+    Decline/cancel or lack of host form support means no remote changes.
+    Do not automatically repeat the form after it was declined or cancelled.
+    Markdown checkboxes alone are not actionable. Never retry a mutation whose
+    remote outcome may be unknown. The checkbox form dismisses only selected
+    assessments as FALSE_POSITIVE, with the exact displayed reason as the GitLab
+    comment. Report actual confirmed outcomes, not intentions.
 Do not commit, push, or open a merge request.
-Only review_false_positives may dismiss findings, after human form approval.
+Only submit_false_positive_approvals may dismiss findings, after human form approval.
 Missing/failed OSV, GitHub Advisory Database,
 NVD, CVE, CWE or NSA data does not block a concrete GitLab-recommended update
 for a locally matched dependency. Continue to qualification, application and
@@ -800,22 +812,32 @@ def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
     return _run("run_validation_matrix", repo_root=repo_root)
 
 
+def _form_supported(ctx: Context) -> bool:
+    """Return whether this host can display an MCP checkbox form."""
+    capabilities = ctx.session.client_capabilities
+    return not (
+        capabilities is None
+        or capabilities.elicitation is None
+        or capabilities.elicitation.form is None
+    )
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Finding Assessments: approve false-positive dismissals",
-        read_only_hint=False,
-        destructive_hint=True,
-        open_world_hint=True,
+        title="Finding Assessments: list false positives for verification",
+        read_only_hint=True,
+        destructive_hint=False,
+        open_world_hint=False,
     )
 )
 async def review_false_positives(
     ctx: Context, repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Show unchecked human approvals; submit selected assessments to GitLab.
+    """Return eligible false positives for human verification without opening a form.
 
-    Requires a host supporting MCP form elicitation and a GitLab API-write token
-    belonging to a user allowed to change vulnerability status. No approval
-    arguments are accepted from the AI. Declining or cancelling writes nothing.
+    The result is immediate, so verification is not limited by a host tool-call
+    deadline. No approval arguments are accepted and nothing is dismissed.
+    Call submit_false_positive_approvals only when the human is ready to submit.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     snapshot = await asyncio.to_thread(selected.false_positive_candidates)
@@ -863,12 +885,59 @@ async def review_false_positives(
             "source_review_queue": queue,
             "message": message,
         }
-    capabilities = ctx.session.client_capabilities
-    if (
-        capabilities is None
-        or capabilities.elicitation is None
-        or capabilities.elicitation.form is None
-    ):
+    if not _form_supported(ctx):
+        return {
+            "status": "APPROVAL_UNAVAILABLE",
+            "reason": "This MCP host does not advertise form elicitation. No GitLab changes were made. Use a form-capable host or dismiss manually in GitLab.",
+            "candidates": candidates,
+            "source_review_queue": queue,
+        }
+    return {
+        "status": "REVIEW_READY",
+        "repo_root": str(selected.repo_root),
+        "results": [],
+        "candidates": candidates,
+        "excluded": snapshot["excluded"],
+        "source_review_queue": queue,
+        "next_tool": "submit_false_positive_approvals",
+        "message": (
+            "These findings are ready for human verification. Take as long as needed; "
+            "this result does not keep a form open and does not expire. "
+            "No GitLab changes were made. When the human is ready to check boxes and "
+            "submit, call submit_false_positive_approvals. Open that form only for the submit click."
+        ),
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Submit false-positive approvals",
+        read_only_hint=False,
+        destructive_hint=True,
+        open_world_hint=True,
+    )
+)
+async def submit_false_positive_approvals(
+    ctx: Context, repo_root: str | None = None
+) -> dict[str, Any]:
+    """Open the checkbox form when the human is ready to submit.
+
+    Call this only for the submit click. Hosts cancel a tool call that stays
+    open while a form is unanswered, so verification belongs in the review
+    result, not on this form. No approval arguments are accepted from the AI.
+    Declining, cancelling, or leaving every box unchecked writes nothing.
+    """
+    selected = await asyncio.to_thread(_engine_for, repo_root)
+    snapshot = await asyncio.to_thread(selected.false_positive_candidates)
+    if snapshot["status"] != "OK":
+        return snapshot
+    candidates = snapshot["candidates"]
+    queue = snapshot["source_review_queue"]
+    if not candidates:
+        review = await review_false_positives(ctx, repo_root)
+        review.pop("candidates", None)
+        return review
+    if not _form_supported(ctx):
         return {
             "status": "APPROVAL_UNAVAILABLE",
             "reason": "This MCP host does not advertise form elicitation. No GitLab changes were made. Use a form-capable host or dismiss manually in GitLab.",
@@ -958,21 +1027,20 @@ def generate_local_report(repo_root: str | None = None) -> CallToolResult:
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Complete security run: review false positives and report",
+        title="Complete security run: list false positives and report",
         read_only_hint=False,
-        destructive_hint=True,
+        destructive_hint=False,
         open_world_hint=True,
     )
 )
 async def complete_security_run(
     ctx: Context, repo_root: str | None = None
 ) -> CallToolResult:
-    """Offer human checkbox approvals, then report once without rerunning assessment.
+    """List eligible false positives and report once without opening the submit form.
 
     Call after verification, fixes and validation in the same user request.
-    Decline, cancel, no eligible findings or unavailable host forms still produce
-    a report. Only human-selected findings may change in GitLab. Both steps stay
-    bound to the initially selected checkout while the human answers the form.
+    The human verifies the returned candidates with no time limit. Submission is
+    a later submit_false_positive_approvals call. This call does not change GitLab.
     """
     selected_root = str((await asyncio.to_thread(_engine_for, repo_root)).repo_root)
     review = await review_false_positives(ctx, repo_root=selected_root)
