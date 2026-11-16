@@ -2111,7 +2111,16 @@ def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
 
 @pytest.mark.parametrize(
     "mode",
-    ["resolved", "logged", "failed", "truncated", "conflict", "unresolved", "mutated"],
+    [
+        "resolved",
+        "logged",
+        "configurations",
+        "failed",
+        "truncated",
+        "conflict",
+        "unresolved",
+        "mutated",
+    ],
 )
 def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
     """Resolve real selected versions once without guessing absent or ambiguous trees."""
@@ -2128,6 +2137,12 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
         output += "\\--- io.example:library:1.0.0\n"
     if mode == "unresolved":
         output += "\\--- io.example:library:1.0.0 FAILED\n"
+    if mode == "configurations":
+        finding["installedVersion"] = "1.1.0"
+        output = (
+            "checkstyle - Tool classpath.\n+--- io.example:library:1.0.0\n"
+            "runtimeClasspath - Application classpath.\n+--- io.example:library:1.1.0\n"
+        )
     runner = Mock()
     runner.run.return_value = CommandResult(
         ["gradle", "--no-daemon", "dependencies"],
@@ -2192,19 +2207,22 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
     assert first["decision"] == again["decision"] == "MANUAL_REVIEW"
     assert first["proposed_fix"] is None
     assert "https://osv.dev" in first["security_validation_sites"]
-    successful = mode in {"resolved", "logged"}
+    successful = mode in {"resolved", "logged", "configurations"}
     assert before_change == (1 if successful else 2)
     assert runner.run.call_count == (2 if successful else 3)
-    expected_version = "1.1.0" if mode in {"resolved", "logged"} else "1.0.0"
+    expected_version = "1.1.0" if successful else "1.0.0"
     assert advisory.lookup.call_args.args[1:] == (
         "Maven",
         "io.example:library",
         expected_version,
     )
-    if mode in {"resolved", "logged"}:
+    if successful:
         assert finding["dependencyResolution"]["version"] == "1.1.0"
-        assert "transitive" in first["reason"].lower()
-        assert "1.2.0" in first["reason"]
+        if mode == "configurations":
+            assert "other configuration versions" in first["reason"]
+        else:
+            assert "transitive" in first["reason"].lower()
+            assert "1.2.0" in first["reason"]
         from gitlab_security_mcp.report import render
 
         payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")

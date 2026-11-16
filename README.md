@@ -78,7 +78,7 @@ all of these changes; updating source files does not update an installed wheel.
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
-The latest 1.0.9 code validation completed with **781 passed, 3 skipped**.
+The latest 1.0.9 code validation completed with **787 passed, 3 skipped**.
 These are offline regression results, not
 live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
 leak resources. Rebuild and reinstall the wheel to deploy source fixes.
@@ -566,12 +566,21 @@ Packages that are genuinely absent or only transitively referenced still need
 dependency-tree evidence; coordinate normalization does not invent a local match.
 For unresolved Gradle coordinates, verification invokes the allowlisted wrapper
 or `gradle --no-daemon dependencies` for the scanner-cited component. Concurrent
-findings share one report while the checkout and tool remain unchanged, with a
-bounded eight-component cache. Selected versions, not requested versions or BOM
-constraint-only rows, provide local evidence. Failed, conflicting, unresolved,
-truncated-without-logs, or source-changing inspections cannot prove absence or
+findings share one parsed report while the checkout and tool remain unchanged,
+with a bounded eight-component cache. Project/configuration selections stay
+separate: a Checkstyle dependency can differ from the application classpath.
+When several versions are resolved, the scanner version must actually appear
+in a resolved configuration; it is not guessed. State and reports retain all
+configuration versions. An unaffected result for one version cannot dismiss
+unassessed versions on other classpaths.
+Selected versions, not requested versions or BOM constraint-only rows, provide
+local evidence. Failed inspections, conflicts within one configuration,
+unresolved selections, missing complete logs, or source-changing inspections cannot prove absence or
 authorize a fix. Complete stdout/stderr logs and per-finding inspection outcomes
 are retained in state and reports; full-log parsing is bounded to 8 MiB.
+Gradle deprecation notices are included once in final report caveats even when
+multiple findings share the same command. They do not imply failed dependency
+resolution or passed product validation.
 Failures are shared across different findings, but re-verifying the same
 unresolved finding retries inspection instead of permanently caching the error.
 Public advisory checks still run when Java/NuGet local resolution is incomplete.

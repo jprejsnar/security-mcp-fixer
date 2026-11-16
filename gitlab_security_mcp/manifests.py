@@ -6,7 +6,7 @@ import json
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
 
@@ -57,6 +57,16 @@ class PackageHit:
     direct: bool | None
     search_truncated: bool = False
     override_manifest: str | None = None
+    configuration_versions: dict[str, list[str]] | None = None
+
+
+@dataclass
+class GradleReport:
+    """Index selected coordinates by project/configuration without retaining raw output."""
+
+    versions: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    unresolved: set[str] = field(default_factory=set)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -573,42 +583,82 @@ def _gradle_hit(root: Path, path: Path, name: str, version: str) -> PackageHit:
     )
 
 
+def parse_gradle_report(report: str) -> GradleReport:
+    """Index actual selections once, preserving independent Gradle classpaths."""
+    parsed = GradleReport()
+    task = re.compile(r"^> Task ((?::[\w.-]+)*):dependencies(?:\s|$)")
+    header = re.compile(r"^([A-Za-z][\w.-]*)(?: - .*)?(?: \(n\))?$")
+    dependency = re.compile(r"^[ |+\\-]+([^:\s]+:[^:\s]+)(?::|\s+->\s+)(.+)$")
+    arrow = re.compile(r"\s+->\s+")
+    project, configuration, resolvable = "", "unscoped", True
+    for line in report.splitlines():
+        if line.startswith("Deprecated Gradle features were used"):
+            warning = line.strip()[:500]
+            if warning not in parsed.warnings:
+                parsed.warnings.append(warning)
+            continue
+        if match := task.match(line):
+            project, configuration, resolvable = match.group(1), "unscoped", True
+            continue
+        if match := header.fullmatch(line):
+            configuration, resolvable = match.group(1), not line.endswith("(n)")
+            continue
+        match = dependency.match(line)
+        if match is None or not resolvable:
+            continue
+        coordinate, selection = match.groups()
+        if "(c)" in selection or "(n)" in selection:
+            continue
+        version = arrow.split(selection, maxsplit=1)[-1].split()[0]
+        if "FAILED" in selection or parse_version(version) is None:
+            parsed.unresolved.add(coordinate)
+            continue
+        scope = f"{project}:{configuration}" if project else configuration
+        parsed.versions.setdefault(coordinate, {}).setdefault(scope, set()).add(version)
+    return parsed
+
+
 def gradle_report_package(
-    root: Path, manifest: Path, name: str, report: str
+    root: Path,
+    manifest: Path,
+    name: str,
+    report: str | GradleReport,
+    *,
+    hinted: str | None = None,
 ) -> PackageHit | None:
-    """Resolve one coordinate only when all actual Gradle selections agree."""
+    """Match observed scanner versions without merging independent classpaths."""
     group, artifact = _split_maven_name(name)
     if not group or not artifact:
         return None
     coordinate = f"{group}:{artifact}"
-    pattern = re.compile(
-        rf"(?m)^[\s|+\\-]+{re.escape(coordinate)}:([^\s]+)"
-        r"(?:[ \t]+->[ \t]+([^\s]+))?([^\r\n]*)\r?$"
-    )
-    versions = set()
-    for match in pattern.finditer(report):
-        requested, selected, suffix = match.groups()
-        if "(c)" in suffix:
-            continue
-        version = selected or requested
-        if "FAILED" in suffix or "(n)" in suffix or parse_version(version) is None:
-            raise ValueError(
-                f"Gradle did not resolve a concrete version of {coordinate}"
-            )
-        versions.add(version)
-    if len(versions) > 1:
-        raise ValueError(f"Gradle selected conflicting versions of {coordinate}")
-    if not versions:
+    parsed = parse_gradle_report(report) if isinstance(report, str) else report
+    if coordinate in parsed.unresolved:
+        raise ValueError(f"Gradle did not resolve a concrete version of {coordinate}")
+    configurations = parsed.versions.get(coordinate) or {}
+    if any(len(versions) > 1 for versions in configurations.values()):
+        raise ValueError(
+            f"Gradle selected conflicting versions of {coordinate} within a configuration"
+        )
+    versions = {version for selected in configurations.values() for version in selected}
+    if not configurations:
         return None
+    if len(versions) > 1 and hinted not in versions:
+        raise ValueError(
+            f"Gradle selected multiple configuration versions of {coordinate}; scanner version {hinted or 'unknown'} was not observed"
+        )
+    version = hinted if hinted in versions else next(iter(versions))
     return PackageHit(
         ecosystem="Maven",
         manager="gradle",
         name=coordinate,
-        version=versions.pop(),
+        version=version,
         spec=None,
         manifest=_rel(root, manifest),
         lockfile=None,
         direct=False,
+        configuration_versions={
+            scope: sorted(selected) for scope, selected in configurations.items()
+        },
     )
 
 

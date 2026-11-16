@@ -35,12 +35,14 @@ from gitlab_security_mcp.fanout import MAX_WORKERS
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
 from gitlab_security_mcp.gitlab_client import GitLabClient
 from gitlab_security_mcp.manifests import (
+    GradleReport,
     PackageHit,
     detect_stack,
     gradle_report_package,
     iter_files,
     locate_package,
     manifests_were_parsed,
+    parse_gradle_report,
 )
 from gitlab_security_mcp.official_docs import (
     DocReview,
@@ -265,7 +267,7 @@ class Engine:
         self._files_truncated = False
         self._gradle_lock = threading.Lock()
         self._gradle_reports: dict[
-            tuple[Path, str], tuple[dict, str, dict, set[str]]
+            tuple[Path, str], tuple[dict, GradleReport, dict, set[str]]
         ] = {}
         self._product_baseline: dict | None = None
         self._closed = False
@@ -2287,7 +2289,7 @@ class Engine:
                 # Share failures across findings, but let the same finding retry.
                 if cached and cached[0] == before and finding["id"] not in cached[3]:
                     entry = cached
-                    report, row = cached[1], dict(cached[2])
+                    parsed, row = cached[1], dict(cached[2])
                 else:
                     result = self.runner.run(
                         [tool, "--no-daemon", "dependencies"],
@@ -2337,17 +2339,29 @@ class Engine:
                         raise ValueError(
                             "Checkout changed during Gradle dependency inspection; retry against a stable tree."
                         )
-                    entry = (before, report, dict(row), set())
+                    parsed = (
+                        parse_gradle_report(report)
+                        if row["status"] != "FAILED"
+                        else GradleReport()
+                    )
+                    if parsed.warnings:
+                        row["warnings"] = parsed.warnings
+                    entry = (before, parsed, dict(row), set())
                     self._gradle_reports[key] = entry
                     if len(self._gradle_reports) > MAX_WORKERS:
                         self._gradle_reports.pop(next(iter(self._gradle_reports)))
             if row["status"] == "FAILED":
                 raise ValueError(row["detail"])
             hit = gradle_report_package(
-                self.repo_root, manifest, finding["component"], report
+                self.repo_root,
+                manifest,
+                finding["component"],
+                parsed,
+                hinted=finding.get("installedVersion"),
             )
             if hit:
                 row.update(status="RESOLVED", version=hit.version)
+                row["configuration_versions"] = hit.configuration_versions
             else:
                 row["detail"] = (
                     "Gradle did not report this coordinate as a resolved dependency; absence is not a false positive."
@@ -2753,6 +2767,26 @@ class Engine:
                 )
                 evidence.append(looked_up.summary)
 
+        if (
+            looked_up.affected is False
+            and hit is not None
+            and len(
+                {
+                    version
+                    for versions in (hit.configuration_versions or {}).values()
+                    for version in versions
+                }
+            )
+            > 1
+        ):
+            reason = "The scanner version is reported unaffected, but other configuration versions have not been assessed. Review every resolved classpath before dismissing this package finding."
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                [*evidence, reason],
+                None,
+                self._prompt(finding, looked_up, reason),
+            )
         if looked_up.outcome in {"lookup_failed", "not_found", PACKAGE_MISMATCH}:
             reason = looked_up.summary
             return (

@@ -29,7 +29,7 @@ def _finding_label(finding: dict) -> str:
 
 
 def _validation_caveats(state: RunState) -> list[dict]:
-    """Keep non-green lint and optional checks separate from product acceptance."""
+    """Keep non-green checks and inspection warnings separate from product acceptance."""
     caveats = []
     for phase, rows in (
         ("Pre-change lint", (state.lint_baseline or {}).get("results") or []),
@@ -55,6 +55,27 @@ def _validation_caveats(state: RunState) -> list[dict]:
                 item["diagnostic_counts"] = {
                     kind: len(entries) for kind, entries in row["diagnostics"].items()
                 }
+            caveats.append(item)
+    seen = set()
+    for finding in state.findings:
+        inspection = finding.get("dependencyResolution") or {}
+        for warning in inspection.get("warnings") or []:
+            identity = (
+                inspection.get("command"),
+                inspection.get("stdout_log_path"),
+                warning,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            item = {
+                "phase": "Dependency inspection",
+                "status": "WARNING",
+                "detail": warning,
+            }
+            for key in ("command", "stdout_log_path", "stderr_log_path"):
+                if inspection.get(key):
+                    item[key] = inspection[key]
             caveats.append(item)
     return caveats
 
@@ -491,6 +512,10 @@ def render(
             lines.append(
                 f"- {finding_id}: {inspection['status']}; {inspection.get('version') or inspection.get('detail') or 'version unknown'}."
             )
+            for scope, versions in (
+                inspection.get("configuration_versions") or {}
+            ).items():
+                lines.append(f"  {scope}: {', '.join(versions)}")
             for key in ("command", "stdout_log_path", "stderr_log_path"):
                 if inspection.get(key):
                     lines.append(f"  {key}: {inspection[key]}")
@@ -553,7 +578,7 @@ def render(
             *(
                 [
                     "## Validation caveats",
-                    "Passed required product checks are not a clean security audit. "
+                    "Passing required product checks is not a clean security audit. "
                     "Pre-existing lint issues and unavailable optional checks remain separate:",
                     *(
                         f"- {_table_cell(item['phase'])}: {_table_cell(item.get('command') or item.get('detail'))}; "

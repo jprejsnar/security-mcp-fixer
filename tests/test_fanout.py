@@ -54,15 +54,22 @@ def test_existing_fix_reuses_catalog_only_and_actual_edits_still_read_fresh(tmp_
 
 
 @pytest.mark.parametrize("exit_code", [0, 1])
-def test_parallel_gradle_findings_share_one_dependency_inspection(tmp_path, exit_code):
+def test_parallel_gradle_findings_share_one_dependency_inspection(
+    tmp_path, monkeypatch, exit_code
+):
     """Five parallel findings reuse one complete tree rather than spawning five builds."""
     # Arrange
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import Mock
 
+    from gitlab_security_mcp import engine as engine_module
     from gitlab_security_mcp.advisory import AdvisoryLookup
     from gitlab_security_mcp.commands import CommandResult
     from gitlab_security_mcp.engine import Engine
+    from gitlab_security_mcp.report import render
+
+    parse = Mock(wraps=engine_module.parse_gradle_report)
+    monkeypatch.setattr(engine_module, "parse_gradle_report", parse)
 
     (tmp_path / "build.gradle").write_text("dependencies { }\n", encoding="utf-8")
     barrier = threading.Barrier(5)
@@ -70,7 +77,11 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(tmp_path, exit
     runner.run.return_value = CommandResult(
         ["gradle", "--no-daemon", "dependencies"],
         exit_code,
-        "+--- io.example:library:1.0.0\n",
+        "checkstyle - Tool classpath.\r\n"
+        "+--- io.example:library:0.9.0\r\n"
+        "runtimeClasspath - Application classpath.\r\n"
+        "+--- io.example:library:1.0.0\r\n"
+        "Deprecated Gradle features were used in this build, making it incompatible with Gradle 10.\r\n",
         "",
         0,
         False,
@@ -111,6 +122,7 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(tmp_path, exit
 
     # Assert
     runner.run.assert_called_once()
+    assert parse.call_count == (0 if exit_code else 1)
     assert advisory.lookup.call_count == 5
     expected = "MANUAL_REVIEW" if exit_code else "NO_SAFE_FIX"
     assert all(result["decision"] == expected for result in results)
@@ -119,8 +131,15 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(tmp_path, exit
         == ("FAILED" if exit_code else "RESOLVED")
         for finding in engine.state.findings
     )
+    if not exit_code:
+        payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+        assert len(payload["validation_caveats"]) == 1
+        assert "Gradle 10" in payload["final_summary_markdown"]
+        assert "checkstyle" in markdown and "runtimeClasspath" in markdown
+        assert engine.state.validation_status is None
     engine.verify_security_finding("0")
     assert runner.run.call_count == (2 if exit_code else 1)
+    assert parse.call_count == (0 if exit_code else 1)
 
 
 def test_advisory_lookups_overlap_without_mixing_validation_sites():

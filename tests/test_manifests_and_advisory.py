@@ -992,6 +992,81 @@ def test_gitlab_slash_coordinates_resolve_to_canonical_maven_packages(
     assert wrong_group is None
 
 
+@pytest.mark.parametrize("hint", ["1.22.1", None, "9.0.0"])
+def test_gradle_report_keeps_configuration_versions_separate(tmp_path, hint):
+    """Tool and application classpaths can legitimately select different versions."""
+    # Arrange
+    from gitlab_security_mcp.manifests import gradle_report_package
+
+    manifest = tmp_path / "build.gradle"
+    manifest.write_text("dependencies { }\n", encoding="utf-8")
+    report = (
+        "checkstyle - Checkstyle tool dependencies.\r\n"
+        "\\--- commons-codec:commons-codec:1.11\r\n"
+        "runtimeClasspath - Application dependencies.\r\n"
+        "+--- commons-codec:commons-codec:1.15 -> 1.22.1\r\n"
+        "\\--- commons-codec:commons-codec:1.22.1 (*)\r\n"
+        "\\--- commons-codec:commons-codec -> 1.22.1\r\n"
+    )
+
+    # Act
+    if hint != "1.22.1":
+        with pytest.raises(ValueError, match="configuration"):
+            gradle_report_package(
+                tmp_path, manifest, "commons-codec/commons-codec", report, hinted=hint
+            )
+        return
+    hit = gradle_report_package(
+        tmp_path, manifest, "commons-codec/commons-codec", report, hinted=hint
+    )
+
+    # Assert
+    assert hit.version == "1.22.1"
+    assert hit.configuration_versions == {
+        "checkstyle": ["1.11"],
+        "runtimeClasspath": ["1.22.1"],
+    }
+
+
+@pytest.mark.parametrize("separate_projects", [False, True])
+def test_gradle_report_only_rejects_conflicts_within_one_project_configuration(
+    tmp_path, separate_projects
+):
+    """Keep distinct projects separate while retaining genuine conflict detection."""
+    # Arrange
+    from gitlab_security_mcp.manifests import gradle_report_package
+
+    manifest = tmp_path / "build.gradle"
+    report = (
+        "> Task :tools:dependencies\nruntimeClasspath - Tool dependencies.\n"
+        "+--- io.example:library:1.0.0\n"
+        + (
+            "> Task :app:dependencies\nruntimeClasspath - Application dependencies.\n"
+            if separate_projects
+            else ""
+        )
+        + "\\--- io.example:library:{strictly 1.1.0} -> 1.1.0\n"
+    )
+
+    # Act
+    if not separate_projects:
+        with pytest.raises(ValueError, match="within a configuration"):
+            gradle_report_package(
+                tmp_path, manifest, "io.example/library", report, hinted="1.1.0"
+            )
+        return
+    hit = gradle_report_package(
+        tmp_path, manifest, "io.example/library", report, hinted="1.1.0"
+    )
+
+    # Assert
+    assert hit.version == "1.1.0"
+    assert hit.configuration_versions == {
+        ":tools:runtimeClasspath": ["1.0.0"],
+        ":app:runtimeClasspath": ["1.1.0"],
+    }
+
+
 def test_maven_pom_gradle_and_nuget_edits(tmp_path):
     """Maven pom gradle and nuget edits."""
     # Arrange
