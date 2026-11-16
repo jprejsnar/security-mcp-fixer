@@ -74,7 +74,9 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
     files = {}
     count = 0
     for finding in findings:
-        if decisions.get(finding["id"], {}).get("decision") != "SOURCE_REVIEW_REQUIRED":
+        decision = decisions.get(finding["id"], {}).get("decision")
+        unverified = not decision and finding.get("category") == "sast"
+        if decision != "SOURCE_REVIEW_REQUIRED" and not unverified:
             continue
         location = finding.get("location") or {}
         path = location.get("file")
@@ -101,8 +103,9 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
             "reviewed_files: [{path, sha256, assessment}]}. Hash full current file bytes. "
             "Do not stop at collecting excerpts or invent a false positive to clear "
             "this queue. Finish with complete_security_run for the candidate list and "
-            "the final report. Call submit_false_positive_approvals only when the human "
-            "is ready to submit. Uncertain findings remain unresolved."
+            "the final report and automatic human approval form for eligible assessments. "
+            "Unverified findings must be assessed, not silently omitted. "
+            "Uncertain findings remain unresolved."
         )
         if count
         else None,

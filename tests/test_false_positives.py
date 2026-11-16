@@ -166,15 +166,25 @@ def test_checkbox_submission_is_the_only_write_gate(
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_combined_completion_lists_candidates_without_opening_the_form(
+def test_combined_completion_automatically_offers_the_form_after_saving_report(
     tmp_path, monkeypatch, supported
 ):
-    """Finish the report immediately so verification is not held inside a form."""
+    """Offer real unchecked checkboxes without another ready-to-submit message."""
     # Arrange
     engine = _engine(tmp_path)
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     ctx = _context(supported=supported)
     tool = Tool.from_function(server.complete_security_run)
+    original = ctx.elicit.side_effect
+
+    async def elicit(message, schema):
+        """Ensure reviewable reports exist before the host displays checkboxes."""
+        assert list((tmp_path / ".security-mcp" / "reports").glob("*.json"))
+        assert engine.state.report_path in message
+        engine.gitlab.dismiss_false_positive.assert_not_called()
+        return await original(message, schema)
+
+    ctx.elicit.side_effect = elicit
 
     # Act
     result = asyncio.run(
@@ -186,20 +196,20 @@ def test_combined_completion_lists_candidates_without_opening_the_form(
     # Assert
     assert not result.is_error
     assert payload["status"] == "REPORT_GENERATED"
-    assert ctx.elicit.await_count == 0
-    assert engine.gitlab.dismiss_false_positive.call_count == 0
-    assert saved["gitlab_dismissals"] == []
+    assert ctx.elicit.await_count == int(supported)
+    assert engine.gitlab.dismiss_false_positive.call_count == int(supported)
+    assert len(saved["gitlab_dismissals"]) == int(supported)
     assert result.content[-1].text == payload["final_summary_markdown"]
     assert saved["final_summary_markdown"] == payload["final_summary_markdown"]
     assert payload["false_positive_review"]["status"] == (
-        "APPROVAL_UNAVAILABLE" if not supported else "REVIEW_READY"
+        "APPROVAL_UNAVAILABLE" if not supported else "OK"
+    )
+    assert saved["false_positive_approval_form"]["status"] == (
+        "OK" if supported else "APPROVAL_UNAVAILABLE"
     )
     if supported:
-        assert payload["false_positive_review"]["candidates"][0]["id"] == "finding-1"
-        assert (
-            payload["false_positive_review"]["next_tool"]
-            == "submit_false_positive_approvals"
-        )
+        assert payload["false_positive_review"]["results"][0]["id"] == "finding-1"
+        assert saved["false_positive_approval"]["not_confirmed_dismissed"] == 0
     engine.advisory.lookup.assert_not_called()
 
 
@@ -219,14 +229,11 @@ def test_combined_completion_reports_approval_errors_without_losing_report(
 
     # Act
     report = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
-    result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
+    result = report.structured_content["false_positive_review"]
 
     # Assert
     assert Path(report.structured_content["json_report"]).is_file()
-    assert (
-        report.structured_content["false_positive_review"]["status"] == "REVIEW_READY"
-    )
-    assert report.is_error is False
+    assert report.is_error is (failure == "mutation")
     assert result["status"] == (
         "APPROVAL_UNAVAILABLE" if failure == "form" else "PARTIAL_FAILURE"
     )
@@ -298,13 +305,37 @@ def test_combined_completion_keeps_checkout_selected_before_the_form(
 
     # Act
     report = asyncio.run(server.complete_security_run(ctx))
-    asyncio.run(server.submit_false_positive_approvals(ctx))
 
     # Assert
     assert Path(report.structured_content["json_report"]).is_relative_to(first_root)
     first.gitlab.dismiss_false_positive.assert_called_once()
     other.gitlab.dismiss_false_positive.assert_not_called()
     assert not (other_root / ".security-mcp").exists()
+
+
+@pytest.mark.parametrize("action", ["decline", "cancel", "accept"])
+def test_repeated_completion_does_not_repeat_an_unselected_form(
+    tmp_path, monkeypatch, action
+):
+    """Do not turn report regeneration into repeated unsolicited approval prompts."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context(action=action, checked=False)
+
+    # Act
+    first = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+    second = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+
+    # Assert
+    assert first.structured_content["false_positive_review"]["status"] == (
+        "OK" if action == "accept" else "CANCELLED"
+    )
+    assert second.structured_content["false_positive_review"]["previous_form"][
+        "status"
+    ] == ("OK" if action == "accept" else "CANCELLED")
+    ctx.elicit.assert_awaited_once()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
 def test_repeat_review_explains_previously_confirmed_dismissals(tmp_path, monkeypatch):
@@ -699,7 +730,7 @@ def test_missing_or_oversized_source_is_not_sent_for_ai_review(
 def test_archived_style_pending_reviews_continue_to_human_approval(
     tmp_path, monkeypatch
 ):
-    """Keep 157 excerpt-only findings pending and approve only an evidenced review."""
+    """Keep seven excerpt-only and 150 unverified findings pending without inventing verdicts."""
     # Arrange
     engine, _source, review = _source_engine(tmp_path)
     first = engine.state.findings[0]
@@ -709,9 +740,10 @@ def test_archived_style_pending_reviews_continue_to_human_approval(
         finding["id"] = f"pending-{index}"
         finding["vulnerabilityId"] = f"gid://gitlab/Vulnerability/{index + 200}"
         engine.state.findings.append(finding)
-        engine.state.decisions[finding["id"]] = deepcopy(
-            engine.state.decisions[first["id"]]
-        )
+        if index < 7:
+            engine.state.decisions[finding["id"]] = deepcopy(
+                engine.state.decisions[first["id"]]
+            )
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     ctx = _context(reason=review["reason"])
 
@@ -729,6 +761,7 @@ def test_archived_style_pending_reviews_continue_to_human_approval(
     assert len(queue["files"]) == 1
     assert len(queue["files"][0]["findings"]) == 157
     assert queue["next_tool"] == "verify_security_finding"
+    assert engine.get_run_status()["source_review_required_count"] == 156
     assert payload["review_status"] == "SOURCE_REVIEW_REQUIRED"
     assert "## Source Review Incomplete" in markdown
     assert "157 SAST findings" in payload["final_summary_markdown"]
@@ -929,9 +962,10 @@ def test_mcp_tool_exposes_no_ai_approval_arguments():
     assert submit.annotations.read_only_hint is False
 
 
+@pytest.mark.parametrize("capability", [{}, {"form": {}}])
 @pytest.mark.parametrize("selection", [True, False, "true"])
 def test_real_sdk_form_dispatch_selects_only_the_checked_finding(
-    tmp_path, monkeypatch, selection
+    tmp_path, monkeypatch, selection, capability
 ):
     """Exercise SDK context injection and boolean validation, not a mocked elicit."""
     # Arrange
@@ -948,7 +982,7 @@ def test_real_sdk_form_dispatch_selects_only_the_checked_finding(
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     session = Mock()
     session.client_capabilities = ClientCapabilities.model_validate(
-        {"elicitation": {"form": {}}}
+        {"elicitation": capability}
     )
     session.elicit_form = AsyncMock(
         return_value=ElicitResult(
@@ -978,3 +1012,92 @@ def test_real_sdk_form_dispatch_selects_only_the_checked_finding(
         )
     else:
         engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_url_only_host_is_not_sent_a_checkbox_form(tmp_path, monkeypatch):
+    """Do not mistake URL elicitation for native form support."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context()
+    ctx.session.client_capabilities = ClientCapabilities.model_validate(
+        {"elicitation": {"url": {}}}
+    )
+
+    # Act
+    result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
+
+    # Assert
+    assert result["status"] == "APPROVAL_UNAVAILABLE"
+    ctx.elicit.assert_not_called()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
+    tmp_path, monkeypatch
+):
+    """Deliver elicitation through a real MCP client/server exchange, not a mock context."""
+    # Arrange
+    from functools import partial
+
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+    from mcp.types import ElicitRequestFormParams, ElicitResult
+
+    engine = _engine(tmp_path)
+    engine.state.decisions["finding-2"] = deepcopy(engine.state.decisions["finding-1"])
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    forms = []
+
+    async def human_response(_context, params):
+        """Return synthetic human selections while GitLab writes remain mocked."""
+        assert isinstance(params, ElicitRequestFormParams)
+        forms.append(params)
+        properties = params.requested_schema["properties"]
+        assert set(properties) == {"finding_0", "finding_1"}
+        assert all(field["type"] == "boolean" for field in properties.values())
+        assert all(field["default"] is False for field in properties.values())
+        assert list((tmp_path / ".security-mcp" / "reports").glob("*.json"))
+        engine.gitlab.dismiss_false_positive.assert_not_called()
+        return ElicitResult(
+            action="accept", content={"finding_0": False, "finding_1": True}
+        )
+
+    async def complete():
+        """Run one actual tool call over paired MCP message streams."""
+        async with create_client_server_memory_streams() as (client, remote):
+            async with anyio.create_task_group() as tasks:
+                lowlevel = server.mcp._lowlevel_server
+                tasks.start_soon(
+                    partial(
+                        lowlevel.run,
+                        *remote,
+                        lowlevel.create_initialization_options(),
+                    )
+                )
+                async with ClientSession(
+                    *client, elicitation_callback=human_response
+                ) as session:
+                    await session.initialize()
+                    result = await session.call_tool(
+                        "complete_security_run", {"repo_root": str(tmp_path)}
+                    )
+                tasks.cancel_scope.cancel()
+                return result
+
+    # Act
+    result = anyio.run(complete)
+
+    # Assert
+    assert not result.is_error
+    assert len(forms) == 1
+    engine.gitlab.dismiss_false_positive.assert_called_once_with(
+        "gid://gitlab/Vulnerability/124",
+        "finding-2",
+        "group/app",
+        engine.state.decisions["finding-2"]["reason"],
+    )
+    saved = json.loads(Path(result.structured_content["json_report"]).read_text())
+    assert saved["false_positive_approval_form"]["selected_ids"] == ["finding-2"]
+    assert saved["false_positive_approval"]["not_confirmed_dismissed"] == 1

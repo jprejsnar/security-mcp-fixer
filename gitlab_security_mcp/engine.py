@@ -2064,6 +2064,13 @@ class Engine:
         }
 
     @_serialized
+    def record_false_positive_approval_form(self, details: dict) -> dict:
+        """Persist form diagnostics, never reusable authorization for a mutation."""
+        self.state.false_positive_approval_form = deepcopy(details)
+        self._remember()
+        return {"status": "OK"}
+
+    @_serialized
     def generate_local_report(self) -> dict:
         """Write the markdown and JSON reports under .security-mcp/reports."""
         self._refresh_source_reviews()
@@ -2097,6 +2104,7 @@ class Engine:
         """Return current counts and retract stale package-validation results."""
         self._refresh_source_reviews()
         self._refresh_package_validation()
+        review_queue = pending_source_reviews(self.state.findings, self.state.decisions)
         return {
             "status": self.state.status,
             "stop_stage": self.state.stop_stage,
@@ -2107,12 +2115,10 @@ class Engine:
             "false_positives_count": len(self.state.false_positives),
             "no_solution_count": len(self.state.no_solution),
             "skipped_user_prompt_count": len(self.state.skipped_user_prompt),
-            "source_review_required_count": sum(
-                item.get("decision") == "SOURCE_REVIEW_REQUIRED"
-                for item in self.state.decisions.values()
-            ),
-            "source_review_queue": pending_source_reviews(
-                self.state.findings, self.state.decisions
+            "source_review_required_count": review_queue["finding_count"],
+            "source_review_queue": review_queue,
+            "false_positive_approval_form": deepcopy(
+                self.state.false_positive_approval_form
             ),
             "report_path": self.state.report_path,
             "lint_issues_path": str(

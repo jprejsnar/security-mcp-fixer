@@ -197,7 +197,8 @@ def render(
     }
     approval_notice = (
         f"{len(pending_dismissals)} locally assessed false positives have no confirmed GitLab dismissal. "
-        "Verify them in this report with no time limit, then call submit_false_positive_approvals when ready to submit. "
+        "Completion automatically offers the human checkbox form after saving this report. "
+        "Cancel to continue reviewing; explicitly request submit_false_positive_approvals to reopen it later. "
         "Local assessment is not dismissal; only the human can approve remote changes."
     )
     unverified = [
@@ -391,6 +392,7 @@ def render(
         "gitlab_dismissals": state.gitlab_dismissals,
         "false_positive_review_tool": "submit_false_positive_approvals",
         "false_positive_approval": dismissal_review,
+        "false_positive_approval_form": state.false_positive_approval_form,
         "unresolved_issues": unresolved,
         "unresolved_issues_table": unresolved_table,
         "git_diff_cached_empty": cached_empty,
@@ -611,6 +613,21 @@ def render(
             ),
             *(
                 [
+                    "## False-Positive Approval Form",
+                    f"Recorded status: {_table_cell(state.false_positive_approval_form['status'])}. "
+                    "This diagnostic is not reusable approval; only confirmed GitLab outcomes establish dismissal.",
+                    *(
+                        [_table_cell(state.false_positive_approval_form["reason"])]
+                        if state.false_positive_approval_form.get("reason")
+                        else []
+                    ),
+                    "",
+                ]
+                if state.false_positive_approval_form
+                else []
+            ),
+            *(
+                [
                     "## Source Review Incomplete",
                     f"{review_queue['finding_count']} SAST findings still require host AI code review. "
                     "Reading scanner-cited excerpts is not a completed assessment. "
@@ -624,7 +641,7 @@ def render(
             "## Finding Assessments",
             payload["finding_assessments_table"],
             "",
-            "To approve false-positive dismissals, verify this report, then call `submit_false_positive_approvals` when ready to submit its checkbox form. Markdown reports do not submit approvals.",
+            "Completion automatically offers unchecked approvals for eligible false positives. Only a human checkbox submission authorizes dismissal. Cancel to continue reviewing, then explicitly request `submit_false_positive_approvals` to reopen the form. Markdown reports do not submit approvals.",
             *(
                 [
                     "",
@@ -716,6 +733,7 @@ def write_report(
         "gitlab_dismissals": payload["gitlab_dismissals"],
         "false_positive_review_tool": payload["false_positive_review_tool"],
         "false_positive_approval": payload["false_positive_approval"],
+        "false_positive_approval_form": payload["false_positive_approval_form"],
         "lint_baseline": payload["lint_baseline"],
         "lint_issues_path": str(root / ".security-mcp" / "lint-issues.json")
         if state.lint_baseline is not None

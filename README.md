@@ -24,8 +24,9 @@ run gitlab-security on this repo
 This is one chat request, not a terminal command. The host AI analyzes findings
 and source, applies eligible fixes, validates the batch, and calls
 `complete_security_run` to list eligible false positives and write the final
-report. Verification of those findings has no time limit. When you are ready
-to submit, `submit_false_positive_approvals` opens the checkbox form.
+report, then automatically offer native approval checkboxes. No extra
+"ready to submit" message is required. Cancel to continue reviewing and
+explicitly request `submit_false_positive_approvals` to reopen the form later.
 Only explicitly selected findings are dismissed in GitLab.
 
 Start with [installation](#installing-the-local-mcp-server), choose your
@@ -62,10 +63,10 @@ all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
 | --- | --- |
-| One-request completion | `complete_security_run` lists eligible false positives and writes the report without opening a form, reusing current assessments without another scan. `submit_false_positive_approvals` opens the checkbox form only when you are ready to submit. There are fourteen tools. |
+| One-request completion | `complete_security_run` saves the report, automatically invokes the human checkbox form once, and refreshes the report with actual outcomes. It reuses current assessments without another scan. There are fourteen tools. |
 | Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
-| Human-only GitLab dismissal | Eligible assessments are listed for verification with no deadline. The checkbox form opens only when you call `submit_false_positive_approvals`. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
+| Human-only GitLab dismissal | Completion automatically offers initially unchecked approvals for eligible assessments. Cancel to keep reviewing, then explicitly request `submit_false_positive_approvals` to reopen. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
 | Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports retain per-finding pipeline provenance, unapplied fix candidates, pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
 | Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
 | Same-day branch reuse | Today's exact security branch can be reused after reviewing prior security logs. Errors preserve evidence and stop reuse. Cleanup removes only recognized generated untracked/ignored security artifacts, not tracked files, policies, configuration or unrelated work. |
@@ -78,7 +79,7 @@ all of these changes; updating source files does not update an installed wheel.
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
-The latest 1.0.9 code validation completed with **787 passed, 3 skipped**.
+The latest 1.0.9 code validation completed with **795 passed, 3 skipped**.
 These are offline regression results, not
 live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
 leak resources. Rebuild and reinstall the wheel to deploy source fixes.
@@ -221,7 +222,7 @@ flowchart TB
   engine --> state["state.py: active RunState and inspection snapshot"]
   engine --> report["report.py: security table, validation and batch isolation evidence"]
   tools --> completion["complete_security_run: candidate list and report"]
-  tools --> submit["submit_false_positive_approvals: checkbox form when ready"]
+  tools --> submit["submit_false_positive_approvals: human checkbox form"]
   completion --> dismissal["Engine checks identity, source freshness and selected dismissal intent"]
   dismissal --> report
   state --> atomic["util.py: repository boundaries and atomic file publication"]
@@ -332,8 +333,8 @@ checkout is active.
 | `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
 | `run_validation_matrix(repo_root=None)` | Validate the complete batch once. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
 | `review_false_positives(repo_root=None)` | List eligible assessments for verification. Returns immediately and dismisses nothing. |
-| `submit_false_positive_approvals(repo_root=None)` | Open the checkbox form when the human is ready to submit. Only selected findings are dismissed; no AI approval argument is accepted. |
-| `complete_security_run(repo_root=None)` | Standard completion: list eligible false positives and write the final report. Does not open the form, rescan, or rerun verification. |
+| `submit_false_positive_approvals(repo_root=None)` | Open human approval checkboxes, automatically invoked by completion or explicitly requested to reopen. Only selected findings are dismissed; no AI approval argument is accepted. |
+| `complete_security_run(repo_root=None)` | Save reports, automatically offer human approval checkboxes once, then refresh reports with actual outcomes. Does not rescan or rerun verification. |
 | `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
@@ -410,23 +411,30 @@ branch checkouts are rejected. Allowed Git mutations are the fast-forward pulls
 and creation of the dated security branch. GitLab calls retrieve data only,
 except `submit_false_positive_approvals`. That tool requires explicit human
 checkbox approval before dismissing selected vulnerabilities with their
-recorded reasons. `review_false_positives` and `complete_security_run` only
-list candidates and write the local report.
+recorded reasons. `review_false_positives` only lists candidates.
+`complete_security_run` saves reports and invokes the same human-only submit
+gate automatically; its tool metadata therefore declares possible remote writes.
 
 ### Approving false positives in Finding Assessments
 
 After verification and validation, the host calls
 `complete_security_run(repo_root=...)`. This finishing tool lists eligible
-false positives and generates the final report. It does not open a form and
-does not wait, so verifying the findings is not limited by the host's tool-call
-deadline. When you are ready to check boxes and submit, call
-`submit_false_positive_approvals`. Decline/cancel or an unsupported/failed host
-form writes nothing remotely. Do not separately call the review or report tool
-in the standard workflow, and do not reopen a declined form automatically.
+false positives, saves the report, and automatically invokes
+`submit_false_positive_approvals` once. It does not wait for another readiness
+message. Review the initially unchecked findings and their exact reasons in
+the native form. The report already exists if you need more time: cancel,
+continue reviewing, then explicitly request `submit_false_positive_approvals`
+to reopen it. Hosts may time out unanswered forms; neither cancellation nor a
+timeout authorizes a remote write. After the response the report is refreshed
+with actual outcomes. Decline/cancel or an unsupported/failed host form writes
+nothing remotely. Do not separately call the review or report tool in the
+standard workflow, and do not reopen a declined form automatically.
 Standalone review/report tools remain available for explicit follow-up requests.
 Reports expose
 `false_positive_approval` separately from source `review_status`: `COMPLETE`
 means the source-review queue is empty, not that GitLab findings were dismissed.
+Unverified SAST findings remain in that queue even if no excerpt was collected;
+they cannot silently produce a completed review status.
 Pending approval is highlighted before the assessment table with the count of
 local false positives lacking a confirmed dismissal.
 In hosts supporting **MCP form elicitation**, `submit_false_positive_approvals` displays one initially unchecked
@@ -444,9 +452,19 @@ When GitLab names no CVE or CWE, the description says no issue-specific record
 page was available. A short label is not accepted.
 
 Declining, cancelling, or leaving all boxes unchecked makes no remote changes.
+Both explicit `elicitation.form: {}` and legacy `elicitation: {}` advertise
+form support under the
+[MCP compatibility rule](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation#capabilities).
+URL-only elicitation is not form support.
 Hosts without advertised form support return `APPROVAL_UNAVAILABLE`; use a
 form-capable host or the GitLab UI. Static Markdown report checkboxes cannot
 execute API calls. The tool accepts no AI-supplied approval list.
+`false_positive_approval_form` in the run snapshot and reports records the
+advertised elicitation capability, candidate IDs, request/outcome status and
+any reported form error. `REQUESTED` without a later outcome does not prove a
+response or dismissal. These diagnostics are never reusable authorization.
+Completion does not automatically retry a previously attempted form in the
+same run, including failed, cancelled or unchecked submissions.
 
 If all findings were previously confirmed dismissed, the tool returns
 `ALREADY_DISMISSED` instead of opening another form. Otherwise an empty approval
@@ -846,10 +864,8 @@ sequenceDiagram
   end
   Host->>MCP: complete_security_run for this checkout
   MCP->>Repo: Save final report
-  MCP-->>Host: Candidate list and final report, with no form and no wait
-  Note over Reviewer,Host: Verify the candidates for as long as needed
-  opt Human is ready to submit and the host supports forms
-    Host->>MCP: submit_false_positive_approvals for this checkout
+  opt Eligible assessments exist and no form was previously attempted
+    MCP->>MCP: Invoke submit_false_positive_approvals for this checkout
     MCP-->>Host: Initially unchecked finding approvals with exact reasons
     Host-->>Reviewer: Display unchecked finding approvals
     Reviewer-->>Host: Submit selected items, decline or cancel
@@ -1628,8 +1644,9 @@ GitLab permissions or clear the host's internal conversation errors.
 6. Follow tool progress and approval prompts. The calling AI must finish
    `HOST_REVIEW_REQUIRED` source analysis and submit hash-bound assessments,
    not hand that task to the user. At completion, select only the false positives
-   you want dismissed. The report returns immediately. When you are ready to
-   submit, ask for `submit_false_positive_approvals` and use its checkbox form.
+   you want dismissed in the automatically offered checkbox form. The report
+   is saved before the form opens. Cancel if you need more time, then explicitly
+   request `submit_false_positive_approvals` to reopen it.
    Do not authorize the AI to answer it.
 7. Review the final Finding Assessments, actual dismissal outcomes, unresolved
    findings, build/test evidence and local diff. Commit/push manually if accepted.
@@ -1665,9 +1682,9 @@ dismissed by that call; use a form-capable host or the GitLab UI.
   product checks, then enter `run gitlab-security on this repo` in Agent chat.
   Cursor's selected host model performs source/input-flow review; deprecated MCP
   sampling is not used. Do not stop at `HOST_REVIEW_REQUIRED`.
-8. Read the candidate list and final report. Verification is not timed. When you
-  are ready to submit, ask for `submit_false_positive_approvals`. The AI must
-  not select boxes for you. If the host cannot show the form,
+8. Use the automatically offered checkbox form; the report is saved first.
+  Cancel to keep reviewing and explicitly request `submit_false_positive_approvals`
+  to reopen it later. The AI must not select boxes for you. If the host cannot show the form,
   `APPROVAL_UNAVAILABLE` means no new dismissals.
 9. Review the reports, unresolved reasons, final validation and local diff.
   Publish reviewed changes manually; the MCP never commits, pushes or opens a
@@ -1706,7 +1723,7 @@ than relying only on a short natural-language success message.
 | Fix application | `status`, `change.files`, `change.detail`, `change.documentation`, and `change.qualification_status`. `DOCS_REQUIRED` means nothing was written. `APPLIED` is not validated. |
 | Validation | Overall `status` and each row in `results`, including `required`, command, status and detail. |
 | Report generation | `human_report`, `json_report`, `unresolved_issues`, and `unresolved_issues_table`. Saved JSON also contains `batch_isolation` trials. |
-| Combined completion | `false_positive_review` holds the form/dismissal status; report `false_positive_approval` distinguishes pending and confirmed outcomes from local `review_status`. A completed source assessment alone does not mean GitLab was changed. |
+| Combined completion | `false_positive_review` holds the form/dismissal status; `false_positive_approval_form` persists capability/request/outcome diagnostics. Report `false_positive_approval` distinguishes pending and confirmed outcomes from local `review_status`. A completed source assessment alone does not mean GitLab was changed. |
 | Current status | `status`, `stop_stage`, counts, `report_path`, and `package_updates`. |
 
 ### Live progress and HTTP timings
@@ -1881,10 +1898,10 @@ run gitlab-security on this repo
 ```
 
 That single request includes the candidate list and final report: after analysis,
-fixes and validation, `complete_security_run` returns immediately. Verify the
-false positives for as long as you need. When you are ready to submit, ask for
-`submit_false_positive_approvals`. That form is only the submit click, because
-the host cancels a tool call that stays open while a form is unanswered.
+fixes and validation, `complete_security_run` saves the report and automatically
+offers native approval checkboxes once. Cancel to continue reviewing, then
+explicitly request `submit_false_positive_approvals` to reopen the form later.
+Hosts may time out unanswered forms, so do not leave a form open during a long review.
 No findings are dismissed without your selected checkboxes.
 
 This is a natural-language request to the MCP host, not a PowerShell, Bash or
@@ -1954,8 +1971,9 @@ and retains a passing combination. Reject incompatible updates and interactions.
 Require a green final build and all unit tests, even when every update is
 rejected and the original baseline is restored. Never claim a broken baseline
 is recovered. Do not retry rejected targets blindly or adapt source/tests.
-Finish with complete_security_run to list false-positive candidates and generate
-the local report. Do not open the submit form during verification. Display final_summary_markdown verbatim at the
+Finish with complete_security_run to save the local report and automatically
+offer the human checkbox form once. Do not wait for an additional readiness message.
+Do not open the submit form during verification. Display final_summary_markdown verbatim at the
 end of your final response: the six-column security issues table. Inspect
 isolation_trials, retained_updates and rejected_updates after recovery.
 If validation returns FIX_REJECTED with continue_with_next_finding true,
@@ -1963,8 +1981,9 @@ all candidates were rejected and the baseline proved green. Otherwise
 stop on run-level failures, incomplete validation or unsafe rollback. Retain finding-level
 manual-review and no-safe-fix reasons; continue only with eligible findings.
 Do not commit, push, or claim pending edits are resolved. Dismiss false positives
-only through submit_false_positive_approvals, after the human is ready to submit
-and checks the form. Do not open that form during verification, and do not make
+only through submit_false_positive_approvals after the human checks and submits
+the form. Completion invokes that gate automatically; only explicitly reopen it on human request.
+Do not open that form during verification, and do not make
 a separate review/report call in this standard workflow.
 ```
 
