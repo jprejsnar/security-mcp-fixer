@@ -263,6 +263,8 @@ class Engine:
         self.project_id = project_id
         self.validation_timeout = validation_timeout
         self.state = RunState()
+        self._source_documentation_key = object()
+        self._fix_selection_snapshot: list[dict] | None = None
         self._finding_progress: dict[str, tuple[str, int]] = {}
         self._files: list[Path] | None = None
         self._files_truncated = False
@@ -493,6 +495,8 @@ class Engine:
                 },
             )
         self.state = RunState()
+        self._source_documentation_key = object()
+        self._fix_selection_snapshot = None
         self.state.status = "PRECHECK_PASSED"
         self._run_day = run_day
         self.state.stop_stage = None
@@ -1035,6 +1039,30 @@ class Engine:
         }
 
     @_serialized
+    def pending_fix_selection(self, request_id: str) -> dict:
+        """Resume only the live human question against its original evidence."""
+        snapshot = self._fix_selection_snapshot
+        current = self.fix_selection_candidates()
+        if (
+            self.state.fix_selection.get("request_id") != request_id
+            or self.state.fix_selection.get("status") != "REQUESTED"
+            or snapshot is None
+            or current.get("status") != "OK"
+            or current["candidates"] != snapshot
+        ):
+            logger.warning("Fix selection retry rejected: request or evidence changed")
+            return {
+                "status": "SELECTION_CHANGED",
+                "reason": "The original live selection request or its evidence changed. No edit permission was recorded.",
+                "next_tool": "get_run_status",
+            }
+        return {
+            "status": "REQUESTED",
+            "request_id": request_id,
+            "candidates": snapshot,
+        }
+
+    @_serialized
     def record_fix_selection(
         self,
         candidates: list[dict],
@@ -1082,6 +1110,9 @@ class Engine:
             "approved_findings": approved,
             "reason": reason,
         }
+        self._fix_selection_snapshot = (
+            deepcopy(candidates) if status == "REQUESTED" else None
+        )
         if not self.state.validation_results:
             self.state.validation_status = (
                 "NOT_RUN_NO_APPROVED_FIXES"
@@ -2731,7 +2762,9 @@ class Engine:
                 and assessment["decision"] == source_review.get("decision")
                 and not config_confirm
             ):
-                doc_review = self._documentation().read_before_fix(finding, [])
+                doc_review = self._documentation().read_for_source(
+                    finding, run_key=self._source_documentation_key
+                )
                 publishers_ok = (
                     isinstance(doc_review, DocReview) and doc_review.complete
                 )

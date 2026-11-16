@@ -1389,6 +1389,7 @@ def test_mcp_json_text_is_compact_without_losing_evidence(
     with_progress, with_structured, wire_result
 ):
     """Reduce actual SDK JSON text without dropping evidence or progress."""
+    # Arrange
     import asyncio
     from copy import deepcopy
     from types import SimpleNamespace
@@ -1413,12 +1414,15 @@ def test_mcp_json_text_is_compact_without_losing_evidence(
     }
 
     def work() -> dict[str, object]:
+        """Return synthetic evidence through the SDK's real serializer."""
         return deepcopy(payload)
 
     async def report(*args):
+        """Model a host without a live progress subscriber."""
         return None
 
     async def exercise():
+        """Pass typed or serialized SDK results through the actual middleware."""
         original = await Tool.from_function(
             work, structured_output=with_structured
         ).run({}, Context(), convert_result=True)
@@ -1426,6 +1430,7 @@ def test_mcp_json_text_is_compact_without_losing_evidence(
         original_structured = deepcopy(original.structured_content)
 
         async def call_next(context):
+            """Represent the SDK handler at either middleware result boundary."""
             if with_progress:
                 progress_sink.get()("Reviewing finding evidence")
             if wire_result:
@@ -1440,7 +1445,9 @@ def test_mcp_json_text_is_compact_without_losing_evidence(
         result = await server._progress_middleware(context, call_next)
         return result, original_text, original_structured
 
+    # Act
     result, original_text, original_structured = asyncio.run(exercise())
+    # Assert
     compact = result.content[-1].text
     assert json.loads(compact) == payload
     assert len(compact) < len(original_text) * 0.8
@@ -1466,6 +1473,7 @@ def test_mcp_json_text_is_compact_without_losing_evidence(
 )
 def test_mcp_text_compaction_preserves_custom_text_and_errors(text):
     """Keep Markdown, non-JSON diagnostics and JSON string content unchanged."""
+    # Arrange
     import asyncio
     from types import SimpleNamespace
 
@@ -1480,10 +1488,13 @@ def test_mcp_text_compaction_preserves_custom_text_and_errors(text):
     )
 
     async def call_next(context):
+        """Return the serialized error envelope used by actual SDK dispatch."""
         return original.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     context = SimpleNamespace(method="tools/call")
+    # Act
     result = asyncio.run(server._progress_middleware(context, call_next))
+    # Assert
     assert result.content[0].text == text
     assert result.structured_content == {"status": "ERROR", "reason": text}
     assert result.is_error is True
@@ -3456,10 +3467,12 @@ def test_tools_are_registered():
 
 def test_mcp_discovery_catalog_stays_within_context_budget():
     """Budget the actual advertised tools, including schemas and descriptions."""
+    # Arrange
     import asyncio
 
     from gitlab_security_mcp.server import mcp
 
+    # Act
     tools = asyncio.run(mcp.list_tools())
     catalog = json.dumps(
         [
@@ -3468,4 +3481,5 @@ def test_mcp_discovery_catalog_stays_within_context_budget():
         ],
         ensure_ascii=False,
     )
+    # Assert
     assert len(catalog) < 11_000

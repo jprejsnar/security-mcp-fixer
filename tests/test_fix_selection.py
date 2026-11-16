@@ -122,6 +122,95 @@ def test_selection_allows_only_selected_findings_and_rejects_identity_changes(
 
 
 @pytest.mark.parametrize(
+    ("action", "values", "status"),
+    [
+        ("accept", {"finding_0": True}, "APPROVED"),
+        ("accept", {"finding_0": "true"}, "INVALID"),
+        ("cancel", None, "SKIPPED"),
+        ("decline", None, "SKIPPED"),
+    ],
+)
+def test_modern_protocol_fix_selection_uses_human_input_rounds(
+    tmp_path, monkeypatch, action, values, status
+):
+    """Exercise the actual SDK modern transport, where elicitation/create is forbidden."""
+    # Arrange
+    from mcp import Client
+    from mcp.types import ElicitResult
+
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    forms = []
+
+    async def choose(context, params):
+        """Answer synthetic forms through the real modern client callback."""
+        forms.append(params)
+        assert all(
+            field["default"] is False
+            for field in params.requested_schema["properties"].values()
+        )
+        return ElicitResult(action=action, content=values)
+
+    async def exercise():
+        """Negotiate modern MCP and let the client perform its input retry."""
+        async with Client(server.mcp, elicitation_callback=choose) as client:
+            assert client.protocol_version >= "2026-07-28"
+            return await client.call_tool(
+                "select_security_fixes", {"repo_root": str(tmp_path)}
+            )
+
+    # Act
+    result = asyncio.run(exercise())
+    # Assert
+    assert result.structured_content["status"] == status
+    assert len(forms) == 1
+    assert engine.state.fix_selection["selected_ids"] == (
+        ["one"] if status == "APPROVED" else []
+    )
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["finding", "new_run", "new_request"])
+def test_modern_form_retry_cannot_authorize_replaced_evidence(
+    tmp_path, monkeypatch, change
+):
+    """Bind the retried tool call to the original live question and candidate snapshot."""
+    # Arrange
+    from mcp import Client
+    from mcp.types import ElicitResult
+
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+
+    async def choose(context, params):
+        """Replace evidence or the request while the synthetic form is open."""
+        if change == "finding":
+            engine.state.findings[0]["title"] = "Replacement issue"
+        elif change == "new_run":
+            engine.state.fix_selection = {}
+        else:
+            engine.record_fix_selection(
+                engine.fix_selection_candidates()["candidates"], [], "REQUESTED"
+            )
+        return ElicitResult(action="accept", content={"finding_0": True})
+
+    async def exercise():
+        """Submit the old answer using the SDK's opaque request-state echo."""
+        async with Client(server.mcp, elicitation_callback=choose) as client:
+            return await client.call_tool(
+                "select_security_fixes", {"repo_root": str(tmp_path)}
+            )
+
+    # Act
+    result = asyncio.run(exercise())
+    # Assert
+    assert result.structured_content["status"] == "SELECTION_CHANGED"
+    denied = server.apply_minimal_fix("one", str(tmp_path))
+    assert denied["status"] == "FIX_APPROVAL_REQUIRED"
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("action", "values", "supported", "status"),
     [
         ("accept", {}, True, "SKIPPED"),

@@ -19,10 +19,25 @@ from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+from mcp.server.elicitation import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    DeclinedElicitation,
+    ElicitationResult,
+    render_elicitation_schema,
+)
 from mcp.server.mcpserver import Context
 from mcp.shared.exceptions import MCPError
-from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import Field, create_model
+from mcp.types import (
+    CallToolResult,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    ElicitResult,
+    InputRequiredResult,
+    TextContent,
+    ToolAnnotations,
+)
+from pydantic import BaseModel, Field, create_model
 
 from gitlab_security_mcp import __version__, desktop_approval
 from gitlab_security_mcp.ai_source_review import SourceEvidence
@@ -923,6 +938,42 @@ def _form_supported(ctx: Context) -> bool:
     return elicitation.form is not None or not elicitation.model_dump(exclude_none=True)
 
 
+async def _fix_form_response(
+    ctx: Context, message: str, schema: type[BaseModel], request_id: str
+) -> ElicitationResult[BaseModel] | InputRequiredResult:
+    """Use modern input rounds or the legacy back-channel without AI consent inputs."""
+    protocol = ctx.protocol_version
+    if not isinstance(protocol, str) or protocol < "2026-07-28":
+        return await ctx.elicit(message, schema)
+    if ctx.input_responses is None:
+        return InputRequiredResult(
+            input_requests={
+                "fix_selection": ElicitRequest(
+                    params=ElicitRequestFormParams(
+                        message=message,
+                        requested_schema=render_elicitation_schema(schema),
+                    )
+                )
+            },
+            request_state=request_id,
+        )
+    if (
+        ctx.request_state != request_id
+        or set(ctx.input_responses) != {"fix_selection"}
+        or not isinstance(
+            response := ctx.input_responses["fix_selection"], ElicitResult
+        )
+    ):
+        raise ValueError(
+            "The human fix-selection response does not match the live request."
+        )
+    if response.action == "accept":
+        return AcceptedElicitation(data=schema.model_validate(response.content))
+    if response.action == "decline":
+        return DeclinedElicitation()
+    return CancelledElicitation()
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Select security issues to fix",
@@ -933,14 +984,24 @@ def _form_supported(ctx: Context) -> bool:
 )
 async def select_security_fixes(
     ctx: Context, repo_root: str | None = None
-) -> dict[str, Any]:
+) -> dict[str, Any] | InputRequiredResult:
     """Ask the human to select issues before any qualification or remediation edits.
 
     No AI consent. Empty/cancel/unavailable means skip edits and complete the run.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
-    snapshot = await asyncio.to_thread(selected.fix_selection_candidates)
-    if snapshot["status"] != "OK":
+    protocol = ctx.protocol_version
+    if (
+        isinstance(protocol, str)
+        and protocol >= "2026-07-28"
+        and ctx.request_state is not None
+    ):
+        snapshot = await asyncio.to_thread(
+            selected.pending_fix_selection, ctx.request_state
+        )
+    else:
+        snapshot = await asyncio.to_thread(selected.fix_selection_candidates)
+    if snapshot["status"] not in {"OK", "REQUESTED"}:
         return snapshot
     candidates = snapshot["candidates"]
     if not candidates or not _form_supported(ctx):
@@ -953,8 +1014,12 @@ async def select_security_fixes(
             if not candidates
             else "The host does not advertise human form support; no code edits are authorized.",
         )
-    pending = await asyncio.to_thread(
-        selected.record_fix_selection, candidates, [], "REQUESTED"
+    pending = (
+        snapshot
+        if snapshot["status"] == "REQUESTED"
+        else await asyncio.to_thread(
+            selected.record_fix_selection, candidates, [], "REQUESTED"
+        )
     )
     if pending["status"] != "REQUESTED":
         return pending
@@ -979,7 +1044,8 @@ async def select_security_fixes(
         },
     )
     try:
-        response = await ctx.elicit(
+        response = await _fix_form_response(
+            ctx,
             f"Choose which security issues may be fixed in {selected.repo_root}. "
             "All boxes start unchecked. Select only the issues you authorize. "
             "An annotation must actually enforce security, not hide a warning. "
@@ -988,7 +1054,10 @@ async def select_security_fixes(
             "Submit with no boxes checked, decline or cancel to skip code fixes and proceed to "
             "independently assessed false positives. Skipping does not make an issue a false positive.",
             schema,
+            pending["request_id"],
         )
+        if isinstance(response, InputRequiredResult):
+            return response
     except (ValueError, MCPError) as exc:
         logger.warning("Security fix selection unavailable or invalid: %s", exc)
         return await asyncio.to_thread(

@@ -78,6 +78,7 @@ _CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _CWE = re.compile(r"CWE-(\d{1,5})", re.IGNORECASE)
 _MAX_BODY = 1_000_000
 _MAX_IDENTIFIERS = 4
+_MAX_SOURCE_CACHE = 128
 INFORMATIONAL_SECURITY_DOCS = frozenset({"cve", "cwe", "nsa", "nist"})
 
 
@@ -92,10 +93,11 @@ class DocSource:
     sha256: str | None
     error: str | None
     required: bool = True
+    reused: bool = False
 
     def as_dict(self) -> dict:
         """Return the page result for evidence and reports."""
-        return {
+        result = {
             "name": self.name,
             "url": self.url,
             "ok": self.ok,
@@ -104,11 +106,14 @@ class DocSource:
             "error": self.error,
             "required": self.required,
         }
+        if self.reused:
+            result["reused"] = True
+        return result
 
 
 @dataclass(frozen=True)
 class DocReview:
-    """Whether every required page was read in this call."""
+    """Receipts for every required page, including explicitly marked source-review reuse."""
 
     sources: tuple[DocSource, ...]
 
@@ -151,8 +156,9 @@ class OfficialDocs:
 
     Independent pages are requested together. The lock is held for the whole
     read, so close waits until those requests finish and cannot retire the
-    client underneath them. Callers discard the review after recording its
-    hashes. An injected client stays open.
+    client underneath them. Read-only source reviews share bounded receipts
+    within one run; physical edits always fetch fresh pages. Bodies are discarded
+    after hashing, and an injected client stays open.
     """
 
     def __init__(
@@ -168,6 +174,8 @@ class OfficialDocs:
         )
         self._lock = threading.RLock()
         self._closed = False
+        self._source_run: object | None = None
+        self._source_cache: dict[tuple[str, str, tuple[str, ...]], DocSource] = {}
 
     def close(self) -> None:
         """Close the owned HTTP client once. An injected client stays open."""
@@ -175,6 +183,8 @@ class OfficialDocs:
             if self._closed:
                 return
             self._closed = True
+            self._source_cache.clear()
+            self._source_run = None
             if self._owns_http:
                 self.http.close()
 
@@ -197,6 +207,36 @@ class OfficialDocs:
         security-reference pages are retained as informational evidence.
         """
         return self._review(finding, doc_pages or [], {})
+
+    def read_for_source(self, finding: dict, *, run_key: object) -> DocReview:
+        """Share bounded read-only receipts within one live run, never across edits."""
+        with self._lock:
+            if self._closed:
+                return self._review(finding, [], {})
+            if self._source_run is not run_key:
+                self._source_run = run_key
+                self._source_cache.clear()
+            review = self._review(
+                finding,
+                [],
+                self._source_cache,
+                reuse_label="shared source review",
+                reuse_records=True,
+            )
+            for page, source in zip(
+                _pages_for(finding, []), review.sources, strict=True
+            ):
+                if not (
+                    (source.ok and source.status_code == 200 and source.sha256)
+                    or (page.get("catalog") and not page["required"])
+                ):
+                    continue
+                key = (page["name"], page["url"], tuple(page["markers"]))
+                self._source_cache.pop(key, None)
+                self._source_cache[key] = replace(source, reused=False)
+                while len(self._source_cache) > _MAX_SOURCE_CACHE:
+                    self._source_cache.pop(next(iter(self._source_cache)))
+            return review
 
     def read_for_existing_fix(
         self,
@@ -224,7 +264,13 @@ class OfficialDocs:
         return self._review(finding, doc_pages or [], reusable)
 
     def _review(
-        self, finding: dict, doc_pages: list[dict], reusable: dict
+        self,
+        finding: dict,
+        doc_pages: list[dict],
+        reusable: dict,
+        *,
+        reuse_label: str = "shared edit",
+        reuse_records: bool = False,
     ) -> DocReview:
         """Read current requirements without inventing requests for reused metadata."""
         with self._lock:
@@ -243,7 +289,19 @@ class OfficialDocs:
                 )
             pages = _pages_for(finding, doc_pages)
             sink = progress_sink.get()
-            completed = 0
+            results: dict[int, DocSource] = {}
+            pending = []
+            for index, page in enumerate(pages):
+                cached = (
+                    reusable.get((page["name"], page["url"], tuple(page["markers"])))
+                    if page.get("catalog") or reuse_records
+                    else None
+                )
+                if cached is None:
+                    pending.append((index, page))
+                else:
+                    results[index] = replace(cached, reused=True)
+            completed = len(results)
             progress_lock = threading.Lock()
 
             def notify() -> None:
@@ -254,7 +312,7 @@ class OfficialDocs:
                     f"Documentation [{'#' * filled}{'.' * (20 - filled)}] "
                     f"{completed}/{total} "
                     + (
-                        "pages checked (shared edit)"
+                        f"pages checked ({reuse_label})"
                         if reusable
                         else "requests completed"
                     )
@@ -268,25 +326,21 @@ class OfficialDocs:
                             "Could not publish documentation progress", exc_info=True
                         )
 
-            def read(page: dict) -> DocSource:
+            def read(item: tuple[int, dict]) -> tuple[int, DocSource]:
                 """Advance the live bar as each concurrent documentation request ends."""
                 nonlocal completed
-                result = (
-                    reusable.get((page["name"], page["url"], tuple(page["markers"])))
-                    if page.get("catalog")
-                    else None
-                )
-                if result is None:
-                    result = self._read_guarded(page)
+                index, page = item
+                result = self._read_guarded(page)
                 with progress_lock:
                     completed += 1
                     notify()
-                return result
+                return index, result
 
             notify()
             # The lock stays held so close cannot drop the client mid-request.
             # Each page is still fetched on its own worker.
-            return DocReview(tuple(map_ordered(read, pages)))
+            results.update(map_ordered(read, pending))
+            return DocReview(tuple(results[index] for index in range(len(pages))))
 
     def _read_guarded(self, page: dict) -> DocSource:
         """Keep one page failure from discarding the other page results."""

@@ -71,6 +71,25 @@ def test_source_languages_follow_the_cited_file():
     assert selected == cases
 
 
+def test_repeated_source_assessments_reuse_current_run_documentation(tmp_path):
+    """Do not transfer the entire publisher catalog for each read-only assessment."""
+    # Arrange
+    engine, review = _engine(tmp_path, "widget.py", "ready = True\n")
+    reader = Mock(wraps=engine.docs._read_page)
+    engine.docs._read_page = reader
+
+    # Act
+    first = engine.verify_security_finding("source", source_review=review)
+    second = engine.verify_security_finding("source", source_review=review)
+
+    # Assert
+    assert first["decision"] == second["decision"] == "FALSE_POSITIVE"
+    assert reader.call_count == len(REQUIRED_DOCS)
+    assert all(
+        source["reused"] for source in second["source_workflow"]["documentation"]
+    )
+
+
 def test_typescript_review_requires_utility_types_and_read_pages(tmp_path):
     """Record the utility-type limits and the fetched publisher pages."""
     # Arrange

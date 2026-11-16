@@ -53,6 +53,121 @@ def test_existing_fix_reuses_catalog_only_and_actual_edits_still_read_fresh(tmp_
     assert len(path.read_text().splitlines()) == len(requests)
 
 
+def test_parallel_source_reviews_share_run_receipts_but_edits_stay_fresh():
+    """Fetch identical source-review pages once, including across simultaneous calls."""
+    # Arrange
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
+
+    requests = []
+    markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS) + " CWE-79"
+    finding = {"identifiers": ["CWE-79"]}
+    scope = object()
+
+    def handler(request):
+        """Count real mock-transport transfers for each required reference."""
+        requests.append(str(request.url))
+        return httpx.Response(200, text=markers + " " + str(request.url))
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with OfficialDocs(http=http) as docs:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                reviews = list(
+                    pool.map(
+                        lambda _: docs.read_for_source(finding, run_key=scope),
+                        range(16),
+                    )
+                )
+            after_shared = Counter(requests)
+            new_run = docs.read_for_source(finding, run_key=object())
+            edit = docs.read_before_fix(finding)
+
+    # Assert
+    assert all(review.complete for review in reviews)
+    assert len(after_shared) == len(REQUIRED_DOCS) + 1
+    assert set(after_shared.values()) == {1}
+    assert any(source.as_dict().get("reused") for source in reviews[-1].sources)
+    assert not any(source.as_dict().get("reused") for source in new_run.sources)
+    assert not any(source.as_dict().get("reused") for source in edit.sources)
+    assert set(Counter(requests).values()) == {3}
+    assert docs.read_for_source(finding, run_key=scope).sources[0].error == (
+        "Documentation client is closed"
+    )
+
+
+@pytest.mark.parametrize("failed", ["python", "cwe:CWE-79", "nsa"])
+def test_source_receipt_reuse_retries_required_and_named_record_failures(failed):
+    """Do not pin a failed required page or CVE/CWE record for the entire run."""
+    # Arrange
+    from collections import Counter
+
+    requests = []
+    markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS) + " CWE-79"
+    urls = {name: url for name, url, _marker in REQUIRED_DOCS}
+    urls["cwe:CWE-79"] = "https://cwe.mitre.org/data/definitions/79.html"
+
+    def handler(request):
+        """Fail one reference once without changing other publisher receipts."""
+        url = str(request.url)
+        requests.append(url)
+        if url == urls[failed] and requests.count(url) == 1:
+            return httpx.Response(403, text="Unavailable")
+        return httpx.Response(200, text=markers + " " + url)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with OfficialDocs(http=http) as docs:
+            scope = object()
+            first = docs.read_for_source({"identifiers": ["CWE-79"]}, run_key=scope)
+            second = docs.read_for_source({"identifiers": ["CWE-79"]}, run_key=scope)
+    # Assert
+    first_source = next(
+        source for source in first.sources if source.url == urls[failed]
+    )
+    second_source = next(
+        source for source in second.sources if source.url == urls[failed]
+    )
+    assert not first_source.ok
+    assert second_source.ok is (failed != "nsa")
+    assert requests.count(urls[failed]) == (1 if failed == "nsa" else 2)
+    assert all(
+        count == 1 for url, count in Counter(requests).items() if url != urls[failed]
+    )
+
+
+def test_source_receipt_cache_evicts_old_records_not_frequently_used_catalog(
+    monkeypatch,
+):
+    """Bound cache growth without repeatedly fetching the shared publisher catalog."""
+    # Arrange
+    from gitlab_security_mcp import official_docs
+
+    monkeypatch.setattr(official_docs, "_MAX_SOURCE_CACHE", len(REQUIRED_DOCS) + 3)
+    requests = []
+    markers = (
+        " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
+        + " "
+        + " ".join(f"CWE-{number}" for number in range(1, 7))
+    )
+
+    def handler(request):
+        """Serve the finite catalog and a stream of distinct CWE records."""
+        requests.append(str(request.url))
+        return httpx.Response(200, text=markers + " " + str(request.url))
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with OfficialDocs(http=http) as docs:
+            scope = object()
+            for number in range(1, 7):
+                docs.read_for_source({"identifiers": [f"CWE-{number}"]}, run_key=scope)
+            docs.read_for_source({"identifiers": ["CWE-1"]}, run_key=scope)
+    # Assert
+    assert requests.count("https://cwe.mitre.org/data/definitions/1.html") == 2
+    assert all(requests.count(url) == 1 for _name, url, _marker in REQUIRED_DOCS)
+
+
 @pytest.mark.parametrize("exit_code", [0, 1])
 def test_parallel_gradle_findings_share_one_dependency_inspection(
     tmp_path, monkeypatch, exit_code
