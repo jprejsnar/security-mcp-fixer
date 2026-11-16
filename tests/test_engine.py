@@ -284,19 +284,6 @@ def test_stdio_server_logs_for_cursor_and_copilot(tmp_path):
 
     def session(client_name: str, protocol: str) -> tuple[str, str]:
         """Run one stdio handshake and return stdout and stderr text."""
-        process = subprocess.Popen(
-            [sys.executable, "-m", "gitlab_security_mcp.server"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env={**os.environ, "PROGRESS_CONSOLE": "off"},
-            cwd=tmp_path,
-        )
-        assert process.stdin is not None
-        assert process.stdout is not None
         initialize = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -308,21 +295,31 @@ def test_stdio_server_logs_for_cursor_and_copilot(tmp_path):
             },
         }
         tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
-        try:
-            process.stdin.write(json.dumps(initialize) + "\n")
-            process.stdin.write(
-                json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
-                + "\n"
-            )
-            process.stdin.write(json.dumps(tools) + "\n")
-            process.stdin.close()
-            stdout = process.stdout.read()
-            stderr = process.stderr.read() if process.stderr is not None else ""
-            process.wait(timeout=20)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=5)
+        messages = (
+            initialize,
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            tools,
+        )
+        with subprocess.Popen(
+            [sys.executable, "-m", "gitlab_security_mcp.server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PROGRESS_CONSOLE": "off"},
+            cwd=tmp_path,
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(
+                    "".join(json.dumps(message) + "\n" for message in messages),
+                    timeout=20,
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
         return stdout, stderr
 
     # Act
@@ -1383,6 +1380,113 @@ def test_progress_mcp_text_is_bounded_and_keeps_report_last():
     assert result.structured_content["progress_output"] == [
         f"Progress {index}" for index in range(6, 70)
     ]
+
+
+@pytest.mark.parametrize("with_progress", [False, True])
+@pytest.mark.parametrize("with_structured", [False, True])
+@pytest.mark.parametrize("wire_result", [False, True])
+def test_mcp_json_text_is_compact_without_losing_evidence(
+    with_progress, with_structured, wire_result
+):
+    """Reduce actual SDK JSON text without dropping evidence or progress."""
+    import asyncio
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from mcp.server.mcpserver import Context
+    from mcp.server.mcpserver.tools.base import Tool
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    payload = {
+        "status": "MANUAL_REVIEW",
+        "findings": [
+            {
+                "id": f"finding-{index}",
+                "source": 'const message = "caf\u00e9";\n  validate(message);\n',
+                "documentation": {"ok": False, "reason": None},
+                "evidence": ["First receipt.", "Second receipt."],
+            }
+            for index in range(20)
+        ],
+    }
+
+    def work() -> dict[str, object]:
+        return deepcopy(payload)
+
+    async def report(*args):
+        return None
+
+    async def exercise():
+        original = await Tool.from_function(
+            work, structured_output=with_structured
+        ).run({}, Context(), convert_result=True)
+        original_text = original.content[0].text
+        original_structured = deepcopy(original.structured_content)
+
+        async def call_next(context):
+            if with_progress:
+                progress_sink.get()("Reviewing finding evidence")
+            if wire_result:
+                return original.model_dump(
+                    mode="json", by_alias=True, exclude_none=True
+                )
+            return original
+
+        context = SimpleNamespace(
+            method="tools/call", session=SimpleNamespace(report_progress=report)
+        )
+        result = await server._progress_middleware(context, call_next)
+        return result, original_text, original_structured
+
+    result, original_text, original_structured = asyncio.run(exercise())
+    compact = result.content[-1].text
+    assert json.loads(compact) == payload
+    assert len(compact) < len(original_text) * 0.8
+    if with_progress:
+        assert result.content[0].text.startswith("## Execution Progress")
+        if original_structured is not None:
+            original_structured["progress_output"] = ["Reviewing finding evidence"]
+    assert result.structured_content == original_structured
+    assert result.is_error is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "## Unresolved Security Issues\n\n| Issue | Reason |\n| --- | --- |\n",
+        "{incomplete scanner evidence",
+        '"  a JSON string is not a structured tool payload  "',
+        '{\n  "value": 0.123456789012345678901234567890\n}',
+        '{\n  "id": 1,\n  "id": 2\n}',
+        '{\n  "value": ' + "1" * 5000 + "\n}",
+        '{\n  "value": ' + "[" * 2000 + "0" + "]" * 2000 + "\n}",
+    ],
+)
+def test_mcp_text_compaction_preserves_custom_text_and_errors(text):
+    """Keep Markdown, non-JSON diagnostics and JSON string content unchanged."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp.types import CallToolResult, TextContent
+
+    from gitlab_security_mcp import server
+
+    original = CallToolResult(
+        content=[TextContent(text=text)],
+        structuredContent={"status": "ERROR", "reason": text},
+        isError=True,
+    )
+
+    async def call_next(context):
+        return original.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    context = SimpleNamespace(method="tools/call")
+    result = asyncio.run(server._progress_middleware(context, call_next))
+    assert result.content[0].text == text
+    assert result.structured_content == {"status": "ERROR", "reason": text}
+    assert result.is_error is True
 
 
 def test_progress_console_can_be_disabled(monkeypatch):
@@ -3348,3 +3452,20 @@ def test_tools_are_registered():
         "complete_security_run",
         "get_run_status",
     }
+
+
+def test_mcp_discovery_catalog_stays_within_context_budget():
+    """Budget the actual advertised tools, including schemas and descriptions."""
+    import asyncio
+
+    from gitlab_security_mcp.server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    catalog = json.dumps(
+        [
+            tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for tool in tools
+        ],
+        ensure_ascii=False,
+    )
+    assert len(catalog) < 11_000

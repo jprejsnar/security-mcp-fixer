@@ -482,6 +482,27 @@ def test_normalize_dependency_finding():
     assert finding["identifiers"] == ["CVE-2021-23337"]
 
 
+@pytest.mark.parametrize(
+    ("kind", "value", "expected"),
+    [
+        ("cwe", "601", "CWE-601"),
+        ("CWE", "cwe-601", "CWE-601"),
+        ("cve", "2026-119051", "CVE-2026-119051"),
+        ("scanner", "601", "601"),
+    ],
+)
+def test_normalized_security_identifiers_preserve_their_type(kind, value, expected):
+    """Keep typed numeric weaknesses recognizable without inventing types for scanner IDs."""
+    # Arrange
+    node = {"identifiers": [{"externalType": kind, "externalId": value}]}
+
+    # Act
+    finding = normalize_finding(node, None)
+
+    # Assert
+    assert finding["identifiers"] == [expected]
+
+
 def _gitlab_transport(handler):
     """Supply a tracked main branch before delegating vulnerability queries."""
 

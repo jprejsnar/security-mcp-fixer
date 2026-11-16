@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import json
 import logging
 import os
 import subprocess
@@ -498,6 +499,22 @@ def _finish_progress_call(terminal: bool) -> _ProgressConsole | None:
         return console
 
 
+def _compact_tool_text(result: CallToolResult) -> None:
+    """Remove only formatting from canonical SDK JSON, never evidence or prose."""
+    for item in result.content:
+        if not isinstance(item, TextContent) or not item.text.startswith(
+            ("{\n", "[\n")
+        ):
+            continue
+        try:
+            payload = json.loads(item.text)
+        except (ValueError, RecursionError):
+            continue
+        # Round-trip equality protects custom JSON number spellings and precision.
+        if json.dumps(payload, ensure_ascii=False, indent=2) == item.text:
+            item.text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 async def _progress_middleware(
     context: ServerRequestContext[Any, Any], call_next: CallNext
 ) -> HandlerResult:
@@ -562,6 +579,14 @@ async def _progress_middleware(
     terminal = True
     try:
         result = await call_next(context)
+        if (
+            isinstance(result, dict)
+            and "content" in result
+            and result.get("resultType", "complete") == "complete"
+        ):
+            result = CallToolResult.model_validate(result)
+        if isinstance(result, CallToolResult):
+            _compact_tool_text(result)
         payload = (
             result.structured_content if isinstance(result, CallToolResult) else result
         )
@@ -700,11 +725,7 @@ def _run(
 def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
     """Require corporate DNS and clean main or today's exact security branch.
 
-    DNS must resolve nexus.ert.com; otherwise connect to corporate VPN first.
-    Pass the active workspace path explicitly when REPO_ROOT is unset or contains
-    an unresolved host placeholder. Another checkout can run at the same time.
-    Before same-day reuse, check artifact filesystem safety. Prior execution
-    errors do not block a fresh start on a clean branch; unsafe filesystem state does.
+    Pass the absolute application repo_root. On DNS failure, connect to VPN and retry.
     """
     return _run("run_prechecks", repo_root=repo_root)
 
@@ -718,16 +739,9 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
     )
 )
 def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
-    """Phase 1. Pull twice, then run pnpm clean followed by pnpm install.
+    """Pull main twice and prepare pnpm projects; failures stop this run.
 
-    Recheck nexus.ert.com DNS before each pull and before pnpm preparation.
-    DNS failure stops the run and requires connecting to corporate VPN first.
-    Preparation runs once per pnpm project/workspace root before any security
-    checks. Any pull or preparation failure stops that checkout's run. Missing
-    clean scripts or unavailable pnpm are blockers, never silently skipped.
-    Non-pnpm repositories do not run pnpm preparation.
-    Starting on today's branch first checks out main without force. When reusing
-    today's branch, preparation is deferred to create_security_branch after checkout.
+    Reused branches defer pnpm clean/install until create_security_branch.
     """
     return _run("pull_main_twice", repo_root=repo_root)
 
@@ -743,10 +757,7 @@ def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
 def create_security_branch(repo_root: str | None = None) -> dict[str, Any]:
     """Create today's branch or safely reuse its exact dated name.
 
-    On a clean branch, review and remove known generated untracked .security-mcp
-    outputs, including prior failed-run logs. Preserve policies/configuration,
-    tracked and unrelated files; remove directories only if empty. Filesystem
-    safety errors stop cleanup. Prepare pnpm before fetching findings.
+    Clean only recognized untracked run artifacts; preserve policies and user files.
     """
     return _run("create_security_branch", repo_root=repo_root)
 
@@ -774,29 +785,11 @@ async def verify_security_finding(
     repo_root: str | None = None,
     source_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assess source SAST locally and package findings with advisory evidence.
+    """Assess a finding read-only; follow its source or reproduction workflow.
 
-    Source/configuration SAST and IaC return complete cited source for the calling
-    host AI to examine and trace with its code tools. Deprecated MCP sampling is
-    not used. No separate AI service/key is used.
-    Java, C#, TypeScript, JavaScript, Python, Dockerfiles and nginx configurations
-    use the same evidence-bound review. Documented configuration edits require
-    a confirmed-vulnerability review before planning or writing.
-    The host AI must analyze the returned full cited source and callers, then
-    resubmit a source_review within this request; this is not a final verdict.
-    SOURCE_REVIEW_REQUIRED always means unfinished AI work. To record a
-    reviewed conclusion, supply source_review with decision="FALSE_POSITIVE",
-    "CONFIRMED_VULNERABILITY", or "MANUAL_REVIEW", reason, input_origin,
-    finding_analysis (legacy pattern_analysis is accepted), reachability_analysis, and
-    reviewed_files [{path, sha256, assessment}]. Read the full cited source and
-    all input-origin files; use their current full-byte hashes. This audits the
-    host's assessment, not an independent proof. Never infer safety from a test
-    filename, absent CVE, missing source or scanner flag alone.
-    For FALSE_POSITIVE, reason is the security-team/client-facing explanation:
-    1-3 concise sentences, at most 1,000 characters, identifying the actual code
-    or runtime control, relevant input path and why this specific weakness
-    does not apply. Trace the code first; never invent controls or assurances.
-    Keep detailed supporting analysis in the other source_review fields.
+    HOST_REVIEW_REQUIRED requires tracing full cited_source and callers, then
+    resubmitting source_review with the evidence fields in the server instructions.
+    SOURCE_REVIEW_REQUIRED is unfinished work, never a false-positive verdict.
     """
     result = await asyncio.to_thread(
         _run,
@@ -860,33 +853,21 @@ async def verify_security_finding(
 def qualify_package_update(
     finding_id: str, review: dict[str, Any], repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Qualify a package target with reviewed APIs, license terms, and checks.
+    """Qualify a human-selected update using exact target-version evidence.
 
-    review must identify ecosystem, package, and target exactly. Include
+    review: ecosystem, package, target,
     documentation {complete, sources, summary}, compatible=true,
     compatible_without_code_changes=true, api_changes,
-    frameworks [{name, version, source_url, assessment}], and source_fixes=[].
-    Production AND unit-test callers must need no API adaptations for every
-    major/minor/revision/build version. Read official target-version docs;
-    attestations are audited, not independent proof of documentation reading.
-    Corporate approval comes only from the configured policy file. This tool
-    records best-effort initial lint diagnostics in .security-mcp/lint-issues.json
-    and observed rule IDs in .security-mcp/lint-rules.json. Lint is informational:
-    errors, missing scripts or incomplete capture never block editing. Do not
-    run default installs, audits, builds or unit tests before applying the fix.
-    Apply all reviewed version updates before the final build and unit tests.
-    Missing product checks never count as passing. Configured policy checks
-    remain mandatory in the final matrix. Never add waits or polling delays.
-    If no corporate policy is configured/present, include license {expression,
-    sources, commercial_use_permitted:true, no_license_fees:true, obligations,
-    assessment}. No corporate approval JSON file is required in that mode.
-    For proposed major_upgrade=true also provide major_upgrade {scan_id from
+    frameworks [{name, version, source_url, assessment}], source_fixes=[].
+    Neither production nor test callers may need adaptations. Lint capture is
+    informational; apply the batch before build/unit tests.
+    Without corporate policy, include license {expression, sources,
+    commercial_use_permitted:true, no_license_fees:true, obligations, assessment}.
+    For proposed major_upgrade=true, include major_upgrade {scan_id from
     proposed_fix.caller_scan, compatible_without_code_changes:true,
     caller_breakages_found:false, migration_sources:[official HTTPS URLs],
     api_comparison, caller_assessment, dependency_assessment,
-    reviewed_files:[{path, sha256, assessment}]}. Read every source reference
-    and relevant installed dependency callers. All source_fixes must be [].
-    This is reviewed evidence, not a mathematical compatibility guarantee.
+    reviewed_files:[{path, sha256, assessment}]}.
     """
     return _run("qualify_package_update", finding_id, review, repo_root=repo_root)
 
@@ -913,7 +894,7 @@ def apply_minimal_fix(finding_id: str, repo_root: str | None = None) -> dict[str
     )
 )
 def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str, Any]:
-    """Phase 5. Add an Arrange-Act-Assert test when the fix changes runtime behavior."""
+    """Add an Arrange-Act-Assert test for a supported human-selected base-image fix."""
     return _run("generate_aaa_test", finding_id, repo_root=repo_root)
 
 
@@ -928,11 +909,7 @@ def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str
 def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
     """Validate all pending updates with one final build, all unit tests and policy checks.
 
-    Lint was recorded before edits, not rerun per fix. Only a failed batch triggers
-    grouped subset diagnosis and guarded reverts. Retain the tested passing subset;
-    isolation_trials and rejected_updates explain failures and interactions.
-    FIX_REJECTED means every candidate was rejected and the baseline proved green.
-    Stop on failed/incomplete recovery or manual cleanup. Report all rejections.
+    Read isolation_trials/rejected_updates; stop on incomplete recovery or cleanup.
     """
     return _run("run_validation_matrix", repo_root=repo_root)
 
@@ -957,15 +934,9 @@ def _form_supported(ctx: Context) -> bool:
 async def select_security_fixes(
     ctx: Context, repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Ask the human which real issues may receive remediation edits.
+    """Ask the human to select issues before any qualification or remediation edits.
 
-    Call once after read-only verification and before any qualification, source,
-    dependency, configuration or test edits. No AI approval arguments are accepted.
-    Prefer documented security-enforcing annotations only when they fix the root
-    cause; never suppress findings. Otherwise use the smallest proven fix, not a rewrite.
-    Empty selection, decline, cancel, or unavailable form means skip code fixes
-    and call complete_security_run for independently assessed false positives.
-    A selected issue still needs sufficient evidence, compatibility and validation.
+    No AI consent. Empty/cancel/unavailable means skip edits and complete the run.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     snapshot = await asyncio.to_thread(selected.fix_selection_candidates)
@@ -1052,7 +1023,7 @@ async def select_security_fixes(
 
 async def _approval_result(selected: Engine, receipt: dict, result: dict) -> dict:
     """Keep observable form outcomes without treating diagnostics as consent."""
-    await asyncio.to_thread(
+    recorded = await asyncio.to_thread(
         selected.record_false_positive_approval_form,
         {
             **receipt,
@@ -1060,10 +1031,21 @@ async def _approval_result(selected: Engine, receipt: dict, result: dict) -> dic
             **({"reason": result["reason"]} if result.get("reason") else {}),
         },
     )
-    return result
+    return result if recorded["status"] == "OK" else recorded
 
 
 _desktop_approval_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _interrupt_desktop_startup(selected: Engine, receipt: dict) -> None:
+    """Persist interrupted startup only if it still belongs to this live run."""
+    await asyncio.to_thread(
+        selected.resolve_desktop_approval,
+        receipt["request_id"],
+        None,
+        status="APPROVAL_INTERRUPTED",
+        reason="The host cancelled during approval-window startup. No dismissal was authorized.",
+    )
 
 
 async def _finish_desktop_approval(
@@ -1125,9 +1107,7 @@ async def review_false_positives(
 ) -> dict[str, Any]:
     """Return eligible false positives for human verification without opening a form.
 
-    The result is immediate, so verification is not limited by a host tool-call
-    deadline. No approval arguments are accepted and nothing is dismissed.
-    Standard completion automatically offers the human form after saving reports.
+    Read-only inspection; standard completion offers the human form automatically.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     snapshot = await asyncio.to_thread(selected.false_positive_candidates)
@@ -1211,11 +1191,9 @@ async def review_false_positives(
 async def submit_false_positive_approvals(
     ctx: Context, repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Open human-only checkboxes automatically at completion or on explicit request.
+    """Open unchecked human-only dismissal approvals; no AI consent arguments.
 
-    Completion saves reports before invoking this tool once. Cancel to review
-    longer, then explicitly request this tool again. No approval arguments are accepted from the AI.
-    Declining, cancelling, or leaving every box unchecked writes nothing.
+    Completion calls once; reopen only on explicit human request after cancellation.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     previous = selected.state.false_positive_approval_form
@@ -1272,11 +1250,10 @@ async def submit_false_positive_approvals(
     )
     if desktop_approval.available():
         receipt.update(request_id=uuid4().hex, presentation="WINDOWS_DIALOG")
-        await asyncio.to_thread(
-            selected.record_false_positive_approval_form,
-            {**receipt, "status": "REQUESTED"},
-        )
         try:
+            pending = await asyncio.to_thread(selected.begin_desktop_approval, receipt)
+            if pending.get("created") is not True:
+                return pending
             properties = schema.model_json_schema()["properties"]
             for index, item in enumerate(candidates):
                 properties[f"finding_{index}"]["summary"] = item["description"]
@@ -1289,6 +1266,10 @@ async def submit_false_positive_approvals(
                 "Cancel or close changes nothing. There is no selection deadline.",
                 properties,
             )
+        except asyncio.CancelledError:
+            logger.warning("Windows approval startup interrupted before delivery")
+            await asyncio.shield(_interrupt_desktop_startup(selected, receipt))
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not display Windows approval window: %s", exc)
             return await _approval_result(
@@ -1310,9 +1291,16 @@ async def submit_false_positive_approvals(
                     ),
                 },
             )
+        except asyncio.CancelledError:
+            await dialog.close()
+            await asyncio.shield(_interrupt_desktop_startup(selected, receipt))
+            raise
         except BaseException:
             await dialog.close()
             raise
+        if result["status"] != "AWAITING_HUMAN":
+            await dialog.close()
+            return result
         task = asyncio.create_task(
             _finish_desktop_approval(
                 selected, receipt["request_id"], candidates, schema, dialog
@@ -1427,12 +1415,7 @@ def _generate_local_report(repo_root: str | None = None) -> CallToolResult:
 async def generate_local_report(
     ctx: Context, repo_root: str | None = None
 ) -> CallToolResult:
-    """Save reports and offer the same human approvals as complete_security_run.
-
-    This legacy finishing name must not skip the unchecked dismissal form.
-    Reports exist before approval. Only human-selected false positives may be
-    dismissed; declined/cancelled forms are not automatically repeated.
-    """
+    """Legacy alias for complete_security_run, including human dismissal approvals."""
     return await complete_security_run(ctx, repo_root)
 
 
@@ -1449,9 +1432,7 @@ async def complete_security_run(
 ) -> CallToolResult:
     """Save reports and automatically offer native human approval checkboxes once.
 
-    Call after verification, fixes and validation in the same user request.
-    Reports exist before the form opens. Only checked human submissions can change
-    GitLab. Declining or cancelling does not trigger an automatic repeat prompt.
+    Call after assessments and approved fixes/validation; never poll AWAITING_HUMAN.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     selected_root = str(selected.repo_root)

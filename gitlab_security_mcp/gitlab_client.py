@@ -590,15 +590,16 @@ def _pipeline_summary(node: dict) -> dict:
 
 
 def _identifier(item: dict) -> str | None:
-    """Prefer external identifiers and normalize missing CVE prefixes."""
-    external_type = (item.get("externalType") or "").lower()
+    """Preserve typed CVE/CWE identifiers, including numeric GitLab weakness IDs."""
+    external_type = (item.get("externalType") or "").strip().lower()
     external_id = (item.get("externalId") or "").strip()
     name = (item.get("name") or "").strip()
-    if external_type == "cve" and external_id:
+    if external_type in {"cve", "cwe"} and external_id:
+        prefix = external_type.upper() + "-"
         return (
-            external_id
-            if external_id.upper().startswith("CVE-")
-            else f"CVE-{external_id}"
+            external_id.upper()
+            if external_id.upper().startswith(prefix)
+            else f"{prefix}{external_id}"
         )
     if external_id:
         return external_id

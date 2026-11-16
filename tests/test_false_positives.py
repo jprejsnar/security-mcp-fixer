@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,12 @@ from gitlab_security_mcp.gitlab_client import (
     DISMISSAL_TARGET_QUERY,
     GitLabClient,
     normalize_finding,
+)
+from gitlab_security_mcp.official_docs import (
+    DocReview,
+    DocSource,
+    cited_security_pages,
+    cited_security_pages_ok,
 )
 from gitlab_security_mcp.report import render
 from tests.conftest import documentation_client
@@ -273,6 +280,130 @@ $timer.Dispose()
         if accept
         else {"action": "cancel"}
     )
+
+
+def test_concurrent_desktop_requests_share_one_starting_window(tmp_path, monkeypatch):
+    """Reserve a window atomically before awaiting its native startup."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    dialog = Mock(wait=AsyncMock(return_value={"action": "cancel"}), close=AsyncMock())
+    snapshot = engine.false_positive_candidates
+    rendezvous = threading.Barrier(2)
+
+    def concurrent_snapshot():
+        """Make both requests finish their snapshot before either reserves startup."""
+        result = snapshot()
+        rendezvous.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(engine, "false_positive_candidates", concurrent_snapshot)
+
+    async def exercise():
+        """Hold the first launch pending while the second request arrives."""
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def open_dialog(*_args):
+            """Model a slow but successful native window startup."""
+            entered.set()
+            await release.wait()
+            return dialog
+
+        opened = AsyncMock(side_effect=open_dialog)
+        monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+        first = asyncio.create_task(
+            server.submit_false_positive_approvals(_context(), str(tmp_path))
+        )
+        second = asyncio.create_task(
+            server.submit_false_positive_approvals(_context(), str(tmp_path))
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            completed, _pending = await asyncio.wait(
+                (first, second), timeout=2, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert len(completed) == 1
+            assert completed.pop().result()["status"] == "REQUESTED"
+            assert opened.await_count == 1
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+            await asyncio.gather(*list(server._desktop_approval_tasks.values()))
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    dialog.close.assert_awaited_once()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "interruption", ["cancel", "receipt", "fresh_run", "fresh_cancel"]
+)
+def test_desktop_startup_interruption_does_not_leave_or_recreate_pending_receipt(
+    tmp_path, monkeypatch, interruption
+):
+    """Clean cancelled startup and prevent its late response from overwriting a new run."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    dialog = Mock(wait=AsyncMock(return_value={"action": "cancel"}), close=AsyncMock())
+    record = server._approval_result
+
+    async def record_response(selected, receipt, result):
+        """Model cancellation after native Shown but before the background owner starts."""
+        if interruption == "receipt" and result["status"] == "AWAITING_HUMAN":
+            raise asyncio.CancelledError
+        return await record(selected, receipt, result)
+
+    monkeypatch.setattr(server, "_approval_result", record_response)
+
+    async def open_dialog(*_args):
+        """Interrupt startup or replace its run before the window reports ready."""
+        if interruption == "cancel":
+            raise asyncio.CancelledError
+        if interruption in {"fresh_run", "fresh_cancel"}:
+            engine.state = deepcopy(engine.state)
+            engine.state.false_positive_approval_form = {}
+        if interruption == "fresh_cancel":
+            raise asyncio.CancelledError
+        return dialog
+
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", open_dialog)
+
+    async def exercise():
+        """Ensure no background task is left behind by a rejected startup."""
+        if interruption != "fresh_run":
+            with pytest.raises(asyncio.CancelledError):
+                await server.submit_false_positive_approvals(_context(), str(tmp_path))
+        else:
+            result = await server.submit_false_positive_approvals(
+                _context(), str(tmp_path)
+            )
+            assert result["status"] == "ERROR"
+            assert engine.state.false_positive_approval_form == {}
+            dialog.close.assert_awaited_once()
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    if interruption in {"cancel", "receipt"}:
+        assert (
+            engine.state.false_positive_approval_form["status"]
+            == "APPROVAL_INTERRUPTED"
+        )
+    if interruption == "receipt":
+        dialog.close.assert_awaited_once()
+    if interruption == "fresh_cancel":
+        assert engine.state.false_positive_approval_form == {}
+        assert engine.state.status == "FINDINGS_LISTED"
+    assert not server._desktop_approval_tasks
+    engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
 def test_interrupted_native_form_is_not_left_requested(tmp_path, monkeypatch):
@@ -773,6 +904,68 @@ def _source_context(sampling=False):
     return Context(
         request_context=SimpleNamespace(session=session, request_id="verification")
     )
+
+
+@pytest.mark.parametrize("receipt", ["valid", "missing", "wrong_url", "over_limit"])
+def test_source_record_coverage_requires_every_named_record_receipt(receipt):
+    """Missing or capped-away records cannot pass a vacuous all-success check."""
+    # Arrange
+    finding = {
+        "identifiers": (
+            [f"CWE-{index}" for index in range(600, 605)]
+            if receipt == "over_limit"
+            else ["CWE-601"]
+        )
+    }
+    pages = cited_security_pages(finding)
+    sources = tuple(
+        DocSource(
+            page["name"],
+            "https://cwe.mitre.org/" if receipt == "wrong_url" else page["url"],
+            True,
+            200,
+            "fixture-hash",
+            None,
+        )
+        for page in pages
+    )
+    review = DocReview(()) if receipt == "missing" else DocReview(sources)
+
+    # Act
+    complete = cited_security_pages_ok(review, finding)
+
+    # Assert
+    assert complete is (receipt == "valid")
+
+
+def test_typed_numeric_cwe_is_checked_and_retained_in_false_positive_audit(tmp_path):
+    """Reproduce the latest run's numeric CWE without using its private application code."""
+    # Arrange
+    engine, source, review = _source_engine(tmp_path)
+    engine.state.findings[0] = normalize_finding(
+        {
+            "id": GID,
+            "uuid": "finding-1",
+            "reportType": "SAST",
+            "title": "Synthetic redirect finding",
+            "location": {"file": source.name, "startLine": 1},
+            "identifiers": [{"externalType": "cwe", "externalId": "601"}],
+        },
+        None,
+    )
+    engine.docs = documentation_client(
+        {"https://cwe.mitre.org/data/definitions/601.html": "CWE-601 fixture"}
+    )
+    review["finding_analysis"] += " CWE-601 does not apply to a literal declaration."
+
+    # Act
+    result = engine.verify_security_finding("finding-1", source_review=review)
+
+    # Assert
+    assert result["decision"] == "FALSE_POSITIVE"
+    assert "https://cwe.mitre.org/data/definitions/601.html" in result["reason"]
+    assert "GitLab did not cite a CVE or CWE" not in result["reason"]
+    engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
 def test_source_approval_description_uses_reviewed_code_and_preserves_audit(tmp_path):

@@ -2289,8 +2289,36 @@ class Engine:
         }
 
     @_serialized
+    def begin_desktop_approval(self, details: dict) -> dict:
+        """Reserve one window for this checkout before asynchronous native startup."""
+        previous = self.state.false_positive_approval_form
+        if previous.get("presentation") == "WINDOWS_DIALOG" and previous.get(
+            "status"
+        ) in {"REQUESTED", "AWAITING_HUMAN"}:
+            return {
+                "status": previous["status"],
+                "request_id": previous["request_id"],
+                "message": "A Windows approval window is already starting or open for this run. No duplicate window was launched.",
+            }
+        self.record_false_positive_approval_form({**details, "status": "REQUESTED"})
+        return {"status": "REQUESTED", "created": True}
+
+    @_serialized
     def record_false_positive_approval_form(self, details: dict) -> dict:
         """Persist form diagnostics, never reusable authorization for a mutation."""
+        if (
+            details.get("presentation") == "WINDOWS_DIALOG"
+            and details.get("status") != "REQUESTED"
+        ):
+            previous = self.state.false_positive_approval_form
+            if previous.get("request_id") != details.get("request_id") or previous.get(
+                "status"
+            ) not in {"REQUESTED", "AWAITING_HUMAN"}:
+                logger.warning("Ignoring a stale desktop approval status update")
+                return {
+                    "status": "ERROR",
+                    "reason": "The approval window belongs to a different or completed run.",
+                }
         self.state.false_positive_approval_form = deepcopy(details)
         self._remember()
         return {"status": "OK"}
@@ -2723,6 +2751,10 @@ class Engine:
                     assessment["reason"] = (
                         "Language, Dockerfile, nginx, CVE, or CWE documentation "
                         "was not read, so the source conclusion was not accepted."
+                        if not publishers_ok
+                        else "CVE/CWE record documentation is incomplete: a required record "
+                        "receipt is missing, failed, or outside the bounded fetch limit. "
+                        "The source conclusion was not accepted."
                     )
                     assessment["workflow"] = {
                         **assessment["workflow"],

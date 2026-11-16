@@ -422,6 +422,11 @@ def cited_security_pages(finding: dict) -> list[dict]:
     A finding with no CVE or CWE identifier has no issue-specific record page.
     Catalog home pages are not a substitute for that record.
     """
+    return _security_pages(finding, _MAX_IDENTIFIERS)
+
+
+def _security_pages(finding: dict, limit: int | None) -> list[dict]:
+    """Bound network targets without dropping requirements from coverage validation."""
     text = " ".join(
         str(part)
         for part in (
@@ -431,7 +436,7 @@ def cited_security_pages(finding: dict) -> list[dict]:
         )
     )
     pages = []
-    for ident in _unique(_CVE.findall(text))[:_MAX_IDENTIFIERS]:
+    for ident in _unique(_CVE.findall(text))[:limit]:
         cve = ident.upper()
         pages.append(
             {
@@ -449,7 +454,7 @@ def cited_security_pages(finding: dict) -> list[dict]:
                 "markers": (cve,),
             }
         )
-    for number in _unique(_CWE.findall(text))[:_MAX_IDENTIFIERS]:
+    for number in _unique(_CWE.findall(text))[:limit]:
         cwe = f"CWE-{int(number)}"
         pages.append(
             {
@@ -464,18 +469,11 @@ def cited_security_pages(finding: dict) -> list[dict]:
 
 def cited_security_pages_ok(review: DocReview, finding: dict) -> bool:
     """Require each CVE or CWE named by the finding to have been read."""
-    text = " ".join(
-        str(part)
-        for part in (
-            finding.get("identifiers") or [],
-            finding.get("title"),
-            finding.get("description"),
-        )
+    successful = {(item.name, item.url) for item in review.sources if item.ok}
+    return all(
+        (page["name"], page["url"]) in successful
+        for page in _security_pages(finding, None)
     )
-    needed = {f"cve:{item.upper()}" for item in _CVE.findall(text)}
-    needed.update(f"nist:{item.upper()}" for item in _CVE.findall(text))
-    needed.update(f"cwe:CWE-{int(item)}" for item in _CWE.findall(text))
-    return all(item.ok for item in review.sources if item.name in needed)
 
 
 def _unique(values: list[str]) -> list[str]:

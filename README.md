@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.13.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.15.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -43,6 +43,14 @@ is resized; long lists scroll vertically. The duplicate lower description pane
 has been removed. Source explanations still cite the reviewed file/line. Full
 audit comments remain in the saved reports and are retained for GitLab submission.
 
+Release 1.0.14 preserves typed numeric GitLab CWE identifiers, so `601` tagged as
+`cwe` becomes `CWE-601` and its actual record page is checked. Source false positives
+require successful receipts for every named CVE/CWE record URL: missing receipts,
+catalog home pages and references omitted by the bounded fetch limit cannot pass.
+Concurrent approval requests reserve one native window per checkout before startup;
+cancelled startup is recorded explicitly, and stale startup responses cannot replace
+a newer run's receipt. Rejected startup windows are closed and reaped.
+
 The legacy `generate_local_report` MCP tool also routes through
 the same saved-report and human-approval flow. Neither finishing tool silently
 leaves eligible dismissals without a form attempt. Cancellation is still respected.
@@ -60,6 +68,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 - [Architecture](#architecture)
 - [Workflow](#workflow)
 - [Safety boundaries](#safety-boundaries)
+- [Reducing AI context overhead](#reducing-ai-context-overhead)
 - [Requirements and qualification](#requirements-and-qualification)
 - [Building the local MCP server](#building-the-local-mcp-server)
 - [Installing the local MCP server](#installing-the-local-mcp-server)
@@ -77,7 +86,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.13. Earlier wheels do not contain
+This summary covers changes through 1.0.15. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -99,15 +108,75 @@ all of these changes; updating source files does not update an installed wheel.
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
-The latest 1.0.13 code validation completed with **847 passed, 3 skipped**, including
+The 1.0.14 full-suite validation completed with **861 passed, 3 skipped**, including
 the two opt-in native Windows tests (`SECURITY_MCP_DESKTOP_TESTS=1`). Those tests
 measured multiline text and row heights in both columns, verified reflow after
 narrowing the window, vertical scrolling, removal of the lower pane, initially
 unchecked boxes, selected-only submissions and cancellation. The no-timeout
 workflow and full audit comments remain covered by the regression suite.
+Additional cases cover typed numeric CWE identifiers, missing/wrong/bounded-away
+record receipts, simultaneous approval snapshots, cancellation before and after
+the window is shown, and stale-run cleanup. Real concurrent stdio probes using
+Cursor and VS Code client identities each created one native window and recorded
+cancellation without GitLab changes. The full suite passed with resource,
+deprecation, unraisable-exception and background-thread warnings treated as errors;
+the stdio test harness also closes its pipes and reaps its child on timeout.
 These are regression
 results, not live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
 leak resources. Rebuild and reinstall the wheel to deploy source fixes.
+
+## Reducing AI context overhead
+
+Release 1.0.15 shortens duplicate tool descriptions while keeping the complete
+server workflow instructions unchanged. All fifteen tool names, input/output
+schemas and approval annotations remain unchanged. The MCP response middleware
+also compacts canonical SDK JSON text without removing fields, truncating
+evidence or changing string contents. Custom Markdown, exact number spellings
+that cannot round-trip, error flags and structured results are preserved.
+It handles both typed and serialized SDK result envelopes, so compaction and
+the bounded progress fallback work on actual stdio calls, not only direct tests.
+Live progress remains available.
+
+Measured before/after using the same JSON serialization:
+
+| Context | Before (characters) | After (characters) | Reduction |
+| --- | ---: | ---: | ---: |
+| Advertised tool catalog, including schemas | 15,323 | 10,529 | 31.3% |
+| Workflow instructions plus tool catalog | 35,437 | 30,643 | 13.5% |
+| Synthetic 20-finding JSON text response | 5,931 | 3,879 | 34.6% |
+
+These are character counts, **not billed token measurements**. Actual token and
+cost savings depend on the host, model, caching and workload. Required source
+reads, publisher/security documentation, human selection, compatibility checks,
+validation and complete final report tables have not been shortened or skipped.
+
+Official guidance reviewed for this change:
+
+- [GitHub Copilot MCP guidance](https://docs.github.com/en/copilot/concepts/customizations/mcp)
+  recommends enabling only needed toolsets.
+- [Microsoft's VS Code token-efficiency guidance](https://code.visualstudio.com/blogs/2026/06/17/improving-token-efficiency-in-github-copilot)
+  explains deferred tool discovery and prompt-prefix caching. These are
+  host/model capabilities, not settings this stdio server can force.
+- [VS Code tool management](https://code.visualstudio.com/docs/agents/run/tools)
+  explains tool selection for each harness. Limit unrelated tools through the
+  appropriate tool picker/customization UI; keep this workflow's required tools
+  and source-analysis tools enabled. Some selections persist across sessions.
+- [Cursor MCP documentation](https://cursor.com/docs/mcp) explains disabling
+  unused servers in **Customize**. Keep this server running during the scan and
+  while a human approval window is open.
+- [Microsoft Learn MCP best practices](https://learn.microsoft.com/en-us/training/support/mcp-best-practices)
+  describes response budgets. Its `maxTokenBudget` query parameter applies to
+  Learn MCP search, **not** to this server or its required full-page reads.
+
+Do not repeatedly poll `AWAITING_HUMAN`, repeat completed phases or reverify
+findings merely to open approvals. Use the existing completion flow once.
+No IDE settings are changed automatically, and no model API or tokenizer
+dependency is added.
+
+Release 1.0.15 validation: **308 related server and consent tests passed**,
+including sixteen new context-budget/compaction cases and both native Windows
+approval tests. Resource, deprecation, unraisable-exception and background-thread
+warnings were treated as errors. Ruff lint/format and whitespace checks passed.
 
 ## Architecture
 
@@ -558,6 +627,12 @@ remains in the saved reports and is the unchanged GitLab submission text.
 Advisory-only findings use their existing assessed
 reason; resolved-on-main descriptions explicitly preserve their branch scope
 and never claim the older branch is safe.
+
+Window startup is reserved atomically per checkout. A simultaneous request returns
+`REQUESTED` while the first window is starting, or `AWAITING_HUMAN` after it opens,
+rather than launching a duplicate. Cancellation before background ownership starts
+records `APPROVAL_INTERRUPTED`; a response from an old run cannot recreate approval
+state or refresh a newer run's report.
 
 On other platforms, hosts supporting **MCP form elicitation** display an in-chat
 form; those requests remain subject to the host's own deadlines. Both presentations
@@ -1273,7 +1348,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.13-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.15-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1289,7 +1364,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.13-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.15-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1329,7 +1404,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.13-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.15-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1345,7 +1420,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.13-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.15-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1366,7 +1441,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.13-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.15-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1375,7 +1450,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.13-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.15-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -1675,7 +1750,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.13-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.15-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -1709,7 +1784,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.13**
+3. Apply the deployment-specific update and verify installed version **1.0.15**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -1718,7 +1793,7 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.13`
+   edits before requesting a new run. Its `server_version` must be `1.0.15`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
