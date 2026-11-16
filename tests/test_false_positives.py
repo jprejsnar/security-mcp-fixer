@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from mcp.server.mcpserver.tools.base import Tool
 from mcp.shared.exceptions import MCPError
 from mcp.types import ClientCapabilities
 
-from gitlab_security_mcp import server
+from gitlab_security_mcp import __version__, server
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.gitlab_client import (
     DISMISS_FALSE_POSITIVE,
@@ -88,6 +89,306 @@ def _context(
 
     ctx.elicit = AsyncMock(side_effect=elicit)
     return ctx
+
+
+@pytest.mark.parametrize(
+    ("action", "checked"), [("accept", True), ("accept", False), ("cancel", False)]
+)
+def test_desktop_approval_returns_before_human_response_and_refreshes_report(
+    tmp_path, monkeypatch, action, checked
+):
+    """Keep human review outside the MCP deadline and mutate only checked snapshots."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    ctx = _context()
+    dialog = Mock()
+    dialog.close = AsyncMock()
+    opened = AsyncMock(return_value=dialog)
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+
+    async def exercise():
+        """Return completion while the human response is still blocked."""
+        ready = asyncio.Event()
+
+        async def wait():
+            """Model an indefinitely open human dialog, not a timed response."""
+            await ready.wait()
+            return {"action": action, "content": {"finding_0": checked}}
+
+        dialog.wait = wait
+        result = await asyncio.wait_for(
+            server.complete_security_run(ctx, str(tmp_path)), 5
+        )
+        task = next(iter(server._desktop_approval_tasks.values()))
+        assert not task.done()
+        assert (
+            result.structured_content["false_positive_review"]["status"]
+            == "AWAITING_HUMAN"
+        )
+        engine.gitlab.dismiss_false_positive.assert_not_called()
+        duplicate = await server.submit_false_positive_approvals(ctx, str(tmp_path))
+        assert duplicate["status"] == "AWAITING_HUMAN"
+        ready.set()
+        await task
+        return result
+
+    # Act
+    asyncio.run(exercise())
+    report = json.loads(Path(engine.state.json_report_path).read_text())
+
+    # Assert
+    ctx.elicit.assert_not_called()
+    opened.assert_awaited_once()
+    properties = opened.call_args.args[1]
+    assert properties["finding_0"]["summary"] == (
+        "The installed version is outside the affected range."
+    )
+    assert (
+        "Dismiss as FALSE_POSITIVE with comment:"
+        in properties["finding_0"]["description"]
+    )
+    dialog.close.assert_awaited_once()
+    assert engine.gitlab.dismiss_false_positive.call_count == int(
+        action == "accept" and checked
+    )
+    assert report["false_positive_approval_form"]["status"] == (
+        "OK" if action == "accept" else "CANCELLED"
+    )
+    assert report["false_positive_approval_form"]["presentation"] == "WINDOWS_DIALOG"
+    assert report["false_positive_approval"]["not_confirmed_dismissed"] == int(
+        not checked
+    )
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or os.environ.get("SECURITY_MCP_DESKTOP_TESTS") != "1",
+    reason="Requires an interactive Windows desktop and SECURITY_MCP_DESKTOP_TESTS=1",
+)
+@pytest.mark.parametrize("accept", [False, True])
+def test_native_approval_wraps_both_columns_and_reflows_without_details_pane(
+    monkeypatch, accept
+):
+    """Measure actual wrapped rows before/after resize and preserve checked-only consent."""
+    # Arrange
+    desktop = server.desktop_approval
+    properties = {
+        f"finding_{index}": {
+            "title": "TEST ONLY - "
+            + (
+                "A lengthy synthetic issue title with file path and identifier. " * 8
+                if index == 0
+                else f"Short issue {index}"
+            ),
+            "summary": (
+                "A synthetic explanation demonstrates a bounded literal input and a reviewed runtime control. "
+                * 10
+                if index == 0
+                else "Short synthetic explanation."
+            ),
+        }
+        for index in range(35)
+    }
+    test_script = r"""
+$script:phase = 0
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 400
+$timer.Add_Tick({
+    $issue = $table.GetControlFromPosition(0, 1)
+    $title = $issue.GetControlFromPosition(1, 0)
+    $reason = $table.GetControlFromPosition(1, 1)
+    if ($script:phase -eq 0) {
+        if (-not $form.Visible -or $table.ColumnCount -ne 2) { throw 'Wrapped table not shown' }
+        if ($title.Height -le 2 * $title.Font.Height -or $reason.Height -le 2 * $reason.Font.Height) {
+            throw 'Both columns must display multiline text'
+        }
+        if ($title.Text -ne $choices[0].title -or $reason.Text -ne $choices[0].summary) {
+            throw 'Wrapped text was changed or clipped'
+        }
+        if (@($form.Controls | Where-Object { $_ -is [System.Windows.Forms.TextBox] }).Count -ne 1) {
+            throw 'The duplicate lower description pane still exists'
+        }
+        $script:titleHeight = $title.Height
+        $script:reasonHeight = $reason.Height
+        $script:phase = 1
+        $form.Size = New-Object System.Drawing.Size(760, 500)
+        return
+    }
+    $timer.Stop()
+    if ($title.Height -le $script:titleHeight -or $reason.Height -le $script:reasonHeight) {
+        throw 'Both columns must reflow and grow after narrowing the window'
+    }
+    if ($title.Height -lt $title.PreferredSize.Height -or $reason.Height -lt $reason.PreferredSize.Height) {
+        throw 'A wrapped cell was clipped'
+    }
+    $rowHeight = $table.GetRowHeights()[1]
+    if ($rowHeight -lt $issue.Height + $issue.Margin.Vertical -or $rowHeight -lt $reason.Height + $reason.Margin.Vertical) {
+        throw 'Row height does not fit its wrapped contents'
+    }
+    if (-not $viewport.VerticalScroll.Visible -or $viewport.HorizontalScroll.Visible) {
+        throw 'Rows must scroll vertically without horizontal clipping'
+    }
+    if (@($checks | Where-Object { $_.Checked }).Count -ne 0) { throw 'An issue was selected automatically' }
+    if (-not $submit.Visible -or -not $cancel.Visible) { throw 'Approval buttons are not visible' }
+    if (ACCEPT_TEST_RESPONSE) {
+        $checks[1].Checked = $true
+        $submit.PerformClick()
+    } else {
+        $cancel.PerformClick()
+    }
+})
+$form.Add_Shown({ $timer.Start() })
+$result = $form.ShowDialog()
+$timer.Dispose()
+""".replace("ACCEPT_TEST_RESPONSE", "$true" if accept else "$false")
+    monkeypatch.setattr(
+        desktop,
+        "SCRIPT",
+        desktop.SCRIPT.replace("$result = $form.ShowDialog()", test_script),
+    )
+
+    async def exercise():
+        """Auto-close a clearly synthetic window; never call a GitLab mutation."""
+        dialog = await desktop.open_dialog(
+            "TEST ONLY - automated wrapping verification. No GitLab calls. Closes automatically.",
+            properties,
+        )
+        try:
+            return await asyncio.wait_for(dialog.wait(), 15)
+        finally:
+            await dialog.close()
+
+    # Act
+    response = asyncio.run(exercise())
+
+    # Assert
+    assert response == (
+        {
+            "action": "accept",
+            "content": {
+                f"finding_{index}": index == 1 for index in range(len(properties))
+            },
+        }
+        if accept
+        else {"action": "cancel"}
+    )
+
+
+def test_interrupted_native_form_is_not_left_requested(tmp_path, monkeypatch):
+    """Persist host cancellation explicitly instead of claiming the form was delivered."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context()
+    ctx.elicit.side_effect = asyncio.CancelledError()
+
+    # Act
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
+
+    # Assert
+    assert engine.state.false_positive_approval_form["status"] == "APPROVAL_INTERRUPTED"
+    report = json.loads(Path(engine.state.json_report_path).read_text())
+    assert report["false_positive_approval_form"]["status"] == "APPROVAL_INTERRUPTED"
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_desktop_window_closes_on_server_shutdown_without_authorizing(
+    tmp_path, monkeypatch
+):
+    """Reap the pending window when the server event loop shuts down."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    dialog = Mock()
+    dialog.close = AsyncMock()
+    monkeypatch.setattr(
+        server.desktop_approval, "open_dialog", AsyncMock(return_value=dialog)
+    )
+
+    async def exercise():
+        """Leave the human response pending until asyncio.run cancels tasks."""
+        waiting = asyncio.Event()
+
+        async def wait():
+            """Keep the simulated window open indefinitely."""
+            waiting.set()
+            await asyncio.Event().wait()
+
+        dialog.wait = wait
+        await server.complete_security_run(_context(), str(tmp_path))
+        await waiting.wait()
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    dialog.close.assert_awaited_once()
+    assert not server._desktop_approval_tasks
+    assert engine.state.false_positive_approval_form["status"] == "APPROVAL_INTERRUPTED"
+    report = json.loads(Path(engine.state.json_report_path).read_text())
+    assert report["false_positive_approval_form"]["status"] == "APPROVAL_INTERRUPTED"
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["launch", "invalid_response"])
+def test_desktop_approval_failures_are_reported_without_dismissal(
+    tmp_path, monkeypatch, failure
+):
+    """Expose native UI failures without accepting fallback approvals."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    dialog = Mock()
+    dialog.close = AsyncMock()
+    dialog.wait = AsyncMock(
+        return_value={"action": "accept", "content": {"finding_0": "true"}}
+    )
+    opened = AsyncMock(return_value=dialog)
+    if failure == "launch":
+        opened.side_effect = OSError("Synthetic desktop launch failure")
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+
+    async def exercise():
+        """Finish the background validator if the window opened."""
+        await server.complete_security_run(_context(), str(tmp_path))
+        tasks = list(server._desktop_approval_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    assert engine.state.false_positive_approval_form["status"] == (
+        "APPROVAL_UNAVAILABLE" if failure == "launch" else "APPROVAL_INVALID"
+    )
+    report = json.loads(Path(engine.state.json_report_path).read_text())
+    assert report["false_positive_approval_form"]["reason"]
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_desktop_approval_cannot_apply_to_a_fresh_run(tmp_path):
+    """An old window cannot authorize identical findings in a new run."""
+    # Arrange
+    engine = _engine(tmp_path)
+    candidates = engine.false_positive_candidates()["candidates"]
+    engine.state.false_positive_approval_form = {
+        "request_id": "old",
+        "status": "AWAITING_HUMAN",
+    }
+    engine.state = deepcopy(engine.state)
+    engine.state.false_positive_approval_form = {}
+
+    # Act
+    result = engine.resolve_desktop_approval("old", candidates)
+
+    # Assert
+    assert result["status"] == "ERROR"
+    engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
 @pytest.mark.parametrize("dismissed", [False, True])
@@ -166,15 +467,18 @@ def test_checkbox_submission_is_the_only_write_gate(
 
 
 @pytest.mark.parametrize("supported", [True, False])
+@pytest.mark.parametrize(
+    "tool_name", ["complete_security_run", "generate_local_report"]
+)
 def test_combined_completion_automatically_offers_the_form_after_saving_report(
-    tmp_path, monkeypatch, supported
+    tmp_path, monkeypatch, supported, tool_name
 ):
     """Offer real unchecked checkboxes without another ready-to-submit message."""
     # Arrange
     engine = _engine(tmp_path)
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     ctx = _context(supported=supported)
-    tool = Tool.from_function(server.complete_security_run)
+    tool = Tool.from_function(getattr(server, tool_name))
     original = ctx.elicit.side_effect
 
     async def elicit(message, schema):
@@ -206,6 +510,13 @@ def test_combined_completion_automatically_offers_the_form_after_saving_report(
     )
     assert saved["false_positive_approval_form"]["status"] == (
         "OK" if supported else "APPROVAL_UNAVAILABLE"
+    )
+    snapshot = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+    assert payload["server_version"] == saved["server_version"] == __version__
+    assert (
+        snapshot["server_version"]
+        == engine.get_run_status()["server_version"]
+        == __version__
     )
     if supported:
         assert payload["false_positive_review"]["results"][0]["id"] == "finding-1"
@@ -314,8 +625,11 @@ def test_combined_completion_keeps_checkout_selected_before_the_form(
 
 
 @pytest.mark.parametrize("action", ["decline", "cancel", "accept"])
+@pytest.mark.parametrize(
+    "tool_name", ["complete_security_run", "generate_local_report"]
+)
 def test_repeated_completion_does_not_repeat_an_unselected_form(
-    tmp_path, monkeypatch, action
+    tmp_path, monkeypatch, action, tool_name
 ):
     """Do not turn report regeneration into repeated unsolicited approval prompts."""
     # Arrange
@@ -324,7 +638,7 @@ def test_repeated_completion_does_not_repeat_an_unselected_form(
     ctx = _context(action=action, checked=False)
 
     # Act
-    first = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
+    first = asyncio.run(getattr(server, tool_name)(ctx, str(tmp_path)))
     second = asyncio.run(server.complete_security_run(ctx, str(tmp_path)))
 
     # Assert
@@ -459,6 +773,55 @@ def _source_context(sampling=False):
     return Context(
         request_context=SimpleNamespace(session=session, request_id="verification")
     )
+
+
+def test_source_approval_description_uses_reviewed_code_and_preserves_audit(tmp_path):
+    """Show the source-backed explanation separately without weakening the GitLab comment."""
+    # Arrange
+    engine, _source, review = _source_engine(tmp_path)
+    engine.verify_security_finding("finding-1", source_review=review)
+
+    # Act
+    candidates = engine.false_positive_candidates()["candidates"]
+    result = engine.dismiss_false_positives(candidates)
+
+    # Assert
+    assert candidates[0]["description"] == f"Endpoint.java:1: {review['reason']}"
+    assert "Files reviewed:" not in candidates[0]["description"]
+    comment = candidates[0]["reason"]
+    assert review["reason"] in comment
+    assert review["finding_analysis"] in comment
+    assert review["reviewed_files"][0]["sha256"] in comment
+    assert result["status"] == "OK"
+    engine.gitlab.dismiss_false_positive.assert_called_once_with(
+        GID, "finding-1", "group/app", comment
+    )
+
+
+@pytest.mark.parametrize("reason_length", [1000, 1001])
+def test_false_positive_explanation_length_requires_concise_reassessment(
+    tmp_path, reason_length
+):
+    """Reject rather than silently clip a summary that obscures the actual conclusion."""
+    # Arrange
+    engine, _source, review = _source_engine(tmp_path)
+    prefix = review["reason"] + " Supporting review detail: "
+    review["reason"] = prefix + "x" * (reason_length - len(prefix) - 1) + "."
+
+    # Act
+    result = engine.verify_security_finding("finding-1", source_review=review)
+
+    # Assert
+    assert result["decision"] == (
+        "FALSE_POSITIVE" if reason_length == 1000 else "SOURCE_REVIEW_REQUIRED"
+    )
+    candidates = engine.false_positive_candidates()["candidates"]
+    if reason_length == 1000:
+        assert candidates[0]["description"] == f"Endpoint.java:1: {review['reason']}"
+    else:
+        assert "1,000 characters" in result["reason"]
+        assert candidates == []
+    engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1033,8 +1396,11 @@ def test_url_only_host_is_not_sent_a_checkbox_form(tmp_path, monkeypatch):
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "tool_name", ["complete_security_run", "generate_local_report"]
+)
 def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, tool_name
 ):
     """Deliver elicitation through a real MCP client/server exchange, not a mock context."""
     # Arrange
@@ -1081,7 +1447,7 @@ def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
                 ) as session:
                     await session.initialize()
                     result = await session.call_tool(
-                        "complete_security_run", {"repo_root": str(tmp_path)}
+                        tool_name, {"repo_root": str(tmp_path)}
                     )
                 tasks.cancel_scope.cancel()
                 return result
@@ -1221,6 +1587,14 @@ def test_branch_resolution_requires_main_evidence_human_approval_and_freshness(
         engine.state.decisions.clear()
         engine.state.pulls = [{"end_head": sha}]
         decision = engine.verify_security_finding(GID)
+        candidates = engine.false_positive_candidates()["candidates"]
+        if candidates:
+            assert candidates[0]["description"] == (
+                "GitLab confirms this finding on branch release "
+                f"is already resolved on main at {sha}. "
+                "It is stale for this main-branch review; this does not prove "
+                "the older branch is safe."
+            )
         phase["approval"] = True
         result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
 

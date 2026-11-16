@@ -324,6 +324,7 @@ def render(
     }
     payload = {
         "run_status": state.status,
+        "server_version": state.server_version,
         "stop_stage": state.stop_stage,
         "branch": state.branch_name,
         "pipeline": state.pipeline,
@@ -425,6 +426,7 @@ def render(
     lines = [
         "# Security remediation report",
         "",
+        f"Server version: {state.server_version}",
         f"Status: {state.status}",
         f"Stop stage: {state.stop_stage or 'none'}",
         f"Branch: {state.branch_name or 'not created'}",
@@ -738,6 +740,7 @@ def write_report(
     atomic_write_text(human_path, markdown)
     return {
         "status": "REPORT_GENERATED",
+        "server_version": payload["server_version"],
         "review_status": payload["review_status"],
         "source_review_queue": payload["source_review_queue"],
         "final_summary_markdown": payload["final_summary_markdown"],

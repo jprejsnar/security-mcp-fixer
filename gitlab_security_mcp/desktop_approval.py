@@ -1,0 +1,225 @@
+"""Owned Windows checkbox dialogs that do not hold an MCP request open."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
+$inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'GitLab false-positive approvals'
+$form.Size = New-Object System.Drawing.Size(1200, 760)
+$form.StartPosition = 'CenterScreen'
+$form.TopMost = $true
+$message = New-Object System.Windows.Forms.TextBox
+$message.Multiline = $true
+$message.ReadOnly = $true
+$message.ScrollBars = 'Vertical'
+$message.Dock = 'Top'
+$message.Height = 125
+$message.Text = $inputData.message
+$viewport = New-Object System.Windows.Forms.Panel
+$viewport.Dock = 'Fill'
+$viewport.AutoScroll = $true
+$table = New-Object System.Windows.Forms.TableLayoutPanel
+$table.Dock = 'Top'
+$table.AutoSize = $true
+$table.AutoSizeMode = 'GrowAndShrink'
+$table.ColumnCount = 2
+$table.CellBorderStyle = 'Single'
+[void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 35)))
+[void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 65)))
+$table.SuspendLayout()
+$issueHeader = New-Object System.Windows.Forms.Label
+$issueHeader.Text = 'Issue'
+$issueHeader.AutoSize = $true
+$reasonHeader = New-Object System.Windows.Forms.Label
+$reasonHeader.Text = 'Why this is a false positive'
+$reasonHeader.AutoSize = $true
+[void]$table.Controls.Add($issueHeader, 0, 0)
+[void]$table.Controls.Add($reasonHeader, 1, 0)
+$choices = @($inputData.choices)
+$checks = @()
+for ($i = 0; $i -lt $choices.Count; $i++) {
+    $issue = New-Object System.Windows.Forms.TableLayoutPanel
+    $issue.Dock = 'Top'
+    $issue.AutoSize = $true
+    $issue.AutoSizeMode = 'GrowAndShrink'
+    $issue.ColumnCount = 2
+    [void]$issue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Absolute', 24)))
+    [void]$issue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    $check = New-Object System.Windows.Forms.CheckBox
+    $check.AccessibleName = [string]$choices[$i].title
+    $check.Checked = $false
+    $check.AutoSize = $true
+    $issueText = New-Object System.Windows.Forms.Label
+    $issueText.Text = [string]$choices[$i].title
+    $issueText.AutoSize = $true
+    $issueText.UseMnemonic = $false
+    [void]$issue.Controls.Add($check, 0, 0)
+    [void]$issue.Controls.Add($issueText, 1, 0)
+    $reason = New-Object System.Windows.Forms.Label
+    $reason.Text = [string]$choices[$i].summary
+    $reason.AutoSize = $true
+    $reason.UseMnemonic = $false
+    $reason.Anchor = 'Top, Left'
+    [void]$table.Controls.Add($issue, 0, $i + 1)
+    [void]$table.Controls.Add($reason, 1, $i + 1)
+    $checks += $check
+}
+$script:lastWrapWidth = -1
+$table.Add_SizeChanged({
+    if ($script:lastWrapWidth -eq $table.ClientSize.Width) { return }
+    $script:lastWrapWidth = $table.ClientSize.Width
+    $table.SuspendLayout()
+    try {
+        $widths = $table.GetColumnWidths()
+        foreach ($control in $table.Controls) {
+            $column = $table.GetColumn($control)
+            $width = [Math]::Max(1, $widths[$column] - $control.Margin.Horizontal - 2)
+            if ($control.MaximumSize.Width -ne $width) {
+                $control.MaximumSize = New-Object System.Drawing.Size($width, 0)
+            }
+            if ($control -is [System.Windows.Forms.TableLayoutPanel]) {
+                $text = $control.GetControlFromPosition(1, 0)
+                $textWidth = [Math]::Max(1, $width - 24 - $text.Margin.Horizontal)
+                $text.MaximumSize = New-Object System.Drawing.Size($textWidth, 0)
+            }
+        }
+    } finally {
+        $table.ResumeLayout($true)
+    }
+})
+[void]$viewport.Controls.Add($table)
+$table.ResumeLayout($true)
+$buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+$buttons.Dock = 'Bottom'
+$buttons.Height = 50
+$buttons.FlowDirection = 'RightToLeft'
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.AutoSize = $true
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$submit = New-Object System.Windows.Forms.Button
+$submit.Text = 'Dismiss checked items'
+$submit.AutoSize = $true
+$submit.Add_Click({
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Close()
+})
+[void]$buttons.Controls.Add($cancel)
+[void]$buttons.Controls.Add($submit)
+$form.CancelButton = $cancel
+$form.Controls.Add($viewport)
+$form.Controls.Add($message)
+$form.Controls.Add($buttons)
+$form.Add_Shown({ $form.Activate(); [Console]::Out.WriteLine('READY'); [Console]::Out.Flush() })
+$result = $form.ShowDialog()
+$response = @{ action = 'cancel' }
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    $content = @{}
+    for ($i = 0; $i -lt $choices.Count; $i++) {
+        $content[[string]$choices[$i].key] = [bool]$checks[$i].Checked
+    }
+    $response = @{ action = 'accept'; content = $content }
+}
+$form.Dispose()
+[Console]::Out.WriteLine(($response | ConvertTo-Json -Depth 5 -Compress))
+"""
+
+
+def available() -> bool:
+    """Use a local dialog only on Windows with its standard PowerShell runtime."""
+    return os.name == "nt" and powershell().is_file()
+
+
+def powershell() -> Path:
+    """Resolve the OS executable, not a command supplied by repository contents."""
+    return Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
+        r"System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+
+
+@dataclass
+class DesktopApproval:
+    """Own one visible dialog until a human submits or closes it."""
+
+    process: asyncio.subprocess.Process
+
+    async def wait(self) -> dict:
+        """Wait without an approval deadline; validate transport errors explicitly."""
+        stdout, stderr = await self.process.communicate()
+        if self.process.returncode != 0:
+            raise RuntimeError(
+                f"Approval window exited with code {self.process.returncode}: "
+                f"{stderr.decode(errors='replace')[-2000:]}"
+            )
+        response = json.loads(stdout.decode("utf-8-sig"))
+        if not isinstance(response, dict) or response.get("action") not in {
+            "accept",
+            "cancel",
+        }:
+            raise ValueError("The approval window returned an invalid response")
+        return response
+
+    async def close(self) -> None:
+        """Close and reap only this server-owned dialog process."""
+        if self.process.returncode is None:
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass
+        await self.process.wait()
+
+
+async def open_dialog(message: str, properties: dict) -> DesktopApproval:
+    """Return after the actual checkbox window is shown, not after human selection."""
+    process = await asyncio.create_subprocess_exec(
+        str(powershell()),
+        "-NoProfile",
+        "-STA",
+        "-Command",
+        SCRIPT,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    dialog = DesktopApproval(process)
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("Approval window pipes were not created")
+        payload = {
+            "message": message,
+            "choices": [
+                {
+                    "key": key,
+                    "title": value["title"],
+                    "summary": value["summary"],
+                }
+                for key, value in properties.items()
+            ],
+        }
+        process.stdin.write(json.dumps(payload, ensure_ascii=True).encode())
+        await process.stdin.drain()
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        if (await process.stdout.readline()).strip() != b"READY":
+            _, stderr = await process.communicate()
+            raise RuntimeError(
+                "The Windows approval window could not be shown: "
+                + stderr.decode(errors="replace")[-2000:]
+            )
+        return dialog
+    except BaseException:
+        await dialog.close()
+        raise

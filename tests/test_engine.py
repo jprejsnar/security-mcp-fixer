@@ -1493,7 +1493,7 @@ def test_report_tool_delivers_security_report_as_mcp_text(repo, monkeypatch):
 
     # Assert
     assert isinstance(result, CallToolResult)
-    text = result.content[0].text
+    text = result.content[-1].text
     assert text == result.structured_content["final_summary_markdown"]
     assert text.startswith("## Finding Assessments")
     assert text.rstrip().endswith(result.structured_content["unresolved_issues_table"])
@@ -1511,7 +1511,7 @@ def test_report_error_is_visible_as_text(monkeypatch):
     )
 
     # Act
-    result = server.generate_local_report()
+    result = server._generate_local_report()
 
     # Assert
     assert result.is_error

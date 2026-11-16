@@ -14,6 +14,7 @@ from collections import deque
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
@@ -22,7 +23,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field, create_model
 
-from gitlab_security_mcp import __version__
+from gitlab_security_mcp import __version__, desktop_approval
 from gitlab_security_mcp.ai_source_review import SourceEvidence
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
@@ -102,6 +103,13 @@ Call the tools in this order:
     do not prove a runtime control). A missing page blocks the conclusion.
     A false-positive reason, input_origin, finding_analysis, reachability_analysis,
     and each file assessment must be complete sentences about the cited code.
+    Write reason for security-team and client review: 1-3 concise sentences
+    (at most 1,000 characters) naming the actual code or runtime control, relevant
+    input path and why this specific weakness does not apply. Read and trace the
+    code first; do not invent controls, infer safety from a scanner miss, or use
+    generic assurances. Keep detailed analysis and evidence in the other fields.
+    The approval window shows this source-cited conclusion beside each issue;
+    its full audit comment remains available for review and GitLab submission.
     When GitLab names a CVE or CWE, the analysis must address that identifier
     and whether its record applies to this code. The stored description records
     those sentences plus whether each record page was available. Do not invent
@@ -240,14 +248,26 @@ Call the tools in this order:
     rollback cannot be proved safe or later edits need manual cleanup: stop
     editing and report the blocker. Never adapt production/tests to make a fix
     pass. At the end list every unapplied/rejected fix and its exact reason.
+    Record finding assessments and run-state updates through this live MCP
+    server's tools. Use host code tools for source analysis and approved source
+    fixes, but never construct a separate Engine, hydrate RunState from saved JSON, or
+    overwrite run-state/reports from a host-side Python batch. Disk snapshots
+    are inspection-only, not resumable state or approval. Separate processes
+    cannot synchronize this server's assessments or open its human forms.
 11. complete_security_run(repo_root=the same checkout). This finishing tool saves
     the local report, then automatically offers native unchecked approval
     checkboxes for eligible false positives through submit_false_positive_approvals.
     Do not wait for another "ready to submit" message. Only the human may answer.
     The report exists before the form opens and is refreshed after the response.
+    On Windows, a separate local checkbox window opens and this tool returns
+    AWAITING_HUMAN immediately. There is no human selection timeout. Do not poll
+    or repeat completion while the human reviews; the saved report updates when
+    that window closes. This does not depend on the host's in-chat form support.
     The human can cancel to keep reviewing and explicitly reopen the form later.
-    Do not call review_false_positives or generate_local_report separately in the
-    standard workflow, and do not rescan/reverify just to request approval.
+    Do not call review_false_positives separately in the standard workflow.
+    The legacy generate_local_report MCP tool uses this same completion and
+    approval flow; it is not a report-only bypass. Do not rescan/reverify just
+    to request approval.
     Display the returned final_summary_markdown once at the end of the final
     response, not just report paths. The tool's text content is this complete
     Markdown block, not a JSON wrapper. Copy it into the final assistant message;
@@ -261,7 +281,7 @@ Call the tools in this order:
 12. submit_false_positive_approvals(repo_root=the same checkout) opens the unchecked
     checkbox form. Completion invokes it automatically once; call it separately
     only for an explicit human request to reopen the form. Never generate or infer approval.
-    Decline/cancel or lack of host form support means no remote changes.
+    Decline/cancel or unavailable approval UI means no remote changes.
     Do not automatically repeat the form after it was declined or cancelled.
     Markdown checkboxes alone are not actionable. Never retry a mutation whose
     remote outcome may be unknown. The checkbox form dismisses only selected
@@ -772,6 +792,11 @@ async def verify_security_finding(
     all input-origin files; use their current full-byte hashes. This audits the
     host's assessment, not an independent proof. Never infer safety from a test
     filename, absent CVE, missing source or scanner flag alone.
+    For FALSE_POSITIVE, reason is the security-team/client-facing explanation:
+    1-3 concise sentences, at most 1,000 characters, identifying the actual code
+    or runtime control, relevant input path and why this specific weakness
+    does not apply. Trace the code first; never invent controls or assurances.
+    Keep detailed supporting analysis in the other source_review fields.
     """
     result = await asyncio.to_thread(
         _run,
@@ -1038,6 +1063,55 @@ async def _approval_result(selected: Engine, receipt: dict, result: dict) -> dic
     return result
 
 
+_desktop_approval_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _finish_desktop_approval(
+    selected: Engine,
+    request_id: str,
+    candidates: list[dict],
+    schema: type,
+    dialog: desktop_approval.DesktopApproval,
+) -> None:
+    """Wait outside the tool request; only physical checkbox selections authorize writes."""
+    try:
+        response = await dialog.wait()
+        approved = None
+        if response["action"] == "accept":
+            values = schema.model_validate(response.get("content")).model_dump()
+            approved = [
+                item
+                for index, item in enumerate(candidates)
+                if values.get(f"finding_{index}") is True
+            ]
+        result = await asyncio.to_thread(
+            selected.resolve_desktop_approval, request_id, approved
+        )
+        logger.info("Desktop false-positive approval finished: %s", result["status"])
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            asyncio.to_thread(
+                selected.resolve_desktop_approval,
+                request_id,
+                None,
+                status="APPROVAL_INTERRUPTED",
+                reason="The server stopped before a human response. No new dismissal was authorized.",
+            )
+        )
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Desktop false-positive approval failed: %s", exc)
+        await asyncio.to_thread(
+            selected.resolve_desktop_approval,
+            request_id,
+            None,
+            status="APPROVAL_INVALID",
+            reason=str(exc),
+        )
+    finally:
+        await dialog.close()
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Finding Assessments: list false positives for verification",
@@ -1101,7 +1175,7 @@ async def review_false_positives(
             "source_review_queue": queue,
             "message": message,
         }
-    if not _form_supported(ctx):
+    if not desktop_approval.available() and not _form_supported(ctx):
         return {
             "status": "APPROVAL_UNAVAILABLE",
             "reason": "This MCP host does not advertise form elicitation. No GitLab changes were made. Use a form-capable host or dismiss manually in GitLab.",
@@ -1144,6 +1218,12 @@ async def submit_false_positive_approvals(
     Declining, cancelling, or leaving every box unchecked writes nothing.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
+    previous = selected.state.false_positive_approval_form
+    if previous.get("request_id") in _desktop_approval_tasks:
+        return {
+            "status": "AWAITING_HUMAN",
+            "message": "The existing Windows checkbox window is still open. No duplicate window or GitLab change was made.",
+        }
     snapshot = await asyncio.to_thread(selected.false_positive_candidates)
     if snapshot["status"] != "OK":
         return snapshot
@@ -1162,7 +1242,7 @@ async def submit_false_positive_approvals(
             else None
         ),
     }
-    if not _form_supported(ctx):
+    if not desktop_approval.available() and not _form_supported(ctx):
         return await _approval_result(
             selected,
             receipt,
@@ -1181,12 +1261,68 @@ async def submit_false_positive_approvals(
                     default=False,
                     strict=True,
                     title=f"{item['id']}: {item['title']}",
-                    description=f"Location: {item['location']}\nDismiss as FALSE_POSITIVE with comment:\n{item['reason']}",
+                    description=(
+                        f"Why this is a false positive: {item['description']}\n\n"
+                        f"Dismiss as FALSE_POSITIVE with comment:\n{item['reason']}"
+                    ),
                 ),
             )
             for index, item in enumerate(candidates)
         },
     )
+    if desktop_approval.available():
+        receipt.update(request_id=uuid4().hex, presentation="WINDOWS_DIALOG")
+        await asyncio.to_thread(
+            selected.record_false_positive_approval_form,
+            {**receipt, "status": "REQUESTED"},
+        )
+        try:
+            properties = schema.model_json_schema()["properties"]
+            for index, item in enumerate(candidates):
+                properties[f"finding_{index}"]["summary"] = item["description"]
+            dialog = await desktop_approval.open_dialog(
+                f"Repository: {selected.repo_root}\r\n"
+                "Check only the false positives you approve. All boxes start unchecked. "
+                "Both columns wrap; each row expands to show the issue and explanation. "
+                "Full audit comments and supporting evidence remain in the saved reports. "
+                "Dismiss checked items submits only checked findings to GitLab. "
+                "Cancel or close changes nothing. There is no selection deadline.",
+                properties,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not display Windows approval window: %s", exc)
+            return await _approval_result(
+                selected,
+                receipt,
+                {"status": "APPROVAL_UNAVAILABLE", "reason": str(exc)},
+            )
+        try:
+            result = await _approval_result(
+                selected,
+                receipt,
+                {
+                    "status": "AWAITING_HUMAN",
+                    "message": (
+                        "The Windows checkbox approval window is open. This MCP call is complete; "
+                        "the window has no selection timeout. Only checked human submissions can "
+                        "dismiss findings. Saved reports update after submission or cancellation. "
+                        "Do not repeat completion or poll while the human is reviewing."
+                    ),
+                },
+            )
+        except BaseException:
+            await dialog.close()
+            raise
+        task = asyncio.create_task(
+            _finish_desktop_approval(
+                selected, receipt["request_id"], candidates, schema, dialog
+            )
+        )
+        _desktop_approval_tasks[receipt["request_id"]] = task
+        task.add_done_callback(
+            lambda _task: _desktop_approval_tasks.pop(receipt["request_id"], None)
+        )
+        return result
     await asyncio.to_thread(
         selected.record_false_positive_approval_form,
         {**receipt, "status": "REQUESTED"},
@@ -1204,6 +1340,20 @@ async def submit_false_positive_approvals(
             "Cancel to continue reviewing the saved local report and explicitly reopen this form later.",
             schema,
         )
+    except asyncio.CancelledError:
+        logger.warning("False-positive form interrupted before a human response")
+        await asyncio.shield(
+            _approval_result(
+                selected,
+                receipt,
+                {
+                    "status": "APPROVAL_INTERRUPTED",
+                    "reason": "The host cancelled or timed out before returning human selections. No new dismissal was authorized.",
+                },
+            )
+        )
+        await asyncio.shield(asyncio.to_thread(selected.generate_local_report))
+        raise
     except ValueError as exc:
         logger.warning("Invalid false-positive approval response: %s", exc)
         return await _approval_result(
@@ -1251,21 +1401,8 @@ async def submit_false_positive_approvals(
     )
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Generate local report",
-        read_only_hint=False,
-        destructive_hint=False,
-        open_world_hint=False,
-    )
-)
-def generate_local_report(repo_root: str | None = None) -> CallToolResult:
-    """Write reports and display final_summary_markdown once, not only paths.
-
-    Every finding has an ID/location, decision and reason, including false positives.
-    The final block retains unresolved issues and consulted security sites. Do not
-    repeat rows or call this tool repeatedly just to present the same report.
-    """
+def _generate_local_report(repo_root: str | None = None) -> CallToolResult:
+    """Write and format the report without recursively invoking human approval."""
     result = _run("generate_local_report", repo_root=repo_root)
     return CallToolResult(
         content=[
@@ -1277,6 +1414,26 @@ def generate_local_report(repo_root: str | None = None) -> CallToolResult:
         structuredContent=result,
         isError=result.get("status") == "ERROR",
     )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Generate local report and offer false-positive approvals",
+        read_only_hint=False,
+        destructive_hint=True,
+        open_world_hint=True,
+    )
+)
+async def generate_local_report(
+    ctx: Context, repo_root: str | None = None
+) -> CallToolResult:
+    """Save reports and offer the same human approvals as complete_security_run.
+
+    This legacy finishing name must not skip the unchecked dismissal form.
+    Reports exist before approval. Only human-selected false positives may be
+    dismissed; declined/cancelled forms are not automatically repeated.
+    """
+    return await complete_security_run(ctx, repo_root)
 
 
 @mcp.tool(
@@ -1299,7 +1456,7 @@ async def complete_security_run(
     selected = await asyncio.to_thread(_engine_for, repo_root)
     selected_root = str(selected.repo_root)
     review = await review_false_positives(ctx, repo_root=selected_root)
-    report = await asyncio.to_thread(generate_local_report, repo_root=selected_root)
+    report = await asyncio.to_thread(_generate_local_report, repo_root=selected_root)
     if report.structured_content is None:
         raise RuntimeError("The local report did not return structured report data")
     if not report.is_error and review["status"] in {
@@ -1317,7 +1474,7 @@ async def complete_security_run(
         else:
             review = await submit_false_positive_approvals(ctx, repo_root=selected_root)
             report = await asyncio.to_thread(
-                generate_local_report, repo_root=selected_root
+                _generate_local_report, repo_root=selected_root
             )
             if report.structured_content is None:
                 raise RuntimeError(

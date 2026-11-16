@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.9.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.13.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -28,6 +28,25 @@ report, then automatically offer native approval checkboxes. No extra
 "ready to submit" message is required. Cancel to continue reviewing and
 explicitly request `submit_false_positive_approvals` to reopen the form later.
 Only explicitly selected findings are dismissed in GitLab.
+
+On Windows, release 1.0.11 opens a separate local checkbox window and returns
+`AWAITING_HUMAN` as soon as the window is shown. Human review has **no timeout**:
+it does not wait inside Cursor's or VS Code's MCP tool request. Only clicking
+**Dismiss checked items** submits checked findings; Cancel or closing the window
+changes nothing. Keep the MCP server running while reviewing. Saved reports update
+after the window closes; the host must not poll or repeat completion while waiting.
+Server shutdown closes its own approval window without authorizing new dismissals.
+
+Release 1.0.13 wraps the text in both approval columns, **Issue** and **Why this
+is a false positive**. Rows grow to fit their contents and reflow when the window
+is resized; long lists scroll vertically. The duplicate lower description pane
+has been removed. Source explanations still cite the reviewed file/line. Full
+audit comments remain in the saved reports and are retained for GitLab submission.
+
+The legacy `generate_local_report` MCP tool also routes through
+the same saved-report and human-approval flow. Neither finishing tool silently
+leaves eligible dismissals without a form attempt. Cancellation is still respected.
+The running server version is recorded in `get_run_status`, run snapshots and reports.
 
 Start with [installation](#installing-the-local-mcp-server), choose your
 [host configuration](#mcp-configuration), then follow the
@@ -58,7 +77,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers today's changes through 1.0.9. Earlier wheels do not contain
+This summary covers changes through 1.0.13. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -80,9 +99,14 @@ all of these changes; updating source files does not update an installed wheel.
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
-The latest 1.0.9 code validation completed with **826 passed, 3 skipped**.
-These are offline regression results, not
-live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
+The latest 1.0.13 code validation completed with **847 passed, 3 skipped**, including
+the two opt-in native Windows tests (`SECURITY_MCP_DESKTOP_TESTS=1`). Those tests
+measured multiline text and row heights in both columns, verified reflow after
+narrowing the window, vertical scrolling, removal of the lower pane, initially
+unchecked boxes, selected-only submissions and cancellation. The no-timeout
+workflow and full audit comments remain covered by the regression suite.
+These are regression
+results, not live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
 leak resources. Rebuild and reinstall the wheel to deploy source fixes.
 
 ## Architecture
@@ -346,7 +370,7 @@ checkout is active.
 | `review_false_positives(repo_root=None)` | List eligible assessments for verification. Returns immediately and dismisses nothing. |
 | `submit_false_positive_approvals(repo_root=None)` | Open human approval checkboxes, automatically invoked by completion or explicitly requested to reopen. Only selected findings are dismissed; no AI approval argument is accepted. |
 | `complete_security_run(repo_root=None)` | Save reports, automatically offer human approval checkboxes once, then refresh reports with actual outcomes. Does not rescan or rerun verification. |
-| `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
+| `generate_local_report(repo_root=None)` | Legacy finishing name: save Markdown/JSON reports, offer the same human-only false-positive approvals as `complete_security_run`, and refresh actual outcomes. It is not a report-only bypass. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
 ### Human selection and surgical fixes
@@ -371,6 +395,12 @@ the MCP server cannot intercept edits made by external tools. Its own remediatio
 entry points are gated atomically. Selection cannot be replaced after MCP edits
 have been recorded; finish validating that batch before a fresh clean run.
 Inspection snapshots are never reloaded as authorization.
+
+Keep provider assessment and completion calls in the same live MCP server.
+Do not construct a separate Python `Engine`, hydrate saved `RunState` JSON, or
+overwrite the snapshot from a host-side batch. Those processes cannot synchronize
+the server's in-memory assessments or deliver its human form. A saved report alone
+is not an approval request. Use the finishing MCP tool in the active connection.
 
 If the human selects nothing, declines/cancels, or the host lacks form support,
 skip remediation edits and remediation builds/tests and call `complete_security_run`.
@@ -498,13 +528,45 @@ Unverified SAST findings remain in that queue even if no excerpt was collected;
 they cannot silently produce a completed review status.
 Pending approval is highlighted before the assessment table with the count of
 local false positives lacking a confirmed dismissal.
-In hosts supporting **MCP form elicitation**, `submit_false_positive_approvals` displays one initially unchecked
-boolean/checkbox per eligible false-positive assessment, including finding ID,
+On Windows with the standard Windows PowerShell runtime and an interactive desktop,
+`submit_false_positive_approvals` opens a local Windows checkbox window, independent
+of the host's elicitation UI. It returns `AWAITING_HUMAN` after the window is shown,
+without waiting for a human response. There is **no selection deadline**. Reports
+refresh asynchronously after submission or cancellation. Do not poll, restart the
+server, or repeatedly request completion while reviewing. A late response cannot
+authorize a new run or different finding snapshots.
+
+The window has two columns: **Issue** (including its unchecked approval box) and
+**Why this is a false positive**. For source findings, the second column cites
+the reviewed file and line and shows `source_review.reason`. That field must be
+written after reading and tracing the code: 1-3 concise sentences, at most
+1,000 characters, explaining the actual code or runtime control, the relevant
+input path, and why the specific reported weakness does not apply. Generic
+assurances, invented controls and missing advisories are not supporting evidence.
+An overlong explanation remains `SOURCE_REVIEW_REQUIRED` until reassessed; it
+is never silently truncated. Detailed analysis belongs in `finding_analysis`,
+`reachability_analysis`, `input_origin` and the reviewed-file assessments.
+Previously accepted reviews are rechecked against current full-file hashes before
+offering or accepting approval. These checks audit the host's assessment, not an
+independent proof of semantic correctness.
+
+Both columns wrap their complete text, and each row grows to fit the taller cell.
+Resizing the window reflows both columns; long lists scroll vertically. There is
+no duplicate lower description pane. Only checking an issue and submitting grants
+approval. The full audit comment, including evidence and documentation references,
+remains in the saved reports and is the unchanged GitLab submission text.
+Advisory-only findings use their existing assessed
+reason; resolved-on-main descriptions explicitly preserve their branch scope
+and never claim the older branch is safe.
+
+On other platforms, hosts supporting **MCP form elicitation** display an in-chat
+form; those requests remain subject to the host's own deadlines. Both presentations
+display one initially unchecked boolean/checkbox per eligible assessment, including finding ID,
 location and exact reason. Select the findings you approve and submit the form.
 Submission immediately dismisses only selected findings in GitLab with
 `dismissalReason: FALSE_POSITIVE` and the displayed reason as `comment`, using
 [`vulnerabilityDismiss`](https://docs.gitlab.com/api/graphql/reference/mutations/#vulnerabilitydismiss).
-The host controls the exact form appearance. Only the human should answer it;
+The host controls the in-chat form appearance. Only the human should answer it;
 the AI must never synthesize approvals. A source false positive is stored as an
 audit description: the cited file and line, the code analysis, input origin,
 reachability, each reviewed file, the publisher pages read for that file, and
@@ -517,13 +579,15 @@ Both explicit `elicitation.form: {}` and legacy `elicitation: {}` advertise
 form support under the
 [MCP compatibility rule](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation#capabilities).
 URL-only elicitation is not form support.
-Hosts without advertised form support return `APPROVAL_UNAVAILABLE`; use a
+Outside the Windows dialog path, hosts without advertised form support return `APPROVAL_UNAVAILABLE`; use a
 form-capable host or the GitLab UI. Static Markdown report checkboxes cannot
 execute API calls. The tool accepts no AI-supplied approval list.
 `false_positive_approval_form` in the run snapshot and reports records the
-advertised elicitation capability, candidate IDs, request/outcome status and
+advertised elicitation capability, candidate IDs, presentation, request/outcome status and
 any reported form error. `REQUESTED` without a later outcome does not prove a
-response or dismissal. These diagnostics are never reusable authorization.
+response or dismissal. `AWAITING_HUMAN` means the Windows window is open, not that
+a dismissal occurred. Interrupted in-chat forms record `APPROVAL_INTERRUPTED`
+instead of remaining `REQUESTED`. These diagnostics are never reusable authorization.
 Completion does not automatically retry a previously attempted form in the
 same run, including failed, cancelled or unchecked submissions.
 
@@ -1209,7 +1273,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.9-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.13-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1225,7 +1289,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.9-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.13-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1265,7 +1329,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.9-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.13-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1281,7 +1345,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.9-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.13-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1302,7 +1366,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.9-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.13-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1311,7 +1375,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.9-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.13-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -1611,7 +1675,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.9-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.13-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -1645,7 +1709,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.9**
+3. Apply the deployment-specific update and verify installed version **1.0.13**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -1654,7 +1718,9 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run.
+   edits before requesting a new run. Its `server_version` must be `1.0.13`
+   for this release. Missing version/approval fields identify older output;
+   checking pip alone does not prove a running MCP process was restarted.
 
 ### Cursor upgrade steps
 
@@ -2263,6 +2329,17 @@ Run development commands from this MCP project's root. Use the equivalent
 .\.venv\Scripts\python.exe -m ruff check gitlab_security_mcp server.py tests
 .\.venv\Scripts\python.exe -m ruff format --check gitlab_security_mcp server.py tests
 .\.venv\Scripts\python.exe -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q -W error::pytest.PytestUnraisableExceptionWarning -W error::pytest.PytestUnhandledThreadExceptionWarning
+```
+
+The native wrapping tests are opt-in and require an interactive Windows desktop.
+They open clearly marked synthetic windows, verify both columns wrap and reflow
+after resizing, check scrolling and pane removal, then automatically cancel or
+submit a synthetic checkbox selection. They make no GitLab calls.
+
+```powershell
+$env:SECURITY_MCP_DESKTOP_TESTS = "1"
+.\.venv\Scripts\python.exe -m pytest -q tests\test_false_positives.py -k native_approval_wraps
+Remove-Item Env:\SECURITY_MCP_DESKTOP_TESTS
 ```
 
 ### Python and AAA standards

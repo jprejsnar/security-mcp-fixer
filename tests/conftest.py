@@ -9,6 +9,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def no_interactive_approval_windows(monkeypatch):
+    """Keep default regressions on MCP forms; native UI integration tests opt in."""
+    monkeypatch.setattr("gitlab_security_mcp.desktop_approval.available", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def corporate_dns(monkeypatch):
     """Keep corporate DNS deterministic and offline unless a test overrides it."""
     from unittest.mock import Mock

@@ -2166,6 +2166,22 @@ class Engine:
                     "Retrieve and verify findings in a fresh run with the updated server."
                 )
             else:
+                description = reason.strip()
+                source_review = finding.get("sourceReview")
+                resolution = finding.get("mainBranchResolution")
+                if resolution:
+                    description = (
+                        f"GitLab confirms this finding on branch {resolution['branch']} "
+                        f"is already resolved on main at {resolution['main_sha']}. "
+                        "It is stale for this main-branch review; this does not prove "
+                        "the older branch is safe."
+                    )
+                elif isinstance(source_review, dict):
+                    location = finding["location"]
+                    description = (
+                        f"{location['file']}:{location['startLine']}: "
+                        f"{source_review['reason'].strip()}"
+                    )
                 candidates.append(
                     {
                         "id": finding["id"],
@@ -2173,6 +2189,7 @@ class Engine:
                         "project_path": self.state.gitlab_project_path,
                         "title": finding.get("title"),
                         "location": finding.get("location") or {},
+                        "description": description,
                         "reason": reason,
                         "assessment": deepcopy(assessment),
                         "source_review": deepcopy(finding.get("sourceReview")),
@@ -2279,6 +2296,42 @@ class Engine:
         return {"status": "OK"}
 
     @_serialized
+    def resolve_desktop_approval(
+        self,
+        request_id: str,
+        approved: list[dict] | None,
+        *,
+        status: str = "CANCELLED",
+        reason: str = "",
+    ) -> dict:
+        """Resolve only this live run's owned window, then refresh saved outcomes."""
+        receipt = self.state.false_positive_approval_form
+        if receipt.get("request_id") != request_id or receipt.get("status") not in {
+            "REQUESTED",
+            "AWAITING_HUMAN",
+        }:
+            logger.warning("Ignoring a stale desktop approval response")
+            return {
+                "status": "ERROR",
+                "reason": "The approval window belongs to a different or completed run.",
+            }
+        result = (
+            self.dismiss_false_positives(approved)
+            if approved is not None
+            else {"status": status, "reason": reason, "results": []}
+        )
+        self.record_false_positive_approval_form(
+            {
+                **receipt,
+                "status": result["status"],
+                "selected_ids": [item["id"] for item in approved or []],
+                **({"reason": result["reason"]} if result.get("reason") else {}),
+            }
+        )
+        self.generate_local_report()
+        return result
+
+    @_serialized
     def generate_local_report(self) -> dict:
         """Write the markdown and JSON reports under .security-mcp/reports."""
         self._refresh_source_reviews()
@@ -2315,6 +2368,7 @@ class Engine:
         review_queue = pending_source_reviews(self.state.findings, self.state.decisions)
         return {
             "status": self.state.status,
+            "server_version": self.state.server_version,
             "stop_stage": self.state.stop_stage,
             "manual_cleanup_required": self.state.manual_cleanup_required,
             "branch": self.state.branch_name,

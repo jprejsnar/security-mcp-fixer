@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from gitlab_security_mcp import __version__
 from gitlab_security_mcp.util import atomic_write_text
 
 
@@ -42,6 +43,7 @@ class RunState:
     gitlab_dismissals: list[dict] = field(default_factory=list)
     false_positive_approval_form: dict = field(default_factory=dict)
     fix_selection: dict = field(default_factory=dict)
+    server_version: str = __version__
 
     def save(self, repo_root: Path) -> None:
         """Publish an inspection snapshot, not raw in-memory rollback file contents."""

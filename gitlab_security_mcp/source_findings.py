@@ -10,6 +10,7 @@ from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_page
 from gitlab_security_mcp.util import resolve_inside
 
 _MIN_AUDIT_SENTENCE = 24
+_MAX_APPROVAL_REASON = 1000
 
 MAX_SOURCE_BYTES = 1_000_000
 # Names and review limits from the TypeScript utility-types reference
@@ -136,6 +137,13 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
             "Source review requires finding_analysis (or legacy pattern_analysis)"
         )
     if review.get("decision") == "FALSE_POSITIVE":
+        if len(review["reason"].strip()) > _MAX_APPROVAL_REASON:
+            raise ValueError(
+                f"False-positive reason must be at most {_MAX_APPROVAL_REASON:,} characters. "
+                "Use 1-3 concise sentences explaining the reviewed code and why this "
+                "specific weakness does not apply; keep detailed evidence in "
+                "finding_analysis, reachability_analysis and reviewed_files."
+            )
         for key in ("reason", "input_origin", analysis_key, "reachability_analysis"):
             if len(review[key].strip()) < _MIN_AUDIT_SENTENCE:
                 raise ValueError(
@@ -205,7 +213,12 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
             "Include the cited source and every file relied on; hashes cover full bytes. "
             "finding_analysis must address this rule (for example authorization, CSRF, "
             "CORS, Unicode, log/header injection, or regex), not unrelated regex claims. "
-            "An endpoint inventory finding is not automatically a defect or a false positive.",
+            "An endpoint inventory finding is not automatically a defect or a false positive. "
+            "For a false positive, write reason for security-team and client review: "
+            "1-3 concise sentences, at most 1,000 characters, naming the actual code "
+            "or runtime control, the relevant input path and why this specific "
+            "weakness does not apply. Trace the code first; do not invent controls "
+            "or use generic safety assurances. Put detailed evidence in the other fields.",
             "Read the current publisher pages for this file before a false positive "
             "or a fix: TypeScript and JavaScript, Node.js, Python, Oracle Java, "
             "Microsoft C# and .NET, the Dockerfile reference, or nginx, whichever "
