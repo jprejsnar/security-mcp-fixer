@@ -8,8 +8,10 @@ from collections.abc import Callable
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
+_FIX_VERSION = r"v?\d+\.\d+(?:\.\d+)?[0-9A-Za-z.+-]*"
 _FIXED_IN = re.compile(
-    r"\b(?:upgrade(?:d)? to|update to|fixed in|patched in)(?:\s+version)?\s+v?(\d+\.\d+(?:\.\d+)?[0-9A-Za-z.+-]*)",
+    rf"\b(?:upgrade(?:d)? to|update to|fixed in|patched in)(?:\s+versions?)?\s+"
+    rf"({_FIX_VERSION}(?:\s*(?:,\s*(?:(?:or|and)\s+)?|(?:or|and)\s+){_FIX_VERSION})*)",
     re.IGNORECASE,
 )
 
@@ -29,14 +31,15 @@ def parse_version(value: str | None) -> Version | None:
 
 
 def parse_fixed_versions(solution: str | None) -> list[str]:
-    """Pull versions out of solution text such as 'Upgrade to version 1.2.3'."""
+    """Extract explicit fix versions and their comma/and/or-separated alternatives."""
     if not solution:
         return []
     found: list[str] = []
     for match in _FIXED_IN.finditer(solution):
-        version = match.group(1).rstrip(".,);")
-        if version not in found:
-            found.append(version)
+        for raw in re.findall(_FIX_VERSION, match.group(1), re.IGNORECASE):
+            version = raw.lstrip("vV").rstrip(".,);")
+            if parse_version(version) is not None and version not in found:
+                found.append(version)
     return found
 
 

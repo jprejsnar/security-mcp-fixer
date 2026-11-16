@@ -66,22 +66,22 @@ all of these changes; updating source files does not update an installed wheel.
 | Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
 | Human-only GitLab dismissal | Eligible assessments are listed for verification with no deadline. The checkbox form opens only when you call `submit_false_positive_approvals`. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
-| Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports show pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
+| Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports retain per-finding pipeline provenance, unapplied fix candidates, pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
 | Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
 | Same-day branch reuse | Today's exact security branch can be reused after reviewing prior security logs. Errors preserve evidence and stop reuse. Cleanup removes only recognized generated untracked/ignored security artifacts, not tracked files, policies, configuration or unrelated work. |
 | VPN and dependency preparation | Corporate DNS is checked before work, each pull and pnpm preparation. The server runs `pnpm clean` then `pnpm install` once per pnpm root; reused branches are prepared after their checkout. |
 | Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in existing console/notification/transcript channels. Retries retain their finding's position. |
-| Advisory robustness | Ordered OSV/GitHub fallback, shared NVD pacing and bounded transient retries respect `Retry-After`. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. Unavailable advisory data remains explicit. |
+| Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Missing NVD version bounds require review, not a no-fix verdict. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
 | Dependency edits | The minimal qualified plan may refresh only the lockfile, bump the owning `package.json`, or add a pnpm override in `pnpm-workspace.yaml` when present. Compatibility/license checks and final production build/all-unit-test validation still apply. |
-| Bounded fan-out | Independent documentation/advisory reads use at most eight workers per batch, bounded submissions, isolated request contexts and input-ordered results. Ready workers are refilled without waiting for an earlier slow result. Checkout edits, validation/rollback and dismissals stay serialized. |
+| Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Checkout edits, validation/rollback and dismissals wait for active verifications. |
 | Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
-The 1.0.9 code validation completed with **721 passed, 3 skipped**; **135 tests**
-also passed against the built wheel. These are offline regression results, not
+The latest 1.0.9 code validation completed with **781 passed, 3 skipped**.
+These are offline regression results, not
 live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
-leak resources. The documentation-only refresh does not change server behavior.
+leak resources. Rebuild and reinstall the wheel to deploy source fixes.
 
 ## Architecture
 
@@ -159,7 +159,8 @@ NVD detail pages, and four CWE definitions are added when the finding names them
 
 All components below live in the same Python process. A registry keeps one
 `Engine` per checkout. The registry lock covers only that map. Each engine
-serializes its own tool calls, so two checkouts can proceed together. Independent
+serializes mutations while allowing independent finding evidence reads to overlap,
+so two checkouts can also proceed together. Independent
 documentation and advisory reads share a short-lived pool of at most eight
 workers. GitLab report pages stay in cursor order. Each command runner still
 runs one allowlisted command at a time.
@@ -234,6 +235,9 @@ The snapshot is not a resume database. A restarted process creates a new
 job scheduler, general-purpose rollback, or multi-file transaction. Failed fix
 candidates have guarded restoration of unchanged updater-owned files; later user
 edits are preserved rather than overwritten.
+Raw dependency rollback text stays in memory. Inspection snapshots instead expose
+`dependency_backup_manifest` with UTF-8 byte counts and SHA-256 hashes, or `null`
+for a previously absent file. They cannot restore files after a restart.
 
 ## Workflow
 
@@ -522,6 +526,8 @@ must follow the declared source-edit policy.
 
 Commands have timeouts, capped output, and audit records with output hashes rather
 than raw stdout/stderr. Tool results can still contain bounded diagnostic output.
+Product checks and dependency audits also retain complete stdout/stderr under
+`.security-mcp/command-logs/`, including failed registry audit responses.
 Keep credentials out of source control and avoid secrets in command arguments,
 product logs, or reports. GitLab queries and advisory requests send the relevant
 project or vulnerability/package identifiers to their configured services.
@@ -544,17 +550,60 @@ silently ignored. Pacing is visible in progress output. Successful records and
 ordinary 404 misses are cached; failed reads are not cached as valid evidence.
 Persistent outages remain unresolved unless an independently verified GitLab
 target can proceed through the normal qualification/validation gates.
+An NVD identifier record without usable package/version bounds is incomplete
+evidence, not proof that no fix exists or that the installed version is safe.
+It requires manual review. A no-fix assessment requires confirmed affected-version
+evidence; explicit GitLab fix candidates still use the normal target checks.
+GitLab solution lists such as `Upgrade to versions 7.30.2, 8.12.4 or above.`
+retain every explicit fixed version. The smallest version newer than the local
+dependency is checked as a candidate; plural wording does not discard the fix,
+and unrelated version numbers elsewhere in the prose are not treated as fixes.
 
 GitLab Maven package names in either `group:artifact` or `group/artifact`
 format are matched to canonical Maven/Gradle coordinates, including version
 catalogs. Artifact names from a different group are not treated as a match.
 Packages that are genuinely absent or only transitively referenced still need
 dependency-tree evidence; coordinate normalization does not invent a local match.
+For unresolved Gradle coordinates, verification invokes the allowlisted wrapper
+or `gradle --no-daemon dependencies` for the scanner-cited component. Concurrent
+findings share one report while the checkout and tool remain unchanged, with a
+bounded eight-component cache. Selected versions, not requested versions or BOM
+constraint-only rows, provide local evidence. Failed, conflicting, unresolved,
+truncated-without-logs, or source-changing inspections cannot prove absence or
+authorize a fix. Complete stdout/stderr logs and per-finding inspection outcomes
+are retained in state and reports; full-log parsing is bounded to 8 MiB.
+Failures are shared across different findings, but re-verifying the same
+unresolved finding retries inspection instead of permanently caching the error.
+Public advisory checks still run when Java/NuGet local resolution is incomplete.
+Unresolved packages remain manual review even if an online lookup says unaffected.
+Resolved Gradle transitives with available fixes require a reviewed parent/BOM
+update or constraint; the server does not blindly add force rules.
 
-Each checkout's tools are serialized with that engine's lock. Two checkouts in
-the same process do not share that lock. Shutdown copies the registry, then
+An advisory that explicitly says upgrading alone does not fix affected code is
+manual review, even when it names a fixed release. A version-only plan cannot
+establish remediation for such an issue.
+
+Independent finding verifications within a checkout may overlap, up to eight
+at a time. They assess detached finding copies and commit decisions/snapshots
+under the engine lock. Repeat verification of the same finding waits its turn.
+Other tools, checkout edits, reports, and shutdown wait for active verifications;
+they never consume a half-committed assessment. Two checkouts in
+the same process do not share the engine lock. Shutdown copies the registry, then
 closes every owned client after its in-flight read finishes, and later calls
 are rejected. Tool results are detached snapshots rather than live state.
+Advisory reads keep consulted sites request-local, share in-flight/cache results
+for identical GETs and package/version POST queries, and retain the bounded
+256-entry cache. Cache hits do not invent new HTTP timing records. NVD pacing
+and source priority are unchanged.
+
+Reports retain pipeline IDs, SHAs, and refs per finding instead of showing an
+unknown global pipeline when GitLab returned individual provenance. Verified
+but unapplied fix candidates remain in the unresolved-issues table.
+The final summary and JSON `validation_caveats` explicitly disclose non-green
+pre-change lint and optional checks, including unavailable dependency audits and
+missing optional runtimes. Required product validation can pass without claiming
+a clean security audit. An unavailable corporate registry audit is not retried
+against a public registry.
 
 Independent documentation pages and advisory identifiers are fetched together,
 at most eight at a time per batch, and returned in request order. Submission is
@@ -673,6 +722,15 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
   in the final matrix, sharing exact build/test results rather than rerunning them.
   Corporate-policy mode additionally requires positive, untruncated runtime
   smoke and full resolved-dependency license checks with configured markers.
+
+When separately qualified findings propose the exact same package plan, the server
+can associate them with an already-applied edit only while every backed-up
+dependency path still matches its applied hash. The change records `reused_from`;
+it does not rewrite files or repeat the lockfile command. Only this no-write path
+can reuse successful common publisher evidence; each finding's CVE/CWE and
+rule-specific pages are still read freshly. Actual edits always require fresh
+publisher reads. Each association still requires its own qualification and final
+validation, and retains guarded rollback evidence.
 
 An incompatible or uncertain target is skipped for review. All major, minor,
 revision and build updates require `compatible_without_code_changes: true`

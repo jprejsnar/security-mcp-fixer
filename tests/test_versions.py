@@ -1,5 +1,7 @@
 """Check safe fixed-version selection and conservative range evaluation."""
 
+import pytest
+
 from gitlab_security_mcp.versions import (
     bump_npm_spec,
     lowest_fixed,
@@ -8,6 +10,28 @@ from gitlab_security_mcp.versions import (
     range_allows,
     range_contains,
 )
+
+
+@pytest.mark.parametrize(
+    "solution, expected",
+    [
+        ("Upgrade to versions 7.30.2, 8.12.4 or above.", ["7.30.2", "8.12.4"]),
+        ("Fixed in versions v1.2.3 and v2.4.0.", ["1.2.3", "2.4.0"]),
+        ("Update to 1.2.3, 1.2.3, or 2.0.0.", ["1.2.3", "2.0.0"]),
+        ("Patched in version 1.2.3; requires runtime 24.0.0.", ["1.2.3"]),
+        ("Affected versions 7.30.1 and 8.12.3. No solution is available.", []),
+    ],
+)
+def test_fixed_version_lists_exclude_unrelated_versions(solution, expected):
+    """Keep all explicit fix alternatives without harvesting unrelated prose."""
+    # Arrange
+    text = solution
+
+    # Act
+    parsed = parse_fixed_versions(text)
+
+    # Assert
+    assert parsed == expected
 
 
 def test_lowest_fixed_is_the_next_patch():

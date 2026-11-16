@@ -6,6 +6,8 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -164,15 +166,25 @@ class AdvisoryClient:
         self.http_log_path = http_log_path
         self._cache: dict[str, dict | list | None] = {}
         self._closed = False
+        self._closing = False
         self._lock = threading.RLock()
         self._cache_lock = threading.Lock()
-        self._validation_sites: set[str] = set()
+        self._idle = threading.Condition(self._lock)
+        self._active_lookups = 0
+        self._cache_ready = threading.Condition(self._cache_lock)
+        self._pending: set[str] = set()
+        self._validation_sites: ContextVar[set[str] | None] = ContextVar(
+            "advisory_validation_sites", default=None
+        )
 
     def close(self) -> None:
         """Release cached payloads and owned HTTP resources exactly once."""
         with self._lock:
-            if self._closed:
+            if self._closing:
+                self._idle.wait_for(lambda: self._closed)
                 return
+            self._closing = True
+            self._idle.wait_for(lambda: self._active_lookups == 0)
             try:
                 if self._owns_http:
                     self.http.close()
@@ -180,6 +192,7 @@ class AdvisoryClient:
                 with self._cache_lock:
                     self._cache.clear()
                 self._closed = True
+                self._idle.notify_all()
 
     def __enter__(self) -> AdvisoryClient:
         """Return this advisory client for use in a context manager."""
@@ -204,14 +217,21 @@ class AdvisoryClient:
         affected status, candidate fixes, and sources.
         Failed requests, malformed responses, and calls after close return
         lookup_failed rather than claiming the version is safe. The engine may
-        still use an explicit GitLab fix. Serialize access with shutdown and
+        still use an explicit GitLab fix. Coordinate active reads with shutdown and
         retain sites consulted even when no record or fix data is available.
         """
         with self._lock:
-            self._validation_sites = set()
+            if self._closing:
+                return AdvisoryLookup(
+                    outcome="lookup_failed",
+                    summary="Online advisory data could not be read safely.",
+                    errors=["Advisory client is closed"],
+                )
+            self._active_lookups += 1
+        sites: set[str] = set()
+        token = self._validation_sites.set(sites)
+        try:
             try:
-                if self._closed:
-                    raise RuntimeError("Advisory client is closed")
                 result = self._lookup(finding, ecosystem, package, version)
             except (
                 httpx.HTTPError,
@@ -225,8 +245,13 @@ class AdvisoryClient:
                     summary="Online advisory data could not be read safely.",
                     errors=[self._clean(str(exc))],
                 )
-            result.validation_sites = sorted(self._validation_sites)
+            result.validation_sites = sorted(sites)
             return result
+        finally:
+            self._validation_sites.reset(token)
+            with self._idle:
+                self._active_lookups -= 1
+                self._idle.notify_all()
 
     def _lookup(
         self,
@@ -456,57 +481,90 @@ class AdvisoryClient:
                 f"{name}={value}" for name, value in sorted((params or {}).items())
             )
         )
-        with self._cache_lock:
-            self._validation_sites.add(
-                str(httpx.URL(url).copy_with(path="", query=None, fragment=None))
-            )
-            if key in self._cache:
-                return self._cache[key]
-        if url == NVD_CVE:
-            _nvd_wait(bool(self.nvd_api_key))
-        with timed_http_stream(
-            self.http,
-            "GET",
-            url,
-            source="advisory",
-            log_path=self.http_log_path,
-            params=params,
-            headers=headers,
-        ) as response:
-            if response.status_code == 404:
-                payload = None
-            else:
+        self._record_site(url)
+
+        def fetch() -> dict | list | None:
+            """Read one uncached record after any required NVD pacing."""
+            if url == NVD_CVE:
+                _nvd_wait(bool(self.nvd_api_key))
+            with timed_http_stream(
+                self.http,
+                "GET",
+                url,
+                source="advisory",
+                log_path=self.http_log_path,
+                params=params,
+                headers=headers,
+            ) as response:
+                if response.status_code == 404:
+                    return None
                 response.raise_for_status()
-                payload = _decode_advisory(response)
-        with self._cache_lock:
+                return _decode_advisory(response)
+
+        return self._cached_json(key, fetch)
+
+    def _cached_json(
+        self, key: str, fetch: Callable[[], dict | list | None]
+    ) -> dict | list | None:
+        """Share in-flight reads and cache only successfully decoded responses."""
+        with self._cache_ready:
+            self._cache_ready.wait_for(lambda: key not in self._pending)
             if key in self._cache:
                 return self._cache[key]
-            self._cache[key] = payload
-            if len(self._cache) > MAX_CACHE_ENTRIES:
-                self._cache.pop(next(iter(self._cache)))
-        return payload
+            self._pending.add(key)
+        try:
+            payload = fetch()
+            with self._cache_ready:
+                self._cache[key] = payload
+                if len(self._cache) > MAX_CACHE_ENTRIES:
+                    self._cache.pop(next(iter(self._cache)))
+            return payload
+        finally:
+            with self._cache_ready:
+                self._pending.remove(key)
+                self._cache_ready.notify_all()
 
     def _post_json(self, url: str, body: dict) -> dict | None:
-        """Submit an advisory query and close its response after parsing."""
-        with self._cache_lock:
-            self._validation_sites.add(
-                str(httpx.URL(url).copy_with(path="", query=None, fragment=None))
-            )
-        with timed_http_stream(
-            self.http,
-            "POST",
-            url,
-            source="advisory",
-            log_path=self.http_log_path,
-            json=body,
-        ) as response:
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            payload = _decode_advisory(response)
-        if not isinstance(payload, dict):
+        """Cache repeated package/version queries and close responses after parsing."""
+        self._record_site(url)
+        key = (
+            "POST "
+            + url
+            + " "
+            + json.dumps(body, sort_keys=True, separators=(",", ":"))
+        )
+
+        def fetch() -> dict | None:
+            """Validate query responses before admitting them to the shared cache."""
+            with timed_http_stream(
+                self.http,
+                "POST",
+                url,
+                source="advisory",
+                log_path=self.http_log_path,
+                json=body,
+            ) as response:
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                payload = _decode_advisory(response)
+            if not isinstance(payload, dict):
+                raise ValueError("Advisory query response must be a JSON object")
+            return payload
+
+        payload = self._cached_json(key, fetch)
+        if payload is not None and not isinstance(payload, dict):
             raise ValueError("Advisory query response must be a JSON object")
         return payload
+
+    def _record_site(self, url: str) -> None:
+        """Retain consulted hosts only in the current lookup's request context."""
+        with self._cache_lock:
+            sites = self._validation_sites.get()
+            if sites is not None:
+                sites.add(
+                    str(httpx.URL(url).copy_with(path="", query=None, fragment=None))
+                )
 
     def _clean(self, text: str) -> str:
         """Redact advisory credentials before returning request details."""
@@ -793,6 +851,7 @@ def _from_nvd(
     current = parse_version(version) if version else None
     votes: list[bool] = []
     saw_vulnerable = False
+    matched_product = False
     wanted = _product_key(package) if package else None
     for config in cve.get("configurations") or []:
         for node in config.get("nodes") or []:
@@ -805,6 +864,7 @@ def _from_nvd(
                 product = _cpe_product(str(match.get("criteria") or ""))
                 if wanted and (product is None or product.replace("-", "_") != wanted):
                     continue
+                matched_product = True
                 end_excluding = match.get("versionEndExcluding")
                 end_including = match.get("versionEndIncluding")
                 start_including = match.get("versionStartIncluding") or "0"
@@ -829,10 +889,17 @@ def _from_nvd(
                     votes.append(current < end_excluding_version)
                 elif end_including_version is not None:
                     votes.append(current <= end_including_version)
-    if wanted and saw_vulnerable and not ranges and not votes:
+    if wanted and saw_vulnerable and not matched_product:
         return AdvisoryLookup(
             outcome=PACKAGE_MISMATCH,
             summary=f"NVD lists this CVE, but no affected product matches {package}.",
+            sources=sources,
+            errors=errors,
+        )
+    if not ranges:
+        return AdvisoryLookup(
+            outcome="lookup_failed",
+            summary="NVD lists this CVE, but usable affected-version bounds for this package are missing. Manual review is required; missing bounds do not establish that no fix exists.",
             sources=sources,
             errors=errors,
         )
@@ -848,7 +915,7 @@ def _from_nvd(
             outcome="no_fix_published",
             affected=affected,
             ranges=ranges,
-            summary="NVD does not publish a versionEndExcluding fix for this CVE.",
+            summary="NVD records an affected range but no fixed-version bound for this package. This does not establish that no fix exists in other sources.",
             sources=sources,
             errors=errors,
         )

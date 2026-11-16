@@ -615,6 +615,8 @@ class CommandRunner:
             | {
                 "clean",
                 "install",
+                "audit",
+                "dependencies",
                 "verify",
                 "format",
                 "checkstyle:check",

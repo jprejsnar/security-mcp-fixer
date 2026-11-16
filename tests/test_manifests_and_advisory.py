@@ -1086,7 +1086,9 @@ def test_plan_picks_lockfile_when_range_already_allows(tmp_path):
     assert plan.score == 1
 
 
-@pytest.mark.parametrize("directory", ["node_modules", ".pnpm-store", ".angular"])
+@pytest.mark.parametrize(
+    "directory", ["node_modules", ".pnpm-store", ".angular", ".gradle"]
+)
 def test_dependency_directories_are_not_scanned(tmp_path, directory):
     """Dependency directories are not scanned."""
     # Arrange

@@ -25,6 +25,7 @@ SKIP_DIRS = {
     "node_modules",
     ".pnpm-store",
     ".angular",
+    ".gradle",
     "bin",
     "obj",
     "target",
@@ -569,6 +570,45 @@ def _gradle_hit(root: Path, path: Path, name: str, version: str) -> PackageHit:
         manifest=_rel(root, path),
         lockfile=None,
         direct=True,
+    )
+
+
+def gradle_report_package(
+    root: Path, manifest: Path, name: str, report: str
+) -> PackageHit | None:
+    """Resolve one coordinate only when all actual Gradle selections agree."""
+    group, artifact = _split_maven_name(name)
+    if not group or not artifact:
+        return None
+    coordinate = f"{group}:{artifact}"
+    pattern = re.compile(
+        rf"(?m)^[\s|+\\-]+{re.escape(coordinate)}:([^\s]+)"
+        r"(?:[ \t]+->[ \t]+([^\s]+))?([^\r\n]*)\r?$"
+    )
+    versions = set()
+    for match in pattern.finditer(report):
+        requested, selected, suffix = match.groups()
+        if "(c)" in suffix:
+            continue
+        version = selected or requested
+        if "FAILED" in suffix or "(n)" in suffix or parse_version(version) is None:
+            raise ValueError(
+                f"Gradle did not resolve a concrete version of {coordinate}"
+            )
+        versions.add(version)
+    if len(versions) > 1:
+        raise ValueError(f"Gradle selected conflicting versions of {coordinate}")
+    if not versions:
+        return None
+    return PackageHit(
+        ecosystem="Maven",
+        manager="gradle",
+        name=coordinate,
+        version=versions.pop(),
+        spec=None,
+        manifest=_rel(root, manifest),
+        lockfile=None,
+        direct=False,
     )
 
 

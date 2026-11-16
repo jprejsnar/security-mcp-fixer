@@ -467,6 +467,131 @@ def pending_package_batch(package_engine, package_review, request):
     return package_engine
 
 
+@pytest.fixture
+def duplicate_package_update(package_engine, package_review):
+    """Verify six findings before applying their identical physical update."""
+    root = package_engine.repo_root
+    (root / "package-lock.json").write_text(
+        '{"packages":{"node_modules/example":{"version":"1.0.0"}}}', encoding="utf-8"
+    )
+    for index in range(1, 6):
+        extra = deepcopy(package_engine.state.findings[0])
+        extra["id"] = "same-package" if index == 1 else f"same-package-{index}"
+        package_engine.state.findings.append(extra)
+    for finding in package_engine.state.findings:
+        package_engine.verify_security_finding(finding["id"])
+    assert (
+        package_engine.qualify_package_update("package", package_review)["status"]
+        == "QUALIFIED"
+    )
+    first = package_engine.apply_minimal_fix("package")
+    assert first["status"] == "APPLIED"
+    return package_engine, package_review, first
+
+
+def test_identical_package_fix_reuses_edit_only_after_own_qualification(
+    duplicate_package_update,
+):
+    """Associate another CVE without another write, install, or catalog download."""
+    # Arrange
+    engine, review, first = duplicate_package_update
+    manifest = engine.repo_root / "package.json"
+    original = manifest.read_bytes()
+
+    # Act
+    blocked = engine.apply_minimal_fix("same-package")
+    qualified = []
+    associated = []
+    for finding in engine.state.findings[1:]:
+        finding_id = finding["id"]
+        qualified.append(engine.qualify_package_update(finding_id, review))
+        associated.append(engine.apply_minimal_fix(finding_id))
+    pending = [
+        finding["packageQualification"]["status"] for finding in engine.state.findings
+    ]
+    validation = engine.run_validation_matrix()
+    installs = [
+        call for call in engine.runner.run.call_args_list if "install" in call.args[0]
+    ]
+
+    # Assert
+    assert blocked["status"] == "QUALIFICATION_REQUIRED"
+    assert all(result["status"] == "QUALIFIED" for result in qualified)
+    assert all(result["status"] == "APPLIED" for result in associated)
+    assert all(
+        result["change"]["reused_from"] == first["finding_id"] for result in associated
+    )
+    assert all(result["change"]["commands"] == [] for result in associated)
+    assert len(installs) == 1
+    assert manifest.read_bytes() == original
+    assert pending == ["PENDING_VALIDATION"] * 6
+    assert validation["status"] == "VALIDATION_COMPLETE", validation
+    assert all(
+        finding["packageQualification"]["status"] == "VALIDATED"
+        for finding in engine.state.findings
+    )
+
+
+def test_changed_dependency_files_prevent_edit_reuse(duplicate_package_update):
+    """An earlier updater receipt never masks later dependency edits."""
+    # Arrange
+    engine, review, _first = duplicate_package_update
+    manifest = engine.repo_root / "package.json"
+    data = json.loads(manifest.read_text())
+    data["dependencies"]["example"] = "1.0.0"
+    manifest.write_text(json.dumps(data))
+
+    # Act
+    qualified = engine.qualify_package_update("same-package", review)
+    second = engine.apply_minimal_fix("same-package")
+    installs = [
+        call for call in engine.runner.run.call_args_list if "install" in call.args[0]
+    ]
+
+    # Assert
+    assert qualified["status"] == "QUALIFIED"
+    assert second["status"] == "APPLIED"
+    assert not second["change"].get("reused_from")
+    assert len(installs) == 2
+
+
+def test_shared_update_failure_restores_original_dependency(duplicate_package_update):
+    """Shared finding associations keep the physical edit's guarded rollback."""
+    # Arrange
+    engine, review, _first = duplicate_package_update
+    manifest = engine.repo_root / "package.json"
+    assert (
+        engine.qualify_package_update("same-package", review)["status"] == "QUALIFIED"
+    )
+    assert engine.apply_minimal_fix("same-package")["status"] == "APPLIED"
+
+    def execute(argv, **_kwargs):
+        """Reject the target but permit all checks on the restored baseline."""
+        updated = json.loads(manifest.read_text())["dependencies"]["example"] == "1.0.1"
+        failed = updated and argv[1:] == ["run", "build"]
+        return CommandResult(
+            argv,
+            int(failed),
+            "CHECK_PASSED",
+            "incompatible update" if failed else "",
+            0,
+            False,
+            "out",
+            "err",
+        )
+
+    engine.runner.run.side_effect = execute
+
+    # Act
+    result = engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == "FIX_REJECTED", result
+    assert json.loads(manifest.read_text())["dependencies"]["example"] == "1.0.0"
+    assert all(change["status"] == "ROLLED_BACK" for change in engine.state.changes)
+    assert not engine.state.manual_cleanup_required
+
+
 def test_package_batch_builds_and_tests_once(pending_package_batch):
     """Apply independent updates before a single final build and unit-test run."""
     # Arrange

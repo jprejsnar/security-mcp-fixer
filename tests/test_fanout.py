@@ -15,6 +15,296 @@ from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
 from gitlab_security_mcp.util import timed_http_stream
 
 
+def test_existing_fix_reuses_catalog_only_and_actual_edits_still_read_fresh(tmp_path):
+    """Avoid repeated publisher transfers only when associating an unchanged edit."""
+    # Arrange
+    requests = []
+    markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
+    name, url, marker = REQUIRED_DOCS[0]
+    rule_page = {"name": name, "url": url, "markers": [marker]}
+
+    def handler(request):
+        """Include catalog and identifier markers without leaving the local transport."""
+        requests.append(str(request.url))
+        return httpx.Response(200, text=markers + " " + str(request.url))
+
+    path = tmp_path / "http-timings.jsonl"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with OfficialDocs(http=http, http_log_path=path) as docs:
+            first = docs.read_before_fix({"identifiers": ["CVE-2020-0001"]})
+
+            # Act
+            second = docs.read_for_existing_fix(
+                {"identifiers": ["CVE-2020-0002"]}, first.as_list(), [rule_page]
+            )
+            after_shared = list(requests)
+            fresh = docs.read_before_fix({"identifiers": ["CVE-2020-0002"]})
+
+    # Assert
+    assert first.complete and second.complete and fresh.complete
+    assert after_shared.count(rule_page["url"]) == 2
+    assert requests.count(rule_page["url"]) == 3
+    assert all(
+        after_shared.count(url) == 1 for _name, url, _marker in REQUIRED_DOCS[1:]
+    )
+    assert all(requests.count(url) == 2 for _name, url, _marker in REQUIRED_DOCS[1:])
+    assert any("CVE-2020-0002" in url for url in after_shared)
+    assert not any("CVE-2020-0001" in source.url for source in second.sources)
+    assert len(path.read_text().splitlines()) == len(requests)
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_parallel_gradle_findings_share_one_dependency_inspection(tmp_path, exit_code):
+    """Five parallel findings reuse one complete tree rather than spawning five builds."""
+    # Arrange
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.advisory import AdvisoryLookup
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.engine import Engine
+
+    (tmp_path / "build.gradle").write_text("dependencies { }\n", encoding="utf-8")
+    barrier = threading.Barrier(5)
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        ["gradle", "--no-daemon", "dependencies"],
+        exit_code,
+        "+--- io.example:library:1.0.0\n",
+        "",
+        0,
+        False,
+        "out",
+        "err",
+    )
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="no_fix_published", affected=True, summary="No fixed version published."
+    )
+    engine = Engine(
+        tmp_path,
+        runner=runner,
+        gitlab=Mock(),
+        advisory=advisory,
+        which=lambda name: "gradle" if name == "gradle" else None,
+    )
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [
+        {
+            "id": str(index),
+            "component": "io.example/library",
+            "installedVersion": "1.0.0",
+            "category": "dependency_scanning",
+            "location": {"file": "build.gradle"},
+        }
+        for index in range(5)
+    ]
+
+    def verify(finding_id):
+        """Start all findings together to exercise in-flight sharing."""
+        barrier.wait(timeout=5)
+        return engine.verify_security_finding(finding_id)
+
+    # Act
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(verify, [str(index) for index in range(5)]))
+
+    # Assert
+    runner.run.assert_called_once()
+    assert advisory.lookup.call_count == 5
+    expected = "MANUAL_REVIEW" if exit_code else "NO_SAFE_FIX"
+    assert all(result["decision"] == expected for result in results)
+    assert all(
+        finding["dependencyResolution"]["status"]
+        == ("FAILED" if exit_code else "RESOLVED")
+        for finding in engine.state.findings
+    )
+    engine.verify_security_finding("0")
+    assert runner.run.call_count == (2 if exit_code else 1)
+
+
+def test_advisory_lookups_overlap_without_mixing_validation_sites():
+    """Independent findings share connections but not consulted-site evidence."""
+    # Arrange
+    rendezvous = threading.Barrier(2)
+
+    def handler(request):
+        """Require both lookups to enter before allowing either to finish."""
+        if request.url.host == "api.osv.dev":
+            ident = request.url.path.rsplit("/", 1)[-1]
+            if ident == "CVE-2020-0002":
+                return httpx.Response(404)
+        else:
+            ident = "CVE-2020-0002"
+        rendezvous.wait(timeout=3)
+        record = {
+            "id": ident,
+            "affected": [
+                {
+                    "package": {"ecosystem": "npm", "name": "left-pad"},
+                    "ranges": [
+                        {
+                            "type": "SEMVER",
+                            "events": [{"introduced": "0"}, {"fixed": "1.2.0"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        if request.url.host == "api.github.com":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "vulnerabilities": [
+                            {
+                                "package": {"ecosystem": "npm", "name": "left-pad"},
+                                "vulnerable_version_range": "< 1.2.0",
+                                "first_patched_version": "1.2.0",
+                            }
+                        ],
+                    }
+                ],
+            )
+        return httpx.Response(200, json=record)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            results = map_ordered(
+                lambda ident: client.lookup(
+                    {"identifiers": [ident]}, "npm", "left-pad", None
+                ),
+                ["CVE-2020-0001", "CVE-2020-0002"],
+            )
+
+    # Assert
+    assert [result.outcome for result in results] == ["resolved", "resolved"]
+    assert results[0].validation_sites == ["https://api.osv.dev"]
+    assert results[1].validation_sites == [
+        "https://api.github.com",
+        "https://api.osv.dev",
+    ]
+
+
+def test_advisory_close_waits_for_active_lookup():
+    """Never close the connection pool while a concurrent lookup is reading."""
+    # Arrange
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release, closing = threading.Event(), threading.Event(), threading.Event()
+
+    def handler(_request):
+        """Keep an advisory read active until shutdown has attempted to start."""
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("Test release timed out")
+        return httpx.Response(
+            200,
+            json={
+                "id": "CVE-2020-0001",
+                "affected": [
+                    {
+                        "package": {"ecosystem": "npm", "name": "left-pad"},
+                        "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}],
+                    }
+                ],
+            },
+        )
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = AdvisoryClient(http=http)
+
+        def close():
+            """Record that the closer thread has begun before requesting shutdown."""
+            closing.set()
+            client.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            lookup = pool.submit(
+                client.lookup,
+                {"identifiers": ["CVE-2020-0001"]},
+                "npm",
+                "left-pad",
+                "1.0.0",
+            )
+            try:
+                assert entered.wait(3)
+                closer = pool.submit(close)
+                assert closing.wait(3)
+                with pytest.raises(TimeoutError):
+                    closer.result(timeout=0.1)
+            finally:
+                release.set()
+            result = lookup.result(timeout=5)
+            closer.result(timeout=5)
+
+        # Assert
+        assert result.outcome == "no_fix_published"
+        assert client.lookup({}, "npm", "left-pad", "1.0.0").outcome == "lookup_failed"
+        assert not http.is_closed
+
+
+@pytest.mark.parametrize("failure", [503, "invalid_shape"])
+def test_failed_package_query_is_not_cached(failure):
+    """A failed shared POST does not poison subsequent advisory evidence."""
+    # Arrange
+    requests = []
+
+    def handler(request):
+        """Recover from the first HTTP or response-shape failure."""
+        requests.append(request)
+        if len(requests) == 1:
+            return (
+                httpx.Response(503) if failure == 503 else httpx.Response(200, json=[])
+            )
+        return httpx.Response(200, json={"vulns": []})
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            with pytest.raises((httpx.HTTPStatusError, ValueError)):
+                client._post_json("https://api.osv.dev/v1/query", {})
+            recovered = client._post_json("https://api.osv.dev/v1/query", {})
+            cached = client._post_json("https://api.osv.dev/v1/query", {})
+
+    # Assert
+    assert recovered == cached == {"vulns": []}
+    assert len(requests) == 2
+
+
+def test_identical_package_queries_share_one_cached_request():
+    """Repeated findings for one installed package reuse its bounded query result."""
+    # Arrange
+    requests = []
+
+    def handler(request):
+        """Count package queries independently of identifier-specific reads."""
+        requests.append(request)
+        return httpx.Response(200, json={"vulns": []})
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            body = {
+                "package": {"ecosystem": "npm", "name": "left-pad"},
+                "version": "1.0.0",
+            }
+            results = map_ordered(
+                lambda _: client._post_json("https://api.osv.dev/v1/query", body),
+                range(8),
+            )
+            distinct = client._post_json(
+                "https://api.osv.dev/v1/query", {**body, "version": "1.1.0"}
+            )
+
+    # Assert
+    assert results == [{"vulns": []}] * 8
+    assert distinct == {"vulns": []}
+    assert len(requests) == 2
+
+
 @pytest.mark.parametrize("outcome", ["success", "http_error", "timeout", "body_error"])
 def test_http_timings_include_body_failures_without_secrets(
     tmp_path, monkeypatch, outcome

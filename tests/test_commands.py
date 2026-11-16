@@ -724,8 +724,16 @@ def test_timeout_kills_the_command_and_reports_124(repo):
 
 
 @pytest.mark.parametrize("code", [0, 1])
+@pytest.mark.parametrize(
+    "tool,operation",
+    [
+        ("pnpm", ["test"]),
+        ("pnpm", ["audit", "--json"]),
+        ("gradle", ["--no-daemon", "dependencies"]),
+    ],
+)
 def test_product_logs_preserve_all_output_and_final_summary(
-    tmp_path, monkeypatch, code
+    tmp_path, monkeypatch, code, tool, operation
 ):
     """Keep complete disk logs and final diagnostics without unbounded RAM previews."""
     # Arrange
@@ -740,7 +748,7 @@ def test_product_logs_preserve_all_output_and_final_summary(
 
     def product_process(argv, **kwargs):
         """Replace only the test's pnpm command with a deterministic noisy child."""
-        assert argv == ["pnpm", "test"]
+        assert argv == [tool, *operation]
         return real_popen([sys.executable, "-c", script], **kwargs)
 
     monkeypatch.setattr(commands.subprocess, "Popen", product_process)
@@ -748,7 +756,7 @@ def test_product_logs_preserve_all_output_and_final_summary(
     runner = CommandRunner(tmp_path, max_output=128, progress_callback=updates.append)
 
     # Act
-    result = runner.run(["pnpm", "test"], timeout=30, check=False)
+    result = runner.run([tool, *operation], timeout=30, check=False)
     record = json.loads(runner.audit_path.read_text(encoding="utf-8").splitlines()[-1])
 
     # Assert
@@ -768,7 +776,8 @@ def test_product_logs_preserve_all_output_and_final_summary(
     )
     assert record["stdout_log_path"] == result.stdout_log_path
     assert record["stderr_log_path"] == result.stderr_log_path
-    assert any("4910/4910 tests (100%)" in text for text in updates)
+    if operation == ["test"]:
+        assert any("4910/4910 tests (100%)" in text for text in updates)
     assert updates[-1].endswith(f"command finished; exit {code}")
     assert ("!" * 20 if code else "#" * 20) in updates[-1]
 

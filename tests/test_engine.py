@@ -960,6 +960,215 @@ def _finding(fid, package, identifier, version="1.0.0"):
     }
 
 
+@pytest.mark.parametrize("target_affected", [None, True])
+def test_plural_gitlab_fix_reaches_transitive_pnpm_plan(tmp_path, target_affected):
+    """Recover the logged undici fix while retaining target-conflict safeguards."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.gitlab_client import normalize_finding
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    manifest = frontend / "package.json"
+    manifest.write_text('{"name":"frontend"}', encoding="utf-8")
+    (frontend / "pnpm-lock.yaml").write_text(
+        "packages:\n  undici@7.30.1: {}\n", encoding="utf-8"
+    )
+    finding = normalize_finding(
+        {
+            "uuid": "undici-plural",
+            "title": "Origin validation",
+            "reportType": "DEPENDENCY_SCANNING",
+            "solution": "Upgrade to versions 7.30.2, 8.12.4 or above.",
+            "location": {
+                "file": "frontend/pnpm-lock.yaml",
+                "dependency": {"package": {"name": "undici"}, "version": "7.30.1"},
+            },
+        },
+        None,
+    )
+    advisory = Mock()
+    advisory.lookup.side_effect = [
+        AdvisoryLookup(outcome="lookup_failed", summary="Version bounds missing."),
+        AdvisoryLookup(
+            outcome="resolved" if target_affected else "lookup_failed",
+            affected=target_affected,
+            summary="Target advisory evidence.",
+        ),
+    ]
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding("undici-plural")
+
+    # Assert
+    assert finding["fixedVersions"] == ["7.30.2", "8.12.4"]
+    if target_affected:
+        assert result["decision"] == "MANUAL_REVIEW"
+        assert result["proposed_fix"] is None
+    else:
+        assert result["decision"] == "CHANGE_REQUIRED"
+        assert result["proposed_fix"]["strategy"] == "override"
+        assert result["proposed_fix"]["target"] == "7.30.2"
+        assert result["qualification_required"] is True
+        assert result["eligible_for_auto_fix"] is False
+    assert manifest.read_text(encoding="utf-8") == '{"name":"frontend"}'
+
+
+def test_unknown_affected_version_is_not_a_definitive_no_solution(tmp_path):
+    """Incomplete advisory metadata stays actionable as manual review."""
+    # Arrange
+    from unittest.mock import Mock
+
+    (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"4.17.20"}}')
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="no_fix_published", affected=None, summary="No fixed bound published."
+    )
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [_finding("unknown", "lodash", "CVE-2021-23337", "4.17.20")]
+
+    # Act
+    result = engine.verify_security_finding("unknown")
+
+    # Assert
+    assert result["decision"] == "MANUAL_REVIEW"
+    assert result["user_prompt"]
+    assert engine.state.no_solution == []
+    assert engine.state.skipped_user_prompt[0]["id"] == "unknown"
+
+
+def test_parallel_finding_verification_overlaps_advisories_and_persists_both(tmp_path):
+    """Network waits do not serialize unrelated findings or lose committed decisions."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.fanout import map_ordered
+
+    (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"4.17.20"}}')
+    rendezvous = threading.Barrier(2)
+    advisory = Mock()
+
+    def lookup(*_args):
+        """Require both finding assessments to be in flight together."""
+        rendezvous.wait(timeout=3)
+        return AdvisoryLookup(
+            outcome="no_fix_published", affected=True, summary="No fix published."
+        )
+
+    advisory.lookup.side_effect = lookup
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [
+        _finding(fid, "lodash", "CVE-2021-23337", "4.17.20")
+        for fid in ("first", "second")
+    ]
+
+    # Act
+    results = map_ordered(engine.verify_security_finding, ["first", "second"])
+
+    # Assert
+    assert [result["decision"] for result in results] == ["NO_SAFE_FIX"] * 2
+    saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+    assert set(saved["decisions"]) == {"first", "second"}
+    assert len(saved["no_solution"]) == 2
+    results[0]["evidence"].append("caller mutation")
+    assert "caller mutation" not in engine.state.decisions["first"]["evidence"]
+
+
+@pytest.mark.parametrize(
+    "operation", ["get_run_status", "close", "verify_security_finding"]
+)
+def test_exclusive_tools_and_same_finding_wait_for_verification(tmp_path, operation):
+    """Keep shutdown, snapshots, and repeat assessments behind an active finding."""
+    # Arrange
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import Mock
+
+    (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"4.17.20"}}')
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    advisory = Mock()
+
+    def lookup(*_args):
+        """Retain the finding reservation until the test permits its commit."""
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("Test release timed out")
+        return AdvisoryLookup(
+            outcome="no_fix_published", affected=True, summary="No fix published."
+        )
+
+    advisory.lookup.side_effect = lookup
+    engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [_finding("first", "lodash", "CVE-2021-23337", "4.17.20")]
+
+    def competing_tool():
+        """Mark entry before requesting engine access from another thread."""
+        waiting.set()
+        method = getattr(engine, operation)
+        return method("first") if operation == "verify_security_finding" else method()
+
+    # Act
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(engine.verify_security_finding, "first")
+        try:
+            assert entered.wait(3)
+            second = pool.submit(competing_tool)
+            assert waiting.wait(3)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release.set()
+        first_result, second_result = first.result(timeout=5), second.result(timeout=5)
+
+    # Assert
+    assert first_result["decision"] == "NO_SAFE_FIX"
+    if operation == "close":
+        assert second_result is None
+        assert engine.get_run_status()["status"] == "ERROR"
+    elif operation == "get_run_status":
+        assert second_result["no_solution_count"] == 1
+    else:
+        assert second_result["decision"] == "NO_SAFE_FIX"
+        assert len(engine.state.no_solution) == 1
+
+
+def test_report_keeps_pipeline_provenance_and_unapplied_package_candidates():
+    """Do not lose per-finding pipelines or omit pending package fixes."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+    from gitlab_security_mcp.state import RunState
+
+    finding = _finding("pending", "lodash", "CVE-2021-23337", "4.17.20")
+    finding["pipeline"] = {"id": "pipeline-42", "sha": "abc123", "ref": "main"}
+    finding["proposedFix"] = {
+        "ecosystem": "npm",
+        "package": "lodash",
+        "target": "4.17.21",
+    }
+    state = RunState(
+        status="FINDINGS_LISTED",
+        findings=[finding],
+        decisions={
+            "pending": {"decision": "CHANGE_REQUIRED", "reason": "Upgrade lodash."}
+        },
+    )
+
+    # Act
+    payload, markdown = render(state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    assert payload["finding_pipelines"] == {"pending": finding["pipeline"]}
+    assert "pipeline-42" in markdown and "abc123" in markdown
+    assert payload["unresolved_issues"][0]["id"] == "pending"
+    assert "not been applied" in payload["unresolved_issues"][0]["reason"].lower()
+
+
 def test_mcp_progress_is_delivered_while_tool_is_running(monkeypatch):
     """Send live bars through the request session before returning a tool result."""
     # Arrange
@@ -1900,6 +2109,178 @@ def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
     assert blocked["status"] == "QUALIFICATION_REQUIRED"
 
 
+@pytest.mark.parametrize(
+    "mode",
+    ["resolved", "logged", "failed", "truncated", "conflict", "unresolved", "mutated"],
+)
+def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
+    """Resolve real selected versions once without guessing absent or ambiguous trees."""
+    # Arrange
+    from unittest.mock import Mock
+
+    (tmp_path / "build.gradle").write_text("dependencies { }\n", encoding="utf-8")
+    (tmp_path / "gradle.properties").write_text("platformVersion=1\n", encoding="utf-8")
+    finding = _finding("gradle-transitive", "io.example/library", "CVE-TEST", "1.0.0")
+    finding["location"] = {"file": "build.gradle"}
+    finding["solution"] = "Upgrade to version 1.2.0 or above."
+    output = "+--- io.example:library:1.0.0 -> 1.1.0\n"
+    if mode == "conflict":
+        output += "\\--- io.example:library:1.0.0\n"
+    if mode == "unresolved":
+        output += "\\--- io.example:library:1.0.0 FAILED\n"
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        ["gradle", "--no-daemon", "dependencies"],
+        int(mode == "failed"),
+        output,
+        "Gradle failed" if mode == "failed" else "",
+        0,
+        mode == "truncated",
+        "out",
+        "err",
+    )
+    if mode == "logged":
+        log = tmp_path / ".security-mcp" / "command-logs" / "dependencies.stdout.log"
+        log.parent.mkdir(parents=True)
+        log.write_bytes(
+            b"+--- io.example:library:9.0.0 (c)\r\n"
+            b"+--- io.example:library:1.0.0 -> 1.1.0\r\n"
+            b"\\--- io.example:library:1.1.0 (*)\r\n"
+        )
+        runner.run.return_value.stdout = "capped preview"
+        runner.run.return_value.truncated = True
+        runner.run.return_value.stdout_log_path = str(log)
+    if mode == "mutated":
+
+        def mutate_build_inputs(*_args, **_kwargs):
+            """Reject tree evidence produced while build inputs are changing."""
+            (tmp_path / "gradle.properties").write_text(
+                f"platformVersion={runner.run.call_count + 10}\n", encoding="utf-8"
+            )
+            return runner.run.return_value
+
+        runner.run.side_effect = mutate_build_inputs
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved",
+        affected=True,
+        lowest_fixed_version="1.2.0",
+        fixed_versions=["1.2.0"],
+        summary="Fixed in 1.2.0.",
+        validation_sites=["https://osv.dev"],
+    )
+    if mode not in {"resolved", "logged"}:
+        advisory.lookup.return_value.affected = False
+    engine = Engine(
+        tmp_path,
+        runner=runner,
+        gitlab=Mock(),
+        advisory=advisory,
+        which=lambda name: "gradle" if name == "gradle" else None,
+    )
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    first = engine.verify_security_finding(finding["id"])
+    again = engine.verify_security_finding(finding["id"])
+    before_change = runner.run.call_count
+    (tmp_path / "gradle.properties").write_text("platformVersion=2\n", encoding="utf-8")
+    engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert first["decision"] == again["decision"] == "MANUAL_REVIEW"
+    assert first["proposed_fix"] is None
+    assert "https://osv.dev" in first["security_validation_sites"]
+    successful = mode in {"resolved", "logged"}
+    assert before_change == (1 if successful else 2)
+    assert runner.run.call_count == (2 if successful else 3)
+    expected_version = "1.1.0" if mode in {"resolved", "logged"} else "1.0.0"
+    assert advisory.lookup.call_args.args[1:] == (
+        "Maven",
+        "io.example:library",
+        expected_version,
+    )
+    if mode in {"resolved", "logged"}:
+        assert finding["dependencyResolution"]["version"] == "1.1.0"
+        assert "transitive" in first["reason"].lower()
+        assert "1.2.0" in first["reason"]
+        from gitlab_security_mcp.report import render
+
+        payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+        assert payload["dependency_resolutions"][finding["id"]]["version"] == "1.1.0"
+        assert "Gradle Dependency Inspections" in markdown
+    else:
+        assert finding["dependencyResolution"]["status"] != "RESOLVED"
+        assert any("Gradle" in evidence for evidence in first["evidence"])
+    assert not engine.state.false_positives
+
+
+def test_canonical_maven_coordinate_can_use_explicit_gitlab_target(tmp_path):
+    """Slash-separated scanner names do not disable the exact-package fix fallback."""
+    # Arrange
+    from unittest.mock import Mock
+
+    (tmp_path / "build.gradle").write_text(
+        "dependencies { implementation 'io.example:library:1.0.0' }\n",
+        encoding="utf-8",
+    )
+    finding = _finding("canonical", "io.example/library", "CVE-TEST", "1.0.0")
+    finding["location"] = {"file": "build.gradle"}
+    finding["solution"] = "Upgrade to version 1.2.0 or above."
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="lookup_failed", summary="Public version bounds missing."
+    )
+    engine = Engine(tmp_path, gitlab=Mock(), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert result["decision"] == "CHANGE_REQUIRED"
+    assert result["proposed_fix"]["package"] == "io.example:library"
+    assert result["proposed_fix"]["target"] == "1.2.0"
+    assert [call.args[-1] for call in advisory.lookup.call_args_list] == [
+        "1.0.0",
+        "1.2.0",
+    ]
+
+
+def test_version_only_update_cannot_fix_explicit_source_change_advisory(tmp_path):
+    """A fixed release must not mask a scanner's explicit upgrade-alone warning."""
+    # Arrange
+    from unittest.mock import Mock
+
+    (tmp_path / "package.json").write_text('{"dependencies":{"example":"1.0.0"}}')
+    finding = _finding("source-required", "example", "CVE-TEST", "1.0.0")
+    finding["description"] = (
+        "Version 1.2.0 corrects documentation. Upgrading alone does not fix affected code."
+    )
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved",
+        affected=True,
+        lowest_fixed_version="1.2.0",
+        fixed_versions=["1.2.0"],
+        summary="Fixed release exists.",
+    )
+    engine = Engine(tmp_path, gitlab=Mock(), advisory=advisory)
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert result["decision"] == "MANUAL_REVIEW"
+    assert result["proposed_fix"] is None
+    assert "upgrading alone" in result["reason"].lower()
+    advisory.lookup.assert_called_once()
+
+
 def test_unresolved_java_transitive_dependency_is_not_false_positive(tmp_path):
     """Unresolved java transitive dependency is not false positive."""
     # Arrange
@@ -2768,6 +3149,70 @@ def test_report_says_unknown_when_the_index_cannot_be_read(tmp_path):
     assert payload["git_diff_cached_empty"] is None
     assert "git diff --cached empty: unknown" in markdown
     assert payload["unverified_findings"] == ["a"]
+
+
+@pytest.mark.parametrize("receipt_key", ["packageQualification", "localFixAttempt"])
+def test_inspection_snapshot_keeps_hashes_not_raw_rollback_text(tmp_path, receipt_key):
+    """Keep rollback bytes in memory without repeatedly publishing large lockfiles."""
+    # Arrange
+    import hashlib
+
+    from gitlab_security_mcp.state import RunState
+
+    original = "lockfile-private-content\u00e9\r\n" * 10000
+    receipt = {"dependency_before": {"pnpm-lock.yaml": original, "new-file": None}}
+    state = RunState(findings=[{"id": "a", receipt_key: receipt}])
+
+    # Act
+    state.save(tmp_path)
+    raw = (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+    snapshot = json.loads(raw)["findings"][0][receipt_key]
+
+    # Assert
+    assert len(raw) < len(original) // 20
+    assert "lockfile-private-content" not in raw
+    assert "dependency_before" not in snapshot
+    assert snapshot["dependency_backup_manifest"]["pnpm-lock.yaml"] == {
+        "sha256": hashlib.sha256(original.encode()).hexdigest(),
+        "bytes": len(original.encode()),
+    }
+    assert snapshot["dependency_backup_manifest"]["new-file"] is None
+    assert receipt["dependency_before"]["pnpm-lock.yaml"] == original
+
+
+def test_final_summary_exposes_baseline_and_optional_validation_gaps():
+    """Passing builds/tests do not hide failed lint or unavailable security audits."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+    from gitlab_security_mcp.state import RunState
+
+    state = RunState(
+        validation_status="VALIDATION_COMPLETE",
+        lint_baseline={"results": [{"status": "FAILED", "command": "pnpm run lint"}]},
+        validation_results=[
+            {
+                "status": "INFORMATIONAL",
+                "required": False,
+                "exit_code": 1,
+                "command": "pnpm audit --json",
+                "detail": "ERR_PNPM_AUDIT_BAD_RESPONSE: HTTP 400",
+            },
+            {"status": "SKIPPED", "required": False, "detail": "docker is not on PATH"},
+        ],
+    )
+
+    # Act
+    payload, markdown = render(state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    assert payload["validation_status"] == "VALIDATION_COMPLETE"
+    assert len(payload["validation_caveats"]) == 3
+    summary = payload["final_summary_markdown"]
+    assert "Validation caveats" in summary
+    assert "pnpm run lint" in summary
+    assert "ERR_PNPM_AUDIT_BAD_RESPONSE" in summary
+    assert "docker is not on PATH" in summary
+    assert "not a clean security audit" in markdown.lower()
 
 
 def test_state_snapshot_leaves_no_temp_files(tmp_path):

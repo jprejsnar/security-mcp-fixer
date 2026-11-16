@@ -196,6 +196,37 @@ class OfficialDocs:
         and response failures block required publisher reads only; failed
         security-reference pages are retained as informational evidence.
         """
+        return self._review(finding, doc_pages or [], {})
+
+    def read_for_existing_fix(
+        self,
+        finding: dict,
+        prior_sources: list[dict],
+        doc_pages: list[dict] | None = None,
+    ) -> DocReview:
+        """Reuse successful catalog evidence only for an unchanged, already-applied edit.
+
+        Issue-specific references and rule pages are still fetched for this finding.
+        This must not authorize another physical write; read_before_fix stays fresh.
+        """
+        prior = {
+            (source.get("name"), source.get("url")): source
+            for source in prior_sources
+            if source.get("ok")
+            and source.get("status_code") == 200
+            and source.get("sha256")
+        }
+        reusable = {
+            (name, url, (marker,)): DocSource(**prior[(name, url)])
+            for name, url, marker in REQUIRED_DOCS
+            if (name, url) in prior
+        }
+        return self._review(finding, doc_pages or [], reusable)
+
+    def _review(
+        self, finding: dict, doc_pages: list[dict], reusable: dict
+    ) -> DocReview:
+        """Read current requirements without inventing requests for reused metadata."""
         with self._lock:
             if self._closed:
                 return DocReview(
@@ -210,7 +241,7 @@ class OfficialDocs:
                         ),
                     )
                 )
-            pages = _pages_for(finding, doc_pages or [])
+            pages = _pages_for(finding, doc_pages)
             sink = progress_sink.get()
             completed = 0
             progress_lock = threading.Lock()
@@ -221,7 +252,12 @@ class OfficialDocs:
                 filled = completed * 20 // total if total else 20
                 message = (
                     f"Documentation [{'#' * filled}{'.' * (20 - filled)}] "
-                    f"{completed}/{total} requests completed"
+                    f"{completed}/{total} "
+                    + (
+                        "pages checked (shared edit)"
+                        if reusable
+                        else "requests completed"
+                    )
                 )
                 logger.info(message)
                 if sink is not None:
@@ -235,7 +271,13 @@ class OfficialDocs:
             def read(page: dict) -> DocSource:
                 """Advance the live bar as each concurrent documentation request ends."""
                 nonlocal completed
-                result = self._read_guarded(page)
+                result = (
+                    reusable.get((page["name"], page["url"], tuple(page["markers"])))
+                    if page.get("catalog")
+                    else None
+                )
+                if result is None:
+                    result = self._read_guarded(page)
                 with progress_lock:
                     completed += 1
                     notify()
@@ -357,6 +399,7 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
             "url": url,
             "markers": (marker,),
             "required": name not in INFORMATIONAL_SECURITY_DOCS,
+            "catalog": True,
         }
         for name, url, marker in REQUIRED_DOCS
     ]

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from gitlab_security_mcp.util import atomic_write_text
@@ -41,10 +42,32 @@ class RunState:
     gitlab_dismissals: list[dict] = field(default_factory=list)
 
     def save(self, repo_root: Path) -> None:
-        """Write ``.security-mcp/run-state.json`` without leaving a half-written file."""
+        """Publish an inspection snapshot, not raw in-memory rollback file contents."""
         path = repo_root / ".security-mcp" / "run-state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        text = json.dumps(asdict(self), indent=2, ensure_ascii=False)
+        snapshot = {item.name: getattr(self, item.name) for item in fields(self)}
+        snapshot["findings"] = []
+        for finding in self.findings:
+            inspection = dict(finding)
+            for key in ("packageQualification", "localFixAttempt"):
+                receipt = finding.get(key)
+                if receipt and "dependency_before" in receipt:
+                    inspection[key] = {
+                        name: value
+                        for name, value in receipt.items()
+                        if name != "dependency_before"
+                    }
+                    inspection[key]["dependency_backup_manifest"] = {
+                        name: {
+                            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                            "bytes": len(text.encode("utf-8")),
+                        }
+                        if text is not None
+                        else None
+                        for name, text in receipt["dependency_before"].items()
+                    }
+            snapshot["findings"].append(inspection)
+        text = json.dumps(snapshot, indent=2, ensure_ascii=False)
         atomic_write_text(path, text)
 
     def forget(self, finding_id: str) -> None:

@@ -13,6 +13,53 @@ from gitlab_security_mcp.versions import (
 FINDING = {"identifiers": ["CVE-2021-23337"], "title": "lodash"}
 
 
+@pytest.mark.parametrize(
+    "configurations",
+    [
+        [],
+        [
+            {
+                "nodes": [
+                    {
+                        "cpeMatch": [
+                            {
+                                "vulnerable": True,
+                                "criteria": "cpe:2.3:a:lodash:lodash:*:*:*:*:*:*:*:*",
+                            }
+                        ]
+                    }
+                ]
+            }
+        ],
+    ],
+)
+def test_nvd_without_version_evidence_requires_review(configurations):
+    """Do not convert missing NVD bounds into a definitive no-fix assessment."""
+
+    # Arrange
+    def handler(request):
+        """Return an identifier record without usable affected-version evidence."""
+        if request.url.host == "services.nvd.nist.gov":
+            return httpx.Response(
+                200,
+                json={"vulnerabilities": [{"cve": {"configurations": configurations}}]},
+            )
+        if request.url.host == "api.github.com":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            result = client.lookup(FINDING, "npm", "lodash", "4.17.20")
+
+    # Assert
+    assert result.outcome == "lookup_failed"
+    assert result.affected is None
+    assert result.sources == ["nvd:CVE-2021-23337"]
+    assert "version" in result.summary.lower()
+
+
 @pytest.mark.parametrize("failure", [429, 503, "timeout"])
 def test_nvd_recovers_transient_failures_without_caching_them(failure, nvd_clock):
     """Retry the archive's transient NVD failures and cache only a valid recovery."""

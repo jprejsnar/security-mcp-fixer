@@ -28,6 +28,37 @@ def _finding_label(finding: dict) -> str:
     )
 
 
+def _validation_caveats(state: RunState) -> list[dict]:
+    """Keep non-green lint and optional checks separate from product acceptance."""
+    caveats = []
+    for phase, rows in (
+        ("Pre-change lint", (state.lint_baseline or {}).get("results") or []),
+        ("Optional check", state.validation_results),
+    ):
+        for row in rows:
+            if row.get("status") == "PASSED" or (
+                phase == "Optional check" and row.get("required", True)
+            ):
+                continue
+            item = {"phase": phase}
+            for key in (
+                "status",
+                "command",
+                "detail",
+                "exit_code",
+                "stdout_log_path",
+                "stderr_log_path",
+            ):
+                if key in row:
+                    item[key] = row[key]
+            if row.get("diagnostics"):
+                item["diagnostic_counts"] = {
+                    kind: len(entries) for kind, entries in row["diagnostics"].items()
+                }
+            caveats.append(item)
+    return caveats
+
+
 def _unresolved_issues(state: RunState) -> list[dict]:
     """Collect unique unresolved findings using the latest fix outcomes."""
     reasons = {
@@ -55,6 +86,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
         required = (finding.get("proposedFix") or {}).get("qualifiers") and outcome.get(
             "status"
         ) != "APPLIED"
+        unapplied = decision == "CHANGE_REQUIRED" and outcome.get("status") != "APPLIED"
         if decision == "FALSE_POSITIVE" or (
             outcome.get("status") == "APPLIED" and not pending
         ):
@@ -72,6 +104,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 "REPRODUCTION_REQUIRED",
                 "SOURCE_REVIEW_REQUIRED",
                 "CONFIRMED_VULNERABILITY",
+                "CHANGE_REQUIRED",
             }
             and finding_id not in reasons
             and not failed
@@ -95,6 +128,11 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 "decision": outcome.get("status") if failed else decision,
                 "reason": (outcome.get("detail") if failed or pending else None)
                 or qualification.get("reason")
+                or (
+                    "The verified fix candidate has not been applied. Qualification and successful post-update validation are still required."
+                    if unapplied
+                    else None
+                )
                 or (
                     "Security fix requires reviewed evidence and successful post-update product checks."
                     if pending or required
@@ -242,11 +280,17 @@ def render(
         ),
     ]
     assessments_table = "\n".join(assessment_lines) if assessments else "No findings."
+    finding_pipelines = {
+        finding["id"]: finding["pipeline"]
+        for finding in state.findings
+        if finding.get("pipeline")
+    }
     payload = {
         "run_status": state.status,
         "stop_stage": state.stop_stage,
         "branch": state.branch_name,
         "pipeline": state.pipeline,
+        "finding_pipelines": finding_pipelines,
         "findings_total": len(state.findings),
         "review_status": review_queue["status"],
         "source_review_queue": review_queue,
@@ -256,6 +300,11 @@ def render(
             finding["id"]: sorted(set(finding.get("securityValidationSites") or []))
             for finding in state.findings
         },
+        "dependency_resolutions": {
+            finding["id"]: finding["dependencyResolution"]
+            for finding in state.findings
+            if finding.get("dependencyResolution")
+        },
         "unverified_findings": unverified,
         "excluded_findings": state.excluded_findings,
         "decisions": {
@@ -264,6 +313,7 @@ def render(
         "changes_made": state.changes,
         "validation_status": state.validation_status,
         "validation": state.validation_results,
+        "validation_caveats": _validation_caveats(state),
         "batch_isolation": state.batch_isolation,
         "lint_baseline": state.lint_baseline,
         "lint_issues_file": ".security-mcp/lint-issues.json"
@@ -339,7 +389,11 @@ def render(
         f"Status: {state.status}",
         f"Stop stage: {state.stop_stage or 'none'}",
         f"Branch: {state.branch_name or 'not created'}",
-        f"Pipeline: {(state.pipeline or {}).get('id') or 'unknown'} @ {(state.pipeline or {}).get('sha') or 'unknown'}",
+        (
+            "Pipeline: recorded per finding (see Pipeline provenance)."
+            if not state.pipeline and finding_pipelines
+            else f"Pipeline: {(state.pipeline or {}).get('id') or 'unknown'} @ {(state.pipeline or {}).get('sha') or 'unknown'}"
+        ),
         f"Findings considered: {len(state.findings)}",
         *(
             [
@@ -358,6 +412,30 @@ def render(
             "Nothing was staged, committed, or pushed. GitLab dismissal attempts and confirmed outcomes are listed below."
             if state.gitlab_dismissals
             else "This run is local only. Nothing was staged, committed, pushed, or changed in GitLab."
+        ),
+        *(
+            [
+                "",
+                "## Pipeline provenance",
+                "| Finding | Pipeline | SHA | Ref |",
+                "|---|---|---|---|",
+                *(
+                    "| "
+                    + " | ".join(
+                        _table_cell(value)
+                        for value in (
+                            finding_id,
+                            pipeline.get("id"),
+                            pipeline.get("sha"),
+                            pipeline.get("ref"),
+                        )
+                    )
+                    + " |"
+                    for finding_id, pipeline in finding_pipelines.items()
+                ),
+            ]
+            if finding_pipelines
+            else []
         ),
         "",
         "## False positives",
@@ -388,6 +466,10 @@ def render(
                 f"- {change.get('finding_id')}: {change.get('status')} — {change.get('description')} "
                 f"({', '.join(change.get('files') or []) or 'no files'})"
             )
+            if change.get("reused_from"):
+                lines.append(
+                    f"  Shares the unchanged edit from {change['reused_from']}; no additional dependency write or install."
+                )
     else:
         lines.append("No files were changed.")
     lines.extend(
@@ -403,6 +485,15 @@ def render(
             "Existing lint issues are recorded separately from final batch build and unit-test acceptance.",
         ]
     )
+    if payload["dependency_resolutions"]:
+        lines.extend(["", "## Gradle Dependency Inspections"])
+        for finding_id, inspection in payload["dependency_resolutions"].items():
+            lines.append(
+                f"- {finding_id}: {inspection['status']}; {inspection.get('version') or inspection.get('detail') or 'version unknown'}."
+            )
+            for key in ("command", "stdout_log_path", "stderr_log_path"):
+                if inspection.get(key):
+                    lines.append(f"  {key}: {inspection[key]}")
     lines.extend(["", "## Package Update Qualifications"])
     if payload["package_qualifications"]:
         for finding_id, qualification in payload["package_qualifications"].items():
@@ -459,6 +550,35 @@ def render(
                         lines.append(f"  {key}: {failure[key]}")
     payload["final_summary_markdown"] = "\n".join(
         [
+            *(
+                [
+                    "## Validation caveats",
+                    "Passed required product checks are not a clean security audit. "
+                    "Pre-existing lint issues and unavailable optional checks remain separate:",
+                    *(
+                        f"- {_table_cell(item['phase'])}: {_table_cell(item.get('command') or item.get('detail'))}; "
+                        f"{_table_cell(item.get('status'))}"
+                        + (
+                            f"; {_table_cell(item['detail'])}"
+                            if item.get("command") and item.get("detail")
+                            else ""
+                        )
+                        + (
+                            "; diagnostics: "
+                            + ", ".join(
+                                f"{count} {kind}"
+                                for kind, count in item["diagnostic_counts"].items()
+                            )
+                            if item.get("diagnostic_counts")
+                            else ""
+                        )
+                        for item in payload["validation_caveats"]
+                    ),
+                    "",
+                ]
+                if payload["validation_caveats"]
+                else []
+            ),
             *(
                 ["## False-Positive Approval Pending", approval_notice, ""]
                 if pending_dismissals
@@ -567,6 +687,7 @@ def write_report(
         "unresolved_issues_table": payload["unresolved_issues_table"],
         "finding_assessments": payload["finding_assessments"],
         "finding_assessments_table": payload["finding_assessments_table"],
+        "finding_pipelines": payload["finding_pipelines"],
         "gitlab_dismissals": payload["gitlab_dismissals"],
         "false_positive_review_tool": payload["false_positive_review_tool"],
         "false_positive_approval": payload["false_positive_approval"],

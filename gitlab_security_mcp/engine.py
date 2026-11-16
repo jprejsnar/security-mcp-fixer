@@ -6,15 +6,18 @@ import functools
 import json
 import logging
 import os
+import re
 import shutil
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import fields
 from datetime import date
 from inspect import signature
 from pathlib import Path
 from socket import SOCK_STREAM, gaierror, getaddrinfo
+from subprocess import SubprocessError
 from time import monotonic
 from urllib.parse import urlsplit
 
@@ -28,10 +31,13 @@ from gitlab_security_mcp.advisory import (
 )
 from gitlab_security_mcp.commands import CommandRunner, progress_sink, resolve_tool
 from gitlab_security_mcp.config_findings import assess_config, config_kind
+from gitlab_security_mcp.fanout import MAX_WORKERS
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
 from gitlab_security_mcp.gitlab_client import GitLabClient
 from gitlab_security_mcp.manifests import (
+    PackageHit,
     detect_stack,
+    gradle_report_package,
     iter_files,
     locate_package,
     manifests_were_parsed,
@@ -71,7 +77,7 @@ from gitlab_security_mcp.util import (
     logged_lock,
     resolve_inside,
 )
-from gitlab_security_mcp.validate import lint_rule_inventory, run_validation
+from gitlab_security_mcp.validate import _wrapper, lint_rule_inventory, run_validation
 from gitlab_security_mcp.versions import (
     is_major_upgrade,
     lowest_fixed,
@@ -110,23 +116,22 @@ def _progress_severity(finding: dict) -> str:
 
 
 def _serialized(method):
-    """Hold the engine lock for one public tool call.
+    """Serialize mutations while allowing independent finding evidence reads.
 
-    MCP may run sync tools on different threads. The lock is re-entrant
-    so a tool can call another tool method without deadlocking.
-    Copy results before unlocking so callers cannot mutate active state.
+    Verification reserves its finding until its detached assessment is committed.
+    Other tools retain exclusive access, including re-entrant nested calls.
     """
     parameters = signature(method)
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        """Reject calls after close and detach results while holding the lock."""
-        with logged_lock(self._lock, "engine"):
+        """Reject calls after close and return detached results."""
+        finding_id = parameters.bind(self, *args, **kwargs).arguments.get("finding_id")
+        with self._tool_access(
+            finding_id, verification=method.__name__ == "verify_security_finding"
+        ):
             if self._closed:
                 return {"status": "ERROR", "reason": "Engine is closed"}
-            finding_id = parameters.bind(self, *args, **kwargs).arguments.get(
-                "finding_id"
-            )
             started = monotonic()
             self._progress(finding_id, f"{method.__name__} started")
             try:
@@ -166,7 +171,7 @@ class _ValidationRunner:
 
 
 class Engine:
-    """Coordinate one local run through serialized public tool methods.
+    """Coordinate one local run with exclusive edits and concurrent evidence reads.
 
     The state attribute holds active decisions, changes, and validation.
     Call prechecks, branch creation, retrieval, verification, remediation,
@@ -206,6 +211,8 @@ class Engine:
             or self.repo_root / ".security-mcp" / "package-update-policy.json"
         ).resolve()
         self._lock = threading.RLock()
+        self._verification_done = threading.Condition(self._lock)
+        self._verifying: set[str | None] = set()
         self.runner = runner if runner is not None else CommandRunner(self.repo_root)
         self.git = GitOps(self.repo_root, self.runner)
         self._owns_gitlab = gitlab is None
@@ -256,15 +263,47 @@ class Engine:
         self._finding_progress: dict[str, tuple[str, int]] = {}
         self._files: list[Path] | None = None
         self._files_truncated = False
+        self._gradle_lock = threading.Lock()
+        self._gradle_reports: dict[
+            tuple[Path, str], tuple[dict, str, dict, set[str]]
+        ] = {}
         self._product_baseline: dict | None = None
         self._closed = False
         self._reuse_branch_name: str | None = None
 
     def _documentation(self) -> OfficialDocs:
         """Return the injected documentation client or open one on first use."""
-        if self.docs is None:
-            self.docs = OfficialDocs(http_log_path=self.http_log_path)
-        return self.docs
+        with self._lock:
+            if self.docs is None:
+                self.docs = OfficialDocs(http_log_path=self.http_log_path)
+            return self.docs
+
+    @contextmanager
+    def _tool_access(
+        self, finding_id: str | None = None, *, verification: bool = False
+    ) -> Generator[None, None, None]:
+        """Exclude mutations until all reserved finding assessments finish."""
+        with logged_lock(self._lock, "engine"):
+            self._verification_done.wait_for(
+                lambda: (
+                    (
+                        finding_id not in self._verifying
+                        and len(self._verifying) < MAX_WORKERS
+                    )
+                    if verification
+                    else not self._verifying
+                )
+            )
+            if not verification:
+                yield
+                return
+            self._verifying.add(finding_id)
+        try:
+            yield
+        finally:
+            with self._verification_done:
+                self._verifying.remove(finding_id)
+                self._verification_done.notify_all()
 
     @property
     def today(self) -> date:
@@ -277,7 +316,7 @@ class Engine:
         Injected clients stay open. Cleanup failures propagate after every
         owned client is attempted; later tool calls return an error.
         """
-        with logged_lock(self._lock, "engine-close"):
+        with self._tool_access():
             if self._closed:
                 return
             self._closed = True
@@ -337,9 +376,10 @@ class Engine:
 
     def _snapshot(self) -> tuple[list[Path], bool]:
         """Reuse one pruned file list until a fix changes the tree."""
-        if self._files is None:
-            self._files, self._files_truncated = iter_files(self.repo_root)
-        return self._files, self._files_truncated
+        with self._lock:
+            if self._files is None:
+                self._files, self._files_truncated = iter_files(self.repo_root)
+            return self._files, self._files_truncated
 
     def _drop_snapshot(self) -> None:
         """Invalidate cached file discovery after local changes."""
@@ -808,19 +848,25 @@ class Engine:
         self, finding_id: str, *, source_review: dict | None = None
     ) -> dict:
         """Assess source findings locally, or compare dependencies with advisories."""
-        if self.state.status not in AFTER_BRANCH:
-            return {"status": "ERROR", "reason": "Findings have not been listed yet"}
-        finding = self._finding(finding_id)
-        if finding is None:
-            return {"status": "ERROR", "reason": "Finding not found"}
-        if any(
-            change["finding_id"] == finding_id for change in self._package_changes()
-        ):
-            return {
-                "status": "ERROR",
-                "reason": "Retain the applied package's original evidence; run post-update validation instead",
-            }
+        with self._lock:
+            if self.state.status not in AFTER_BRANCH:
+                return {
+                    "status": "ERROR",
+                    "reason": "Findings have not been listed yet",
+                }
+            current = self._finding(finding_id)
+            if current is None:
+                return {"status": "ERROR", "reason": "Finding not found"}
+            if any(
+                change["finding_id"] == finding_id for change in self._package_changes()
+            ):
+                return {
+                    "status": "ERROR",
+                    "reason": "Retain the applied package's original evidence; run post-update validation instead",
+                }
+            finding = deepcopy(current)
         finding.pop("sourceWorkflow", None)
+        finding.pop("dependencyResolution", None)
         try:
             self._progress(finding_id, "Assessing scanner category and local evidence")
             decision, reason, evidence, proposed, prompt = self._decide(
@@ -830,7 +876,6 @@ class Engine:
             reason = f"Finding evidence could not be read safely: {exc}"
             decision, evidence, proposed = "MANUAL_REVIEW", [reason], None
             prompt = self._prompt(finding, None, reason)
-        self.state.forget(finding_id)
         assessment = {"decision": decision, "reason": reason, "evidence": evidence}
         finding["remediationDecision"] = decision
         finding["assessment"] = assessment
@@ -842,31 +887,35 @@ class Engine:
             finding.get("sourceWorkflow") or {}
         ).get("status") == source_review.get("decision"):
             finding["sourceReview"] = deepcopy(source_review)
-        self.state.decisions[finding_id] = assessment
         component = finding.get("component")
-        if decision == "FALSE_POSITIVE":
-            self.state.false_positives.append(
-                {
-                    "id": finding_id,
-                    "component": component,
-                    "reason": reason,
-                    "evidence": evidence,
-                }
-            )
-        elif decision == "NO_SAFE_FIX":
-            self.state.no_solution.append(
-                {"id": finding_id, "component": component, "reason": reason}
-            )
-        elif decision in {"MANUAL_REVIEW", "CONFIRMED_VULNERABILITY"}:
-            self.state.skipped_user_prompt.append(
-                {
-                    "id": finding_id,
-                    "component": component,
-                    "reason": reason,
-                    "prompt": prompt,
-                }
-            )
-        self._remember()
+        with self._lock:
+            current.clear()
+            current.update(finding)
+            self.state.forget(finding_id)
+            self.state.decisions[finding_id] = assessment
+            if decision == "FALSE_POSITIVE":
+                self.state.false_positives.append(
+                    {
+                        "id": finding_id,
+                        "component": component,
+                        "reason": reason,
+                        "evidence": evidence,
+                    }
+                )
+            elif decision == "NO_SAFE_FIX":
+                self.state.no_solution.append(
+                    {"id": finding_id, "component": component, "reason": reason}
+                )
+            elif decision in {"MANUAL_REVIEW", "CONFIRMED_VULNERABILITY"}:
+                self.state.skipped_user_prompt.append(
+                    {
+                        "id": finding_id,
+                        "component": component,
+                        "reason": reason,
+                        "prompt": prompt,
+                    }
+                )
+            self._remember()
         return {
             "finding_id": finding_id,
             "decision": decision,
@@ -1118,6 +1167,7 @@ class Engine:
                 "finding_id": finding_id,
             }
         package_update = proposed["ecosystem"] in PACKAGE_ECOSYSTEMS
+        reused_change = None
         if package_update:
             self._refresh_package_validation()
             receipt = finding.get("packageQualification") or {}
@@ -1142,6 +1192,7 @@ class Engine:
                 receipt["dependency_before"] = backup_dependency_files(
                     self.repo_root, proposed
                 )
+                reused_change = self._matching_package_change(proposed)
             except (
                 OSError,
                 ValueError,
@@ -1187,8 +1238,14 @@ class Engine:
                 lint_rule_inventory(self.state.lint_baseline["results"]), indent=2
             ),
         )
-        review = self._documentation().read_before_fix(
-            finding, proposed.get("doc_pages") or []
+        review = (
+            self._documentation().read_for_existing_fix(
+                finding, reused_change["documentation"], proposed.get("doc_pages") or []
+            )
+            if reused_change
+            else self._documentation().read_before_fix(
+                finding, proposed.get("doc_pages") or []
+            )
         )
         self._record_validation_sites(
             finding, [item["url"] for item in review.as_list()]
@@ -1242,7 +1299,17 @@ class Engine:
                 "tree": tree_snapshot(self.repo_root),
                 "dependency_before": backup_dependency_files(self.repo_root, proposed),
             }
-        outcome = apply_plan(self.repo_root, plan, self.runner, self.which)
+        outcome = (
+            {
+                "status": "APPLIED",
+                "files": list(reused_change["files"]),
+                "commands": [],
+                "description": plan.description,
+                "detail": f"Shares the unchanged dependency edit from {reused_change['finding_id']}; no files rewritten or package commands rerun. Final validation is still required.",
+            }
+            if reused_change
+            else apply_plan(self.repo_root, plan, self.runner, self.which)
+        )
         if package_update:
             receipt["applied_dependency_hashes"] = dependency_file_hashes(
                 self.repo_root, receipt["dependency_before"]
@@ -1265,6 +1332,8 @@ class Engine:
             "qualification_status": "PENDING_VALIDATION" if package_update else None,
             "validation_pending": outcome["status"] == "APPLIED",
         }
+        if reused_change:
+            change["reused_from"] = reused_change["finding_id"]
         if not package_update:
             finding["localFixAttempt"]["applied_dependency_hashes"] = (
                 dependency_file_hashes(
@@ -2105,6 +2174,21 @@ class Engine:
             if change.get("package_update") and change.get("status") == "APPLIED"
         ]
 
+    def _matching_package_change(self, proposed: dict) -> dict | None:
+        """Reuse only an identical reviewed plan whose updater-owned bytes still match."""
+        for change in self._package_changes():
+            receipt = (self._finding(change["finding_id"]) or {}).get(
+                "packageQualification"
+            ) or {}
+            expected = receipt.get("applied_dependency_hashes")
+            if (
+                receipt.get("plan") == proposed
+                and expected
+                and dependency_file_hashes(self.repo_root, expected) == expected
+            ):
+                return change
+        return None
+
     def _package_policy(self, plan: dict, review: dict) -> dict:
         """Enforce configured/existing policy, otherwise require license review."""
         if self._package_policy_required or self.package_policy_path.exists():
@@ -2162,6 +2246,124 @@ class Engine:
                 )
                 self.state.validation_status = "VALIDATION_INCOMPLETE"
                 self.state.status = "VALIDATION_INCOMPLETE"
+
+    def _resolve_gradle_package(
+        self, finding: dict, files: list[Path]
+    ) -> PackageHit | None:
+        """Share a complete, tree-bound dependency inspection across finding workers."""
+        location = (finding.get("location") or {}).get("file")
+        manifest = (
+            resolve_inside(self.repo_root, location)
+            if isinstance(location, str)
+            else None
+        )
+        builds = [
+            path for path in files if path.name in {"build.gradle", "build.gradle.kts"}
+        ]
+        if manifest not in builds:
+            manifest = builds[0] if not location and len(builds) == 1 else None
+        if manifest is None:
+            return None
+        row = {
+            "manager": "gradle",
+            "manifest": manifest.relative_to(self.repo_root).as_posix(),
+            "status": "UNRESOLVED",
+        }
+        entry = None
+        try:
+            tool = (
+                _wrapper(manifest.parent, "gradlew")
+                or _wrapper(self.repo_root, "gradlew")
+                or resolve_tool("gradle", self.which)
+            )
+            if not tool:
+                raise ValueError(
+                    "Gradle wrapper and gradle are unavailable; dependency tree not inspected."
+                )
+            with self._gradle_lock:
+                before = tree_snapshot(self.repo_root)
+                key = (manifest.parent, tool)
+                cached = self._gradle_reports.get(key)
+                # Share failures across findings, but let the same finding retry.
+                if cached and cached[0] == before and finding["id"] not in cached[3]:
+                    entry = cached
+                    report, row = cached[1], dict(cached[2])
+                else:
+                    result = self.runner.run(
+                        [tool, "--no-daemon", "dependencies"],
+                        timeout=min(self.validation_timeout, 120),
+                        check=False,
+                        **(
+                            {"cwd": manifest.parent}
+                            if manifest.parent != self.repo_root
+                            else {}
+                        ),
+                    )
+                    row.update(
+                        command=result.display(),
+                        stdout_log_path=result.stdout_log_path,
+                        stderr_log_path=result.stderr_log_path,
+                    )
+                    report = result.stdout
+                    if result.exit_code:
+                        row.update(
+                            status="FAILED",
+                            detail=f"Gradle dependency inspection exited {result.exit_code}: "
+                            + (result.stderr or result.stdout)[-500:],
+                        )
+                    elif result.truncated:
+                        log = (
+                            resolve_inside(self.repo_root, result.stdout_log_path)
+                            if result.stdout_log_path
+                            else None
+                        )
+                        directory = self.repo_root / ".security-mcp" / "command-logs"
+                        if log is None or not log.is_relative_to(directory):
+                            row.update(
+                                status="FAILED",
+                                detail="Gradle dependency output is truncated and has no complete local log.",
+                            )
+                        else:
+                            with log.open("rb") as stream:
+                                raw = stream.read(8 * 1024 * 1024 + 1)
+                            if len(raw) > 8 * 1024 * 1024:
+                                row.update(
+                                    status="FAILED",
+                                    detail="Gradle dependency log exceeds the 8 MiB inspection limit.",
+                                )
+                            else:
+                                report = raw.decode("utf-8")
+                    if tree_snapshot(self.repo_root) != before:
+                        raise ValueError(
+                            "Checkout changed during Gradle dependency inspection; retry against a stable tree."
+                        )
+                    entry = (before, report, dict(row), set())
+                    self._gradle_reports[key] = entry
+                    if len(self._gradle_reports) > MAX_WORKERS:
+                        self._gradle_reports.pop(next(iter(self._gradle_reports)))
+            if row["status"] == "FAILED":
+                raise ValueError(row["detail"])
+            hit = gradle_report_package(
+                self.repo_root, manifest, finding["component"], report
+            )
+            if hit:
+                row.update(status="RESOLVED", version=hit.version)
+            else:
+                row["detail"] = (
+                    "Gradle did not report this coordinate as a resolved dependency; absence is not a false positive."
+                )
+                with self._gradle_lock:
+                    entry[3].add(finding["id"])
+            finding["dependencyResolution"] = row
+            return hit
+        except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
+            if entry is not None:
+                with self._gradle_lock:
+                    entry[3].add(finding["id"])
+            row.update(status="FAILED", detail=str(exc))
+            logger.warning("Gradle dependency inspection unavailable: %s", exc)
+            finding["dependencyResolution"] = row
+            return None
 
     def _decide(
         self, finding: dict, source_review: dict | None = None
@@ -2368,6 +2570,20 @@ class Engine:
             files,
             truncated=files_truncated,
         )
+        if hit is None and category == "dependency_scanning" and component:
+            self._progress(
+                finding.get("id"), "Inspecting the resolved Gradle dependency tree"
+            )
+            hit = self._resolve_gradle_package(finding, files)
+            if resolution := finding.get("dependencyResolution"):
+                evidence.append(
+                    f"Gradle dependency inspection: {resolution['status']}. "
+                    + (
+                        resolution.get("detail")
+                        or f"Selected version {resolution.get('version')}."
+                    )
+                )
+        local_review_reason = None
         if hit:
             evidence.append(
                 f"Local {hit.ecosystem} {hit.manager} package {hit.name} version {hit.version or 'unknown'} "
@@ -2397,28 +2613,41 @@ class Engine:
                 }
                 for path in files
             ):
-                reason = "The package was not resolved locally. Java and NuGet manifests do not enumerate every transitive dependency; manual dependency-tree review is required."
-                return (
-                    "MANUAL_REVIEW",
-                    reason,
-                    [*evidence, reason],
-                    None,
-                    self._prompt(finding, None, reason),
+                local_review_reason = "The package was not resolved locally. Java and NuGet manifests do not enumerate every transitive dependency; manual dependency-tree review is required."
+            else:
+                evidence.append(
+                    f"{component} was not found in the parsed manifests or lockfiles."
                 )
-            evidence.append(
-                f"{component} was not found in the parsed manifests or lockfiles."
-            )
-            return (
-                "FALSE_POSITIVE",
-                f"{component} is not present in the parsed dependency files.",
-                evidence,
-                None,
-                None,
-            )
+                return (
+                    "FALSE_POSITIVE",
+                    f"{component} is not present in the parsed dependency files.",
+                    evidence,
+                    None,
+                    None,
+                )
 
         installed = (hit.version if hit else None) or finding.get("installedVersion")
         ecosystem = hit.ecosystem if hit else None
         package_name = hit.name if hit else component
+        if local_review_reason and component:
+            if Path(str(location_file or "")).suffix.lower() in {
+                ".csproj",
+                ".fsproj",
+                ".vbproj",
+            }:
+                ecosystem = "NuGet"
+            elif (
+                ":" in component or ("/" in component and not component.startswith("@"))
+            ) and any(
+                path.name in {"build.gradle", "build.gradle.kts", "pom.xml"}
+                for path in files
+            ):
+                ecosystem, package_name = "Maven", component.replace("/", ":")
+            elif any(
+                path.suffix.lower() in {".csproj", ".fsproj", ".vbproj"}
+                for path in files
+            ):
+                ecosystem = "NuGet"
         self._progress(finding.get("id"), "Checking public advisory evidence")
         looked_up = self.advisory.lookup(
             finding,
@@ -2436,10 +2665,33 @@ class Engine:
         if looked_up.errors:
             evidence.append("Lookup errors: " + "; ".join(looked_up.errors))
 
+        if re.search(
+            r"\bupgrad(?:e|ing)\s+alone\s+(?:does\s+not|will\s+not|won't)\s+(?:fix|resolve|remediate)\b",
+            " ".join((finding.get("description") or "", finding.get("solution") or "")),
+            flags=re.IGNORECASE,
+        ):
+            reason = "The advisory explicitly warns that upgrading alone does not fix affected code. Review actual callers and required source changes; a version-only update cannot establish remediation."
+            return (
+                "MANUAL_REVIEW",
+                reason,
+                [*evidence, reason],
+                None,
+                self._prompt(finding, looked_up, reason),
+            )
+        if local_review_reason:
+            return (
+                "MANUAL_REVIEW",
+                local_review_reason,
+                [*evidence, local_review_reason],
+                None,
+                self._prompt(finding, looked_up, local_review_reason),
+            )
+
         if (
             category == "dependency_scanning"
             and hit is not None
-            and component == hit.name
+            and (component.replace("/", ":") if ecosystem == "Maven" else component)
+            == hit.name
             and parse_version(installed) is not None
             and (
                 not finding.get("installedVersion")
@@ -2521,7 +2773,7 @@ class Engine:
                 if looked_up.outcome == "no_fix_published"
                 else "No fixed version is newer than the installed version."
             )
-            if looked_up.affected is None and looked_up.fixed_versions:
+            if looked_up.affected is None:
                 reason = "Online records were found, but the installed version could not be compared to the affected range."
                 return (
                     "MANUAL_REVIEW",
@@ -2556,6 +2808,15 @@ class Engine:
         if plan is None and "already at or above" in plan_reason:
             return "FALSE_POSITIVE", plan_reason, evidence, None, None
         if plan is None:
+            if hit and hit.manager == "gradle" and not hit.direct:
+                reason = f"The resolved transitive dependency {hit.name} at {installed} has fixed target {fixed}, but requires a reviewed parent/BOM update or coordinate-specific constraint. The server does not automatically override BOM-managed dependencies."
+                return (
+                    "MANUAL_REVIEW",
+                    reason,
+                    [*evidence, reason],
+                    None,
+                    self._prompt(finding, looked_up, reason),
+                )
             if category == "sast":
                 reason = (
                     "SAST findings do not get a guessed source edit. " + plan_reason
@@ -2675,12 +2936,22 @@ class Engine:
         return (
             f"Finding {finding.get('id')} ({finding.get('component') or 'unknown component'}) needs your decision. {reason} "
             f"GitLab solution: {solution}. Versions mentioned by GitLab: {mentioned}. "
-            "Tell the agent the fixed version to apply, or confirm that this is a false positive. "
+            + (
+                f"Public advisory fixed target: {looked_up.lowest_fixed_version}. "
+                if looked_up and looked_up.lowest_fixed_version
+                else ""
+            )
+            + "Tell the agent the fixed version to apply, or confirm that this is a false positive. "
             "This finding is skipped and the remaining findings continue."
         )
 
     def _progress(self, finding_id: str | None, step: str) -> None:
         """Emit bounded, single-line progress without scanner payloads or review contents."""
+        with self._lock:
+            self._progress_locked(finding_id, step)
+
+    def _progress_locked(self, finding_id: str | None, step: str) -> None:
+        """Assign progress ordinals while holding the engine's state lock."""
         finding = self._finding(finding_id) if finding_id else None
         label = " ".join(str(finding_id or "run").split())[:200]
         package = " ".join(str((finding or {}).get("component") or "N/A").split())[:200]
