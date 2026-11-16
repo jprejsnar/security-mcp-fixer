@@ -41,6 +41,7 @@ class RunState:
     gitlab_project_path: str | None = None
     gitlab_dismissals: list[dict] = field(default_factory=list)
     false_positive_approval_form: dict = field(default_factory=dict)
+    fix_selection: dict = field(default_factory=dict)
 
     def save(self, repo_root: Path) -> None:
         """Publish an inspection snapshot, not raw in-memory rollback file contents."""

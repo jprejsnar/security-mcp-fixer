@@ -57,8 +57,11 @@ def test_retrieve_patient_web_security_findings(patient_web_findings):
     assert len(set(finding_ids)) == len(finding_ids)
     for finding in patient_web_findings:
         assert finding["status"] in {"detected", "confirmed"}
-        assert finding["trackedRef"]["name"] == "main"
-        assert finding["resolvedOnDefaultBranch"] is False
+        if finding.get("mainBranchResolution"):
+            assert finding["trackedRef"]["name"] != "main"
+        else:
+            assert finding["trackedRef"]["name"] == "main"
+            assert finding["resolvedOnDefaultBranch"] is False
         assert finding["title"]
         assert finding["category"]
     print(f"Retrieved {len(patient_web_findings)} active patient-web vulnerabilities")

@@ -1404,6 +1404,72 @@ def test_progress_console_can_be_disabled(monkeypatch):
     launch.assert_not_called()
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_run_completion_closes_owned_console_and_a_new_run_reopens_it(
+    monkeypatch, failed
+):
+    """Keep the log console during work, then reap it even when a run raises."""
+    # Arrange
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    first, second = Mock(), Mock()
+    launch = Mock(side_effect=[first, second])
+    monkeypatch.setattr(server, "_open_progress_console", launch)
+    monkeypatch.setattr(server, "_progress_console", None)
+    monkeypatch.setattr(server, "_progress_console_attempted", False)
+    monkeypatch.setattr(server, "_progress_console_enabled", False)
+    monkeypatch.setattr(server, "_progress_close_pending", False)
+    monkeypatch.setattr(server, "_progress_calls", 0)
+
+    async def execute(name, status, raises=False):
+        """Exercise the actual middleware lifecycle without starting any process."""
+
+        async def report(*args):
+            """Consume progress as a host would."""
+            return None
+
+        async def next_call(context):
+            """Publish real run progress and optionally fail before returning."""
+            progress_sink.get()("fixture progress")
+            if raises:
+                raise RuntimeError("run failed")
+            return {"status": status}
+
+        context = SimpleNamespace(
+            method="tools/call",
+            params={"name": name},
+            session=SimpleNamespace(report_progress=report),
+        )
+        return await server._progress_middleware(context, next_call)
+
+    async def run():
+        """Complete two runs in the same persistent MCP server."""
+        await execute("run_prechecks", "PRECHECK_PASSED")
+        first.close.assert_not_called()
+        if failed:
+            with pytest.raises(RuntimeError, match="run failed"):
+                await execute("run_validation_matrix", "", raises=True)
+        else:
+            await execute("complete_security_run", "REPORT_GENERATED")
+        first.close.assert_called_once()
+        assert server._progress_console is None
+        await execute("run_prechecks", "PRECHECK_PASSED")
+        second.close.assert_not_called()
+        await execute("complete_security_run", "REPORT_GENERATED")
+
+    # Act
+    asyncio.run(run())
+
+    # Assert
+    assert launch.call_count == 2
+    second.close.assert_called_once()
+
+
 def test_report_tool_delivers_security_report_as_mcp_text(repo, monkeypatch):
     """Deliver the final security report as text, not nested JSON."""
     # Arrange
@@ -2790,6 +2856,11 @@ def test_current_today_branch_reuses_its_own_dependencies_and_preserves_policies
         which=lambda tool: tool,
         today=day,
     )
+    engine.state.status = "REPORT_GENERATED"
+    engine.state.decisions = {
+        "previous-run": {"decision": "MANUAL_REVIEW", "reason": "Old assessment"}
+    }
+    engine.state.false_positive_approval_form = {"status": "CANCELLED"}
 
     # Act
     precheck = engine.run_prechecks()
@@ -2810,11 +2881,12 @@ def test_current_today_branch_reuses_its_own_dependencies_and_preserves_policies
     assert policy.read_text(encoding="utf-8") == '{"keep":"policy"}'
     assert unknown.read_text(encoding="utf-8") == '{"keep":"settings"}'
     assert engine.list_security_findings("group/app")["status"] == "OK"
+    assert engine.state.false_positive_approval_form == {}
 
 
 @pytest.mark.parametrize("stage", ["prechecks", "branch"])
-def test_branch_reuse_runtime_errors_preserve_prior_run_artifacts(cloned_repo, stage):
-    """Never overwrite the saved run or remove reports after a prior log failure."""
+def test_clean_branch_reuse_discards_prior_generated_failure_logs(cloned_repo, stage):
+    """A clean existing branch can start fresh without stale runtime failures blocking it."""
     # Arrange
     from tests.conftest import git
 
@@ -2840,22 +2912,17 @@ def test_branch_reuse_runtime_errors_preserve_prior_run_artifacts(cloned_repo, s
     old_report.write_text("Preserve for diagnosis.", encoding="utf-8")
 
     # Act
-    result = (
-        engine.run_prechecks()
-        if stage == "prechecks"
-        else engine.create_security_branch()
-    )
+    if stage == "prechecks":
+        assert engine.run_prechecks()["status"] == "PRECHECK_PASSED"
+        assert engine.pull_main_twice()["status"] == "PULLS_SUCCEEDED"
+    result = engine.create_security_branch()
 
     # Assert
-    assert result["status"] == (
-        "PRECHECK_FAILED" if stage == "prechecks" else "BRANCH_CREATION_FAILED"
-    )
-    assert result["security_artifacts"]["error_count"] > 0
-    assert result["security_artifacts"]["deleted_files"] == []
-    assert state.read_text(encoding="utf-8") == '{"previous":"evidence"}'
-    assert old_report.read_text(encoding="utf-8") == "Preserve for diagnosis."
-    assert log.exists()
-    assert engine.list_security_findings()["status"] == "ERROR"
+    assert result["status"] == "BRANCH_CREATED"
+    assert result["security_artifacts"]["previous_run_error_count"] > 0
+    assert not old_report.exists()
+    assert not log.exists()
+    assert json.loads(state.read_text(encoding="utf-8"))["status"] == "BRANCH_CREATED"
 
 
 def test_origin_only_today_branch_is_reused(cloned_repo):
@@ -3270,6 +3337,7 @@ def test_tools_are_registered():
         "create_security_branch",
         "list_security_findings",
         "verify_security_finding",
+        "select_security_fixes",
         "qualify_package_update",
         "apply_minimal_fix",
         "generate_aaa_test",

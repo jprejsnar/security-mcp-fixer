@@ -20,6 +20,7 @@ from socket import SOCK_STREAM, gaierror, getaddrinfo
 from subprocess import SubprocessError
 from time import monotonic
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -412,7 +413,7 @@ class Engine:
 
     @_serialized
     def run_prechecks(self) -> dict:
-        """Require DNS and a clean main/today branch; preserve failed prior runs."""
+        """Require DNS and a clean main/today branch before a guarded fresh start."""
         dns_failure = self._check_corporate_dns("PRECHECK_FAILED")
         if dns_failure is not None:
             return {**dns_failure, "no_changes_attempted": True}
@@ -455,7 +456,7 @@ class Engine:
             self._reuse_branch_name = name if exists else None
             if exists:
                 review = review_security_artifacts(self.repo_root)
-                if review["status"] != "OK":
+                if not review["filesystem_safe"]:
                     return self._security_log_failure("PRECHECK_FAILED", review)
             in_progress = self.git.in_progress_operation()
             if in_progress:
@@ -491,6 +492,7 @@ class Engine:
                     "no_changes_attempted": True,
                 },
             )
+        self.state = RunState()
         self.state.status = "PRECHECK_PASSED"
         self._run_day = run_day
         self.state.stop_stage = None
@@ -649,9 +651,9 @@ class Engine:
         )
         return {
             "status": status,
-            "reason": "Prior security logs contain runtime errors or could not be fully verified. All remaining security artifacts were preserved.",
+            "reason": "Prior security artifacts could not be safely inspected or cleaned. All remaining artifacts were preserved.",
             "security_artifacts": review,
-            "action": "Review the reported log files and resolve the errors before retrying. No automatic log cleanup is permitted while errors remain.",
+            "action": "Resolve the reported filesystem/snapshot safety errors before retrying cleanup.",
         }
 
     def _prepare_pnpm(self) -> list[dict]:
@@ -707,7 +709,7 @@ class Engine:
 
     @_serialized
     def create_security_branch(self) -> dict:
-        """Create today's branch, or reuse it after safe error-free log cleanup."""
+        """Create today's branch, or reuse it after guarded generated-artifact cleanup."""
         if self.state.status == "BRANCH_CREATED" and self.state.branch_name:
             return {
                 "status": "BRANCH_CREATED",
@@ -758,7 +760,9 @@ class Engine:
                 )
             if reused:
                 tracked = self.git.tracked_security_paths()
-                cleanup = review_security_artifacts(self.repo_root, tracked)
+                cleanup = review_security_artifacts(
+                    self.repo_root, tracked, fresh_start=True
+                )
                 if cleanup["status"] != "OK":
                     return self._security_log_failure("BRANCH_CREATION_FAILED", cleanup)
                 self._drop_snapshot()
@@ -842,7 +846,7 @@ class Engine:
             "project_source": project_source,
             "pipeline": fetched.pipeline,
             "findings": fetched.findings,
-            "note": "Read-only GraphQL from the project vulnerability report. Filters: Needs triage or Confirmed; tracked branch main; Still detected. Pipeline provenance is recorded per finding.",
+            "note": "Read-only project vulnerability reports: active main findings plus non-main branch findings explicitly reported resolved on default main. Branch-resolution candidates require verification against the pulled main commit and human checkbox approval.",
         }
 
     @_serialized
@@ -966,6 +970,195 @@ class Engine:
             "reason": reason,
             "evidence": deepcopy(assessment["evidence"]),
         }
+
+    @_serialized
+    def fix_selection_candidates(self) -> dict:
+        """List real assessed issues without inventing edit plans or authorizing writes."""
+        if self.state.status not in AFTER_BRANCH:
+            return {"status": "ERROR", "reason": "Verify findings in this run first"}
+        if self.state.changes:
+            return {
+                "status": "SELECTION_LOCKED",
+                "reason": "Edits already exist. Validate this authorized batch before starting a fresh clean run.",
+            }
+        candidates = []
+        for finding in self.state.findings:
+            assessment = self.state.decisions.get(finding["id"]) or {}
+            if assessment.get("decision") not in {
+                "CHANGE_REQUIRED",
+                "CONFIRMED_VULNERABILITY",
+                "REPRODUCTION_REQUIRED",
+            }:
+                continue
+            candidates.append(
+                {
+                    "identity": self._fix_identity(finding),
+                    "id": finding["id"],
+                    "title": finding.get("title"),
+                    "severity": finding.get("severity"),
+                    "location": deepcopy(finding.get("location") or {}),
+                    "decision": assessment["decision"],
+                    "reason": assessment.get("reason"),
+                    "proposed_fix": {
+                        key: value
+                        for key, value in (finding.get("proposedFix") or {}).items()
+                        if key
+                        in {
+                            "ecosystem",
+                            "package",
+                            "target",
+                            "strategy",
+                            "description",
+                            "file",
+                        }
+                    },
+                }
+            )
+        return {"status": "OK", "candidates": candidates}
+
+    @staticmethod
+    def _fix_identity(finding: dict) -> dict:
+        """Bind permission to the actual issue, not mutable qualification receipts."""
+        return {
+            key: deepcopy(finding.get(key))
+            for key in (
+                "id",
+                "vulnerabilityId",
+                "findingUuid",
+                "title",
+                "category",
+                "identifiers",
+                "location",
+                "trackedRef",
+                "mainBranchResolution",
+            )
+        }
+
+    @_serialized
+    def record_fix_selection(
+        self,
+        candidates: list[dict],
+        selected_ids: list[str],
+        status: str,
+        reason: str = "",
+        *,
+        request_id: str | None = None,
+    ) -> dict:
+        """Record only host-form selections against an unchanged candidate snapshot."""
+        current = self.fix_selection_candidates()
+        if current["status"] != "OK":
+            return current
+        stale_request = request_id is not None and (
+            self.state.fix_selection.get("request_id") != request_id
+            or self.state.fix_selection.get("status") != "REQUESTED"
+        )
+        if (
+            stale_request
+            or (
+                (status == "REQUESTED" or selected_ids)
+                and current["candidates"] != candidates
+            )
+            or not set(selected_ids).issubset(item["id"] for item in candidates)
+        ):
+            logger.warning("Fix selection rejected: finding evidence changed")
+            return {
+                "status": "SELECTION_CHANGED",
+                "reason": "Findings changed while the form was open. No new edit permission was recorded.",
+                "next_tool": "get_run_status"
+                if stale_request
+                else "select_security_fixes",
+            }
+        candidates = current["candidates"]
+        approved = {
+            item["id"]: item["identity"]
+            for item in candidates
+            if item["id"] in selected_ids
+        }
+        self.state.fix_selection = {
+            "request_id": uuid4().hex if status == "REQUESTED" else request_id,
+            "status": status,
+            "candidate_ids": [item["id"] for item in candidates],
+            "selected_ids": selected_ids,
+            "approved_findings": approved,
+            "reason": reason,
+        }
+        if not self.state.validation_results:
+            self.state.validation_status = (
+                "NOT_RUN_NO_APPROVED_FIXES"
+                if status in {"SKIPPED", "UNAVAILABLE", "INVALID"}
+                else None
+            )
+        self._remember()
+        return {
+            "status": status,
+            "request_id": self.state.fix_selection["request_id"],
+            "selected_ids": selected_ids,
+            "skipped_ids": [
+                item["id"] for item in candidates if item["id"] not in approved
+            ],
+            "reason": reason,
+            "next_tool": "qualify_package_update or approved scoped host edits"
+            if selected_ids
+            else "complete_security_run",
+            "message": (
+                "Only selected issues authorize remediation edits. Authorization is not proof of a safe fix. "
+                "Skipped issues remain unresolved, not false positives. False-positive dismissal requires separate human approval."
+            ),
+        }
+
+    @_serialized
+    def run_approved_fix(self, operation: str, *args, **kwargs) -> dict:
+        """Atomically guard MCP editing and validation entry points with human selection."""
+        if operation not in {
+            "qualify_package_update",
+            "apply_minimal_fix",
+            "generate_aaa_test",
+            "run_validation_matrix",
+        }:
+            return {
+                "status": "ERROR",
+                "reason": "Not a supported remediation operation",
+            }
+        selection = self.state.fix_selection
+        approved = selection.get("approved_findings") or {}
+        if operation == "run_validation_matrix":
+            if (
+                not approved
+                and not self.state.changes
+                and selection.get("status")
+                in {
+                    "SKIPPED",
+                    "UNAVAILABLE",
+                    "INVALID",
+                }
+            ):
+                return {
+                    "status": "SKIPPED_NO_APPROVED_FIXES",
+                    "reason": "No code fixes were approved. Continue to independently assessed false positives.",
+                    "next_tool": "complete_security_run",
+                }
+            ids = {item["finding_id"] for item in self.state.changes} or set(approved)
+        else:
+            ids = {args[0]} if args else set()
+        authorized = selection.get("status") == "APPROVED" and bool(ids)
+        for finding_id in ids:
+            finding = self._finding(finding_id)
+            if finding is None or self._fix_identity(finding) != approved.get(
+                finding_id
+            ):
+                authorized = False
+                break
+        if not authorized:
+            logger.warning(
+                "Remediation blocked without current human permission: %s", operation
+            )
+            return {
+                "status": "FIX_APPROVAL_REQUIRED",
+                "reason": "The human has not approved these exact findings for edits in this run.",
+                "next_tool": "select_security_fixes",
+                "operation": operation,
+            }
+        return getattr(self, operation)(*args, **kwargs)
 
     @_serialized
     def qualify_package_update(self, finding_id: str, review: dict) -> dict:
@@ -1983,6 +2176,16 @@ class Engine:
                         "reason": reason,
                         "assessment": deepcopy(assessment),
                         "source_review": deepcopy(finding.get("sourceReview")),
+                        **(
+                            {
+                                "main_resolution": deepcopy(
+                                    finding["mainBranchResolution"]
+                                ),
+                                "finding_uuid": finding.get("findingUuid"),
+                            }
+                            if finding.get("mainBranchResolution")
+                            else {}
+                        ),
                     }
                 )
                 continue
@@ -2032,9 +2235,14 @@ class Engine:
             try:
                 outcome = self.gitlab.dismiss_false_positive(
                     item["vulnerability_id"],
-                    item["id"],
+                    item.get("finding_uuid") or item["id"],
                     item["project_path"],
                     item["reason"],
+                    **(
+                        {"main_resolution": item["main_resolution"]}
+                        if item.get("main_resolution")
+                        else {}
+                    ),
                 )
                 record.update(outcome)
             except (
@@ -2120,6 +2328,7 @@ class Engine:
             "false_positive_approval_form": deepcopy(
                 self.state.false_positive_approval_form
             ),
+            "fix_selection": deepcopy(self.state.fix_selection),
             "report_path": self.state.report_path,
             "lint_issues_path": str(
                 self.repo_root / ".security-mcp" / "lint-issues.json"
@@ -2397,6 +2606,32 @@ class Engine:
         evidence = [
             "Reachability of the vulnerable code path was not determined. Unknown reachability is not treated as a false positive."
         ]
+        resolution = finding.get("mainBranchResolution")
+        if resolution is not None:
+            pulled_sha = (self.state.pulls or [{}])[-1].get("end_head")
+            if (
+                resolution.get("verified") is not True
+                or not pulled_sha
+                or resolution.get("main_sha") != pulled_sha
+            ):
+                reason = (
+                    "The non-main finding is not proven resolved on the current pulled main: "
+                    "GitLab resolution/ref evidence is incomplete, conflicts with main, or main changed. "
+                    "No local fix or false-positive dismissal is authorized."
+                )
+                return "MANUAL_REVIEW", reason, [reason], None, reason
+            reason = (
+                f"Finding {finding['id']} ({finding.get('title')}) was reported on "
+                f"non-main branch {resolution['branch']} (tracked ref {resolution['tracked_ref_id']}). "
+                f"GitLab explicitly reports resolvedOnDefaultBranch=true; its default branch was "
+                f"verified as main at {pulled_sha}, matching this run's pulled main commit. "
+                f"Location: {finding.get('location')}; identifiers: {finding.get('identifiers') or []}. "
+                "This is an already-resolved-on-main finding for this main remediation run, "
+                "not proof that the older branch is safe. No code change is proposed. "
+                "Dismiss as FALSE_POSITIVE only if a human approves this exact branch-scoped description; "
+                "GitLab main/ref/resolution evidence is rechecked immediately before dismissal."
+            )
+            return "FALSE_POSITIVE", reason, [reason], None, None
         category = finding.get("category") or ""
         component = finding.get("component")
         location_file = (finding.get("location") or {}).get("file")

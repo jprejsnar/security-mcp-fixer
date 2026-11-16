@@ -5,7 +5,7 @@ It retrieves active findings, verifies installed dependencies against public
 advisories, qualifies compatible package updates, applies supported minimal edits,
 and produces local Markdown and JSON reports.
 
-The MCP host starts this Python process and calls its fourteen tools over stdio.
+The MCP host starts this Python process and calls its fifteen tools over stdio.
 One process can hold several application checkouts at once. Each checkout keeps
 its own run, and later calls select it with `repo_root` when more than one is
 active. There is no HTTP listener. "Local" describes execution and where edits
@@ -63,15 +63,16 @@ all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
 | --- | --- |
-| One-request completion | `complete_security_run` saves the report, automatically invokes the human checkbox form once, and refreshes the report with actual outcomes. It reuses current assessments without another scan. There are fourteen tools. |
+| One-request completion | `select_security_fixes` obtains separate human consent before remediation edits. `complete_security_run` saves the report, automatically invokes the false-positive checkbox form once, and refreshes the report with actual outcomes. It reuses current assessments without another scan. There are fifteen tools. |
 | Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
 | Human-only GitLab dismissal | Completion automatically offers initially unchecked approvals for eligible assessments. Cancel to keep reviewing, then explicitly request `submit_false_positive_approvals` to reopen. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
 | Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports retain per-finding pipeline provenance, unapplied fix candidates, pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
 | Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
-| Same-day branch reuse | Today's exact security branch can be reused after reviewing prior security logs. Errors preserve evidence and stop reuse. Cleanup removes only recognized generated untracked/ignored security artifacts, not tracked files, policies, configuration or unrelated work. |
+| Same-day branch reuse | Today's exact clean security branch can start fresh, including after a prior failed run. Cleanup removes recognized generated untracked/ignored artifacts and empty directories, not tracked files, policies, configuration or unrelated work. Unsafe filesystem state still blocks cleanup. |
+| Resolved-on-main branch findings | Other tracked branches are checked for GitLab-confirmed main resolution at this run's pulled main commit. Eligible entries require human checkbox approval and fresh remote main/ref/resolution checks; an absent finding alone is not proof. |
 | VPN and dependency preparation | Corporate DNS is checked before work, each pull and pnpm preparation. The server runs `pnpm clean` then `pnpm install` once per pnpm root; reused branches are prepared after their checkout. |
-| Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in existing console/notification/transcript channels. Retries retain their finding's position. |
+| Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in console/notification/transcript channels. Owned Windows log consoles close after completion/failure and reopen for later work; unrelated prompts remain untouched. |
 | Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Missing NVD version bounds require review, not a no-fix verdict. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
 | Dependency edits | The minimal qualified plan may refresh only the lockfile, bump the owning `package.json`, or add a pnpm override in `pnpm-workspace.yaml` when present. Compatibility/license checks and final production build/all-unit-test validation still apply. |
 | Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Checkout edits, validation/rollback and dismissals wait for active verifications. |
@@ -79,7 +80,7 @@ all of these changes; updating source files does not update an installed wheel.
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
-The latest 1.0.9 code validation completed with **795 passed, 3 skipped**.
+The latest 1.0.9 code validation completed with **826 passed, 3 skipped**.
 These are offline regression results, not
 live-host UI certification, a benchmark, or proof that arbitrary workloads cannot
 leak resources. Rebuild and reinstall the wheel to deploy source fixes.
@@ -168,7 +169,7 @@ runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
-  launcher["Root server.py: source launcher"] --> tools["Package server.py: fourteen MCP tools and error boundary"]
+  launcher["Root server.py: source launcher"] --> tools["Package server.py: fifteen MCP tools and error boundary"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Severity positions, Windows console, notifications and bounded transcript"]
   progress --> progressCleanup["Bounded drain; cancel and await sender; reject late callbacks"]
@@ -267,18 +268,21 @@ flowchart TD
   branch --> reusePrep["For reuse: review logs, guarded cleanup, then pnpm clean/install on reused branch"]
   reusePrep --> branchGate{"Branch and applicable preparation passed?"}
   branchGate -->|"No"| stopRun
-  branchGate -->|"Yes"| listing["list_security_findings: infer project from trusted origin, retrieve tracked-main findings"]
+  branchGate -->|"Yes"| listing["list_security_findings: active main and explicitly resolved non-main findings"]
   listing --> retrievalGate{"Retrieval succeeded without truncation?"}
   retrievalGate -->|"No"| stopRun
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
-  moreFindings -->|"No"| postChecks["run_validation_matrix: one final production build, all unit tests and policy checks"]
+  moreFindings -->|"No"| fixSelection["select_security_fixes: human receives unchecked issue selections"]
+  fixSelection --> approvedFixes{"Human selected any issues?"}
+  approvedFixes -->|"No: skip code, continue independent false positives"| reports
+  approvedFixes -->|"Yes: selected issues only"| editKind
   moreFindings -->|"Yes"| verify["verify_security_finding: source workflow or local package/advisory evidence"]
   verify --> decisionGate{"Decision?"}
   decisionGate -->|"SOURCE_REVIEW_REQUIRED"| sourceReview["Host AI reads complete source and relevant callers/configuration"]
   sourceReview --> sourceGate{"Sufficient evidence available?"}
   sourceGate -->|"Yes: submit hash-bound source_review"| verify
   sourceGate -->|"No: explicit blocker"| unresolved
-  decisionGate -->|"CONFIRMED_VULNERABILITY without a supported plan"| sourceDefect["Host-led source fix and regression validation, separate from package edits"]
+  decisionGate -->|"CONFIRMED_VULNERABILITY without a supported plan"| sourceDefect["Retain confirmed source issue for later human fix selection"]
   sourceDefect --> unresolved
   decisionGate -->|"FALSE_POSITIVE"| retained["Retain evidence and continue"]
   decisionGate -->|"MANUAL_REVIEW or NO_SAFE_FIX"| unresolved["Retain unresolved reason and continue"]
@@ -286,21 +290,27 @@ flowchart TD
   reproduction --> unresolved
   retained --> moreFindings
   unresolved --> moreFindings
-  decisionGate -->|"CHANGE_REQUIRED"| editKind{"What kind of edit?"}
+  decisionGate -->|"CHANGE_REQUIRED"| queued["Retain verified plan for human selection, no edits yet"]
+  queued --> moreFindings
+  editKind{"What kind of selected edit?"}
+  editKind -->|"Confirmed source defect"| sourceFix["Host applies annotation-first surgical fix only with sufficient evidence and reproduction"]
+  sourceFix --> nextFix
   editKind -->|"Package update"| qualify["Review package docs and policy, then qualify_package_update"]
   qualify --> qualifiedGate{"Exact-target review and required policy accepted?"}
-  qualifiedGate -->|"No: incomplete target review or required policy"| unresolved
+  qualifiedGate -->|"No: incomplete target review or required policy"| nextFix
   qualifiedGate -->|"Yes"| readDocs["Server reads required publisher pages together"]
   editKind -->|"Image tag or cited nginx or GitLab CI line"| readDocs
   readDocs --> docsGate{"Every required page read?"}
-  docsGate -->|"No: DOCS_REQUIRED"| unresolved
+  docsGate -->|"No: DOCS_REQUIRED"| nextFix
   docsGate -->|"Yes"| apply["apply_minimal_fix: local edit only"]
   apply --> appliedGate{"APPLIED?"}
   appliedGate -->|"No"| blockedEdit{"Safe restoration permits continuation?"}
-  blockedEdit -->|"Yes: retain failure reason"| moreFindings
+  blockedEdit -->|"Yes: retain failure reason"| nextFix
   blockedEdit -->|"No: manual cleanup required"| reports
   appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
-  regression --> moreFindings
+  regression --> nextFix{"More selected fixes? Retain exact reasons for rejected edits."}
+  nextFix -->|"Yes"| editKind
+  nextFix -->|"No"| postChecks["run_validation_matrix: one final production build, all unit tests and policy checks"]
   postChecks --> validationGate{"VALIDATION_COMPLETE?"}
   validationGate -->|"Yes"| reports["complete_security_run: reuse current assessments"]
   validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
@@ -328,15 +338,46 @@ checkout is active.
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return complete cited source for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
-| `qualify_package_update(finding_id, review, repo_root=None)` | Require exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
-| `apply_minimal_fix(finding_id, repo_root=None)` | Read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
-| `generate_aaa_test(finding_id, repo_root=None)` | Generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
-| `run_validation_matrix(repo_root=None)` | Validate the complete batch once. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
+| `select_security_fixes(repo_root=None)` | Open unchecked human issue-selection boxes after read-only assessment. No AI selection arguments. MCP qualification, edit, test-generation and validation tools enforce the selected findings. Skip/decline/cancel/unavailable means no remediation edits; continue to independent false-positive review. |
+| `qualify_package_update(finding_id, review, repo_root=None)` | Require human issue selection, exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
+| `apply_minimal_fix(finding_id, repo_root=None)` | For human-selected issues only, read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
+| `generate_aaa_test(finding_id, repo_root=None)` | For human-selected issues only, generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
+| `run_validation_matrix(repo_root=None)` | Validate the human-authorized batch once; skip remediation checks when code fixes were declined. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
 | `review_false_positives(repo_root=None)` | List eligible assessments for verification. Returns immediately and dismisses nothing. |
 | `submit_false_positive_approvals(repo_root=None)` | Open human approval checkboxes, automatically invoked by completion or explicitly requested to reopen. Only selected findings are dismissed; no AI approval argument is accepted. |
 | `complete_security_run(repo_root=None)` | Save reports, automatically offer human approval checkboxes once, then refresh reports with actual outcomes. Does not rescan or rerun verification. |
 | `generate_local_report(repo_root=None)` | Write local Markdown/JSON reports and return the security table as literal MCP text. Structured content retains `final_summary_markdown`, validation and isolation evidence, and report metadata. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
+
+### Human selection and surgical fixes
+
+After read-only verification, call `select_security_fixes` before qualification
+or any remediation edits. Only the human may select issues; all checkboxes start
+unchecked. The selection binds to the current in-memory run and finding identities;
+stale form responses do not authorize a new run or different findings. Selection
+does not prove a safe fix, waive reproduction or compatibility requirements, or
+approve GitLab dismissals. A dependency edit can incidentally resolve other
+findings on that same dependency, but permits no separate edits for unchecked issues.
+
+For a selected source issue, first consider documented framework annotations
+that actually enforce security or validation. Use one only if it fixes the root
+cause. Never substitute scanner suppressions, ignore attributes, comments or
+compile-time types for a security control. Otherwise use the smallest proven
+change: no major rewrites, unrelated refactors, invented issues or speculative
+fixes. Dependency-only updates retain the existing no-caller-adaptation rules.
+
+The host must also obey selection for its own editor/source/test operations;
+the MCP server cannot intercept edits made by external tools. Its own remediation
+entry points are gated atomically. Selection cannot be replaced after MCP edits
+have been recorded; finish validating that batch before a fresh clean run.
+Inspection snapshots are never reloaded as authorization.
+
+If the human selects nothing, declines/cancels, or the host lacks form support,
+skip remediation edits and remediation builds/tests and call `complete_security_run`.
+This still offers separate approval for independently evidenced false positives.
+Skipped findings stay unresolved, not false positives. Do not automatically
+reopen a declined/cancelled selection. Reports and status expose `fix_selection`
+and `NOT_RUN_NO_APPROVED_FIXES` rather than claiming validation passed.
 
 ### Reusing today's security branch
 
@@ -347,35 +388,55 @@ on today's branch temporarily checks out `main` for the two fast-forward pulls;
 the existing branch's commits are not reset, merged, rebased or overwritten.
 Dependency preparation then runs on the reused branch's manifests.
 
-Before any old snapshot is overwritten, all `.log`/`.jsonl` files under
-`.security-mcp` are checked for nonzero command exits, failed HTTP requests,
-timeouts, exception tracebacks and error-level output. Prior failed/incomplete
-run states and uncertain GitLab dismissal outcomes also block cleanup. Expected
-advisory 404 misses and prose such as "0 errors" are not runtime failures.
-Malformed/unreadable logs, links/reparse points, or artifacts changing during
-review are blockers, never proof that the run was clean.
+On a clean reused branch, prior `.log`/`.jsonl` files and run state are inspected
+before cleanup. Prior runtime failures do not block a fresh run: diagnostics
+are returned in `previous_run_errors`/`previous_run_error_count`, and cleanup
+emits a warning before removing disposable generated artifacts. This does not
+certify the previous run as successful or resume its approvals.
+Unreadable files, links/reparse points, or artifacts changing during inspection
+still block cleanup. Modified or staged tracked metadata makes the tree dirty.
 
-If errors are found, the run stops and preserves prior artifacts. Resolve the
-reported failures and manually archive the reviewed error logs outside
-`.security-mcp` before retrying; the server does not erase failure evidence.
-If clean, branch creation removes only generated **untracked/ignored** audit/HTTP
+Branch creation removes only generated **untracked/ignored** audit/HTTP
 logs, command stdout/stderr logs, run state, lint outputs and generated remediation
 reports. Git-tracked/staged files, policies, configuration, unknown files, and
-unrelated untracked work are never deleted. Cleanup unlinks individual files;
-it never runs `git clean` or recursively deletes the metadata root.
+unrelated untracked work are never deleted. Cleanup unlinks individual files,
+then removes empty generated directories and the metadata root only if empty.
+It never runs `git clean` or recursively deletes a directory. Preserved policies
+or tracked files therefore keep the folder present.
 
-The new run starts fresh: it retrieves and re-verifies findings instead of loading
-old assessments or approvals. New logs/state are written as the run continues.
+The new run starts fresh: a successful clean precheck resets prior in-memory
+assessments and form outcomes, including in a persistent MCP process. It retrieves
+and re-verifies findings instead of loading old approvals. New logs/state are
+written as the run continues.
 
 ### GitLab report filters
 
-Retrieval matches Status = Needs triage or Confirmed, Tracked ref = `main`,
-Activity = Still detected. The client resolves the exact tracked branch ID,
-requests `DETECTED` and `CONFIRMED`, and sets `hasResolution: false`. If tracked
+The remediation report matches Status = Needs triage or Confirmed, Tracked ref
+= `main`, Activity = Still detected. The client resolves the exact tracked
+branch ID, requests `DETECTED` and `CONFIRMED`, and sets `hasResolution: false`.
+If tracked
 `main` cannot be resolved, it fails rather than fetching unfiltered findings.
 Pagination and per-finding pipeline provenance are retained. Inspect `truncated`
 before treating a retrieval as complete; do not claim omitted findings were
 verified or resolved.
+
+The client also retrieves `hasResolution: true` findings on other tracked
+**branches**, not tags, for already-resolved-on-main review. Mere absence from
+main is not a false-positive verdict. GitLab must explicitly report
+`resolvedOnDefaultBranch: true`, its actual default branch must be `main`,
+and its main commit must match the commit pulled by this run. Conflicting
+active main finding UUIDs or incomplete evidence remain manual review.
+Branch-scoped vulnerability IDs prevent equal finding UUIDs on different refs
+from sharing an assessment or approval.
+
+Eligible descriptions include the original branch/ref, finding, location,
+identifiers, verified main SHA and scope limitation: an older branch may
+still be vulnerable even though main is fixed. These entries use the same
+initially unchecked human approval form. Immediately before a selected
+dismissal, GitLab identity, branch, resolution flag, default branch and main
+SHA are rechecked. Changed evidence blocks the mutation.
+See GitLab's [resolution-filter definition](https://gitlab.com/gitlab-org/gitlab/-/blob/master/ee/app/graphql/resolvers/vulnerabilities_resolver.rb)
+and [vulnerability fields](https://gitlab.com/gitlab-org/gitlab/-/blob/master/ee/app/graphql/types/vulnerability_type.rb).
 
 ### Fix eligibility
 
@@ -810,13 +871,19 @@ sequenceDiagram
     MCP-->>Host: Stop before branch creation and security checks
   else Checkout prepared
   Host->>MCP: create_security_branch then list_security_findings
-  loop Every eligible package update
+  loop Read-only assessment of every finding
   Host->>MCP: verify_security_finding(finding_id)
   MCP->>Repo: Inspect installed package and local evidence
   Note over Host,MCP: Missing public advisory data does not veto a concrete newer GitLab target
   MCP-->>Host: CHANGE_REQUIRED and proposed exact target
   Host->>Docs: Read release notes, APIs, compatibility and license terms
   Docs-->>Host: Target-version documentation
+  end
+  Host->>MCP: select_security_fixes
+  MCP-->>Reviewer: Unchecked issue selections, separate from false-positive approvals
+  Reviewer->>MCP: Select permitted issues or skip code fixes
+  Note over Host,MCP: Skip means complete_security_run without remediation edits or builds
+  loop Only human-selected eligible package updates
   Host->>MCP: qualify_package_update(finding_id, review)
   MCP->>Policy: Match exact package, target, approvals and checks
   MCP->>Repo: Record informational lint once, defer product checks
@@ -1584,7 +1651,7 @@ an unrelated environment or install the application into the MCP environment.
    For a native Copilot connection, stop/start is the restart operation; for an
    editor-managed connection, use **Restart Server** when available.
 5. Check that tool discovery includes `complete_security_run` and
-   `review_false_positives` among the fourteen tools. Run the read-only status
+   `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
    edits before requesting a new run.
@@ -1602,7 +1669,7 @@ an unrelated environment or install the application into the MCP environment.
 4. Reopen Cursor and enable/reload the server. Review connection logs and trust
    prompts. If a conversation still has a stale tool list after restarting,
    start a fresh Agent chat; do not treat an old chat response as tool discovery.
-5. Confirm the fourteen tools include `complete_security_run` and
+5. Confirm the fifteen tools include `select_security_fixes`, `complete_security_run` and
    `submit_false_positive_approvals`, then run the read-only status check below. Start a
    new remediation run only after reviewing preserved edits and prechecks.
 
@@ -1767,7 +1834,11 @@ a separate **GitLab Security Progress** console automatically. Progress bars
 and stage messages appear there during the tool call, even when the editor
 hides server stderr or does not request MCP progress. The console uses an
 isolated text-only child process; human messages never enter protocol stdout.
-It closes when the server exits. Set `PROGRESS_CONSOLE=off` in the MCP server's
+It opens lazily for run work and closes when completion/reporting finishes,
+a run fails, or the server exits. Active concurrent tool calls drain before
+the owned console is reaped. A later run opens a new console; unrelated command
+prompts are never closed. Read-only status requests do not create a window.
+Set `PROGRESS_CONSOLE=off` in the MCP server's
 environment for CI/headless runs, `on` to force the Windows console, or leave
 the default `auto` to retain ordinary terminal output when stderr is interactive.
 Restart the MCP server after changing code or this setting.
@@ -2283,9 +2354,9 @@ for deployment and restart differences.
 | Server does not start | Check absolute launcher/Python paths, installed runtime dependencies, and host logs. Stdout must contain only MCP messages. |
 | Retrieval fails or tracked main is unavailable | Check token scope/access, exact project path, GitLab URL and tracked branch. Do not use an unfiltered fallback. |
 | `truncated: true` | Treat retrieval/discovery as incomplete; do not claim all findings or absent packages were verified. |
-| `PRECHECK_FAILED` | Use clean `main` or today's exact security branch and finish Git operations manually. If prior logs block reuse, resolve and archive their errors first. The MCP does not discard your work. |
+| `PRECHECK_FAILED` | Use clean `main` or today's exact security branch and finish Git operations manually. Tracked metadata modifications are dirty work; unsafe artifact paths also block reuse. Prior execution errors alone do not block a fresh run. |
 | `PREPARATION_FAILED` | Inspect post-pull `pnpm clean` / `pnpm install` results and full command logs. Provide the repository's existing clean script and pnpm on PATH; resolve failures before security checks. Do not invent a clean script or delete directories as a workaround. |
-| Dated branch already exists | Today's exact branch is reused after error-free log review and guarded cleanup; other dated branches are not reused. Runtime errors preserve artifacts and stop the run. |
+| Dated branch already exists | Today's exact clean branch is reused after guarded generated-artifact cleanup, including failed-run output. Policies, configuration, tracked and unknown files are preserved. Other dated branches are not reused. |
 | `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability, a package-name mismatch, or an undocumented configuration line does not prove a false positive. |
 | `DOCS_REQUIRED` | The required publisher pages were not read completely. Nothing was written. Retry when those pages can be fetched. Do not apply the edit from memory. |
 | More than one repository is active | Pass `repo_root` on every tool call. Omitting it is valid only while one checkout is active. |
@@ -2295,7 +2366,7 @@ for deployment and restart differences.
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
-| An installed wheel still shows old behavior or fewer than fourteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
+| An installed wheel still shows old behavior or fewer than fifteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
 | `WinError 32` during installation | Close all VS Code/Cursor windows, including Agents/background windows, and retry the helper from standalone PowerShell. It detects a lock before pip changes the installation; it never terminates applications automatically. |
 | `Unexpected token 'install'` or a quoted pip path in PowerShell | Use the installer helper as one command, or run venv creation and pip installation as separate commands. An executable path in quotes needs PowerShell's `&` invocation operator. Do not join the two examples into one expression. |
 | `Ignoring invalid distribution ~itlab-security-mcp` | An interrupted install left recovery directories. The helper reports exact leftover paths without deleting them; resolve the file lock and repair the installation before manually reviewing any leftovers. A newer-pip notice is informational. |

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
+
+logger = logging.getLogger("gitlab_security_mcp")
 
 GENERATED_NAMES = {
     "audit.jsonl",
@@ -91,17 +94,24 @@ def _generated(relative: str) -> bool:
     )
 
 
-def review_security_artifacts(repo_root: Path, tracked: set[str] | None = None) -> dict:
+def review_security_artifacts(
+    repo_root: Path, tracked: set[str] | None = None, *, fresh_start: bool = False
+) -> dict:
     """Scan every log; only a stable, error-free snapshot may be cleaned.
 
     With no tracked-file inventory, this performs an inspection only. Cleanup
-    deletes individual owned files, never the metadata root or any directories.
+    deletes individual owned files and empty directories, never recursively.
+    A fresh start may discard prior execution errors, but not unsafe filesystem state.
     """
     root = repo_root / ".security-mcp"
     errors = []
     deleted = []
     logs_scanned = 0
     error_count = 0
+    prior_errors = []
+    prior_error_count = 0
+    deleted_directories = []
+    filesystem_safe = False
 
     def record(path: Path, line: int, reason: str) -> None:
         """Bound returned diagnostics without stopping the complete log scan."""
@@ -179,10 +189,16 @@ def review_security_artifacts(repo_root: Path, tracked: set[str] | None = None) 
                     except (UnicodeError, ValueError):
                         record(path, number, "Log entry is malformed or unreadable")
         if _snapshot(root) != snapshot:
-            record(
-                root,
-                0,
-                "Security artifacts changed during log review; retry when no other run is writing",
+            raise ValueError(
+                "Security artifacts changed during log review; retry when no other run is writing"
+            )
+        filesystem_safe = True
+        if fresh_start and tracked is not None and error_count:
+            prior_errors, prior_error_count = errors, error_count
+            errors, error_count = [], 0
+            logger.warning(
+                "Starting a clean reused branch after %s prior log errors; removing only generated untracked artifacts.",
+                prior_error_count,
             )
         if not error_count and tracked is not None:
             candidates = [
@@ -203,13 +219,40 @@ def review_security_artifacts(repo_root: Path, tracked: set[str] | None = None) 
                     )
                 path.unlink()
                 deleted.append(str(path.relative_to(repo_root)))
+            directories = {root, root / "command-logs", root / "reports"}
+            for path in snapshot:
+                directories.update(
+                    parent for parent in path.parents if parent.is_relative_to(root)
+                )
+            for directory in sorted(
+                directories, key=lambda path: len(path.parts), reverse=True
+            ):
+                if not directory.exists():
+                    continue
+                info = directory.lstat()
+                if (
+                    directory.is_symlink()
+                    or getattr(info, "st_file_attributes", 0) & 0x400
+                    or not directory.resolve().is_relative_to(root)
+                ):
+                    raise ValueError(
+                        "Security artifact directories changed before cleanup"
+                    )
+                if not any(directory.iterdir()):
+                    directory.rmdir()
+                    deleted_directories.append(str(directory.relative_to(repo_root)))
     except (OSError, ValueError) as exc:
+        filesystem_safe = False
         record(root, 0, f"Security log review/cleanup could not complete: {exc}")
     return {
         "status": "ERROR" if error_count else "OK",
+        "filesystem_safe": filesystem_safe,
         "logs_scanned": logs_scanned,
         "error_count": error_count,
         "errors": errors,
         "deleted_files": deleted,
+        "deleted_directories": deleted_directories,
+        "previous_run_error_count": prior_error_count,
+        "previous_run_errors": prior_errors,
         "cleanup_performed": tracked is not None and not error_count,
     }

@@ -16,9 +16,9 @@ from gitlab_security_mcp.util import redact, timed_http_stream
 from gitlab_security_mcp.versions import parse_fixed_versions
 
 FINDINGS_QUERY = """
-query SecurityFindings($fullPath: ID!, $trackedRefIds: [SecurityProjectTrackedContextID!]!, $after: String) {
+query SecurityFindings($fullPath: ID!, $trackedRefIds: [SecurityProjectTrackedContextID!]!, $after: String, $hasResolution: Boolean! = false) {
   project(fullPath: $fullPath) {
-    vulnerabilities(first: 100, after: $after, state: [DETECTED, CONFIRMED], trackedRefIds: $trackedRefIds, hasResolution: false) {
+    vulnerabilities(first: 100, after: $after, state: [DETECTED, CONFIRMED], trackedRefIds: $trackedRefIds, hasResolution: $hasResolution) {
             pageInfo { hasNextPage endCursor }
       nodes {
         id
@@ -126,7 +126,11 @@ mutation DismissFalsePositive($id: VulnerabilityID!, $comment: String!) {
 
 DISMISSAL_TARGET_QUERY = """
 query DismissalTarget($id: VulnerabilityID!) {
-    vulnerability(id: $id) { id uuid state project { fullPath } }
+    vulnerability(id: $id) {
+        id uuid state project { fullPath }
+        trackedRef { id name }
+        resolvedOnDefaultBranch
+    }
 }
 """.strip()
 
@@ -264,7 +268,13 @@ class GitLabClient:
         return unquote(project_id).strip("/")
 
     def dismiss_false_positive(
-        self, vulnerability_id: str, finding_id: str, project_path: str, reason: str
+        self,
+        vulnerability_id: str,
+        finding_id: str,
+        project_path: str,
+        reason: str,
+        *,
+        main_resolution: dict | None = None,
     ) -> dict:
         """Check target identity and active state, then dismiss with the exact reason.
 
@@ -302,6 +312,19 @@ class GitLabClient:
                 raise RuntimeError(
                     "GitLab target changed, is not active, or does not match the approved finding/project"
                 )
+            if main_resolution is not None:
+                branch = self._main_branch_snapshot(project_path)
+                tracked = target.get("trackedRef") or {}
+                if (
+                    branch["sha"] != main_resolution.get("main_sha")
+                    or target.get("resolvedOnDefaultBranch") is not True
+                    or tracked.get("id") != main_resolution.get("tracked_ref_id")
+                    or tracked.get("name") != main_resolution.get("branch")
+                    or tracked.get("name") == "main"
+                ):
+                    raise RuntimeError(
+                        "Main or branch-resolution evidence changed after approval; no dismissal was attempted"
+                    )
             payload = self._request(
                 "POST",
                 self._graphql_url(),
@@ -327,12 +350,13 @@ class GitLabClient:
                 )
             return {"status": "DISMISSED", "vulnerability_id": vulnerability_id}
 
-    def _main_tracked_ref(self, full_path: str) -> str:
-        """Resolve tracked main with bounded, advancing pagination.
+    def _tracked_branches(self, full_path: str) -> dict[str, str]:
+        """Resolve tracked branches with bounded, advancing pagination.
 
         Raise if main is unreadable or missing instead of dropping filters.
         """
         after = None
+        branches = {}
         for _page in range(MAX_PAGES):
             payload = self._graphql(
                 TRACKED_REFS_QUERY, {"fullPath": full_path, "after": after}
@@ -345,13 +369,16 @@ class GitLabClient:
             connection = _connection(project, "securityTrackedRefs")
             for tracked_ref in connection["nodes"]:
                 if (
-                    tracked_ref.get("name") == "main"
+                    isinstance(tracked_ref.get("name"), str)
+                    and tracked_ref["name"]
                     and tracked_ref.get("refType") == "BRANCH"
                     and tracked_ref.get("id")
                 ):
-                    return tracked_ref["id"]
+                    branches[tracked_ref["name"]] = tracked_ref["id"]
             page = connection["pageInfo"]
             if not page.get("hasNextPage"):
+                if "main" in branches:
+                    return branches
                 raise RuntimeError(
                     "GitLab security tracked branch 'main' was not found; refusing to fetch unfiltered findings"
                 )
@@ -361,17 +388,77 @@ class GitLabClient:
         raise RuntimeError("GitLab tracked-ref lookup exceeded the page limit")
 
     def _findings(self, full_path: str) -> tuple[dict | None, list[dict], bool]:
-        """Page the persistent filtered report and flag incomplete results."""
-        tracked_ref_id = self._main_tracked_ref(full_path)
+        """Keep main's active report and add explicitly resolved non-main findings."""
+        branches = self._tracked_branches(full_path)
+        main, truncated = self._report_findings(full_path, [branches["main"]])
+        others = [value for name, value in branches.items() if name != "main"]
+        if truncated or not others:
+            return None, main, truncated
+        resolved, branch_truncated = self._report_findings(
+            full_path, others, has_resolution=True
+        )
+        if resolved:
+            snapshot = self._main_branch_snapshot(full_path)
+            main_uuids = {item.get("uuid") for item in main if item.get("uuid")}
+            for item in resolved:
+                tracked = item.get("trackedRef") or {}
+                item["mainBranchResolution"] = {
+                    "main_sha": snapshot["sha"],
+                    "branch": tracked.get("name"),
+                    "tracked_ref_id": tracked.get("id"),
+                    "verified": (
+                        item.get("resolvedOnDefaultBranch") is True
+                        and isinstance(item.get("uuid"), str)
+                        and bool(item["uuid"])
+                        and isinstance(item.get("id"), str)
+                        and bool(
+                            re.fullmatch(
+                                r"gid://gitlab/Vulnerability/[1-9][0-9]*", item["id"]
+                            )
+                        )
+                        and tracked.get("name") != "main"
+                        and branches.get(tracked.get("name")) == tracked.get("id")
+                        and tracked.get("id") in others
+                        and item.get("uuid") not in main_uuids
+                    ),
+                }
+        return None, [*main, *resolved], branch_truncated
+
+    def _main_branch_snapshot(self, full_path: str) -> dict:
+        """Require that GitLab's default branch really is main and has a commit."""
+        branch = self._request(
+            "GET",
+            f"{self.api_url}/projects/{quote(full_path, safe='')}/repository/branches/main",
+        )
+        sha = (branch.get("commit") or {}).get("id")
+        if (
+            branch.get("name") != "main"
+            or branch.get("default") is not True
+            or not isinstance(sha, str)
+            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha)
+        ):
+            raise RuntimeError(
+                "Cannot prove GitLab's default branch is main at a known commit; branch findings cannot be dismissed"
+            )
+        return {"sha": sha}
+
+    def _report_findings(
+        self,
+        full_path: str,
+        tracked_ref_ids: list[str],
+        *,
+        has_resolution: bool = False,
+    ) -> tuple[list[dict], bool]:
+        """Page one explicitly scoped activity view without broadening its filters."""
         after = None
-        pipeline = None
         nodes: list[dict] = []
         for _page in range(MAX_PAGES):
             payload = self._graphql(
                 FINDINGS_QUERY,
                 {
                     "fullPath": full_path,
-                    "trackedRefIds": [tracked_ref_id],
+                    "trackedRefIds": tracked_ref_ids,
+                    "hasResolution": has_resolution,
                     "after": after,
                 },
             )
@@ -384,15 +471,15 @@ class GitLabClient:
             nodes.extend(connection["nodes"])
             page = connection["pageInfo"]
             if not page.get("hasNextPage"):
-                return pipeline, nodes, False
+                return nodes, False
             if not page.get("endCursor") or page["endCursor"] == after:
                 raise RuntimeError(
                     "GitLab vulnerability report pagination did not advance"
                 )
             after = page["endCursor"]
             if len(nodes) >= self.max_findings:
-                return pipeline, nodes, True
-        return pipeline, nodes, True
+                return nodes, True
+        return nodes, True
 
     def _graphql(self, query: str, variables: dict) -> dict:
         """Send only query operations to the GitLab GraphQL endpoint."""
@@ -546,11 +633,14 @@ def normalize_finding(node: dict, pipeline: dict | None) -> dict:
     scanner_evidence = _scanner_evidence(latest.get("evidence"))
     scanner_details = deepcopy(latest.get("details") or node.get("details") or [])
     return {
-        "id": node.get("uuid")
+        "id": (node.get("id") if node.get("mainBranchResolution") else None)
+        or node.get("uuid")
         or node.get("id")
         or node.get("title")
         or "unknown-finding",
         "vulnerabilityId": node.get("id"),
+        "findingUuid": node.get("uuid"),
+        "mainBranchResolution": deepcopy(node.get("mainBranchResolution")),
         "title": node.get("title"),
         "description": node.get("description"),
         "scanner": (node.get("scanner") or {}).get("name"),

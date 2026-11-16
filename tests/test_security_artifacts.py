@@ -104,10 +104,28 @@ def test_security_artifact_link_blocks_cleanup(tmp_path):
         pytest.skip("This Windows account cannot create symbolic links")
 
     # Act
-    result = review_security_artifacts(tmp_path, tracked=set())
+    result = review_security_artifacts(tmp_path, tracked=set(), fresh_start=True)
 
     # Assert
     assert result["status"] == "ERROR"
     assert result["deleted_files"] == []
     assert link.is_symlink()
     assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_fresh_cleanup_removes_empty_generated_directories(tmp_path):
+    """Remove an empty generated tree without recursively deleting any directory."""
+    # Arrange
+    root = tmp_path / ".security-mcp"
+    (root / "command-logs").mkdir(parents=True)
+    (root / "reports").mkdir()
+    (root / "audit.jsonl").write_text('{"exit_code":1}\n', encoding="utf-8")
+
+    # Act
+    result = review_security_artifacts(tmp_path, tracked=set(), fresh_start=True)
+
+    # Assert
+    assert result["status"] == "OK"
+    assert result["previous_run_error_count"] == 1
+    assert not root.exists()
+    assert len(result["deleted_directories"]) == 3

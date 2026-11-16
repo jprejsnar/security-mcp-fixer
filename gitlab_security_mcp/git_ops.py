@@ -53,12 +53,14 @@ def is_metadata_path(path: str) -> bool:
 
 
 def meaningful_status(porcelain: str) -> list[str]:
-    """Drop status lines that only touch ``.security-mcp``."""
+    """Ignore untracked metadata outputs, never modified or staged tracked files."""
     dirty: list[str] = []
     for line in porcelain.splitlines():
         if not line.strip():
             continue
-        if all(is_metadata_path(path) for path in _porcelain_paths(line)):
+        if line.startswith("?? ") and all(
+            is_metadata_path(path) for path in _porcelain_paths(line)
+        ):
             continue
         dirty.append(line)
     return dirty

@@ -45,8 +45,8 @@ Call the tools in this order:
     work starts, each Git pull, and pnpm preparation. On DNS failure, tell the
     user to connect to corporate VPN first and rerun run_prechecks; stop the run.
     Start on clean main or today's exact security-fixes-Month-dd-YYYY branch.
-    Existing same-day branches require scanning prior security logs. Runtime
-    errors or unverifiable logs stop the run and preserve prior artifacts.
+    Existing same-day branches require safe inspection of prior security artifacts.
+    Modified tracked metadata counts as a dirty tree, not disposable output.
 2. pull_main_twice. After both successful pulls this tool automatically runs
     pnpm clean followed by pnpm install in each pnpm project/workspace root,
     before branching or any security checks. Do not issue duplicate host commands.
@@ -56,10 +56,11 @@ Call the tools in this order:
     repositories skip pnpm preparation. The repository must provide its own
     clean script; do not invent one or replace it with a directory deletion.
 3. create_security_branch. Reuse today's exact local/origin branch if it exists.
-    Before cleanup, scan every security log. If clean, delete only known generated
-    untracked files inside .security-mcp; preserve tracked files, policies,
-    configuration and unrelated files. Runtime errors stop the run with files
-    preserved. Never run git clean or delete the metadata root. Older dated
+    On a clean reused branch, inspect and remove known generated untracked files
+    inside .security-mcp, including prior failed-run logs; preserve tracked files,
+    policies, configuration and unrelated files. Report discarded prior errors.
+    Links/reparse points, unreadable files or changing artifacts block cleanup.
+    Remove only empty directories, never use recursive deletion or git clean. Older dated
     branches are not reused. A fresh run re-verifies findings; old assessments
     are not resumed.
 4. list_security_findings. Omit project_id to infer namespace/project from the
@@ -67,6 +68,11 @@ Call the tools in this order:
     a numeric ID or reuse another checkout's project. The origin must match the
     configured trusted GITLAB_API_URL host (gitlab.com by default); never infer
     credentials or change the trusted API destination from repository metadata.
+    Main's active report remains scoped to main. Additional non-main branch
+    findings are considered only with GitLab's explicit resolved-on-default-branch
+    evidence and default main commit verification. Absence from main is not proof.
+    Only human checkbox submissions can dismiss these already-resolved-on-main
+    assessments; do not claim the older branch is safe or update its dependencies.
 5. verify_security_finding for every finding
     Fan out independent read-only evidence work in bounded batches (at most
     eight concurrent requests). Reuse full-file reads for findings in the same
@@ -103,8 +109,11 @@ Call the tools in this order:
     Do not ask the user to perform the code analysis or end with the pending
     placeholder. If access, host consent or sufficient evidence is unavailable,
     report that exact blocker and keep the finding unresolved.
-    For a reproduced defect, apply reviewed source/regression fixes through the host,
-    separately from package updates, and validate before claiming resolution.
+    Assessment is read-only: do not edit production, configuration, dependency
+    or regression-test files before the human fix selection below. For a
+    reproduced defect, only after that issue is selected may the host apply
+    reviewed source/regression fixes, separately from package updates.
+    Validate before claiming resolution.
     API and coverage fuzzing return REPRODUCTION_REQUIRED with fuzzing_workflow.
     Read its scanner_evidence (request URL/body, response body/status and
     supporting exchanges) and scanner_details captured through GraphQL before
@@ -119,7 +128,7 @@ Call the tools in this order:
     inspect the local handler or target, and reproduce the exact failure using
     synthetic data in an explicitly approved local environment. Do not replay
     payloads against the remote scanner hostname. Only after reproduction and
-    review may the host apply scoped application-code and regression-test
+    review AND human selection of that issue may the host apply scoped application-code and regression-test
     fixes, separately from package updates. apply_minimal_fix does not support
     arbitrary source patches. Run identical before/after reproduction, valid
     and boundary cases, lint, production build and executed unit tests. Retain
@@ -143,7 +152,27 @@ Call the tools in this order:
     No direct imports does not establish transitive compatibility. Record
     concrete caller breakages when found; distinguish incomplete evidence
     from proven breakage. Never claim 100% runtime compatibility from a scan.
-7. qualify_package_update with the exact version-bound documentation review.
+7. Call select_security_fixes once after read-only assessments, before ANY
+    remediation edits or package qualification. The human receives unchecked
+    issue-selection boxes; the AI must never answer or simulate consent.
+    Fix only selected IDs in this checkout/run, including host-owned source and
+    test edits. MCP tools enforce their own gate; external editor tools must
+    obey these same permissions. Consent to false-positive dismissal is separate.
+    If no issues are selected, the form is declined/cancelled or unavailable,
+    skip all remediation edits, qualification and remediation builds/tests.
+    Continue directly to complete_security_run for independently assessed false
+    positives; do not relabel skipped true or uncertain findings as false positives.
+    Do not reopen a declined/cancelled form without an explicit user request.
+    Before changing code for a selected issue, inspect the framework's actual
+    supported annotations and prefer an annotation that genuinely enforces the
+    missing security/validation control, but only if evidence shows it fixes
+    the root cause. Comments, scanner suppressions, ignore attributes and
+    compile-time-only types are not security fixes. Otherwise use the smallest
+    proven scoped change. No major rewrites, unrelated refactors, invented
+    findings or speculative fixes. An annotation is not a substitute for fixing
+    an affected dependency version. Selection never waives evidence requirements;
+    reproduction-required findings still need the exact defect reproduced.
+    Then qualify_package_update for selected issues with the exact version-bound documentation review.
     Without a configured/existing policy, provide review.license {expression,
     sources:[official target-version HTTPS URLs], commercial_use_permitted:true,
     no_license_fees:true, obligations, assessment}. Read actual terms; do not
@@ -191,7 +220,7 @@ Call the tools in this order:
     guess case counts from source text. For other commands, show real reported
     counts when available and output-driven activity when totals are unknown;
     never infer completion percentages from elapsed time.
-    LOOP over findings: verify, review, qualify and apply all eligible version
+    LOOP over human-selected findings: qualify and apply only eligible version
     updates without running build/unit tests between updates. Then call
     run_validation_matrix once for the complete batch. Accept only with a successful
     production build and all built/executed unit tests passing, plus configured
@@ -412,6 +441,41 @@ def _open_progress_console() -> _ProgressConsole | None:
 
 
 _progress_console: _ProgressConsole | None = None
+_progress_console_lock = threading.Lock()
+_progress_console_attempted = False
+_progress_console_enabled = False
+_progress_calls = 0
+_progress_close_pending = False
+
+
+def _console_for_progress() -> _ProgressConsole | None:
+    """Lazily open one owned console per run, including after an earlier run ended."""
+    global _progress_console, _progress_console_attempted
+    with _progress_console_lock:
+        if not _progress_console_enabled:
+            return _progress_console
+        if _progress_console is None and not _progress_console_attempted:
+            _progress_console_attempted = True
+            _progress_console = _open_progress_console()
+        return _progress_console
+
+
+def _finish_progress_call(terminal: bool) -> _ProgressConsole | None:
+    """Detach the owned console when a run ends and active writers have drained."""
+    global _progress_console, _progress_console_attempted
+    global _progress_console_enabled
+    global _progress_calls, _progress_close_pending
+    with _progress_console_lock:
+        _progress_calls -= 1
+        _progress_close_pending |= terminal
+        if _progress_calls or not _progress_close_pending:
+            return None
+        console = _progress_console
+        _progress_console = None
+        _progress_console_attempted = False
+        _progress_console_enabled = False
+        _progress_close_pending = False
+        return console
 
 
 async def _progress_middleware(
@@ -420,6 +484,18 @@ async def _progress_middleware(
     """Deliver live text bars to the active MCP request without crossing checkouts."""
     if context.method != "tools/call":
         return await call_next(context)
+    global _progress_calls, _progress_console_enabled
+    with _progress_console_lock:
+        _progress_calls += 1
+        name = (getattr(context, "params", None) or {}).get("name")
+        if name is not None and name not in {
+            "get_run_status",
+            "review_false_positives",
+            "complete_security_run",
+            "generate_local_report",
+            "submit_false_positive_approvals",
+        }:
+            _progress_console_enabled = True
     loop = asyncio.get_running_loop()
     messages: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
     transcript: deque[str] = deque(maxlen=64)
@@ -440,8 +516,9 @@ async def _progress_middleware(
         if finished.is_set():
             return
         text = str(text)[:2000]
-        if _progress_console is not None:
-            _progress_console.write(text)
+        console = _console_for_progress()
+        if console is not None:
+            console.write(text)
         try:
             loop.call_soon_threadsafe(enqueue, text)
         except RuntimeError:
@@ -462,8 +539,20 @@ async def _progress_middleware(
 
     token = progress_sink.set(publish)
     sender = asyncio.create_task(deliver())
+    terminal = True
     try:
         result = await call_next(context)
+        payload = (
+            result.structured_content if isinstance(result, CallToolResult) else result
+        )
+        status = payload.get("status", "") if isinstance(payload, dict) else ""
+        terminal = (isinstance(result, CallToolResult) and result.is_error) or (
+            isinstance(status, str)
+            and (
+                status in {"REPORT_GENERATED", "ERROR"}
+                or status.endswith(("_FAILED", "_INCOMPLETE"))
+            )
+        )
     finally:
         progress_sink.reset(token)
         try:
@@ -479,6 +568,9 @@ async def _progress_middleware(
             sender.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sender
+            console = _finish_progress_call(terminal)
+            if console is not None:
+                await asyncio.to_thread(console.close)
     if transcript:
         output = list(transcript)
         if isinstance(result, dict):
@@ -559,6 +651,13 @@ def _run(
     selected: Engine | None = None
     try:
         selected = _engine_for(repo_root)
+        if tool_name in {
+            "qualify_package_update",
+            "apply_minimal_fix",
+            "generate_aaa_test",
+            "run_validation_matrix",
+        }:
+            return selected.run_approved_fix(tool_name, *args, **kwargs)
         return getattr(selected, tool_name)(*args, **kwargs)
     except Exception as exc:
         logger.exception("%s failed", tool_name)
@@ -584,8 +683,8 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
     DNS must resolve nexus.ert.com; otherwise connect to corporate VPN first.
     Pass the active workspace path explicitly when REPO_ROOT is unset or contains
     an unresolved host placeholder. Another checkout can run at the same time.
-    Before same-day reuse, scan prior security logs; errors preserve artifacts
-    and stop the run without overwriting the old run snapshot.
+    Before same-day reuse, check artifact filesystem safety. Prior execution
+    errors do not block a fresh start on a clean branch; unsafe filesystem state does.
     """
     return _run("run_prechecks", repo_root=repo_root)
 
@@ -624,10 +723,10 @@ def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
 def create_security_branch(repo_root: str | None = None) -> dict[str, Any]:
     """Create today's branch or safely reuse its exact dated name.
 
-    Review all prior security logs first. Runtime errors or unverifiable logs
-    preserve artifacts and stop. If clean, remove only known generated untracked
-    .security-mcp outputs, never policies/configuration, tracked or unrelated
-    files. Prepare pnpm on the reused branch before fetching findings.
+    On a clean branch, review and remove known generated untracked .security-mcp
+    outputs, including prior failed-run logs. Preserve policies/configuration,
+    tracked and unrelated files; remove directories only if empty. Filesystem
+    safety errors stop cleanup. Prepare pnpm before fetching findings.
     """
     return _run("create_security_branch", repo_root=repo_root)
 
@@ -776,7 +875,7 @@ def qualify_package_update(
     )
 )
 def apply_minimal_fix(finding_id: str, repo_root: str | None = None) -> dict[str, Any]:
-    """Apply only a fresh qualified package plan; resolution requires post-checks."""
+    """Apply only a human-selected, fresh qualified plan; resolution needs post-checks."""
     return _run("apply_minimal_fix", finding_id, repo_root=repo_root)
 
 
@@ -820,6 +919,110 @@ def _form_supported(ctx: Context) -> bool:
         return False
     elicitation = capabilities.elicitation
     return elicitation.form is not None or not elicitation.model_dump(exclude_none=True)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Select security issues to fix",
+        read_only_hint=False,
+        destructive_hint=False,
+        open_world_hint=False,
+    )
+)
+async def select_security_fixes(
+    ctx: Context, repo_root: str | None = None
+) -> dict[str, Any]:
+    """Ask the human which real issues may receive remediation edits.
+
+    Call once after read-only verification and before any qualification, source,
+    dependency, configuration or test edits. No AI approval arguments are accepted.
+    Prefer documented security-enforcing annotations only when they fix the root
+    cause; never suppress findings. Otherwise use the smallest proven fix, not a rewrite.
+    Empty selection, decline, cancel, or unavailable form means skip code fixes
+    and call complete_security_run for independently assessed false positives.
+    A selected issue still needs sufficient evidence, compatibility and validation.
+    """
+    selected = await asyncio.to_thread(_engine_for, repo_root)
+    snapshot = await asyncio.to_thread(selected.fix_selection_candidates)
+    if snapshot["status"] != "OK":
+        return snapshot
+    candidates = snapshot["candidates"]
+    if not candidates or not _form_supported(ctx):
+        return await asyncio.to_thread(
+            selected.record_fix_selection,
+            candidates,
+            [],
+            "SKIPPED" if not candidates else "UNAVAILABLE",
+            "No evidenced fix candidates."
+            if not candidates
+            else "The host does not advertise human form support; no code edits are authorized.",
+        )
+    pending = await asyncio.to_thread(
+        selected.record_fix_selection, candidates, [], "REQUESTED"
+    )
+    if pending["status"] != "REQUESTED":
+        return pending
+    schema = create_model(
+        "SecurityFixSelection",
+        **{
+            f"finding_{index}": (
+                bool,
+                Field(
+                    default=False,
+                    strict=True,
+                    title=f"{item['severity']}: {item['id']}: {item['title']}",
+                    description=(
+                        f"Location: {item['location']}\nAssessment: {item['decision']}: {item['reason']}\n"
+                        f"Existing proposed plan (empty means no verified edit plan yet): {item['proposed_fix']}\n"
+                        "Allow a surgical fix for this issue only. Prefer a documented security-enforcing "
+                        "annotation when sufficient; no suppressions, invented fixes, major rewrites or API adaptations."
+                    ),
+                ),
+            )
+            for index, item in enumerate(candidates)
+        },
+    )
+    try:
+        response = await ctx.elicit(
+            f"Choose which security issues may be fixed in {selected.repo_root}. "
+            "All boxes start unchecked. Select only the issues you authorize. "
+            "An annotation must actually enforce security, not hide a warning. "
+            "Only precise, evidence-backed fixes are allowed. Dependency updates may incidentally "
+            "resolve other findings sharing that dependency; no separate edits for unchecked issues are authorized. "
+            "Submit with no boxes checked, decline or cancel to skip code fixes and proceed to "
+            "independently assessed false positives. Skipping does not make an issue a false positive.",
+            schema,
+        )
+    except (ValueError, MCPError) as exc:
+        logger.warning("Security fix selection unavailable or invalid: %s", exc)
+        return await asyncio.to_thread(
+            selected.record_fix_selection,
+            candidates,
+            [],
+            "INVALID" if isinstance(exc, ValueError) else "UNAVAILABLE",
+            str(exc),
+            request_id=pending["request_id"],
+        )
+    chosen = (
+        response.data.model_dump()
+        if response.action == "accept" and response.data is not None
+        else {}
+    )
+    ids = [
+        item["id"]
+        for index, item in enumerate(candidates)
+        if chosen.get(f"finding_{index}") is True
+    ]
+    return await asyncio.to_thread(
+        selected.record_fix_selection,
+        candidates,
+        ids,
+        "APPROVED" if ids else "SKIPPED",
+        ""
+        if ids
+        else "The human did not approve any code fixes; proceed to false-positive review.",
+        request_id=pending["request_id"],
+    )
 
 
 async def _approval_result(selected: Engine, receipt: dict, result: dict) -> dict:
@@ -1150,7 +1353,6 @@ def main() -> None:
     global _progress_console
     _install_host_logging()
     logger.info("gitlab-security-mcp %s serving stdio", __version__)
-    _progress_console = _open_progress_console()
     try:
         mcp.run(transport="stdio")
     finally:

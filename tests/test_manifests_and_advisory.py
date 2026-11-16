@@ -644,10 +644,12 @@ def test_report_filters_match_patient_web_ui():
                 },
             )
         assert "state: [DETECTED, CONFIRMED]" in body["query"]
-        assert "hasResolution: false" in body["query"]
+        assert "hasResolution: $hasResolution" in body["query"]
         assert "trackedRefIds: $trackedRefIds" in body["query"]
         assert body["variables"]["trackedRefIds"] == [
-            "gid://gitlab/Security::ProjectTrackedContext/2"
+            "gid://gitlab/Security::ProjectTrackedContext/1"
+            if body["variables"]["hasResolution"]
+            else "gid://gitlab/Security::ProjectTrackedContext/2"
         ]
         return httpx.Response(
             200,
@@ -669,7 +671,7 @@ def test_report_filters_match_patient_web_ui():
 
     # Assert
     assert fetched.ok is True
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_project_report_findings_do_not_require_a_successful_pipeline():
@@ -763,7 +765,8 @@ def test_report_pagination_preserves_each_findings_pipeline():
             "gid://gitlab/Security::ProjectTrackedContext/2"
         ]
         assert "state: [DETECTED, CONFIRMED]" in body["query"]
-        assert "hasResolution: false" in body["query"]
+        assert "hasResolution: $hasResolution" in body["query"]
+        assert body["variables"]["hasResolution"] is False
         cursors.append(body["variables"]["after"])
         return httpx.Response(200, json=next(pages))
 

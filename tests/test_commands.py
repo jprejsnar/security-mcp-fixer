@@ -593,6 +593,20 @@ def test_server_notes_do_not_count_as_a_dirty_tree():
     assert dirty == ["?? package.json"]
 
 
+def test_modified_tracked_security_files_are_not_ignored():
+    """Preserve the clean-branch gate for tracked policies and generated files."""
+    # Arrange
+    status = (
+        " M .security-mcp/package-update-policy.json\nM  .security-mcp/run-state.json"
+    )
+
+    # Act
+    dirty = meaningful_status(status)
+
+    # Assert
+    assert dirty == status.splitlines()
+
+
 def test_branch_name_uses_english_month():
     """Branch name uses english month."""
     # Arrange

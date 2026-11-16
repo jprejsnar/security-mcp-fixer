@@ -134,6 +134,12 @@ def _unresolved_issues(state: RunState) -> list[dict]:
         ):
             continue
         detail = reasons.get(finding_id) or {}
+        unselected = (
+            state.fix_selection.get("status")
+            in {"APPROVED", "SKIPPED", "UNAVAILABLE", "INVALID"}
+            and finding_id in state.fix_selection.get("candidate_ids", [])
+            and finding_id not in state.fix_selection.get("selected_ids", [])
+        )
         unresolved.append(
             {
                 "id": finding_id,
@@ -148,6 +154,15 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 "location": finding.get("location") or {},
                 "decision": outcome.get("status") if failed else decision,
                 "reason": (outcome.get("detail") if failed or pending else None)
+                or (
+                    "No remediation edit was authorized for this finding. "
+                    + (
+                        state.fix_selection.get("reason")
+                        or "The human did not select this issue."
+                    )
+                    if unselected
+                    else None
+                )
                 or qualification.get("reason")
                 or (
                     "The verified fix candidate has not been applied. Qualification and successful post-update validation are still required."
@@ -333,6 +348,7 @@ def render(
             key: value.get("decision") for key, value in state.decisions.items()
         },
         "changes_made": state.changes,
+        "fix_selection": state.fix_selection,
         "validation_status": state.validation_status,
         "validation": state.validation_results,
         "validation_caveats": _validation_caveats(state),
@@ -418,6 +434,12 @@ def render(
             else f"Pipeline: {(state.pipeline or {}).get('id') or 'unknown'} @ {(state.pipeline or {}).get('sha') or 'unknown'}"
         ),
         f"Findings considered: {len(state.findings)}",
+        "",
+        "## Human Code-Fix Selection",
+        f"Status: {_table_cell(state.fix_selection.get('status') or 'NOT_REQUESTED')}",
+        f"Selected issue IDs: {_table_cell(', '.join(state.fix_selection.get('selected_ids', [])) or 'none')}",
+        "Only human-selected issues authorize remediation edits. Unselected issues are not thereby false positives.",
+        "",
         *(
             [
                 "Warning: GitLab returned more findings than this run fetched. The list is incomplete."
@@ -734,6 +756,7 @@ def write_report(
         "false_positive_review_tool": payload["false_positive_review_tool"],
         "false_positive_approval": payload["false_positive_approval"],
         "false_positive_approval_form": payload["false_positive_approval_form"],
+        "fix_selection": payload["fix_selection"],
         "lint_baseline": payload["lint_baseline"],
         "lint_issues_path": str(root / ".security-mcp" / "lint-issues.json")
         if state.lint_baseline is not None

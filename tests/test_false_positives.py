@@ -1101,3 +1101,142 @@ def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
     saved = json.loads(Path(result.structured_content["json_report"]).read_text())
     assert saved["false_positive_approval_form"]["selected_ids"] == ["finding-2"]
     assert saved["false_positive_approval"]["not_confirmed_dismissed"] == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "main_changed",
+        "resolution_changed",
+        "default_changed",
+        "ref_changed",
+        "main_present",
+    ],
+)
+def test_branch_resolution_requires_main_evidence_human_approval_and_freshness(
+    tmp_path, monkeypatch, change
+):
+    """Only approve branch-scoped findings explicitly resolved on unchanged default main."""
+    # Arrange
+    phase = {"approval": False}
+    mutations = []
+    sha = "a" * 40
+    branch_node = {
+        "id": GID,
+        "uuid": "finding-1",
+        "title": "Already fixed source issue",
+        "reportType": "SAST",
+        "state": "DETECTED",
+        "trackedRef": {"id": "release-id", "name": "release"},
+        "resolvedOnDefaultBranch": True,
+        "location": {"file": "MissingOnThisCheckout.java", "startLine": 7},
+    }
+
+    def handler(request):
+        """Serve the real GitLab client without any external request or mutation."""
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "main",
+                    "default": not (phase["approval"] and change == "default_changed"),
+                    "commit": {
+                        "id": "b" * 40
+                        if phase["approval"] and change == "main_changed"
+                        else sha
+                    },
+                },
+            )
+        body = json.loads(request.content)
+        if "securityTrackedRefs(" in body["query"]:
+            connection = {
+                "nodes": [
+                    {"id": "main-id", "name": "main", "refType": "BRANCH"},
+                    {"id": "release-id", "name": "release", "refType": "BRANCH"},
+                ],
+                "pageInfo": {"hasNextPage": False},
+            }
+            return httpx.Response(
+                200, json={"data": {"project": {"securityTrackedRefs": connection}}}
+            )
+        if "vulnerabilities(" in body["query"]:
+            resolved = body["variables"]["hasResolution"]
+            assert body["variables"]["trackedRefIds"] == (
+                ["release-id"] if resolved else ["main-id"]
+            )
+            nodes = [deepcopy(branch_node)] if resolved else []
+            if not resolved and change == "main_present":
+                nodes = [
+                    {
+                        **branch_node,
+                        "id": "gid://gitlab/Vulnerability/124",
+                        "trackedRef": {"id": "main-id", "name": "main"},
+                    }
+                ]
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "project": {
+                            "vulnerabilities": {
+                                "nodes": nodes,
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                },
+            )
+        if body["query"] == DISMISSAL_TARGET_QUERY:
+            target = {**branch_node, "project": {"fullPath": "group/app"}}
+            if change == "resolution_changed":
+                target["resolvedOnDefaultBranch"] = False
+            if change == "ref_changed":
+                target["trackedRef"] = {"id": "different", "name": "different"}
+            return httpx.Response(200, json={"data": {"vulnerability": target}})
+        assert body["query"] == DISMISS_FALSE_POSITIVE
+        mutations.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "vulnerabilityDismiss": {
+                        "errors": [],
+                        "vulnerability": {"id": GID, "state": "DISMISSED"},
+                    }
+                }
+            },
+        )
+
+    engine = _engine(tmp_path)
+    ctx = _context(reason="resolvedOnDefaultBranch=true")
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        engine.gitlab = GitLabClient("test-token", http=http)
+        fetched = engine.gitlab.fetch("group/app")
+        assert fetched.ok, fetched.error
+        engine.state.findings = fetched.findings
+        engine.state.decisions.clear()
+        engine.state.pulls = [{"end_head": sha}]
+        decision = engine.verify_security_finding(GID)
+        phase["approval"] = True
+        result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
+
+    # Assert
+    engine.advisory.lookup.assert_not_called()
+    engine.docs.read_before_fix.assert_not_called()
+    if change == "main_present":
+        assert decision["decision"] == "MANUAL_REVIEW"
+        assert mutations == []
+        ctx.elicit.assert_not_called()
+    else:
+        assert decision["decision"] == "FALSE_POSITIVE"
+        assert "not proof that the older branch is safe" in decision["reason"]
+        assert sha in decision["reason"]
+        ctx.elicit.assert_awaited_once()
+        assert len(mutations) == int(change is None)
+        assert result["status"] == ("OK" if change is None else "PARTIAL_FAILURE")
+        if mutations:
+            assert mutations[0]["variables"]["comment"] == decision["reason"]
