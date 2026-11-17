@@ -208,6 +208,7 @@ def timed_http_stream(
     *,
     source: str,
     log_path: Path | None = None,
+    operation: str | None = None,
     **kwargs,
 ) -> Iterator[httpx.Response]:
     """Time a request through body consumption and log safe concurrent spans.
@@ -241,6 +242,8 @@ def timed_http_stream(
             "error": error,
             "worker": threading.current_thread().name,
         }
+        if operation is not None:
+            record["operation"] = operation
         text = json.dumps(record, ensure_ascii=True)
         logger.info("HTTP timing %s", text)
         if log_path is not None:

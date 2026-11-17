@@ -645,6 +645,34 @@ def test_git_mutations_are_rejected(repo):
     assert "A " not in status.stdout
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["git", "push", "origin", "HEAD"],
+        ["git", "push", "--tags"],
+        ["git", "push", "origin", "--delete", "main"],
+        ["git", "commit", "-m", "forbidden"],
+        ["git", "tag", "release"],
+        ["git", "notes", "add", "-m", "forbidden"],
+        ["git", "branch", "-D", "main"],
+    ],
+)
+def test_commits_pushes_tags_notes_and_branch_deletion_are_forbidden(repo, argv):
+    """Reject publishing or attribute changes before launching any subprocess."""
+    # Arrange
+    from unittest.mock import patch
+
+    runner = CommandRunner(repo)
+
+    # Act
+    with patch("gitlab_security_mcp.commands.subprocess.Popen") as popen:
+        with pytest.raises(PermissionError):
+            runner.run(argv, timeout=30)
+
+    # Assert
+    popen.assert_not_called()
+
+
 def test_security_branch_checkout_is_allowed(repo):
     """Security branch checkout is allowed."""
     # Arrange

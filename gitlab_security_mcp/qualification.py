@@ -18,15 +18,14 @@ from urllib.parse import urlparse
 from gitlab_security_mcp.commands import assert_allowed, resolve_tool, tool_name
 from gitlab_security_mcp.manifests import iter_files, java_project_root
 from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
-from gitlab_security_mcp.validate import _run_result, java_wrapper, node_test_blocker
+from gitlab_security_mcp.validate import (
+    _execute_product_check,
+    _run_result,
+    java_wrapper,
+)
 
 PACKAGE_ECOSYSTEMS = {"npm", "NuGet", "Maven"}
 CHECK_KINDS = ("build", "unit_tests", "runtime", "license_audit")
-TEST_POLICY_BLOCKER = (
-    "Corporate policy requires application test execution, but unit tests are "
-    "disabled during security remediation. No policy checks were run or bypassed. "
-    "Have the policy owner resolve this conflict outside remediation."
-)
 ARTIFACT_DIRS = {
     ".gradle",
     ".angular",
@@ -34,6 +33,9 @@ ARTIFACT_DIRS = {
     "coverage",
     ".pytest_cache",
     ".ruff_cache",
+    "TestResults",
+    "test-results",
+    ".nyc_output",
 }
 MAX_TREE_BYTES = 100 * 1024 * 1024
 MAX_SOURCE_BYTES = 512 * 1024
@@ -292,12 +294,14 @@ def _check_args(manager: str, kind: str) -> list[str]:
         return args
     if manager == "maven":
         return {
-            "build": ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
+            "build": ["--batch-mode", "clean", "verify"],
             "unit_tests": ["--batch-mode", "test"],
             "runtime": ["--batch-mode", "-Psecurity-smoke", "verify"],
             "license_audit": ["--batch-mode", "-Psecurity-licenses", "verify"],
         }[kind]
     if manager == "gradle":
+        if kind == "unit_tests":
+            return ["--no-daemon", "test", "--rerun-tasks"]
         return [
             "--no-daemon",
             {
@@ -312,6 +316,8 @@ def _check_args(manager: str, kind: str) -> list[str]:
 
 def _check_variants(manager: str, kind: str) -> list[list[str]]:
     """Permit fixed .NET category filters for VSTest and native MTP."""
+    if manager == "gradle" and kind == "unit_tests":
+        return [_check_args(manager, kind), ["--no-daemon", "test"]]
     if manager != "nuget" or kind not in {"runtime", "license_audit"}:
         return [_check_args(manager, kind)]
     category = "SecurityRuntimeSmoke" if kind == "runtime" else "LicenseCompliance"
@@ -397,31 +403,6 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
     }
 
 
-def _policy_requires_tests(checks: dict) -> bool:
-    """Reject explicit test checks and build lifecycles that implicitly run tests."""
-    if "unit_tests" in checks:
-        return True
-    for check in checks.values():
-        if not isinstance(check, dict) or not isinstance(check.get("argv"), list):
-            continue
-        argv = check["argv"]
-        if not argv or not all(isinstance(arg, str) for arg in argv):
-            continue
-        manager = tool_name(argv[0])
-        args = argv[1:]
-        if any(arg == "test" or arg.startswith("test:") for arg in args):
-            return True
-        if manager in {"mvn", "mvnw"} and any(
-            arg in {"verify", "install", "deploy", "integration-test"} for arg in args
-        ):
-            return True
-        if manager in {"gradle", "gradlew"} and any(
-            arg in {"build", "check", "test"} for arg in args
-        ):
-            return True
-    return False
-
-
 def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     """Require exact-version corporate approval and all product checks.
 
@@ -479,8 +460,6 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         {"build", "runtime", "license_audit"} <= set(checks) <= set(CHECK_KINDS)
     ):
         raise ValueError("Policy must require build, runtime, and license_audit checks")
-    if _policy_requires_tests(checks):
-        raise ValueError(TEST_POLICY_BLOCKER)
     manager = plan.get("manager")
     tools = {
         "npm": {"npm"},
@@ -490,7 +469,6 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         "maven": {"mvn", "mvnw"},
         "gradle": {"gradle", "gradlew"},
     }.get(manager, set())
-    workdir = _check_workdir(root, plan)
     for kind, check in checks.items():
         if not isinstance(check, dict):
             raise ValueError("Qualification checks must be objects")
@@ -509,8 +487,6 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
             )
         _text(check.get("success_marker"), f"{kind} success marker")
         assert_allowed(argv, root)
-        if node_test_blocker(workdir, argv):
-            raise ValueError(TEST_POLICY_BLOCKER)
     return {
         "approval": approval,
         "policy_mode": "corporate_policy",
@@ -555,25 +531,7 @@ def run_checks(
     that prove actual checks ran rather than accepting empty test runs.
     Record expected execution errors per check; interrupts still propagate.
     """
-    if _policy_requires_tests(checks):
-        return [
-            {
-                "status": "FAILED",
-                "required": True,
-                "kind": "policy_conflict",
-                "detail": TEST_POLICY_BLOCKER,
-            }
-        ]
     workdir = _check_workdir(root, plan)
-    if any(node_test_blocker(workdir, check["argv"]) for check in checks.values()):
-        return [
-            {
-                "status": "FAILED",
-                "required": True,
-                "kind": "policy_conflict",
-                "detail": TEST_POLICY_BLOCKER,
-            }
-        ]
     rows = []
     for kind in CHECK_KINDS:
         if kind not in checks:
@@ -595,13 +553,34 @@ def run_checks(
                     }
                 )
                 continue
+            argv = [tool, *check["argv"][1:]]
+            if (
+                kind == "unit_tests"
+                and tool_name(tool) in {"gradle", "gradlew"}
+                and "--rerun-tasks" not in argv
+                and "--rerun" not in argv
+            ):
+                argv.append("--rerun-tasks")
+            if kind == "unit_tests":
+                row = _execute_product_check(runner, argv, timeout, workdir, kind)
+                if row["status"] == "PASSED" and (
+                    not row.get("output_complete")
+                    or check["success_marker"]
+                    not in row.get("stdout", "") + row.get("stderr", "")
+                ):
+                    row.update(
+                        status="FAILED",
+                        detail="Positive check evidence is missing or output was truncated",
+                    )
+                rows.append(row)
+                continue
             result = runner.run(
-                [tool, *check["argv"][1:]],
+                argv,
                 timeout=timeout,
                 check=False,
                 **({"cwd": workdir} if workdir != root.resolve() else {}),
             )
-        except (OSError, RuntimeError, SubprocessError) as exc:
+        except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
             rows.append(
                 {
                     "command": check["argv"],

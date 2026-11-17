@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.20.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.25.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -28,6 +28,54 @@ report, then automatically offer native approval checkboxes. No extra
 "ready to submit" message is required. Cancel to continue reviewing and
 explicitly request `submit_false_positive_approvals` to reopen the form later.
 Only explicitly selected findings are dismissed in GitLab.
+
+Release 1.0.23 makes the earlier **fix selection** precise: each package option
+shows its name, current version and evidence source, exact proposed version,
+affected files, rationale, major-upgrade risk and build/unit-test acceptance
+requirements. An unknown current version is explicitly marked, never invented.
+Source choices show file/line and the proposed scoped action instead of raw
+dictionaries. Approval binds the displayed package versions and file scope;
+changed findings or proposed targets require fresh consent.
+
+Release 1.0.25 reduces Gradle package-validation overhead for wrappers declaring
+Gradle 7.6+: one `--no-daemon assemble test --rerun` invocation replaces the
+unused upfront dependency scan and separate build/test invocations. Tests
+execute afresh while unchanged compilation prerequisites remain incremental.
+Exact resolved-version checks still run after validation for transitive overrides.
+Older, custom-version and unknown wrappers retain the compatible path.
+Reports now record approval-execution phase durations and dependency-edit/
+lockfile-refresh durations separately. Pre-edit Checkstyle can compile sources;
+that baseline and subsequent build/tests are not file-writing time.
+Tool-discovery descriptions remain within the existing context budget without
+removing tools, required review fields or human-approval safeguards.
+
+Release 1.0.24 fixes a continuation gap in 1.0.23: checking packages recorded
+approval but did not execute updates until the host received another request.
+The host now supplies exact-target documentation/API/framework/license reviews
+before opening the Windows form. Missing evidence returns
+`PACKAGE_REVIEW_REQUIRED`, not an approval window that cannot proceed. An
+explicit `blocked_reason` can identify an unqualifiable target without inventing
+evidence or preventing other updates; the window labels that choice **BLOCKED**.
+On human submission, the server qualifies and applies only selected eligible
+packages, shares identical dependency edits, and validates the whole batch once.
+Failures use the existing selective rollback path. Reports record execution
+steps and blockers; approval alone is never reported as an applied update.
+The server then offers the separate false-positive approval flow.
+
+On **Windows, both VS Code/Copilot and Cursor** now use a separate unchecked
+fix-selection window with **no human-review timeout**, even without in-chat form
+support. The tool returns `AWAITING_HUMAN` after the window opens; the IDE's timed
+request does not stay open. Read as long as needed, then click **Approve checked
+fixes**. Selected, reviewed package updates now execute automatically; **no second
+"continue" request is needed for packages**. Only selected source-code fixes still
+need the host AI to continue its scoped work. Keep the MCP server running.
+Cancelling/closing before submission authorizes nothing. After submission, shutdown
+signals the owned worker and waits for its in-flight bounded step; interrupted,
+unvalidated edits are not accepted and require review. The native window is closed
+before package commands begin. Duplicate edits, completion and new runs are blocked
+while the owned package batch is queued/running. Other operating
+systems retain the host form, whose IDE-controlled deadline cannot be removed
+by this server. False-positive dismissal still requires separate consent.
 
 On Windows, release 1.0.11 opens a separate local checkbox window and returns
 `AWAITING_HUMAN` as soon as the window is shown. Human review has **no timeout**:
@@ -51,14 +99,38 @@ Concurrent approval requests reserve one native window per checkout before start
 cancelled startup is recorded explicitly, and stale startup responses cannot replace
 a newer run's receipt. Rejected startup windows are closed and reaped.
 
+Release 1.0.22 supersedes the earlier build-only policy: approved package security
+updates for Node, .NET/C# and Java are retained only when production builds,
+executed unit tests and configured policy checks pass. Empty, skipped or missing
+test execution is not success. A failed batch is diagnosed using guarded
+dependency-file restores and reviewed subset reapplication; the final checkout
+retains passing updates and reverts offending updates, without overwriting later
+user edits. If the restored baseline also fails, the run remains blocked.
+Known fixed transitive Java dependencies can now receive a coordinate-specific
+Gradle force rule or Maven dependency-management entry, subject to documentation,
+license and resolved-version verification. BOM versions and application/test
+source stay unchanged. No commits, pushes or unrelated GitLab writes are added.
+
+Release 1.0.21 independently reads GitLab after each approved dismissal and
+requires persisted `DISMISSED` state with `FALSE_POSITIVE` reason before reporting
+success. Already-dismissed findings can be confirmed without another mutation.
+Legacy acknowledgement-only receipts remain unverified. Per-selection progress,
+confirmation counts, timing and safe GraphQL operation names make partial failures
+visible; uncertain writes are never automatically retried. Direct API requests
+reject unrelated mutations, including project tags, notes, labels and remote
+branches. The approved dismissal still records its reason in vulnerability activity.
+See [dismissal verification](#dismissal-verification-and-troubleshooting) before
+interpreting scanner flags or historical pipeline reports as human dismissal state.
+
 Release 1.0.20 fixes nested Gradle and Maven validation. Build, dependency and
 corporate checks use the owning Java component or reactor, including Gradle
 version-catalog edits. The nearest wrapper inside the checkout is preferred.
 Declared Maven modules and Gradle settings-based subprojects build together,
 while independent builds are still checked separately. JDK 17+ is accepted;
 the actual wrapper, compiler and project toolchain must still build successfully.
-Gradle uses `assemble`; Maven uses `clean package -Dmaven.test.skip=true`.
-No application unit tests are run. Java source false-positive review retains
+That release used `assemble` and Maven `clean package -Dmaven.test.skip=true`
+without unit tests; **1.0.22 supersedes that validation policy**.
+Java source false-positive review retains
 the same cited-source evidence and human-dismissal approval requirements.
 
 Release 1.0.19 fixes NuGet lockfile refreshes in split repositories such as
@@ -69,7 +141,8 @@ false-positive review support both components in one run. Configure `REPO_ROOT`
 to the common Git checkout root, not either component directory. GitLab
 false-positive dismissal still requires human approval.
 
-Release 1.0.18 disables application unit-test execution during security remediation.
+Historically, release 1.0.18 disabled application unit-test execution during security remediation.
+**The following build-only behavior is superseded by 1.0.22.**
 Production builds and non-test checks remain required. Reports explicitly state
 **Test compatibility was not verified**; a green build is not a tested-compatibility
 claim. This also applies to batch isolation, restored-baseline checks and host-led
@@ -144,7 +217,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.20. Earlier wheels do not contain
+This summary covers changes through 1.0.25. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -152,7 +225,7 @@ all of these changes; updating source files does not update an installed wheel.
 | One-request completion | `select_security_fixes` obtains separate human consent before remediation edits. `complete_security_run` saves the report, automatically invokes the false-positive checkbox form once, and refreshes the report with actual outcomes. It reuses current assessments without another scan. There are fifteen tools. |
 | Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
-| Human-only GitLab dismissal | Completion automatically offers initially unchecked approvals for eligible assessments. Cancel to keep reviewing, then explicitly request `submit_false_positive_approvals` to reopen. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and mutation results are checked; unknown outcomes are not automatically retried. |
+| Human-only GitLab dismissal | Completion automatically offers initially unchecked approvals for eligible assessments. Cancel to keep reviewing, then explicitly request `submit_false_positive_approvals` to reopen. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and independently read-back state/reason are checked; unknown outcomes are not automatically retried. |
 | Honest reports | Finding Assessments distinguish local assessment from confirmed GitLab dismissal. Reports retain per-finding pipeline provenance, unapplied fix candidates, pending approvals, unfinished source reviews, exact unresolved reasons, consulted sites and validation/isolation outcomes. |
 | Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
 | Same-day branch reuse | Today's exact clean security branch can start fresh, including after a prior failed run. Cleanup removes recognized generated untracked/ignored artifacts and empty directories, not tracked files, policies, configuration or unrelated work. Unsafe filesystem state still blocks cleanup. |
@@ -160,7 +233,7 @@ all of these changes; updating source files does not update an installed wheel.
 | VPN and dependency preparation | Corporate DNS is checked before work, each pull and pnpm preparation. The server runs `pnpm clean` then `pnpm install` once per pnpm root; reused branches are prepared after their checkout. |
 | Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in console/notification/transcript channels. Owned Windows log consoles close after completion/failure and reopen for later work; unrelated prompts remain untouched. |
 | Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Missing NVD version bounds require review, not a no-fix verdict. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
-| Dependency edits | The minimal qualified plan may refresh only the lockfile, bump the owning `package.json`, or add a pnpm override in `pnpm-workspace.yaml` when present. Compatibility/license review and final production build/non-test validation still apply. Unit tests are not run. |
+| Dependency edits | Qualified plans may refresh lockfiles, update manifests or add supported transitive overrides, including Gradle/Maven coordinates. Compatibility/license review, passing production builds and executed unit tests remain mandatory. Failed updates are isolated; passing updates remain. |
 | Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Checkout edits, validation/rollback and dismissals wait for active verifications. |
 | Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
@@ -267,6 +340,7 @@ flowchart TB
   server -->|"Unchecked approval form through host elicitation"| reviewer
   reviewer -->|"Explicit checkbox selections only"| approval["Human-approved false-positive dismissal"]
   approval -->|"Fixed GitLab mutation and exact assessment reason"| gitlab
+  gitlab -->|"Independent state and dismissal-reason read-back"| server
 
   subgraph remoteServices["Remote services: reads and explicit approved dismissals"]
     gitlab["GitLab vulnerability report and approved dismissals"]
@@ -289,7 +363,7 @@ flowchart TB
   commands --> checkout
   commands -->|"Resolved origin selects project path; trusted API stays configured"| origin["Git origin"]
   commands -->|"Two fast-forward pulls and guarded same-day branch reuse"| checkout
-  commands -->|"Post-pull pnpm clean/install, then final batch build and non-test checks"| product["Installed toolchains and package managers"]
+  commands -->|"Post-pull pnpm clean/install, then final batch build and unit tests"| product["Installed toolchains and package managers"]
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
   server -->|"After approval outcome: final reports, snapshots and audit"| artifacts["Target checkout: .security-mcp"]
@@ -375,7 +449,7 @@ flowchart TB
   validation --> runner
   runner --> processes["Owned command trees, stdout/stderr readers and full logs"]
   processes --> processCleanup["Timeout, cancellation or exit: reap descendants and close handles"]
-  runner -->|"Fresh Jest suite discovery and completed test counts"| progress
+  runner -->|"Production build and unit-test progress"| progress
   officialDocs -->|"Completed document request counts"| progress
 
   engine --> state["state.py: active RunState and inspection snapshot"]
@@ -383,7 +457,8 @@ flowchart TB
   tools --> completion["complete_security_run: candidate list and report"]
   tools --> submit["submit_false_positive_approvals: human checkbox form"]
   completion --> dismissal["Engine checks identity, source freshness and selected dismissal intent"]
-  dismissal --> report
+  dismissal --> readback["Independent GitLab read: DISMISSED and FALSE_POSITIVE"]
+  readback -->|"Verified receipt or explicit unconfirmed outcome"| report
   state --> atomic["util.py: repository boundaries and atomic file publication"]
   report --> atomic
   manifests --> atomic
@@ -431,7 +506,10 @@ flowchart TD
   retrievalGate -->|"No"| stopRun
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
   moreFindings -->|"No"| fixSelection["select_security_fixes: human receives unchecked issue selections"]
-  fixSelection --> approvedFixes{"Human selected any issues?"}
+  fixSelection --> selectionMode{"Windows native selection?"}
+  selectionMode -->|"Yes"| selectionWait["No review deadline: submit choices; reviewed packages execute automatically"]
+  selectionMode -->|"No: host-controlled form"| approvedFixes{"Human selected any issues?"}
+  selectionWait --> approvedFixes
   approvedFixes -->|"No: skip code, continue independent false positives"| reports
   approvedFixes -->|"Yes: selected issues only"| editKind
   moreFindings -->|"Yes"| verify["verify_security_finding: source workflow or local package/advisory evidence"]
@@ -468,7 +546,7 @@ flowchart TD
   appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
   regression --> nextFix{"More selected fixes? Retain exact reasons for rejected edits."}
   nextFix -->|"Yes"| editKind
-  nextFix -->|"No"| postChecks["run_validation_matrix: production build and non-test checks; test-requiring policy blocks"]
+  nextFix -->|"No"| postChecks["run_validation_matrix: production builds, executed unit tests and policy checks"]
   postChecks --> validationGate{"VALIDATION_COMPLETE?"}
   validationGate -->|"Yes"| reports["complete_security_run: reuse current assessments"]
   validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
@@ -496,7 +574,7 @@ checkout is active.
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
-| `select_security_fixes(repo_root=None)` | Open unchecked human issue-selection boxes after read-only assessment. No AI selection arguments. MCP qualification, edit, test-generation and validation tools enforce the selected findings. Skip/decline/cancel/unavailable means no remediation edits; continue to independent false-positive review. |
+| `select_security_fixes(repo_root=None, package_reviews=None)` | Open unchecked human issue-selection boxes after read-only assessment. On Windows, supply exact-target documentation/compatibility/license reviews keyed by finding ID; no AI selection arguments. Human submission automatically qualifies, edits and validates selected package updates, then saves reports and offers independent false-positive approval. Source fixes remain host-led. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require human issue selection, exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
 | `apply_minimal_fix(finding_id, repo_root=None)` | For human-selected issues only, read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
 | `generate_aaa_test(finding_id, repo_root=None)` | For human-selected issues only, generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
@@ -517,6 +595,23 @@ does not prove a safe fix, waive reproduction or compatibility requirements, or
 approve GitLab dismissals. A dependency edit can incidentally resolve other
 findings on that same dependency, but permits no separate edits for unchecked issues.
 
+Package options identify **current version -> proposed version**, distinguish
+resolved/plan evidence from scanner-reported versions, and list affected files,
+reason, compatibility risk and acceptance checks. Code options show the precise
+location and scoped action, explicitly admitting when a verified plan is absent.
+On Windows, selection uses the no-deadline native window in either IDE. After
+submitting, reviewed package updates run automatically; no additional host request
+is needed. The host must supply `package_reviews` before opening the form using
+the evidence schema of `qualify_package_update`; collecting reviews is read-only,
+not consent. If evidence cannot establish safety, supply the exact package/target
+and an honest `blocked_reason`; that choice is labeled blocked and never edited.
+Only selected source-code work still needs the agent to continue. Read
+`get_run_status` when requested; never reopen approved selections. While
+`REQUESTED`/`AWAITING_HUMAN` or `package_execution.status=QUEUED/RUNNING`,
+do not poll, duplicate edits/checks, restart the run or complete it.
+This keeps the human's reading time outside the host tool-request deadline;
+server startup and command timeouts remain unchanged.
+
 For a selected source issue, first consider documented framework annotations
 that actually enforce security or validation. Use one only if it fixes the root
 cause. Never substitute scanner suppressions, ignore attributes, comments or
@@ -536,7 +631,7 @@ overwrite the snapshot from a host-side batch. Those processes cannot synchroniz
 the server's in-memory assessments or deliver its human form. A saved report alone
 is not an approval request. Use the finishing MCP tool in the active connection.
 
-If the human selects nothing, declines/cancels, or the host lacks form support,
+If the human selects nothing, declines/cancels, or neither a Windows dialog nor host form is available,
 skip remediation edits and remediation builds/tests and call `complete_security_run`.
 This still offers separate approval for independently evidenced false positives.
 Skipped findings stay unresolved, not false positives. Do not automatically
@@ -610,9 +705,9 @@ A finding is auto-fixed only when all of these are true:
 - An online advisory publishes a fixed version newer than what is installed, or GitLab explicitly recommends a newer fix for the matching local dependency. Missing data, missing records and failed public lookups do not veto GitLab's recommendation. Positive evidence that the proposed target remains affected is distinct from missing data.
 - The edit is a lockfile refresh, a manifest version bump, a package override, an unpinned `FROM` tag bump, or one cited nginx or GitLab CI line that the current publisher page still documents.
 - Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing post-update checks. Major image-tag changes still require manual review.
-- Every package update requires no production/unit-test API adaptations and passing post-update builds and configured non-test corporate checks. Application unit tests are disabled and test compatibility is unverified. A policy requiring tests blocks remediation. Pre-change lint capture is informational only: errors, missing scripts or incomplete capture never block security fixes. Same-major does not prove compatibility.
+- Every package update requires no production/unit-test API adaptations and passing post-update builds, executed unit tests and configured corporate checks. Missing or skipped tests cannot qualify an update. Pre-change lint capture is informational only: errors, missing scripts or incomplete capture never block security fixes. Same-major does not prove compatibility.
 
-An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before the normal qualification workflow. Failed lookups of either the installed or target version are informational when GitLab provides a concrete newer fix. Production builds and non-test checks determine acceptance; failures reject and restore the attempted fix. Test compatibility is not verified. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
+An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before the normal qualification workflow. Failed lookups of either the installed or target version are informational when GitLab provides a concrete newer fix. Production builds, executed unit tests and configured policy checks determine acceptance; failures isolate and restore offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
 
 CVE, CWE, NSA and NIST security-reference pages are best-effort information,
 not an authorization gate for version or supported code/configuration fixes.
@@ -639,6 +734,11 @@ checkbox approval before dismissing selected vulnerabilities with their
 recorded reasons. `review_false_positives` only lists candidates.
 `complete_security_run` saves reports and invokes the same human-only submit
 gate automatically; its tool metadata therefore declares possible remote writes.
+The API boundary rejects PUT/PATCH/DELETE, REST writes, and GraphQL mutations other
+than the fixed vulnerability dismissal. It does not create, update or delete
+GitLab project tags, notes, labels or remote branches. The displayed dismissal
+reason is recorded in vulnerability audit activity, not through a project-note
+API. Local dated security-branch creation remains intentional.
 
 ### Approving false positives in Finding Assessments
 
@@ -798,10 +898,43 @@ finding UUID, project and active state. It records each pending attempt before
 the request and each result afterward in the run snapshot. Requests are not
 retried automatically. Partial failures are returned per finding, and a lost
 response may leave the remote outcome unknown: inspect GitLab before retrying.
-Confirmed dismissals are excluded from later approval forms in the same run.
+Only independently verified dismissals are excluded from later approval forms in the same run.
 Regenerate the report after approval to include `gitlab_dismissals` and the
 confirmed/failed outcomes. Source changes can retract a local assessment but
 do not automatically reopen a previously dismissed GitLab vulnerability.
+
+#### Dismissal verification and troubleshooting
+
+After an acknowledged mutation, a separate GitLab read must match the vulnerability
+ID, finding UUID, project, `DISMISSED` state and `FALSE_POSITIVE` reason. If GitLab
+omits the top-level reason, the latest dismissal transition must supply it.
+A wrong non-null reason is never overridden with an older transition.
+The local finding becomes `dismissed` only after this check. Each saved receipt
+includes `verification` (state, reason, reason source and verification timestamp),
+the tracked ref, direct vulnerability link, attempt times and duration.
+`get_run_status.gitlab_dismissal_counts` exposes attempted, confirmed and
+not-confirmed counts without returning all assessment descriptions.
+
+A missing/stale read-back, GraphQL error, timeout or lost write response is an
+explicit unconfirmed outcome: the mutation **may have succeeded**. Other selected
+items continue; writes remain serialized and are never blindly retried.
+Inspect the vulnerability before requesting another human approval. A freshly
+approved request for an already-dismissed false positive performs read-only
+confirmation instead of posting another dismissal or audit comment. Saved
+snapshots and old checkbox selections are never replayed as authorization.
+Legacy `DISMISSED` receipts without independent proof display **UNVERIFIED**.
+
+Use the project's **Vulnerability report**, with **Dismissed / False positive**
+filters and the matching tracked ref, or open the receipt's direct vulnerability
+link. A scanner-produced `falsePositive` flag and saved pipeline scan artifacts
+are not the human vulnerability dismissal state; dismissal does not delete those
+historical rows. A missing UI badge alone does not establish that the write failed.
+
+The SQE archive reviewed for this release contained 55 selected items and 55
+acknowledged dismissals, but no independent persisted-state read-back. Its logged
+commands all exited successfully and it showed no HTTP transport failures.
+Those logs cannot prove either failed persistence or a particular GitLab UI bug;
+this release removes acknowledgement-only success reporting going forward.
 
 The allowlist is **not an operating-system sandbox**. Product scripts, package
 installation hooks, and repository wrappers can execute their own code and use
@@ -870,8 +1003,12 @@ Failures are shared across different findings, but re-verifying the same
 unresolved finding retries inspection instead of permanently caching the error.
 Public advisory checks still run when Java/NuGet local resolution is incomplete.
 Unresolved packages remain manual review even if an online lookup says unaffected.
-Resolved Gradle transitives with available fixes require a reviewed parent/BOM
-update or constraint; the server does not blindly add force rules.
+Resolved Java transitives with available fixes may receive a reviewed
+coordinate-specific override: Gradle `resolutionStrategy.force` in the owning build,
+or Maven `dependencyManagement` in a supported POM. Parent/BOM versions are not
+silently upgraded. A fresh resolved tree must confirm the fixed version before
+acceptance, in addition to passing builds and unit tests. Unsupported profiles,
+ambiguous declarations or unresolved coordinates remain explicit review items.
 
 An advisory that explicitly says upgrading alone does not fix affected code is
 manual review, even when it names a fixed release. A version-only plan cannot
@@ -964,7 +1101,7 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   trusted GitLab API host. The server discovers the project path from Git;
   an explicit project path or numeric ID is an optional override, not a prerequisite.
 - The package managers and toolchains required by the target application.
-- Meaningful production-build/non-test checks and documented license review; independently
+- Meaningful production builds, executed unit tests and documented license review; independently
   approved corporate policy only when required/configured for your organization.
 
 Point `REPO_ROOT` at the application Git checkout, not this MCP project.
@@ -992,8 +1129,8 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
    API/migration guides, runtime/peer requirements, and license terms. It inspects
    the actual product's frameworks and callers, not only the GitLab suggestion.
 2. The update must preserve product build, startup/runtime behavior, and the
-   existing unit-suite APIs without executing that suite. Test compatibility is
-   unverified. Review Angular/Node/TypeScript/RxJS/Crystal compatibility,
+   existing unit-suite APIs, with passing builds and executed unit tests.
+   Review Angular/Node/TypeScript/RxJS/Crystal compatibility,
    Quarkus platform/BOM and extension alignment, Java requirements, and .NET
    target frameworks as applicable. Never force peer resolution or change the
    product framework/runtime/BOM to disguise an incompatible package update.
@@ -1010,16 +1147,16 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
   the project's lint configuration. Errors, missing lint scripts, timeouts,
   truncated output or lint execution failures never block editing. Completeness
   is recorded honestly; an incomplete capture cannot list unseen rule IDs.
-  Apply all reviewed version updates first, then run one final production build
-  and non-test checks. Application unit tests are disabled, including discovery.
+  Apply all reviewed version updates first, then run production builds,
+  unit tests and configured policy checks for the complete batch.
   Lint-only capture does not install or audit dependencies first.
-  Node components must define `build`; a `test` script is not required.
+  Node components must define both `build` and a terminating `test` script.
   Reports never present skipped tests as passing evidence.
   Initial lint evidence is retained rather than rerun on
   qualification retries or after updates. No sleeps, cooldowns or polling delays
   are required. Corporate approvals remain mandatory; configured commands run
   in the final matrix, sharing exact build results rather than rerunning them.
-  Policies requiring test execution block the update without being bypassed.
+  Corporate unit-test requirements are honored, never removed or bypassed.
   Corporate-policy mode additionally requires positive, untruncated runtime
   smoke and full resolved-dependency license checks with configured markers.
 
@@ -1053,8 +1190,8 @@ be empty, reviewed caller files must have current SHA256 evidence, and all
 identified source references must be assessed. Transitive npm updates also
 require installed `node_modules` consumer source evidence. The server rejects
 stale scans and source/test changes, and records the reviewed evidence. A failed
-or skipped required build check never becomes a validated fix. Test compatibility
-remains unverified because application unit tests are not executed. Lint is
+or skipped required build or unit-test check never becomes a validated fix.
+Passing tests do not prove compatibility for every execution path. Lint is
 informational even when missing, failed, timed out or truncated. Configured
 corporate checks still apply. Failed attempted updates are rejected and the
 plugin restores its own dependency-file edits only when their hashes still
@@ -1093,8 +1230,14 @@ sequenceDiagram
   Docs-->>Host: Target-version documentation
   end
   Host->>MCP: select_security_fixes
-  MCP-->>Reviewer: Unchecked issue selections, separate from false-positive approvals
+  MCP-->>Reviewer: Unchecked choices with current and proposed versions, scope and risk
+  alt Windows native selection
+  MCP-->>Host: AWAITING_HUMAN; request ends, no human-review deadline
+  Reviewer->>MCP: Approve checked fixes or cancel in the separate window
+  Note over Host,MCP: On Windows the following package steps run inside the server without a second host request; only source work needs Agent continuation
+  else Other operating systems
   Reviewer->>MCP: Select permitted issues or skip code fixes
+  end
   Note over Host,MCP: Skip means complete_security_run without remediation edits or builds
   loop Only human-selected eligible package updates
   Host->>MCP: qualify_package_update(finding_id, review)
@@ -1130,14 +1273,14 @@ sequenceDiagram
   end
   Host->>MCP: run_validation_matrix once after all updates
   MCP->>Policy: Recheck approval, markers and policy hash
-  MCP->>Repo: One production build and configured non-test checks
+  MCP->>Repo: Production builds, executed unit tests and configured checks
   MCP-->>Host: Live command bars and fresh Jest suite progress
   alt Complete batch passes
     MCP-->>Host: VALIDATION_COMPLETE, all retained packages VALIDATED
   else Failed batch
     loop Split failed groups, test accepted plus candidate subsets
       MCP->>Repo: Guarded dependency restore and reviewed subset replay
-      MCP->>Repo: Diagnostic build and mandatory non-test checks
+      MCP->>Repo: Diagnostic builds, unit tests and mandatory policy checks
     end
     MCP->>Repo: Verify final passing subset, or restored baseline if all rejected
     MCP-->>Host: Retained updates, rejected updates and isolation trials, or blocked recovery
@@ -1153,7 +1296,9 @@ sequenceDiagram
     alt Human submits checked findings
       MCP->>Repo: Recheck all reviewed source hashes
       MCP->>GitLab: Validate identity and dismiss selected findings with exact reasons
-      GitLab-->>MCP: Confirmed dismissal or explicit failure/unknown outcome
+      GitLab-->>MCP: Mutation acknowledgement or error
+      MCP->>GitLab: Independently read vulnerability state and dismissal reason
+      GitLab-->>MCP: Verified DISMISSED and FALSE_POSITIVE or explicit unconfirmed outcome
     else Declined, cancelled or all unchecked
       MCP-->>Host: No new GitLab changes
     end
@@ -1167,8 +1312,8 @@ Corporate-policy mode is optional. Set `PACKAGE_UPDATE_POLICY` to a controlled
 JSON file's absolute path, or provision `.security-mcp/package-update-policy.json`
 under `REPO_ROOT`. An explicit path or an existing default file is enforced;
 missing/invalid explicit policy fails closed. When neither exists, qualification
-uses documented license review, informational lint and production-build checks
-without creating a policy. Application unit tests are disabled during remediation.
+uses documented license review, informational lint, production builds and unit
+tests without creating a policy.
 Keep approvals access-controlled, preferably outside the AI-writable checkout.
 The AI/server must never create or modify actual approvals. The server reads and
 hashes this file; it cannot authenticate a corporate signer or grant legal rights.
@@ -1204,27 +1349,33 @@ approve both Boolean fields before any update is permitted:
 
 Use ecosystem keys exactly `npm`, `NuGet`, or `Maven` (Gradle also uses `Maven`).
 Every entry must contain `build`, `runtime`, and `license_audit`, using the detected
-manager. An existing `unit_tests` requirement is not removed or ignored: it blocks
-remediation without executing the policy checks. Configure real non-test
+manager. An existing `unit_tests` requirement is honored alongside the mandatory
+stack unit tests; identical command results are shared. Configure real
 repository-owned scripts/profiles before starting
 on clean main; they are not supplied automatically by this MCP server. Markers
-must be emitted only after meaningful non-test checks and complete license-policy
+must be emitted only after meaningful product checks and complete license-policy
 checks, never by a placeholder `echo` or a generic build-success line.
 In corporate-policy mode, missing tools, checks, markers, or approvals block edits.
 
 | Manager | Production Build | Runtime Smoke | Resolved-Graph License Audit |
 | --- | --- | --- | --- |
 | npm/pnpm/yarn | `MANAGER run build` | `MANAGER run security:smoke` | `MANAGER run security:licenses` |
-| NuGet/.NET | `dotnet build --configuration Release --nologo` | Existing test-based policy checks block remediation | Existing test-based policy checks block remediation |
-| Maven/mvnw | `TOOL --batch-mode clean package -Dmaven.test.skip=true` | Existing `verify` policy checks block remediation | Existing `verify` policy checks block remediation |
+| NuGet/.NET | `dotnet build --configuration Release --nologo` | `dotnet test --configuration Release --nologo --filter Category=SecurityRuntimeSmoke` | `dotnet test --configuration Release --nologo --filter Category=LicenseCompliance` |
+| Maven/mvnw | `TOOL --batch-mode clean verify` | `TOOL --batch-mode -Psecurity-smoke verify` | `TOOL --batch-mode -Psecurity-licenses verify` |
 | Gradle/gradlew | `TOOL --no-daemon assemble` | `TOOL --no-daemon securitySmoke` | `TOOL --no-daemon securityLicenses` |
 
-No application unit tests or test discovery run, even as a diagnostic retry.
+Unit tests run after production builds, including diagnostic subset/baseline
+validation when needed. Known Gradle 7.6+ wrappers combine `assemble test --rerun`
+in one process, forcing tests without forcing all prerequisites to recompile.
+Older/unknown wrappers use separate build and `test --rerun-tasks` invocations.
+Legacy corporate checks reuse successful verified build/test evidence from the
+same validation pass, working directory and executable, preserving command
+provenance and required positive markers. Fresh JUnit reports prove execution
+when Gradle prints no test counts. Final override resolution remains independent.
 Java wrappers are resolved inside the checkout using the current OS's wrapper
-form. The host must inspect repository-specific build/check scripts and custom
-plugins for hidden test invocations. Known Node test runners, script chains and
-lifecycle hooks are blocked explicitly, not rewritten or silently skipped.
-This inspection is not a sandbox or proof about arbitrary executable code.
+form. Existing Node scripts and lifecycle hooks may run tests; they are not
+rewritten or silently skipped. Repository scripts remain trusted executable code,
+not an operating-system sandbox.
 
 #### Documentation review input
 
@@ -1333,9 +1484,9 @@ do not establish compatibility or commercial approval for an individual update.
 
 | Repository | Automatic dependency fixes | Validation |
 | --- | --- | --- |
-| Node.js | npm, pnpm, Yarn Classic and modern Yarn; direct version bumps, supported lock refreshes, overrides/resolutions | Install, advisory audit, informational lint and production-build scripts; no unit tests |
-| .NET 10 | NuGet project references and existing central `Directory.Packages.props` versions | SDK compatibility check, restore, Release build only; `.sln`, `.slnx`, C#, F#, and VB project detection |
-| Java 17+ | Maven direct versions/properties and Gradle coordinates, plugin versions and supported version catalogs | Component-aware Maven package/dependency tree or Gradle dependencies/assemble; nearest checkout wrapper preferred; no unit tests |
+| Node.js | npm, pnpm, Yarn Classic and modern Yarn; direct version bumps, supported lock refreshes, overrides/resolutions | Install, advisory audit, informational lint, production build and unit tests |
+| .NET 10 | NuGet project references and existing central `Directory.Packages.props` versions | SDK compatibility check, restore, Release build and unit tests; `.sln`, `.slnx`, C#, F#, and VB project detection |
+| Java 17+ | Maven versions/properties, Gradle coordinates/plugins/catalogs and supported coordinate-specific transitive overrides | Component-aware Maven verify/dependency tree or Gradle dependencies/assemble/test; nearest checkout wrapper preferred |
 
 These are safe dependency-remediation paths, not a promise to fix every security
 finding. A matching advisory or locally verified GitLab recommendation, a compatible
@@ -1385,8 +1536,7 @@ reported remote hostname. An API route is not a local source-file path.
 After reproduction and review, the host may apply a scoped application-code
 fix and regression test separately from dependency updates. It must retain
 before/after reproduction evidence, valid and boundary cases, and passing
-informational lint, production build and non-test checks. Never execute
-application unit tests during remediation; test compatibility is unverified.
+informational lint, production builds and executed unit tests.
 Missing artifacts or an
 unavailable environment block this workflow. Scanner text is not a patch.
 
@@ -1430,7 +1580,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.20-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.25-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1446,7 +1596,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.20-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.25-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1486,7 +1636,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.20-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.25-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1502,7 +1652,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.20-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.25-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1523,7 +1673,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.20-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.25-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1532,7 +1682,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.20-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.25-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -1832,7 +1982,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.20-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.25-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -1866,7 +2016,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.20**
+3. Apply the deployment-specific update and verify installed version **1.0.25**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -1875,7 +2025,7 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.20`
+   edits before requesting a new run. Its `server_version` must be `1.0.25`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -1933,13 +2083,18 @@ GitLab permissions or clear the host's internal conversation errors.
    must pass the same `repo_root` on subsequent calls.
 6. Follow tool progress and approval prompts. The calling AI must finish
    `HOST_REVIEW_REQUIRED` source analysis and submit hash-bound assessments,
-   not hand that task to the user. At completion, select only the false positives
+   not hand that task to the user. Before edits, review the package current/proposed
+   versions or scoped code actions and check only the fixes you permit. On Windows,
+   the separate window has no review deadline: submit and the reviewed package
+   updates execute automatically. Only selected source fixes need Agent continuation.
+   Keep the server running until builds/tests and reports finish.
+   At completion, select only the false positives
    you want dismissed in the automatically offered checkbox form. The report
    is saved before the form opens. Cancel if you need more time, then explicitly
    request `submit_false_positive_approvals` to reopen it.
    Do not authorize the AI to answer it.
 7. Review the final Finding Assessments, actual dismissal outcomes, unresolved
-   findings, production-build/non-test evidence and local diff. Commit/push manually if accepted.
+   findings, production-build/unit-test evidence and local diff. Commit/push manually if accepted.
 
 **If the Command Palette does not show MCP controls:** use the Chat view's
 **Open Customizations > MCP Servers** navigation when available. Check the
@@ -1972,7 +2127,12 @@ dismissed by that call; use a form-capable host or the GitLab UI.
   product checks, then enter `run gitlab-security on this repo` in Agent chat.
   Cursor's selected host model performs source/input-flow review; deprecated MCP
   sampling is not used. Do not stop at `HOST_REVIEW_REQUIRED`.
-8. Use the automatically offered checkbox form; the report is saved first.
+8. Before remediation edits, review current/proposed versions and code scope in
+  the unchecked fix-selection window. On Windows it has no review deadline;
+  submit and the reviewed package updates execute automatically. Only selected
+  source fixes need Agent continuation. Keep the server running until validation
+  finishes. At completion use the separate false-positive
+  checkbox form; the report is saved first.
   Cancel to keep reviewing and explicitly request `submit_false_positive_approvals`
   to reopen it later. The AI must not select boxes for you. If the host cannot show the form,
   `APPROVAL_UNAVAILABLE` means no new dismissals.
@@ -2107,6 +2267,9 @@ record includes `source` (GitLab, advisory or documentation), `method`, sanitize
 `status_code`, exception-class `error`, and `worker`. Timing covers the complete
 streaming request, including redirects and body consumption, not just headers.
 Only log appends are locked; fan-out requests remain concurrent.
+GitLab GraphQL records also include the safe operation name, distinguishing
+identity reads, dismissal mutations and independent confirmation reads without
+logging variables, reasons, source text or response bodies.
 
 For performance analysis, sort by `duration_ms`, group by URL/source, and compare
 start/end spans to confirm overlap. Do not sum concurrent spans as wall time.
@@ -2214,9 +2377,9 @@ clean script, or failed clean/install stops the run; no deletion workaround or
 duplicate host-issued preparation is needed.
 
 Follow the live MCP progress notifications or the server output/log panel.
-Apply all reviewed version updates first, then run one final production build
-and non-test checks. Unit tests are disabled and test compatibility is unverified.
-Additional diagnostic build runs occur only when that batch fails.
+Apply all reviewed version updates first, then run production builds, unit tests
+and configured policy checks. Additional diagnostic build/test runs occur only
+when that batch fails.
 There is no pre-edit product suite or timer-based progress estimate. The final
 response displays unresolved findings and consulted security sites. Review local
 reports and `git diff`; commit and push yourself.
@@ -2227,7 +2390,7 @@ a command-line replacement for the agent request above.
 ## Running remediation
 
 1. Install runtime dependencies and configure your MCP host.
-2. Review exact-target license terms and provide production-build/non-test checks; provision corporate approvals/checks if configured or required by your organization. Policies requiring tests block remediation.
+2. Review exact-target license terms and provide production-build/unit-test checks; provision corporate approvals/checks if configured or required by your organization.
 3. Use clean `main` or today's allowed security branch in `REPO_ROOT`; finish
    any in-progress Git operation. Prior errors block same-day reuse.
 4. Start/reload `gitlab-security` and enable its tools.
@@ -2255,18 +2418,16 @@ any package version. Run lint before changes and retain every diagnostic and
 raw output in .security-mcp/lint-issues.json and observed violation rule IDs in
 .security-mcp/lint-rules.json. Lint capture is best-effort and never gates a fix,
 including missing scripts, execution failures and incomplete output. Apply all
-reviewed version updates first, then run the production build and non-test checks
+reviewed version updates first, then run production builds and unit tests
 once for the complete batch, including mandatory configured policy checks.
-Never run application unit tests, including discovery, lifecycle hooks or retries.
-Stop with a blocker if corporate policy requires tests; never silently waive it.
+Require executed unit tests as well as builds; never waive configured policy checks.
 Do not run a pre-fix build/test suite. Keep live MCP progress
 bars visible; never insert sleeps, polling waits or elapsed-time percentages.
-Accept only with passing builds and required non-test checks; state that test
-compatibility was not verified.
-Only a failed final batch permits diagnostic build reruns. The server
+Accept only with passing builds, executed unit tests and required policy checks.
+Only a failed final batch permits diagnostic build/test reruns. The server
 splits failed groups, replays reviewed subsets with guarded dependency restores,
 and retains a passing combination. Reject incompatible updates and interactions.
-Require a green final build and non-test checks, even when every update is
+Require green final builds and unit tests, even when every update is
 rejected and the original baseline is restored. Never claim a broken baseline
 is recovered. Do not retry rejected targets blindly or adapt source/tests.
 Finish with complete_security_run to save the local report and automatically
@@ -2293,7 +2454,7 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | --- | --- |
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
-| `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type and worker. New GitLab/advisory/documentation calls only. |
+| `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
 | `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
 | `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |
@@ -2376,8 +2537,7 @@ false positive.
 
 For a reproduced defect, the host applies a scoped source fix and regression
 test separately from package updates, then runs the same reproduction, boundary
-cases, informational lint, production build and non-test checks. Never run
-application unit tests during remediation; report test compatibility as unverified.
+cases, informational lint, production builds and executed unit tests.
 `apply_minimal_fix` does not
 rewrite arbitrary source code. Do not blanket-escape intentional regular
 expressions or replace test assertions merely to remove a scanner warning.
@@ -2418,7 +2578,7 @@ edit both a manifest and a workspace file:
 
 An available version alone does not authorize an edit. Exact-target
 compatibility/license review, any configured corporate policy, fresh publisher
-documentation and final production-build/non-test validation still apply.
+documentation and final production-build/unit-test validation still apply.
 The host must not modify production or unit-test APIs to make a package upgrade
 pass. Review `change.files`, qualification evidence, lockfile diff and final
 validation before publishing.
@@ -2429,9 +2589,9 @@ A Gradle plugin edit changes one `id ... version` declaration in `build.gradle`,
 
 | Stack | Commands |
 | --- | --- |
-| Node | After pulls, pnpm projects run `pnpm clean` then `pnpm install`. Before edits, capture informational lint once. After all version updates, frozen dependency install, one production `build` and informational advisory audit. No application unit tests. Known test invocations in scripts/hooks block the command. |
-| .NET | Restore, `dotnet format --verify-no-changes --no-restore` for package lint and Release production build. No `dotnet test` or test discovery. A non-`net10.0` target is reported. |
-| Java | Informational pre-edit Checkstyle capture. In each discovered build root, Maven `clean package -Dmaven.test.skip=true` and `dependency:tree`; or Gradle `assemble` and dependency inspection. No test tasks. JDK 17+ is required; project-specific compiler/toolchain requirements still apply. Missing/failed Checkstyle capture never gates a fix. |
+| Node | After pulls, pnpm projects run `pnpm clean` then `pnpm install`. Before edits, capture informational lint once. After all version updates, frozen dependency install, production `build`, unit `test` and informational advisory audit. Both scripts are required for accepting package updates. |
+| .NET | Restore, informational pre-edit `dotnet format --verify-no-changes --no-restore`, Release production build and `dotnet test --configuration Release --nologo`. A non-`net10.0` target is reported. |
+| Java | Informational pre-edit Checkstyle. Each build root runs Maven `clean verify` and `dependency:tree`; or, with a known Gradle 7.6+ wrapper, one `assemble test --rerun` invocation with incremental prerequisites. Older/unknown wrappers retain dependency inspection and separate build/forced-test commands. Transitive overrides additionally require fresh final dependency resolution. JDK 17+ and project-specific toolchain compatibility are required. Fresh successful JUnit reports prove Gradle tests ran when console counts are absent. |
 | NGINX | `nginx -t` when `nginx` is installed and a config file is present |
 | Container | `FROM` is required. `docker build --check` runs when Docker is available. A missing daemon is recorded as skipped. |
 
@@ -2451,9 +2611,9 @@ The engine attempts lint once before any edit, retaining the issues and an
 observed-rule inventory. No lint result gates a fix, including missing scripts,
 execution failures, timeouts or truncated output. It never reruns lint during
 post-fix validation or qualification retries. The complete batch must then
-pass a production build and configured non-test policy checks. Test-requiring
-policy is a blocker. Application unit tests are disabled; test compatibility
-was not verified. Node build failure stops downstream checks; missing
+pass production builds, executed unit tests and configured policy checks.
+Missing, empty or entirely skipped test execution is not passing evidence.
+Node build failure stops downstream checks; missing
 mandatory scripts also stop later checks. Unexecuted checks are explicitly
 skipped, never passed. The validator's standalone strict mode still treats lint
 failure as a blocking check; the remediation engine uses baseline-recording mode.
@@ -2465,17 +2625,17 @@ the same working directory share one execution while each success marker is
 checked independently. An unchanged successful matrix is reused on repeat calls.
 On failure only, grouped subset testing identifies offending updates and
 interactions without exhaustively enumerating combinations. The retained subset
-must pass the final build and non-test checks. If none pass, verify the restored
+must pass the final builds and unit tests. If none pass, verify the restored
 baseline too; an already-broken baseline remains a failed run. Later edits are
 preserved and unsafe recovery requires manual cleanup. Diagnostic trials retain
 failed commands, details and log paths in the JSON report's `batch_isolation`
-and the Markdown **Batch Isolation** section. This is a build-validated subset,
+and the Markdown **Batch Isolation** section. This is a build-and-test-validated subset,
 not a claim to have found the globally largest passing combination.
 New checkout or policy changes invalidate accepted package receipts.
 
 Verbose build output exceeding the preview cap is not a product
-failure. Actual command exit codes determine success; application unit tests
-are not run. Complete local stdout/stderr logs and bounded beginning/end
+failure. Actual command exit codes and executed-test evidence determine success.
+Complete local stdout/stderr logs and bounded beginning/end
 previews preserve final summaries. Rejection details include the failed command,
 exit code, final diagnostics and log paths. A failure reproduced on the original
 baseline is not evidence that a proposed package alone caused it.
@@ -2625,7 +2785,7 @@ for deployment and restart differences.
 | `APPROVAL_UNAVAILABLE` | The host did not advertise form support or could not open the form. No new findings are dismissed by that call. Use a form-capable host or the GitLab UI; do not generate AI approval values or repeatedly reopen a declined form. |
 | No eligible false-positive assessments | Inspect `SOURCE_REVIEW_REQUIRED`, `ASSESSMENT_REQUIRED` or `ALREADY_DISMISSED` and the excluded-finding blockers. The host AI must finish source review and submit valid current evidence first; a scanner flag alone is insufficient. Do not relist or rescan merely to open approvals. |
 | `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI must read the supplied complete source, trace inputs/callers/configuration and submit `source_review` within the same request. This is not a request for the user to analyze code. Deprecated sampling is intentionally disabled. |
-| Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval` and completion's `false_positive_review`. Only checked human submissions with confirmed successful mutations establish dismissal. Pending, failed or unknown outcomes remain explicit; do not automatically retry unknown writes. |
+| Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval`, `gitlab_dismissal_counts` and saved `gitlab_dismissals` verification. Only an independent read of persisted `DISMISSED` / `FALSE_POSITIVE` establishes confirmation; mutation acknowledgements alone remain unverified. Check the Vulnerability report's Dismissed/False positive filters and tracked ref, not historical scanner artifacts. Inspect unknown outcomes; never automatically retry writes. |
 | NVD returns 429/503 or times out | Review recorded errors and pacing/retry progress. Bounded retries honor shared cooldowns and `Retry-After`; long cooldowns fail explicitly. Do not bypass rate limits or treat an outage as proof of safety. |
 | Windows command containment cannot be established | The command fails explicitly before its suspended child resumes; owned resources are cleaned up. Inspect the error and host/job/security-policy restrictions with your administrator rather than disabling containment or launching an uncontained fallback. |
 | Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |

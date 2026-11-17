@@ -13,6 +13,7 @@ import sys
 import threading
 from collections import deque
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -44,6 +45,7 @@ from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.util import logged_lock
+from gitlab_security_mcp.versions import is_major_upgrade
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -60,18 +62,31 @@ Each tool description is the procedure for that step.
 5. verify_security_finding for every finding. Open the file and line GitLab
    already reported and read that code. A false-positive reason is at most
    2 everyday sentences about why the warning does not apply.
-6. select_security_fixes before any remediation edit
+6. select_security_fixes before any remediation edit. For Windows package
+   checkboxes, first collect the exact-target documentation/API/framework/license
+   evidence described by qualify_package_update. Supply package_reviews keyed by
+   finding ID. PACKAGE_REVIEW_REQUIRED means finish that read-only AI review and
+   repeat selection with the evidence; do not invent evidence or approval.
 7. qualify_package_update for each selected package update
 8. apply_minimal_fix for each selected eligible fix, with no build between edits
 9. generate_aaa_test only for a supported base-image change
 10. run_validation_matrix once for the batch
 11. complete_security_run, which offers the human approval checkboxes once
-Never run application unit tests during remediation, including test discovery,
-test commands embedded in build scripts, or diagnostic/rollback retries.
-Keep production builds and non-test checks. If configured corporate policy
-requires tests, report a blocker; never run or silently bypass that requirement.
-Reports must state that test compatibility was not verified. These rules apply
-to host-led source fixes too, not only server-managed package updates.
+If select_security_fixes returns AWAITING_HUMAN, stop and wait. The Windows
+window has no review deadline. On submission the server automatically qualifies,
+applies and build/unit-test validates only the selected package updates, saves
+reports, then offers separate false-positive approvals. No second continue request
+is needed for packages. REMEDIATION_RUNNING also means wait, never duplicate work.
+Selected source-code fixes still require the host AI to continue its scoped work.
+Do not reopen approved selections or start completion, edits or validation while
+selection or server-owned package execution is pending.
+Apply all human-approved, qualified package security updates for Node, .NET/C#
+and Java, including supported transitive dependency overrides. Retain updates
+only after both production builds and executed unit tests pass, along with
+configured policy checks. If a batch fails, isolate and revert offending package
+updates while retaining passing updates. Missing tests or tools are not success;
+an already-failing baseline requires explicit investigation, not a green claim.
+Do not modify source, unit tests or check scripts to make a package update pass.
 Do not open an approval form during finding verification. Only the human may
 select or submit. Do not infer approval, poll AWAITING_HUMAN, or commit, push,
 or open a merge request. Only the human form may dismiss a finding. Unknown
@@ -81,7 +96,12 @@ code or tests to make an update pass. Missing advisory data does not block a
 concrete GitLab package recommendation; failed validation rejects that fix.
 Fuzzing needs local reproduction and must not be replayed against the remote
 host. Copy final_summary_markdown once. Completed source review is not a
-GitLab dismissal. On corporate DNS failure, ask the user to connect to VPN
+GitLab dismissal. Count a dismissal as confirmed only after independent GitLab
+read-back verifies DISMISSED with FALSE_POSITIVE reason. A mutation acknowledgement
+alone is not proof; do not retry an uncertain write automatically. Do not change
+GitLab project tags, notes, labels or remote branches. The approved vulnerability
+dismissal still records its displayed reason in GitLab's vulnerability audit.
+On corporate DNS failure, ask the user to connect to VPN
 and stop.
 """
 
@@ -643,21 +663,19 @@ async def verify_security_finding(
 def qualify_package_update(
     finding_id: str, review: dict[str, Any], repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Qualify a human-selected update using exact target-version evidence.
+    """Qualify a human-selected exact package/target; no production/test caller adaptations.
 
-    review: ecosystem, package, target,
-    documentation {complete, sources, summary}, compatible=true,
-    compatible_without_code_changes=true, api_changes,
-    frameworks [{name, version, source_url, assessment}], source_fixes=[].
-    Neither production nor test callers may need adaptations. Lint capture is
-    informational; apply the batch before production builds. Unit tests are disabled.
-    Without corporate policy, include license {expression, sources,
-    commercial_use_permitted:true, no_license_fees:true, obligations, assessment}.
-    For proposed major_upgrade=true, include major_upgrade {scan_id from
-    proposed_fix.caller_scan, compatible_without_code_changes:true,
-    caller_breakages_found:false, migration_sources:[official HTTPS URLs],
-    api_comparison, caller_assessment, dependency_assessment,
-    reviewed_files:[{path, sha256, assessment}]}.
+    review: ecosystem,package,target,documentation {complete,sources,summary},
+    compatible=true,compatible_without_code_changes=true,api_changes,
+    frameworks [{name,version,source_url,assessment}],source_fixes=[].
+    Lint is informational; build/test after all edits.
+    Without corporate policy: license {expression,sources,
+    commercial_use_permitted:true,no_license_fees:true,obligations,assessment}.
+    If proposed major_upgrade=true: major_upgrade {scan_id from
+    proposed_fix.caller_scan,compatible_without_code_changes:true,
+    caller_breakages_found:false,migration_sources:[official HTTPS URLs],
+    api_comparison,caller_assessment,dependency_assessment,
+    reviewed_files:[{path,sha256,assessment}]}.
     """
     return _run("qualify_package_update", finding_id, review, repo_root=repo_root)
 
@@ -671,9 +689,9 @@ def qualify_package_update(
     )
 )
 def apply_minimal_fix(finding_id: str, repo_root: str | None = None) -> dict[str, Any]:
-    """Apply only a human-selected, fresh qualified plan; resolution needs post-checks.
+    """Apply a human-selected, fresh qualified plan; resolution needs post-checks.
 
-    The server reads the cited language or manifest page and any named CVE or CWE record.
+    Reads cited language/manifest and named CVE/CWE docs.
     """
     return _run("apply_minimal_fix", finding_id, repo_root=repo_root)
 
@@ -700,7 +718,7 @@ def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str
     )
 )
 def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
-    """Validate pending updates with a production build and non-test policy checks.
+    """Validate pending updates with production builds, unit tests and policy checks.
 
     Read isolation_trials/rejected_updates; stop on incomplete recovery or cleanup.
     """
@@ -752,20 +770,267 @@ async def _fix_form_response(
     return CancelledElicitation()
 
 
+def _fix_choice_text(item: dict) -> tuple[str, str]:
+    """Present decision facts without exposing Python dictionaries as form text."""
+    plan = item["proposed_fix"]
+    location = item["location"]
+    path = location.get("file") or location.get("path") or "Not provided"
+    line = location.get("start_line") or location.get("line")
+    where = f"{path}:{line}" if line else str(path)
+    scope = ", ".join(str(path) for path in plan.get("files") or []) or where
+    title = f"{str(item.get('severity') or 'unknown').upper()} | {item.get('title') or item['id']}"
+    facts = [f"Finding: {item['id']}", f"Location: {where}"]
+    if plan.get("package") and plan.get("target"):
+        current = item.get("current_version") or "Not established"
+        title += f" | {plan['package']}: {current} -> {plan['target']}"
+        facts.extend(
+            [
+                f"Package: {plan['package']} ({plan.get('ecosystem') or 'unknown ecosystem'})",
+                f"Current version: {current} ({item['current_version_source']})",
+                f"Proposed version: {plan['target']}",
+                f"Change: {plan.get('description') or plan.get('strategy') or 'Version update'}",
+                f"Scope: {scope}",
+                "Risk: Major-version change; requires API/caller compatibility review."
+                if plan.get("major_upgrade")
+                or is_major_upgrade(item.get("current_version"), plan["target"])
+                else "Risk: Compatibility and license review still required; a version number alone does not prove safety.",
+                "Keep only if production builds, executed unit tests and configured policy checks pass. "
+                "Isolate and revert offending updates; retain passing updates. Do not adapt source or tests to force acceptance.",
+            ]
+        )
+    else:
+        facts.extend(
+            [
+                f"Proposed code change: {plan.get('description') or 'No verified edit plan yet; source review or local reproduction is still required.'}",
+                f"Scope: {scope}",
+                "Approve a scoped, evidence-backed security fix for this issue only. "
+                "An annotation must enforce security, not suppress a warning. No invented fixes, major rewrites or API adaptations.",
+            ]
+        )
+    facts.append(
+        f"Why address this: {item.get('reason') or 'Assessment details are not established.'}"
+    )
+    return title, "\n".join(facts)
+
+
+_desktop_fix_selection_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _finish_desktop_fix_selection(
+    ctx: Context,
+    selected: Engine,
+    request_id: str,
+    candidates: list[dict],
+    schema: type[BaseModel],
+    dialog: desktop_approval.DesktopApproval,
+    started: asyncio.Event,
+    prepared: dict,
+) -> None:
+    """Execute reviewed package choices after physical approval, outside the host deadline."""
+    closed = False
+    work = None
+    cancelled = threading.Event()
+    try:
+        started.set()
+        response = await dialog.wait()
+        await dialog.close()
+        closed = True
+        values = (
+            schema.model_validate(response.get("content")).model_dump()
+            if response["action"] == "accept"
+            else {}
+        )
+        ids = [
+            item["id"]
+            for index, item in enumerate(candidates)
+            if values.get(f"finding_{index}") is True
+        ]
+        result = await asyncio.to_thread(
+            selected.record_fix_selection,
+            candidates,
+            ids,
+            "APPROVED" if ids else "SKIPPED",
+            "" if ids else "The human did not approve any code fixes.",
+            request_id=request_id,
+            presentation="WINDOWS_DIALOG",
+        )
+        logger.info(
+            "Desktop fix selection finished: %s; %s approved for local edits.",
+            result["status"],
+            len(result.get("selected_ids", [])),
+        )
+        if result["status"] == "APPROVED" and any(
+            finding_id in prepared["reviews"] for finding_id in ids
+        ):
+            work = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    selected.execute_selected_package_updates,
+                    request_id,
+                    prepared["reviews"],
+                    prepared["tree"],
+                    cancelled,
+                ),
+            )
+            execution = await asyncio.shield(work)
+            logger.info("Approved package execution finished: %s", execution["status"])
+            if execution.get("finish_run") is True:
+                await complete_security_run(ctx, str(selected.repo_root))
+    except asyncio.CancelledError:
+        if work is not None:
+            cancelled.set()
+            await work
+        await asyncio.shield(
+            asyncio.to_thread(
+                selected.record_fix_selection,
+                candidates,
+                [],
+                "UNAVAILABLE",
+                "The server stopped before a human response. No edits were authorized.",
+                request_id=request_id,
+                presentation="WINDOWS_DIALOG",
+            )
+        )
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Desktop fix selection failed: %s", exc)
+        await asyncio.to_thread(
+            selected.record_fix_selection,
+            candidates,
+            [],
+            "INVALID",
+            str(exc),
+            request_id=request_id,
+            presentation="WINDOWS_DIALOG",
+        )
+    finally:
+        if not closed:
+            await dialog.close()
+
+
+async def _open_fix_selection(
+    ctx: Context,
+    selected: Engine,
+    candidates: list[dict],
+    schema: type[BaseModel],
+    prepared: dict,
+) -> dict:
+    """Reserve one owned Windows window and return before the human finishes reading."""
+    pending = await asyncio.to_thread(
+        selected.record_fix_selection,
+        candidates,
+        [],
+        "REQUESTED",
+        presentation="WINDOWS_DIALOG",
+    )
+    if pending.get("created") is not True:
+        return pending
+    request_id = pending["request_id"]
+    dialog = None
+    task = None
+    started = asyncio.Event()
+    try:
+        properties = schema.model_json_schema()["properties"]
+        for index, item in enumerate(candidates):
+            field = properties[f"finding_{index}"]
+            blocked = prepared["reviews"].get(item["id"], {}).get("blocked_reason")
+            if blocked:
+                field["title"] = "BLOCKED | " + field["title"]
+                field["description"] = (
+                    f"No automatic update: {blocked}\n\n" + field["description"]
+                )
+            field["summary"] = field["description"]
+        dialog = await desktop_approval.open_dialog(
+            f"Repository: {selected.repo_root}\r\n"
+            "Select only the package updates or scoped code fixes you authorize. All boxes start unchecked. "
+            "Review current/proposed versions, file scope, risk and acceptance requirements. "
+            "There is no selection deadline. Cancel or close authorizes nothing. "
+            "After submission, the server automatically applies checked package updates and runs builds/unit tests. "
+            "Keep the server running; no second continue request is needed for packages. Source-code fixes still require your IDE agent.",
+            properties,
+            title="GitLab security: choose updates and code fixes",
+            detail_header="Proposed change and decision details",
+            submit_label="Approve checked fixes",
+        )
+        result = await asyncio.to_thread(
+            selected.record_fix_selection,
+            candidates,
+            [],
+            "AWAITING_HUMAN",
+            request_id=request_id,
+            presentation="WINDOWS_DIALOG",
+        )
+        if result["status"] != "AWAITING_HUMAN":
+            return result
+        task = asyncio.create_task(
+            _finish_desktop_fix_selection(
+                ctx, selected, request_id, candidates, schema, dialog, started, prepared
+            )
+        )
+        _desktop_fix_selection_tasks[request_id] = task
+        task.add_done_callback(
+            lambda _task: _desktop_fix_selection_tasks.pop(request_id, None)
+        )
+        await started.wait()
+        return {
+            **result,
+            "message": "The Windows selection window is open with no review timeout. "
+            "This tool call is complete. Do not poll, reopen selection, start fixes or complete the run. "
+            "After submission the server automatically qualifies, edits and validates selected package updates, then saves reports and offers separate false-positive approvals. "
+            "Keep the server running. Only selected source-code fixes require the IDE agent to continue.",
+        }
+    except asyncio.CancelledError:
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await asyncio.shield(
+            asyncio.to_thread(
+                selected.record_fix_selection,
+                candidates,
+                [],
+                "UNAVAILABLE",
+                "The host interrupted window startup. No edits were authorized.",
+                request_id=request_id,
+                presentation="WINDOWS_DIALOG",
+            )
+        )
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Could not display Windows fix-selection window: %s", exc)
+        return await asyncio.to_thread(
+            selected.record_fix_selection,
+            candidates,
+            [],
+            "UNAVAILABLE",
+            str(exc),
+            request_id=request_id,
+            presentation="WINDOWS_DIALOG",
+        )
+    finally:
+        if dialog is not None and not started.is_set():
+            await dialog.close()
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Select security issues to fix",
         read_only_hint=False,
-        destructive_hint=False,
-        open_world_hint=False,
+        destructive_hint=True,
+        open_world_hint=True,
     )
 )
 async def select_security_fixes(
-    ctx: Context, repo_root: str | None = None
+    ctx: Context,
+    repo_root: str | None = None,
+    package_reviews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | InputRequiredResult:
-    """Ask the human to select issues before any qualification or remediation edits.
+    """Human-only selection; cancel/empty/unavailable skips edits; then complete run.
 
-    No AI consent. Empty/cancel/unavailable means skip edits and complete the run.
+    Windows package_reviews[finding_id]: qualify_package_update evidence before
+    checkboxes; reviews are not consent. Submission auto-qualifies/edits selected
+    packages, builds/tests and selectively rolls back failures.
+    Blocked: exact ecosystem/package/target + blocked_reason; never invent evidence.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     protocol = ctx.protocol_version
@@ -782,7 +1047,8 @@ async def select_security_fixes(
     if snapshot["status"] not in {"OK", "REQUESTED"}:
         return snapshot
     candidates = snapshot["candidates"]
-    if not candidates or not _form_supported(ctx):
+    native = desktop_approval.available()
+    if not candidates or (not native and not _form_supported(ctx)):
         return await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -792,6 +1058,28 @@ async def select_security_fixes(
             if not candidates
             else "The host does not advertise human form support; no code edits are authorized.",
         )
+    schema = create_model(
+        "SecurityFixSelection",
+        **{
+            f"finding_{index}": (
+                bool,
+                Field(
+                    default=False,
+                    strict=True,
+                    title=_fix_choice_text(item)[0],
+                    description=_fix_choice_text(item)[1],
+                ),
+            )
+            for index, item in enumerate(candidates)
+        },
+    )
+    if native:
+        prepared = await asyncio.to_thread(
+            selected.prepare_package_updates, candidates, package_reviews or {}
+        )
+        if prepared["status"] != "READY":
+            return prepared
+        return await _open_fix_selection(ctx, selected, candidates, schema, prepared)
     pending = (
         snapshot
         if snapshot["status"] == "REQUESTED"
@@ -801,26 +1089,6 @@ async def select_security_fixes(
     )
     if pending["status"] != "REQUESTED":
         return pending
-    schema = create_model(
-        "SecurityFixSelection",
-        **{
-            f"finding_{index}": (
-                bool,
-                Field(
-                    default=False,
-                    strict=True,
-                    title=f"{item['severity']}: {item['id']}: {item['title']}",
-                    description=(
-                        f"Location: {item['location']}\nAssessment: {item['decision']}: {item['reason']}\n"
-                        f"Existing proposed plan (empty means no verified edit plan yet): {item['proposed_fix']}\n"
-                        "Allow a surgical fix for this issue only. Prefer a documented security-enforcing "
-                        "annotation when sufficient; no suppressions, invented fixes, major rewrites or API adaptations."
-                    ),
-                ),
-            )
-            for index, item in enumerate(candidates)
-        },
-    )
     try:
         response = await _fix_form_response(
             ctx,
@@ -916,7 +1184,12 @@ async def _finish_desktop_approval(
         result = await asyncio.to_thread(
             selected.resolve_desktop_approval, request_id, approved
         )
-        logger.info("Desktop false-positive approval finished: %s", result["status"])
+        logger.info(
+            "Desktop false-positive approval finished: %s; independently confirmed %s of %s selections",
+            result["status"],
+            result.get("confirmed_dismissals", 0),
+            result.get("selected_count", 0),
+        )
     except asyncio.CancelledError:
         await asyncio.shield(
             asyncio.to_thread(
@@ -1283,6 +1556,28 @@ async def complete_security_run(
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     selected_root = str(selected.repo_root)
+    selection = deepcopy(selected.state.fix_selection)
+    if (selection.get("package_execution") or {}).get("status") in {
+        "QUEUED",
+        "RUNNING",
+    }:
+        message = "The server is executing the approved package batch. Do not duplicate its edits, checks or completion."
+        return CallToolResult(
+            content=[TextContent(text=message)],
+            structuredContent={"status": "REMEDIATION_RUNNING", "message": message},
+        )
+    if selection.get("presentation") == "WINDOWS_DIALOG" and selection.get(
+        "status"
+    ) in {"REQUESTED", "AWAITING_HUMAN"}:
+        message = "Wait for the human's open fix-selection window. Approved, reviewed packages continue automatically; selected source fixes remain host-led. Do not poll or reopen."
+        return CallToolResult(
+            content=[TextContent(text=message)],
+            structuredContent={
+                "status": "AWAITING_HUMAN",
+                "fix_selection": selection,
+                "message": message,
+            },
+        )
     review = await review_false_positives(ctx, repo_root=selected_root)
     report = await asyncio.to_thread(_generate_local_report, repo_root=selected_root)
     if report.structured_content is None:

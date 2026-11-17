@@ -1,6 +1,7 @@
 """Verify human-only issue selection before MCP remediation operations."""
 
 import asyncio
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -62,6 +63,27 @@ def _context(action="accept", values=None, supported=True, before_response=None)
 
     ctx.elicit = AsyncMock(side_effect=elicit)
     return ctx
+
+
+def _native_lifecycle(monkeypatch, engine):
+    """Isolate dialog lifecycle tests from the separately tested package executor."""
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    monkeypatch.setattr(
+        engine,
+        "prepare_package_updates",
+        Mock(
+            return_value={
+                "status": "READY",
+                "reviews": {finding["id"]: {} for finding in engine.state.findings},
+                "tree": {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "execute_selected_package_updates",
+        Mock(return_value={"status": "COMPLETED"}),
+    )
 
 
 @pytest.mark.parametrize(
@@ -371,6 +393,442 @@ def test_batch_validation_cannot_replay_an_unapproved_issue(tmp_path, monkeypatc
     validation.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "installed,reported,current,source",
+    [
+        ("1.4.0", "1.0.0", "1.4.0", "Verified local plan"),
+        (None, "1.0.0", "1.0.0", "Finding reports"),
+        (None, None, "Not established", "Not established"),
+    ],
+)
+def test_selection_explains_package_versions_and_scoped_code_action(
+    tmp_path, monkeypatch, installed, reported, current, source
+):
+    """Render decision facts clearly, distinguish reported versions and admit unknowns."""
+    # Arrange
+    engine = _engine(tmp_path)
+    package, code = engine.state.findings[:2]
+    package["installedVersion"] = reported
+    package["proposedFix"].update(
+        installed=installed, files=["frontend/package.json"], strategy="override"
+    )
+    code["location"] = {"file": "backend/Handler.cs", "start_line": 23}
+    code["proposedFix"] = {
+        "ecosystem": "source",
+        "description": "Enforce authorization on the affected handler.",
+        "files": ["backend/Handler.cs"],
+    }
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context()
+
+    # Act
+    asyncio.run(server.select_security_fixes(ctx, str(tmp_path)))
+    fields = ctx.elicit.call_args.args[1].model_fields
+
+    # Assert
+    details = fields["finding_0"].description
+    assert f"Current version: {current} ({source})" in details
+    assert "Proposed version: 2.0.0" in details
+    assert "Scope: frontend/package.json" in details
+    assert "executed unit tests" in details
+    assert "Evidence for one." in details
+    if installed:
+        assert "Major-version change" in details
+    code_details = fields["finding_1"].description
+    assert "backend/Handler.cs:23" in code_details
+    assert "Proposed code change: Enforce authorization" in code_details
+    assert "not suppress a warning" in code_details
+    assert "{" not in details + code_details
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [("target", "3.0.0"), ("installed", "1.9.0"), ("files", ["other/package.json"])],
+)
+def test_selection_cannot_authorize_different_package_versions_or_scope(
+    tmp_path, monkeypatch, field, replacement
+):
+    """Approval binds the displayed update but not later qualification receipts."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    work = Mock(return_value={"status": "APPLIED"})
+    monkeypatch.setattr(engine, "apply_minimal_fix", work)
+    asyncio.run(
+        server.select_security_fixes(
+            _context(values={"finding_0": True}), str(tmp_path)
+        )
+    )
+    plan = engine.state.findings[0]["proposedFix"]
+
+    # Act
+    plan["qualification_receipt"] = {"status": "APPROVED"}
+    allowed = server.apply_minimal_fix("one", str(tmp_path))
+    plan[field] = replacement
+    denied = server.apply_minimal_fix("one", str(tmp_path))
+
+    # Assert
+    assert allowed["status"] == "APPLIED"
+    assert denied["status"] == "FIX_APPROVAL_REQUIRED"
+    work.assert_called_once_with("one")
+
+
+@pytest.mark.parametrize("protocol", ["2025-11-25", "2026-07-28"])
+@pytest.mark.parametrize(
+    "action,checked", [("accept", True), ("accept", False), ("cancel", True)]
+)
+def test_native_selection_releases_host_request_and_records_only_human_choices(
+    tmp_path, monkeypatch, protocol, action, checked
+):
+    """Both host protocols work without form support or a live timed tool request."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    _native_lifecycle(monkeypatch, engine)
+    ctx = _context(supported=False)
+    ctx.protocol_version = protocol
+    ctx.request_state = None
+    dialog = Mock(close=AsyncMock())
+    opened = AsyncMock(return_value=dialog)
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+    work = Mock()
+    monkeypatch.setattr(engine, "apply_minimal_fix", work)
+
+    async def exercise():
+        """Return promptly and leave the human response independently blocked."""
+        ready = asyncio.Event()
+
+        async def wait():
+            """Model an indefinitely reading human."""
+            await ready.wait()
+            return {"action": action, "content": {"finding_0": checked}}
+
+        dialog.wait = wait
+        result = await asyncio.wait_for(
+            server.select_security_fixes(ctx, str(tmp_path)), 5
+        )
+        task = server._desktop_fix_selection_tasks[result["request_id"]]
+        assert result["status"] == "AWAITING_HUMAN"
+        assert result["next_tool"] == "wait_for_human"
+        assert not task.done()
+        assert (
+            server.apply_minimal_fix("one", str(tmp_path))["status"] == "AWAITING_HUMAN"
+        )
+        completion = await server.complete_security_run(ctx, str(tmp_path))
+        assert completion.structured_content["status"] == "AWAITING_HUMAN"
+        duplicate = await server.select_security_fixes(ctx, str(tmp_path))
+        assert duplicate["status"] == "AWAITING_HUMAN"
+        ready.set()
+        await task
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    ctx.elicit.assert_not_called()
+    opened.assert_awaited_once()
+    assert opened.call_args.kwargs["submit_label"] == "Approve checked fixes"
+    assert opened.call_args.args[1]["finding_0"]["default"] is False
+    assert "Current version:" in opened.call_args.args[1]["finding_0"]["summary"]
+    assert engine.state.fix_selection["selected_ids"] == (
+        ["one"] if action == "accept" and checked else []
+    )
+    assert engine.state.fix_selection["status"] == (
+        "APPROVED" if action == "accept" and checked else "SKIPPED"
+    )
+    work.assert_not_called()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+    dialog.close.assert_awaited_once()
+    assert not server._desktop_fix_selection_tasks
+
+
+def test_concurrent_native_selection_reserves_only_one_window(tmp_path, monkeypatch):
+    """Concurrent tool requests cannot replace a starting window or its snapshot."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    _native_lifecycle(monkeypatch, engine)
+    dialog = Mock(close=AsyncMock())
+
+    async def exercise():
+        """Block startup until a competing request observes the reservation."""
+        starting, release, answer = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def open_dialog(*args, **kwargs):
+            """Delay native readiness, not human reading."""
+            starting.set()
+            await release.wait()
+            return dialog
+
+        async def wait():
+            """Await a physical selection."""
+            await answer.wait()
+            return {"action": "accept", "content": {"finding_1": True}}
+
+        dialog.wait = wait
+        opened = AsyncMock(side_effect=open_dialog)
+        monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+        first = asyncio.create_task(
+            server.select_security_fixes(_context(), str(tmp_path))
+        )
+        await starting.wait()
+        competing = await server.select_security_fixes(_context(), str(tmp_path))
+        assert competing["status"] == "REQUESTED"
+        release.set()
+        result = await first
+        task = server._desktop_fix_selection_tasks[result["request_id"]]
+        opened.assert_awaited_once()
+        answer.set()
+        await task
+        return result, competing
+
+    # Act
+    first, competing = asyncio.run(exercise())
+
+    # Assert
+    assert first["request_id"] == competing["request_id"]
+    assert engine.state.fix_selection["selected_ids"] == ["two"]
+    dialog.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "interruption", ["shutdown", "new_run", "changed_target", "invalid_boolean"]
+)
+def test_native_selection_interruptions_never_authorize_or_leak(
+    tmp_path, monkeypatch, interruption
+):
+    """Shutdown, replacement runs, stale proposals and malformed responses fail closed."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    _native_lifecycle(monkeypatch, engine)
+    dialog = Mock(close=AsyncMock())
+    monkeypatch.setattr(
+        server.desktop_approval, "open_dialog", AsyncMock(return_value=dialog)
+    )
+
+    async def exercise():
+        """Interrupt a shown window before its response is consumed."""
+        answer = asyncio.Event()
+
+        async def wait():
+            """Wait until the stale or invalid answer is ready."""
+            await answer.wait()
+            return {
+                "action": "accept",
+                "content": {
+                    "finding_0": "true" if interruption == "invalid_boolean" else True
+                },
+            }
+
+        dialog.wait = wait
+        pending = await server.select_security_fixes(_context(), str(tmp_path))
+        task = server._desktop_fix_selection_tasks[pending["request_id"]]
+        if interruption == "shutdown":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            if interruption == "new_run":
+                engine.state = RunState()
+            elif interruption == "changed_target":
+                engine.state.findings[0]["proposedFix"]["target"] = "9.0.0"
+            answer.set()
+            await task
+        await asyncio.sleep(0)
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    assert engine.state.fix_selection.get("selected_ids", []) == []
+    assert (
+        engine.state.fix_selection.get("status")
+        == {
+            "shutdown": "UNAVAILABLE",
+            "new_run": None,
+            "changed_target": "INVALID",
+            "invalid_boolean": "INVALID",
+        }[interruption]
+    )
+    dialog.close.assert_awaited_once()
+    assert not server._desktop_fix_selection_tasks
+
+
+@pytest.mark.parametrize(
+    "interruption", ["cancel_receipt", "changed_target", "new_run", "open_error"]
+)
+def test_native_startup_interruption_closes_owned_window_and_releases_selection(
+    tmp_path, monkeypatch, interruption
+):
+    """Failed or stale native startup cannot leave a permanent pending selection."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    _native_lifecycle(monkeypatch, engine)
+    dialog = Mock(close=AsyncMock())
+    record = engine.record_fix_selection
+
+    def interrupt_receipt(*args, **kwargs):
+        """Cancel after readiness is recorded, before ownership transfers."""
+        result = record(*args, **kwargs)
+        if interruption == "cancel_receipt" and args[2] == "AWAITING_HUMAN":
+            raise asyncio.CancelledError
+        return result
+
+    async def open_dialog(*args, **kwargs):
+        """Change the live run before the window reports ready."""
+        if interruption == "open_error":
+            raise OSError("Native selection startup failed.")
+        if interruption == "changed_target":
+            engine.state.findings[0]["proposedFix"]["target"] = "9.0.0"
+        elif interruption == "new_run":
+            engine.state = RunState()
+        return dialog
+
+    monkeypatch.setattr(engine, "record_fix_selection", interrupt_receipt)
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", open_dialog)
+
+    async def exercise():
+        """Wait for startup, not for a human response."""
+        if interruption == "cancel_receipt":
+            with pytest.raises(asyncio.CancelledError):
+                await server.select_security_fixes(_context(), str(tmp_path))
+        else:
+            await server.select_security_fixes(_context(), str(tmp_path))
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    assert engine.state.fix_selection.get("selected_ids", []) == []
+    assert (
+        engine.state.fix_selection.get("status")
+        == {
+            "cancel_receipt": "UNAVAILABLE",
+            "changed_target": "INVALID",
+            "new_run": None,
+            "open_error": "UNAVAILABLE",
+        }[interruption]
+    )
+    assert dialog.close.await_count == int(interruption != "open_error")
+    assert not server._desktop_fix_selection_tasks
+
+
+def test_native_packages_require_real_reviews_before_opening_selection(
+    tmp_path, monkeypatch
+):
+    """A missing AI review must request evidence rather than strand approved choices."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    opened = AsyncMock()
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+
+    # Act
+    result = asyncio.run(server.select_security_fixes(_context(), str(tmp_path)))
+
+    # Assert
+    assert result["status"] == "PACKAGE_REVIEW_REQUIRED"
+    assert {item["finding_id"] for item in result["required_reviews"]} == {"one", "two"}
+    assert "license" in result["message"]
+    opened.assert_not_called()
+    assert not engine.state.fix_selection
+    assert not engine.state.changes
+
+
+def test_native_shutdown_waits_for_its_owned_package_worker(tmp_path, monkeypatch):
+    """Cancellation signals and joins the worker instead of abandoning a live thread."""
+    # Arrange
+    engine = _engine(tmp_path)
+    _native_lifecycle(monkeypatch, engine)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    dialog = Mock(
+        close=AsyncMock(),
+        wait=AsyncMock(
+            return_value={
+                "action": "accept",
+                "content": {"finding_0": True},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        server.desktop_approval, "open_dialog", AsyncMock(return_value=dialog)
+    )
+    running, stopping, release = threading.Event(), threading.Event(), threading.Event()
+
+    def execute(request_id, reviews, tree, cancelled):
+        """Retain ownership until the current bounded operation finishes."""
+        running.set()
+        assert cancelled.wait(5)
+        stopping.set()
+        assert release.wait(5)
+        engine.state.fix_selection["package_execution"] = {"status": "INTERRUPTED"}
+        return {"status": "INTERRUPTED"}
+
+    monkeypatch.setattr(engine, "execute_selected_package_updates", execute)
+
+    async def exercise():
+        """Cancel after approval and verify cleanup waits for the worker."""
+        await server.select_security_fixes(_context(), str(tmp_path))
+        assert await asyncio.to_thread(running.wait, 5)
+        task = next(iter(server._desktop_fix_selection_tasks.values()))
+        task.cancel()
+        assert await asyncio.to_thread(stopping.wait, 5)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    assert engine.state.fix_selection["package_execution"]["status"] == "INTERRUPTED"
+    dialog.close.assert_awaited_once()
+    assert not server._desktop_fix_selection_tasks
+
+
+def test_queued_batch_blocks_duplicate_edits_completion_and_new_runs(
+    tmp_path, monkeypatch
+):
+    """One human submission owns the batch until its execution reaches a terminal state."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    candidates = engine.fix_selection_candidates()["candidates"]
+    pending = engine.record_fix_selection(
+        candidates, [], "REQUESTED", presentation="WINDOWS_DIALOG"
+    )
+    engine.record_fix_selection(
+        candidates,
+        ["one"],
+        "APPROVED",
+        request_id=pending["request_id"],
+        presentation="WINDOWS_DIALOG",
+    )
+    work = Mock()
+    monkeypatch.setattr(engine, "apply_minimal_fix", work)
+
+    # Act
+    prechecks = engine.run_prechecks()
+    duplicate = server.apply_minimal_fix("one", str(tmp_path))
+    selection = asyncio.run(server.select_security_fixes(_context(), str(tmp_path)))
+    completion = asyncio.run(server.complete_security_run(_context(), str(tmp_path)))
+
+    # Assert
+    assert (
+        prechecks["status"]
+        == duplicate["status"]
+        == selection["status"]
+        == completion.structured_content["status"]
+        == "REMEDIATION_RUNNING"
+    )
+    assert engine.state.fix_selection["request_id"] == pending["request_id"]
+    work.assert_not_called()
+
+
 def test_fix_selection_not_reused_by_new_engine(tmp_path, monkeypatch):
     """An inspection snapshot never restores edit authorization after restart."""
     # Arrange
@@ -466,7 +924,10 @@ def test_native_mcp_selection_edits_only_the_chosen_image(repo, monkeypatch):
             for tool in await server.mcp.list_tools()
             if tool.name == "select_security_fixes"
         )
-        assert set(selector.input_schema["properties"]) == {"repo_root"}
+        assert set(selector.input_schema["properties"]) == {
+            "repo_root",
+            "package_reviews",
+        }
         return ElicitResult(
             action="accept", content={"finding_0": True, "finding_1": False}
         )

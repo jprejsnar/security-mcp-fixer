@@ -634,6 +634,8 @@ class HybridRunner(CommandRunner):
         if tool_name(argv[0]) == "git":
             return super().run(argv, timeout=timeout, check=check, cwd=cwd)
         stdout = "ok"
+        if "test" in argv or "verify" in argv:
+            stdout += "\nTests: 1 passed"
         if argv[1:] in (["--version"], ["-version"]):
             stdout = {
                 "node": "24.21.0",
@@ -2085,7 +2087,9 @@ def test_supported_runtime_validation_matrix(tmp_path, stack, runtime, expected)
         return CommandResult(
             argv,
             0,
-            runtime if argv[1] in {"--version", "-version"} else "success",
+            runtime
+            if argv[1] in {"--version", "-version"}
+            else "success\nTests: 1 passed",
             "",
             0,
             False,
@@ -2124,7 +2128,7 @@ def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename
     (tmp_path / filename).write_text(contents, encoding="utf-8")
     runner = Mock()
     runner.run.return_value = CommandResult(
-        ["dotnet", "--version"], 0, "10.0.100", "", 0, False, "", ""
+        ["dotnet", "--version"], 0, "10.0.100\nTests: 1 passed", "", 0, False, "", ""
     )
 
     # Act
@@ -2137,10 +2141,12 @@ def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename
     assert ["dotnet", "build", "--configuration", "Release", "--nologo"] in [
         call.args[0] for call in runner.run.call_args_list
     ]
-    assert all("test" not in call.args[0] for call in runner.run.call_args_list)
-    skipped = [row for row in result["results"] if row.get("kind") == "unit_tests"]
-    assert len(skipped) == 1 and skipped[0]["status"] == "SKIPPED"
-    assert skipped[0]["required"] is False
+    assert ["dotnet", "test", "--configuration", "Release", "--nologo"] in [
+        call.args[0] for call in runner.run.call_args_list
+    ]
+    tests = [row for row in result["results"] if row.get("kind") == "unit_tests"]
+    assert len(tests) == 1 and tests[0]["status"] == "PASSED"
+    assert tests[0]["required"] is True
 
 
 @pytest.mark.parametrize(
@@ -2403,8 +2409,14 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
     engine.verify_security_finding(finding["id"])
 
     # Assert
-    assert first["decision"] == again["decision"] == "MANUAL_REVIEW"
-    assert first["proposed_fix"] is None
+    if mode in {"resolved", "logged"}:
+        assert first["decision"] == again["decision"] == "CHANGE_REQUIRED"
+        assert first["proposed_fix"]["strategy"] == "override"
+        assert first["proposed_fix"]["package"] == "io.example:library"
+        assert first["proposed_fix"]["target"] == "1.2.0"
+    else:
+        assert first["decision"] == again["decision"] == "MANUAL_REVIEW"
+        assert first["proposed_fix"] is None
     assert "https://osv.dev" in first["security_validation_sites"]
     successful = mode in {"resolved", "logged", "configurations"}
     assert before_change == (1 if successful else 2)
@@ -2482,7 +2494,10 @@ def test_nested_gradle_dependency_inspection_finds_enclosing_wrapper(tmp_path):
     result = engine.verify_security_finding("nested")
 
     # Assert
-    assert result["decision"] == "MANUAL_REVIEW"
+    assert result["decision"] == "CHANGE_REQUIRED"
+    assert result["proposed_fix"]["strategy"] == "override"
+    assert result["proposed_fix"]["package"] == "io.example:library"
+    assert result["proposed_fix"]["target"] == "1.2.0"
     assert finding["dependencyResolution"]["status"] == "RESOLVED"
     assert finding["dependencyResolution"]["version"] == "1.1.0"
     assert runner.run.call_args.args[0][0] == str(wrapper)
@@ -2595,7 +2610,7 @@ def test_modern_yarn_validation_uses_supported_commands(tmp_path):
         """Capture Berry validation commands after allowlist enforcement."""
         assert_allowed(argv, tmp_path)
         calls.append(argv)
-        return CommandResult(argv, 0, "v22.20.0", "", 0, False, "", "")
+        return CommandResult(argv, 0, "v22.20.0\nTests: 1 passed", "", 0, False, "", "")
 
     runner = Mock()
     runner.run.side_effect = run
@@ -2726,7 +2741,7 @@ def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
     runner.run.return_value = CommandResult(
         argv=["tool"],
         exit_code=0,
-        stdout="10.0.100",
+        stdout="10.0.100\nTests: 1 passed",
         stderr="",
         duration_ms=0,
         truncated=False,

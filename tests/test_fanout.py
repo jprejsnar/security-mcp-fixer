@@ -617,9 +617,19 @@ def test_http_clients_write_timing_records(tmp_path, operation):
     # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         if operation == "gitlab":
-            client = GitLabClient("secret-token", http=http, http_log_path=path)
+            client = GitLabClient(
+                "secret-token",
+                api_url="https://example.test/api/v4",
+                http=http,
+                http_log_path=path,
+            )
             assert client._request(
-                "POST", "https://example.test/api/graphql", {"query": "secret-body"}
+                "POST",
+                "https://example.test/api/graphql",
+                {
+                    "query": "query Timing { version }",
+                    "variables": {"value": "secret-body"},
+                },
             ) == {"ok": True}
         else:
             client = AdvisoryClient(http=http, http_log_path=path)

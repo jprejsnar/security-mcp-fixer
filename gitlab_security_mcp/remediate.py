@@ -11,6 +11,7 @@ from gitlab_security_mcp.commands import CommandRunner, resolve_tool
 from gitlab_security_mcp.manifests import (
     DEPENDENCY_SECTIONS,
     PackageHit,
+    add_java_override,
     add_npm_override,
     add_nuget_reference,
     bumped_spec,
@@ -94,7 +95,7 @@ class Plan:
                     "Review complete official package documentation and API changes.",
                     "Require no production/unit-test API adaptations or check-script changes for any version increment.",
                     "Review target-version license terms; obey configured corporate policy when present.",
-                    "Record informational baseline lint diagnostics; require successful production builds and configured non-test policy checks. Application unit tests are disabled; test compatibility was not verified. A corporate policy requiring tests blocks remediation.",
+                    "Record informational baseline lint diagnostics; require successful production builds, executed unit tests and configured policy checks. Isolate and revert offending updates while retaining passing updates.",
                 ],
             }
             if self.ecosystem in {"npm", "NuGet", "Maven"}
@@ -197,6 +198,18 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
                 description=f"Pin transitive dependency {hit.name} to {fixed} with a {hit.manager} override.",
             )
         return None
+    if hit.manager in {"maven", "gradle"} and hit.manifest and not hit.direct:
+        return Plan(
+            strategy="override",
+            score=3,
+            ecosystem=hit.ecosystem,
+            package=hit.name,
+            installed=hit.version,
+            target=fixed,
+            files=[hit.manifest],
+            manager=hit.manager,
+            description=f"Pin resolved transitive {hit.name} to {fixed} in {hit.manifest}; require resolved-version, build and unit-test verification.",
+        )
     if hit.manager == "maven" and hit.manifest and hit.direct:
         return Plan(
             strategy="manifest_bump",
@@ -347,11 +360,17 @@ def apply_plan(
             return _apply_node(root, plan, runner, which, edited, commands)
         if plan.manager == "maven":
             manifest = plan.files[0]
+            if plan.strategy == "override":
+                add_java_override(root, manifest, plan.package, plan.target)
+                return _applied(plan, [manifest], commands)
             if not update_pom_version(root, manifest, plan.package, plan.target):
                 return _failed("FIX_FAILED", plan, f"Could not update {manifest}.")
             return _applied(plan, [manifest], commands)
         if plan.manager == "gradle":
             manifest = plan.files[0]
+            if plan.strategy == "override":
+                add_java_override(root, manifest, plan.package, plan.target)
+                return _applied(plan, [manifest], commands)
             if not update_gradle_version(root, manifest, plan.package, plan.target):
                 return _failed("FIX_FAILED", plan, f"Could not update {manifest}.")
             return _applied(plan, [manifest], commands)

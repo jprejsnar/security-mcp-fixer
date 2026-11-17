@@ -16,7 +16,7 @@ Add-Type -AssemblyName System.Drawing
 if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
 $inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'GitLab false-positive approvals'
+$form.Text = [string]$inputData.title
 $form.Size = New-Object System.Drawing.Size(1200, 760)
 $form.StartPosition = 'CenterScreen'
 $form.TopMost = $true
@@ -43,7 +43,7 @@ $issueHeader = New-Object System.Windows.Forms.Label
 $issueHeader.Text = 'Issue'
 $issueHeader.AutoSize = $true
 $reasonHeader = New-Object System.Windows.Forms.Label
-$reasonHeader.Text = 'Why this is a false positive'
+$reasonHeader.Text = [string]$inputData.detail_header
 $reasonHeader.AutoSize = $true
 [void]$table.Controls.Add($issueHeader, 0, 0)
 [void]$table.Controls.Add($reasonHeader, 1, 0)
@@ -110,7 +110,7 @@ $cancel.Text = 'Cancel'
 $cancel.AutoSize = $true
 $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $submit = New-Object System.Windows.Forms.Button
-$submit.Text = 'Dismiss checked items'
+$submit.Text = [string]$inputData.submit_label
 $submit.AutoSize = $true
 $submit.Add_Click({
     $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
@@ -197,7 +197,14 @@ def _close_stream(stream: object) -> None:
     transport.close()
 
 
-async def open_dialog(message: str, properties: dict) -> DesktopApproval:
+async def open_dialog(
+    message: str,
+    properties: dict,
+    *,
+    title: str = "GitLab false-positive approvals",
+    detail_header: str = "Why this is a false positive",
+    submit_label: str = "Dismiss checked items",
+) -> DesktopApproval:
     """Return after the actual checkbox window is shown, not after human selection."""
     process = await asyncio.create_subprocess_exec(
         str(powershell()),
@@ -216,6 +223,9 @@ async def open_dialog(message: str, properties: dict) -> DesktopApproval:
             raise RuntimeError("Approval window pipes were not created")
         payload = {
             "message": message,
+            "title": title,
+            "detail_header": detail_header,
+            "submit_label": submit_label,
             "choices": [
                 {
                     "key": key,

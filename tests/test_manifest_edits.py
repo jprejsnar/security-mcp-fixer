@@ -94,7 +94,11 @@ def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
 @pytest.mark.parametrize(
     ("name", "contents", "expected"),
     [
-        ("package.json", '{"scripts":{"build":"vite build"}}', ["npm", "run", "build"]),
+        (
+            "package.json",
+            '{"scripts":{"build":"vite build","test":"vitest run"}}',
+            ["npm", "run", "build"],
+        ),
         (
             "App.csproj",
             "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>",
@@ -103,7 +107,7 @@ def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
         (
             "pom.xml",
             "<project/>",
-            ["mvn", "--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
+            ["mvn", "--batch-mode", "clean", "verify"],
         ),
         (
             "build.gradle",
@@ -112,10 +116,10 @@ def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
         ),
     ],
 )
-def test_remediation_builds_each_stack_without_executing_unit_tests(
+def test_remediation_requires_builds_and_executed_unit_tests(
     tmp_path, name, contents, expected
 ):
-    """Keep actual build checks while omitting test tasks and discovery entirely."""
+    """Require production builds and executed tests for every supported stack."""
     # Arrange
     from unittest.mock import Mock
 
@@ -128,9 +132,11 @@ def test_remediation_builds_each_stack_without_executing_unit_tests(
     def execute(argv, **kwargs):
         """Validate real command shapes without invoking application toolchains."""
         assert_allowed(argv, tmp_path)
-        assert "test" not in argv and "--listTests" not in argv
-        assert "verify" not in argv
-        text = 'openjdk version "17.0.1"' if argv[0] == "java" else "10.0.100"
+        text = (
+            'openjdk version "17.0.1"'
+            if argv[0] == "java"
+            else "10.0.100\nTests: 1 passed"
+        )
         return CommandResult(argv, 0, text, "", 0, False, "", "")
 
     runner.run.side_effect = execute
@@ -149,9 +155,12 @@ def test_remediation_builds_each_stack_without_executing_unit_tests(
     commands = [call.args[0] for call in runner.run.call_args_list]
     assert expected in commands
     assert result["status"] == "VALIDATION_COMPLETE", result
-    skipped = next(row for row in result["results"] if row.get("kind") == "unit_tests")
-    assert skipped["status"] == "SKIPPED" and not skipped["required"]
-    assert "Test compatibility was not verified" in skipped["detail"]
+    tests = [
+        row
+        for row in result["results"]
+        if row.get("kind") in {"unit_tests", "build_and_unit_tests"}
+    ]
+    assert tests and all(row["status"] == "PASSED" and row["required"] for row in tests)
 
 
 @pytest.mark.parametrize(
@@ -164,19 +173,22 @@ def test_remediation_builds_each_stack_without_executing_unit_tests(
         {"build": "vite build", "postinstall": "npm test"},
     ],
 )
-def test_node_build_or_install_cannot_indirectly_run_tests(tmp_path, scripts):
-    """Block known script chains and hooks instead of silently running unit tests."""
+def test_node_build_or_install_can_run_existing_test_hooks(tmp_path, scripts):
+    """Allow existing test lifecycle hooks without rewriting repository scripts."""
     # Arrange
     from unittest.mock import Mock
 
     from gitlab_security_mcp.commands import CommandResult
     from gitlab_security_mcp.validate import run_validation
 
+    scripts = {**scripts, "test": "vitest run"}
     (tmp_path / "package.json").write_text(
         json.dumps({"scripts": scripts}), encoding="utf-8"
     )
     runner = Mock()
-    runner.run.return_value = CommandResult([], 0, "", "", 0, False, "", "")
+    runner.run.return_value = CommandResult(
+        [], 0, "Tests: 1 passed", "", 0, False, "", ""
+    )
 
     # Act
     result = run_validation(
@@ -189,12 +201,12 @@ def test_node_build_or_install_cannot_indirectly_run_tests(tmp_path, scripts):
     )
 
     # Assert
-    assert result["status"] == "VALIDATION_FAILED"
+    assert result["status"] == "VALIDATION_COMPLETE"
     commands = [call.args[0] for call in runner.run.call_args_list]
-    assert ["npm", "run", "build"] not in commands
+    assert ["npm", "run", "build"] in commands
     if "postinstall" in scripts:
-        assert ["npm", "ci"] not in commands
-    assert any("disabled" in row.get("detail", "") for row in result["results"])
+        assert ["npm", "ci"] in commands
+    assert ["npm", "test"] in commands
 
 
 def test_report_discloses_unverified_tests_even_without_validation(tmp_path):
@@ -580,7 +592,9 @@ def test_nested_java_validation_uses_component_and_available_wrapper(
     def run(argv, **kwargs):
         """Check the real allowlist without executing repository build code."""
         assert_allowed(argv, tmp_path)
-        return CommandResult(argv, 0, 'openjdk version "17.0.1"', "", 0, False, "", "")
+        return CommandResult(
+            argv, 0, 'openjdk version "17.0.1"\nTests run: 1', "", 0, False, "", ""
+        )
 
     runner.run.side_effect = run
 
@@ -597,10 +611,20 @@ def test_nested_java_validation_uses_component_and_available_wrapper(
     # Assert
     assert result["status"] == "VALIDATION_COMPLETE", result
     calls = [call for call in runner.run.call_args_list if call.args[0][0] != "java"]
-    assert len(calls) == 2
+    assert len(calls) == (3 if manager == "gradle" else 2)
     assert all(call.args[0][0] == str(wrapper) for call in calls)
     assert all(call.kwargs["cwd"] == component for call in calls)
-    assert all("test" not in call.args[0][1:] for call in calls)
+    if manager == "gradle":
+        assert [call.args[0][1:] for call in calls] == [
+            ["--no-daemon", "dependencies"],
+            ["--no-daemon", "assemble"],
+            ["--no-daemon", "test", "--rerun-tasks"],
+        ]
+    else:
+        assert [call.args[0][1:] for call in calls] == [
+            ["--batch-mode", "clean", "verify"],
+            ["--batch-mode", "dependency:tree"],
+        ]
 
 
 @pytest.mark.parametrize("manager", ["gradle", "maven"])
@@ -639,7 +663,7 @@ def test_java_reactors_build_once_without_hiding_independent_projects(
         (independent / "pom.xml").write_text("<project />", encoding="utf-8")
     runner = Mock()
     runner.run.side_effect = lambda argv, **kwargs: CommandResult(
-        argv, 0, 'openjdk version "17.0.1"', "", 0, False, "", ""
+        argv, 0, 'openjdk version "17.0.1"\nTests run: 1', "", 0, False, "", ""
     )
 
     # Act
@@ -657,7 +681,7 @@ def test_java_reactors_build_once_without_hiding_independent_projects(
     builds = [
         call
         for call in runner.run.call_args_list
-        if "assemble" in call.args[0] or "package" in call.args[0]
+        if "assemble" in call.args[0] or "verify" in call.args[0]
     ]
     assert [call.kwargs["cwd"] for call in builds] == [component, independent]
 

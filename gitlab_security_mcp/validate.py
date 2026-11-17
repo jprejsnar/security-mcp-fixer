@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Callable
 from pathlib import Path
 from subprocess import SubprocessError
+from xml.etree import ElementTree
 
 from gitlab_security_mcp.commands import (
     CommandResult,
@@ -24,6 +26,37 @@ from gitlab_security_mcp.manifests import (
     java_build_roots,
 )
 
+logger = logging.getLogger("gitlab_security_mcp")
+
+
+def _gradle_scoped_rerun(wrapper: str | None) -> bool:
+    """Use task-scoped reruns only for a wrapper declaring Gradle 7.6 or newer."""
+    if wrapper is None:
+        return False
+    properties = (
+        Path(wrapper).parent / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    )
+    try:
+        with properties.open(encoding="utf-8") as stream:
+            text = stream.read(4097)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Cannot inspect Gradle wrapper version; retaining compatible validation: %s",
+            exc,
+        )
+        return False
+    version = re.search(
+        r"(?m)^\s*distributionUrl\s*=\s*\S*/gradle-(\d+)\.(\d+)(?:\.\d+)?-(?:bin|all)\.zip\s*$",
+        text,
+    )
+    return (
+        len(text) <= 4096
+        and version is not None
+        and (int(version[1]), int(version[2])) >= (7, 6)
+    )
+
 
 def run_validation(
     root: Path,
@@ -36,7 +69,7 @@ def run_validation(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> dict:
-    """Run builds and non-test checks; application unit tests are never invoked."""
+    """Run production builds and unit tests without accepting missing test evidence."""
     try:
         return _run_validation(
             root,
@@ -163,8 +196,16 @@ def _run_validation(
         )
     if package_checks:
         present = {row.get("kind") for row in results}
+        if "build_and_unit_tests" in present:
+            present.update(("build", "unit_tests"))
         kinds = (
-            ("lint",) if lint_only else (("build",) if skip_lint else ("lint", "build"))
+            ("lint",)
+            if lint_only
+            else (
+                ("build", "unit_tests")
+                if skip_lint
+                else ("lint", "build", "unit_tests")
+            )
         )
         for kind in kinds:
             if kind not in present:
@@ -176,19 +217,6 @@ def _run_validation(
                 )
                 row["kind"] = kind
                 results.append(row)
-    if not lint_only:
-        results.append(
-            {
-                **_row(
-                    None,
-                    "SKIPPED",
-                    False,
-                    "Application unit tests are disabled during security remediation. "
-                    "Test compatibility was not verified.",
-                ),
-                "kind": "unit_tests",
-            }
-        )
     if record_lint or lint_only:
         for row in results:
             if lint_only:
@@ -282,69 +310,6 @@ def _java_major(text: str, expected: int) -> bool:
     if not match:
         return False
     return int(match.group("major")) >= expected
-
-
-def node_test_blocker(root: Path, argv: list[str]) -> str | None:
-    """Block known test runners in Node scripts and their reachable lifecycle hooks.
-
-    Repository scripts are trusted executable code, not a sandbox. This catches
-    explicit test commands and script chains; the host must inspect custom tools.
-    """
-    if not argv or tool_name(argv[0]) not in {"npm", "pnpm", "yarn"}:
-        return None
-    args = argv[1:]
-    if not args:
-        return None
-    scripts = (_read_json(root / "package.json") or {}).get("scripts", {})
-    if not isinstance(scripts, dict):
-        raise ValueError("package.json scripts must be an object")
-    pending = []
-    if args[0] in {"ci", "install"}:
-        if "--ignore-scripts" in args:
-            return None
-        pending.extend(
-            ("preinstall", "install", "postinstall", "prepublish", "prepare")
-        )
-    elif args[0] == "run" and len(args) > 1:
-        pending.append(args[1])
-    else:
-        pending.append(args[0])
-    visited = set()
-    runner_pattern = re.compile(
-        r"(?<![\w-])(?:jest|vitest|mocha|jasmine|ava|tap|pytest|unittest|"
-        r"karma\s+start|ng\s+test|(?:npm|pnpm|yarn)(?:\s+run)?\s+test(?:[:\w-]*)|"
-        r"node\s+--test|dotnet\s+test)\b",
-        re.IGNORECASE,
-    )
-    while pending:
-        script = pending.pop()
-        if script in visited:
-            continue
-        visited.add(script)
-        if script == "test" or script.startswith("test:"):
-            return "Application unit tests are disabled during security remediation."
-        command = scripts.get(script, "")
-        if not isinstance(command, str):
-            raise ValueError("package.json scripts must be strings")
-        if runner_pattern.search(command):
-            return (
-                f"The {script} script invokes a test runner. Application unit tests "
-                "are disabled during security remediation; review the build/check "
-                "outside remediation instead of changing scripts to bypass it."
-            )
-        pending.extend(re.findall(r"\b(?:npm|pnpm|yarn)\s+run\s+([\w:-]+)", command))
-        pending.extend(
-            candidate
-            for candidate in scripts
-            if re.search(
-                rf"\b(?:pnpm|yarn)\s+{re.escape(candidate)}(?:\s|$|[;&|])",
-                command,
-            )
-        )
-        for hook in (f"pre{script}", f"post{script}"):
-            if hook in scripts and hook not in visited:
-                pending.append(hook)
-    return None
 
 
 def _node(
@@ -467,8 +432,8 @@ def _node(
         )
         return rows
     blocked = None
-    for script in ("lint", "build"):
-        kind = script
+    for script in ("lint", "build", "test"):
+        kind = "unit_tests" if script == "test" else script
         if kind == "lint" and skip_lint:
             continue
         if blocked is not None:
@@ -486,7 +451,8 @@ def _node(
             row = _row(
                 None,
                 "SKIPPED",
-                package_checks and not (record_lint and kind == "lint"),
+                (package_checks or kind == "unit_tests")
+                and not (record_lint and kind == "lint"),
                 f"{root / 'package.json'} has no {script} script; "
                 + (
                     "informational lint capture unavailable."
@@ -522,7 +488,7 @@ def _dotnet(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> list[dict]:
-    """Restore NuGet dependencies and build Release without running unit tests."""
+    """Restore NuGet dependencies, build Release, then run unit tests."""
     tool = resolve_tool("dotnet", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "dotnet is not on PATH.")]
@@ -564,6 +530,16 @@ def _dotnet(
             cwd=root,
         )
     )
+    if rows[-1]["status"] == "PASSED":
+        rows.append(
+            _run(
+                runner,
+                [tool, "test", "--configuration", "Release", "--nologo"],
+                timeout,
+                required=True,
+                cwd=root,
+            )
+        )
     return rows
 
 
@@ -635,6 +611,28 @@ def _java_gradle(
     tool = wrapper or resolve_tool("gradle", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
+    if not lint_only and package_checks and _gradle_scoped_rerun(wrapper):
+        rows = []
+        if not skip_lint:
+            rows.append(
+                _execute_product_check(
+                    runner,
+                    [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
+                    timeout,
+                    root,
+                    "lint",
+                )
+            )
+        rows.append(
+            _execute_product_check(
+                runner,
+                [tool, "--no-daemon", "assemble", "test", "--rerun"],
+                timeout,
+                root,
+                "build_and_unit_tests",
+            )
+        )
+        return rows
     if lint_only:
         return [
             _execute_product_check(
@@ -679,6 +677,16 @@ def _java_gradle(
             runner, [tool, "--no-daemon", "assemble"], timeout, root, "build"
         )
     )
+    if rows[-1]["status"] == "PASSED":
+        rows.append(
+            _execute_product_check(
+                runner,
+                [tool, "--no-daemon", "test", "--rerun-tasks"],
+                timeout,
+                root,
+                "unit_tests",
+            )
+        )
     return rows
 
 
@@ -719,19 +727,19 @@ def _java_maven(
     rows = [
         _execute_product_check(
             runner,
-            [tool, "--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
+            [tool, "--batch-mode", "clean", "verify"],
             timeout,
             root,
-            "build",
+            "build_and_unit_tests",
         )
     ]
     rows.append(
-        _run(
+        _execute_product_check(
             runner,
             [tool, "--batch-mode", "dependency:tree"],
             timeout,
-            required=True,
-            cwd=root,
+            root,
+            "dependency_tree",
         )
     )
     return lint + rows
@@ -842,13 +850,6 @@ def _run(
     cwd: Path | None = None,
 ) -> dict:
     """Run one allowlisted check and convert its exit code to a row."""
-    reason = (
-        node_test_blocker(cwd or runner.repo_root, argv)
-        if (argv and tool_name(argv[0]) in {"npm", "pnpm", "yarn"})
-        else None
-    )
-    if reason:
-        return {**_row(None, "FAILED", required, reason), "command": argv}
     if required and "test" in argv:
         return _execute_product_check(runner, argv, timeout, cwd, "unit_tests")
     if required and "build" in argv:
@@ -871,17 +872,10 @@ def _execute_product_check(
     runner, argv: list[str], timeout: int, cwd: Path | None, kind: str
 ) -> dict:
     """Keep earlier diagnostics when an individual product command cannot start."""
-    reason = (
-        node_test_blocker(cwd or runner.repo_root, argv)
-        if (argv and tool_name(argv[0]) in {"npm", "pnpm", "yarn"})
-        else None
-    )
-    if reason:
-        return {
-            **_row(None, "FAILED", True, reason),
-            "command": argv,
-            "kind": kind,
-        }
+    gradle_tests = kind in {"unit_tests", "build_and_unit_tests"} and tool_name(
+        argv[0]
+    ) in {"gradle", "gradlew"}
+    reports = _gradle_test_reports(cwd) if gradle_tests else {}
     try:
         result = runner.run(
             argv,
@@ -894,9 +888,58 @@ def _execute_product_check(
         row.update(command=argv, kind=kind, output_complete=False)
         return row
     row = _lint_result(result) if kind == "lint" else _product_result(result, kind)
+    if cwd is not None:
+        row["cwd"] = str(cwd)
+    if gradle_tests and result.exit_code == 0:
+        count = _executed_gradle_tests(cwd, reports)
+        if count and not row.get("reported_test_failures"):
+            result.unit_tests_verified = True
+            row.update(
+                status="PASSED",
+                detail=f"Gradle JUnit reports confirm {count} executed tests.",
+            )
     if kind == "lint" and (result.exit_code == 124 or result.exit_code < 0):
         row["output_complete"] = False
     return row
+
+
+def _gradle_test_reports(root: Path | None) -> dict[Path, tuple[int, int]]:
+    """Fingerprint standard Gradle JUnit reports before running the test task."""
+    if root is None:
+        raise ValueError("Gradle test validation requires a working directory")
+    pattern = os.path.join("**", "build", "test-results", "test", "TEST-*.xml")
+    return {
+        path: (stat.st_mtime_ns, stat.st_size)
+        for path in root.glob(pattern)
+        if (stat := path.stat())
+    }
+
+
+def _executed_gradle_tests(
+    root: Path | None, before: dict[Path, tuple[int, int]]
+) -> int:
+    """Require fresh, nonempty, successful JUnit evidence, not stale build artifacts."""
+    count = 0
+    for path, stamp in _gradle_test_reports(root).items():
+        if before.get(path) == stamp:
+            continue
+        if stamp[1] > 10 * 1024 * 1024:
+            raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
+        try:
+            with path.open("rb") as stream:
+                contents = stream.read(10 * 1024 * 1024 + 1)
+            if len(contents) > 10 * 1024 * 1024:
+                raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
+            report = ElementTree.fromstring(contents)
+        except ElementTree.ParseError as exc:
+            raise ValueError(f"Invalid JUnit report {path}: {exc}") from exc
+        for suite in report.iter("testsuite"):
+            tests = int(suite.get("tests", "0"))
+            skipped = int(suite.get("skipped", "0"))
+            if int(suite.get("failures", "0")) or int(suite.get("errors", "0")):
+                raise ValueError(f"JUnit report contains failing tests: {path}")
+            count += max(0, tests - skipped)
+    return count
 
 
 def _run_result(
@@ -1039,23 +1082,41 @@ def _product_result(result: CommandResult, kind: str) -> dict:
         )
     elif kind in {"unit_tests", "build_and_unit_tests"}:
         output = result.stdout + result.stderr
-        empty = re.search(
-            r"no tests (?:found|to run)|no test is available|tests (?:are )?skipped|tests run:\s*0\b|:test\s+(?:NO-SOURCE|SKIPPED)|\b0 tests? (?:run|passed)\b|\btests:\s*0\b",
-            output,
-            re.IGNORECASE,
-        )
         counts = re.findall(
-            r"(?:tests run:|tests:|passed:)\s*(\d+)|(\d+)\s+tests?\s+(?:completed|passed)",
+            r"(?:passed:|succeeded:|\bpass)\s*(\d+)|"
+            r"(\d+)\s+(?:tests?\s+(?:completed|passed)|passing\b)|"
+            r"\bTests:?[^\r\n]*?\b(\d+)\s+passed",
             output,
             re.IGNORECASE,
         )
-        if empty and not any(
+        executed = result.unit_tests_verified or any(
             int(count) > 0 for groups in counts for count in groups if count
+        )
+        for summary in re.finditer(
+            r"Tests run:\s*(\d+)([^\r\n]*)", output, re.IGNORECASE
         ):
+            skipped = re.search(r"Skipped:\s*(\d+)", summary[2], re.IGNORECASE)
+            executed |= int(summary[1]) > (int(skipped[1]) if skipped else 0)
+        failures = re.search(
+            r"\b(?:failed|failures|errors|cancelled|canceled):\s*[1-9]\d*\b|"
+            r"\b(?:Tests?|Test Suites):?[^\r\n]*\b[1-9]\d*\s+failed\b|"
+            r"\b(?:fail|cancelled|canceled)\s+[1-9]\d*\b",
+            output,
+            re.IGNORECASE,
+        )
+        if failures:
+            row.update(
+                status="FAILED",
+                reported_test_failures=True,
+                detail="Unit-test output reports failures despite the command exit code.",
+            )
+        elif not executed:
             row.update(
                 status="FAILED",
                 detail="Unit tests did not run; a successful exit without executed tests is not passing evidence.",
             )
+        elif result.exit_code == 0:
+            result.unit_tests_verified = True
     if result.exit_code != 0:
         tail = (result.stderr or result.stdout).strip()[-2000:]
         logs = ", ".join(

@@ -1091,6 +1091,90 @@ def add_nuget_reference(
     return _rel(root, path)
 
 
+def add_java_override(root: Path, manifest: str, package: str, version: str) -> None:
+    """Pin one resolved Java coordinate without changing the enclosing BOM."""
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+", package):
+        raise ValueError("A Java override requires an exact group:artifact coordinate")
+    path = _destination(root, manifest)
+    text = _read(path)
+    if path.name in {"build.gradle", "build.gradle.kts"}:
+        _write(
+            path,
+            text.rstrip()
+            + (
+                "\n\nconfigurations.configureEach {\n"
+                f'    resolutionStrategy.force("{package}:{version}")\n'
+                "}\n"
+            ),
+        )
+        return
+    if path.name != "pom.xml":
+        raise ValueError(
+            "Java overrides require a build.gradle, build.gradle.kts or pom.xml"
+        )
+    group, artifact = package.split(":")
+    entry = (
+        "\n      <dependency>\n"
+        f"        <groupId>{group}</groupId>\n"
+        f"        <artifactId>{artifact}</artifactId>\n"
+        f"        <version>{version}</version>\n"
+        "      </dependency>\n"
+    )
+    management = list(
+        re.finditer(
+            r"<dependencyManagement>\s*.*?</dependencyManagement>", text, re.DOTALL
+        )
+    )
+    # Ambiguous profile-specific management requires a narrower reviewed edit.
+    if len(management) > 1 or re.search(r"<\w+:project\b|<profiles\b", text):
+        raise ValueError(
+            "Profile-specific or prefixed Maven dependency management requires review"
+        )
+    if management:
+        match = management[0]
+        body = match[0]
+        for dependency in re.finditer(
+            r"<dependency>\s*.*?</dependency>", body, re.DOTALL
+        ):
+            if re.search(
+                rf"<groupId>\s*{re.escape(group)}\s*</groupId>", dependency[0]
+            ) and re.search(
+                rf"<artifactId>\s*{re.escape(artifact)}\s*</artifactId>", dependency[0]
+            ):
+                raise ValueError(
+                    "Existing managed coordinate requires its own version/property update"
+                )
+        if "</dependencies>" in body:
+            replacement = body.replace(
+                "</dependencies>", entry + "    </dependencies>", 1
+            )
+        else:
+            replacement = body.replace(
+                "</dependencyManagement>",
+                (
+                    "  <dependencies>"
+                    + entry
+                    + "    </dependencies>\n  </dependencyManagement>"
+                ),
+                1,
+            )
+        updated = text[: match.start()] + replacement + text[match.end() :]
+    else:
+        if text.count("</project>") != 1:
+            raise ValueError("Maven project closing element is missing or ambiguous")
+        updated = text.replace(
+            "</project>",
+            (
+                "  <dependencyManagement>\n    <dependencies>"
+                + entry
+                + "    </dependencies>\n  </dependencyManagement>\n</project>"
+            ),
+            1,
+        )
+    ET.fromstring(updated)
+    _write(path, updated)
+
+
 def update_pom_version(root: Path, manifest: str, package: str, version: str) -> bool:
     """Bump one Maven dependency, or the property its version references."""
     path = _destination(root, manifest)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import logging
 import re
 import threading
 from copy import deepcopy
@@ -13,7 +14,7 @@ from urllib.parse import quote, unquote, urlparse
 import httpx
 
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import redact, timed_http_stream
+from gitlab_security_mcp.util import redact, timed_http_stream, utc_now_iso
 from gitlab_security_mcp.versions import parse_fixed_versions
 
 FINDINGS_QUERY = """
@@ -134,6 +135,33 @@ query DismissalTarget($id: VulnerabilityID!) {
     }
 }
 """.strip()
+
+DISMISSAL_CONFIRMATION_QUERY = """
+query ConfirmFalsePositiveDismissal($id: VulnerabilityID!) {
+    vulnerability(id: $id) {
+        id uuid state dismissalReason
+        project { fullPath }
+        stateTransitions(first: 1) {
+            nodes { toState dismissalReason }
+        }
+    }
+}
+""".strip()
+
+logger = logging.getLogger("gitlab_security_mcp")
+
+
+def dismissal_is_confirmed(record: dict) -> bool:
+    """Count only independently read-back false-positive dismissal receipts."""
+    verification = record.get("verification")
+    return (
+        record.get("status") == "DISMISSED"
+        and isinstance(verification, dict)
+        and verification.get("state") == "DISMISSED"
+        and verification.get("dismissal_reason") == "FALSE_POSITIVE"
+        and bool(verification.get("verified_at"))
+    )
+
 
 _TITLE_PACKAGE = re.compile(r"\bin\s+([A-Za-z0-9_@./+-]+)\s*$")
 KEEP_STATES = {"detected", "confirmed"}
@@ -277,10 +305,11 @@ class GitLabClient:
         *,
         main_resolution: dict | None = None,
     ) -> dict:
-        """Check target identity and active state, then dismiss with the exact reason.
+        """Check identity, dismiss once, and independently read back the outcome.
 
         The caller must obtain human approval for this specific assessment first.
-        No retries are made: a lost response may follow a successful remote write.
+        Writes are never retried. A previously completed false-positive dismissal
+        can be confirmed without writing another comment or state transition.
         """
         with self._lock:
             if self._closed:
@@ -308,11 +337,19 @@ class GitLabClient:
                 target.get("id") != vulnerability_id
                 or target.get("uuid") != finding_id
                 or (target.get("project") or {}).get("fullPath") != project_path
-                or target.get("state") not in {"DETECTED", "CONFIRMED"}
             ):
                 raise RuntimeError(
-                    "GitLab target changed, is not active, or does not match the approved finding/project"
+                    "GitLab target changed or does not match the approved finding/project"
                 )
+            if target.get("state") == "DISMISSED":
+                return {
+                    **self._confirm_dismissal(
+                        vulnerability_id, finding_id, project_path
+                    ),
+                    "already_dismissed": True,
+                }
+            if target.get("state") not in {"DETECTED", "CONFIRMED"}:
+                raise RuntimeError("GitLab target is no longer active")
             if main_resolution is not None:
                 branch = self._main_branch_snapshot(project_path)
                 tracked = target.get("trackedRef") or {}
@@ -349,7 +386,64 @@ class GitLabClient:
                 raise RuntimeError(
                     "GitLab did not confirm the requested dismissal; inspect GitLab before retrying"
                 )
-            return {"status": "DISMISSED", "vulnerability_id": vulnerability_id}
+            return self._confirm_dismissal(vulnerability_id, finding_id, project_path)
+
+    def _confirm_dismissal(
+        self, vulnerability_id: str, finding_id: str, project_path: str
+    ) -> dict:
+        """Require persisted identity, state and dismissal reason, not just an ACK."""
+        payload = self._graphql(DISMISSAL_CONFIRMATION_QUERY, {"id": vulnerability_id})
+        data = payload.get("data")
+        target = data.get("vulnerability") if isinstance(data, dict) else None
+        if not isinstance(target, dict):
+            raise RuntimeError("GitLab read-back returned no vulnerability object")
+        reason = target.get("dismissalReason")
+        reason_source = "dismissalReason"
+        if reason is None:
+            transitions = target.get("stateTransitions")
+            nodes = transitions.get("nodes") if isinstance(transitions, dict) else None
+            if (
+                isinstance(nodes, list)
+                and nodes
+                and isinstance(nodes[0], dict)
+                and nodes[0].get("toState") == "DISMISSED"
+            ):
+                reason = nodes[0].get("dismissalReason")
+                reason_source = "stateTransitions"
+        if (
+            target.get("id") != vulnerability_id
+            or target.get("uuid") != finding_id
+            or not isinstance(target.get("project"), dict)
+            or target["project"].get("fullPath") != project_path
+            or target.get("state") != "DISMISSED"
+            or reason != "FALSE_POSITIVE"
+        ):
+            raise RuntimeError(
+                "GitLab read-back did not confirm this finding as DISMISSED / "
+                f"FALSE_POSITIVE (state={target.get('state')!r}, reason={reason!r}). "
+                "The mutation may have succeeded; no write was retried. Check the "
+                "project Vulnerability report, tracked ref and vulnerability details."
+            )
+        result = {
+            "status": "DISMISSED",
+            "vulnerability_id": vulnerability_id,
+            "vulnerability_url": (
+                f"{self._graphql_url().removesuffix('/api/graphql')}/"
+                f"{quote(project_path, safe='/')}/-/security/vulnerabilities/"
+                f"{vulnerability_id.rsplit('/', 1)[-1]}"
+            ),
+            "verification": {
+                "state": "DISMISSED",
+                "dismissal_reason": reason,
+                "reason_source": reason_source,
+                "verified_at": utc_now_iso(),
+            },
+        }
+        logger.info(
+            "GitLab false-positive dismissal independently confirmed: %s",
+            vulnerability_id,
+        )
+        return result
 
     def _tracked_branches(self, full_path: str) -> dict[str, str]:
         """Resolve tracked branches with bounded, advancing pagination.
@@ -517,12 +611,29 @@ class GitLabClient:
 
     def _request(self, method: str, url: str, json_body: dict | None = None) -> dict:
         """Authenticate, close responses, and reject HTTP or GraphQL errors."""
+        query = (json_body or {}).get("query", "")
+        read_query = (
+            isinstance(query, str)
+            and query.lstrip().lower().startswith("query")
+            and re.search(r"\bmutation\b", query, re.IGNORECASE) is None
+        )
+        if method != "GET" and not (
+            method == "POST"
+            and url == self._graphql_url()
+            and (read_query or query == DISMISS_FALSE_POSITIVE)
+        ):
+            raise PermissionError(
+                "Only GitLab reads and the fixed false-positive dismissal mutation "
+                "are allowed; project attributes and repository writes are forbidden"
+            )
+        operation = re.match(r"\s*(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)", query)
         with timed_http_stream(
             self.http,
             method,
             url,
             source="gitlab",
             log_path=self.http_log_path,
+            operation=operation.group(1) if operation else None,
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",

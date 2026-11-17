@@ -30,17 +30,23 @@ from gitlab_security_mcp.advisory import (
     AdvisoryClient,
     AdvisoryLookup,
 )
-from gitlab_security_mcp.commands import CommandRunner, progress_sink, resolve_tool
+from gitlab_security_mcp.commands import (
+    CommandRunner,
+    progress_sink,
+    resolve_tool,
+    tool_name,
+)
 from gitlab_security_mcp.config_findings import assess_config, config_kind
 from gitlab_security_mcp.fanout import MAX_WORKERS
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
-from gitlab_security_mcp.gitlab_client import GitLabClient
+from gitlab_security_mcp.gitlab_client import GitLabClient, dismissal_is_confirmed
 from gitlab_security_mcp.manifests import (
     GradleReport,
     PackageHit,
     detect_stack,
     gradle_report_package,
     iter_files,
+    java_project_root,
     locate_package,
     manifests_were_parsed,
     parse_gradle_report,
@@ -79,11 +85,11 @@ from gitlab_security_mcp.util import (
     log_task,
     logged_lock,
     resolve_inside,
+    utc_now_iso,
 )
 from gitlab_security_mcp.validate import (
     java_wrapper,
     lint_rule_inventory,
-    node_test_blocker,
     run_validation,
 )
 from gitlab_security_mcp.versions import (
@@ -173,6 +179,27 @@ class _ValidationRunner:
     def run(self, argv, **kwargs):
         """Execute each exact command once per working directory."""
         key = (tuple(argv), Path(kwargs.get("cwd", self.root)).resolve())
+        if (
+            key not in self.results
+            and tool_name(argv[0]) in {"gradle", "gradlew"}
+            and argv[1:]
+            in (
+                ["--no-daemon", "assemble"],
+                ["--no-daemon", "test", "--rerun-tasks"],
+            )
+        ):
+            combined = self.results.get(
+                (
+                    (argv[0], "--no-daemon", "assemble", "test", "--rerun"),
+                    key[1],
+                )
+            )
+            if (
+                combined is not None
+                and combined.exit_code == 0
+                and combined.unit_tests_verified
+            ):
+                self.results[key] = combined
         if key not in self.results:
             self.results[key] = self.runner.run(argv, **kwargs)
         return self.results[key]
@@ -421,6 +448,15 @@ class Engine:
     @_serialized
     def run_prechecks(self) -> dict:
         """Require DNS and a clean main/today branch before a guarded fresh start."""
+        if (self.state.fix_selection.get("package_execution") or {}).get("status") in {
+            "QUEUED",
+            "RUNNING",
+        }:
+            return {
+                "status": "REMEDIATION_RUNNING",
+                "reason": "Wait for the server-owned approved package batch before starting another run.",
+                "no_changes_attempted": True,
+            }
         dns_failure = self._check_corporate_dns("PRECHECK_FAILED")
         if dns_failure is not None:
             return {**dns_failure, "no_changes_attempted": True}
@@ -695,9 +731,6 @@ class Engine:
                     "pnpm is required for post-pull clean/install but is not on PATH"
                 )
             for step in ("clean", "install"):
-                reason = node_test_blocker(root, [tool, step])
-                if reason:
-                    raise RuntimeError(reason)
                 self._progress(
                     None, f"Post-pull pnpm {step} in {root.relative_to(self.repo_root)}"
                 )
@@ -986,6 +1019,15 @@ class Engine:
     @_serialized
     def fix_selection_candidates(self) -> dict:
         """List real assessed issues without inventing edit plans or authorizing writes."""
+        if (self.state.fix_selection.get("package_execution") or {}).get("status") in {
+            "QUEUED",
+            "RUNNING",
+        }:
+            return {
+                "status": "REMEDIATION_RUNNING",
+                "message": "The approved package batch is queued or running. Do not reopen selection, duplicate edits or poll.",
+                "next_tool": "wait_for_completion",
+            }
         if self.state.status not in AFTER_BRANCH:
             return {"status": "ERROR", "reason": "Verify findings in this run first"}
         if self.state.changes:
@@ -1002,6 +1044,17 @@ class Engine:
                 "REPRODUCTION_REQUIRED",
             }:
                 continue
+            plan = finding.get("proposedFix") or {}
+            resolved = finding.get("dependencyResolution") or {}
+            current_version = (
+                plan.get("installed")
+                or (
+                    resolved.get("version")
+                    if resolved.get("status") == "RESOLVED"
+                    else None
+                )
+                or finding.get("installedVersion")
+            )
             candidates.append(
                 {
                     "identity": self._fix_identity(finding),
@@ -1011,6 +1064,17 @@ class Engine:
                     "location": deepcopy(finding.get("location") or {}),
                     "decision": assessment["decision"],
                     "reason": assessment.get("reason"),
+                    "current_version": current_version,
+                    "current_version_source": (
+                        "Verified local plan"
+                        if plan.get("installed")
+                        else "Resolved dependency"
+                        if resolved.get("status") == "RESOLVED"
+                        and resolved.get("version")
+                        else "Finding reports"
+                        if finding.get("installedVersion")
+                        else "Not established"
+                    ),
                     "proposed_fix": {
                         key: value
                         for key, value in (finding.get("proposedFix") or {}).items()
@@ -1019,9 +1083,13 @@ class Engine:
                             "ecosystem",
                             "package",
                             "target",
+                            "installed",
                             "strategy",
                             "description",
                             "file",
+                            "files",
+                            "manager",
+                            "major_upgrade",
                         }
                     },
                 }
@@ -1031,7 +1099,7 @@ class Engine:
     @staticmethod
     def _fix_identity(finding: dict) -> dict:
         """Bind permission to the actual issue, not mutable qualification receipts."""
-        return {
+        identity = {
             key: deepcopy(finding.get(key))
             for key in (
                 "id",
@@ -1043,8 +1111,24 @@ class Engine:
                 "location",
                 "trackedRef",
                 "mainBranchResolution",
+                "installedVersion",
             )
         }
+        plan = finding.get("proposedFix") or {}
+        if plan.get("ecosystem") in PACKAGE_ECOSYSTEMS:
+            identity["package_update"] = {
+                key: deepcopy(plan.get(key))
+                for key in (
+                    "ecosystem",
+                    "package",
+                    "installed",
+                    "target",
+                    "strategy",
+                    "files",
+                    "manager",
+                )
+            }
+        return identity
 
     @_serialized
     def pending_fix_selection(self, request_id: str) -> dict:
@@ -1053,7 +1137,8 @@ class Engine:
         current = self.fix_selection_candidates()
         if (
             self.state.fix_selection.get("request_id") != request_id
-            or self.state.fix_selection.get("status") != "REQUESTED"
+            or self.state.fix_selection.get("status")
+            not in {"REQUESTED", "AWAITING_HUMAN"}
             or snapshot is None
             or current.get("status") != "OK"
             or current["candidates"] != snapshot
@@ -1079,24 +1164,50 @@ class Engine:
         reason: str = "",
         *,
         request_id: str | None = None,
+        presentation: str = "HOST_FORM",
     ) -> dict:
         """Record only host-form selections against an unchanged candidate snapshot."""
         current = self.fix_selection_candidates()
         if current["status"] != "OK":
             return current
+        previous = self.state.fix_selection
+        if (
+            status == "REQUESTED"
+            and presentation == "WINDOWS_DIALOG"
+            and previous.get("presentation") == "WINDOWS_DIALOG"
+            and previous.get("status") in {"REQUESTED", "AWAITING_HUMAN"}
+        ):
+            return {
+                "status": previous["status"],
+                "request_id": previous["request_id"],
+                "created": False,
+                "next_tool": "wait_for_human",
+                "message": "The selection window is starting or open. Wait for the human; do not reopen or poll.",
+            }
         stale_request = request_id is not None and (
             self.state.fix_selection.get("request_id") != request_id
-            or self.state.fix_selection.get("status") != "REQUESTED"
+            or self.state.fix_selection.get("status")
+            not in {"REQUESTED", "AWAITING_HUMAN"}
         )
         if (
             stale_request
             or (
-                (status == "REQUESTED" or selected_ids)
+                (status in {"REQUESTED", "AWAITING_HUMAN"} or selected_ids)
                 and current["candidates"] != candidates
             )
             or not set(selected_ids).issubset(item["id"] for item in candidates)
         ):
             logger.warning("Fix selection rejected: finding evidence changed")
+            if request_id is not None and not stale_request:
+                self.state.fix_selection = {
+                    **self.state.fix_selection,
+                    "status": "INVALID",
+                    "selected_ids": [],
+                    "approved_findings": [],
+                    "reason": "The reviewed findings or proposed versions changed. No edits are authorized; request a fresh selection.",
+                }
+                self._fix_selection_snapshot = None
+                self._remember()
             return {
                 "status": "SELECTION_CHANGED",
                 "reason": "Findings changed while the form was open. No new edit permission was recorded.",
@@ -1113,13 +1224,20 @@ class Engine:
         self.state.fix_selection = {
             "request_id": uuid4().hex if status == "REQUESTED" else request_id,
             "status": status,
+            "presentation": presentation,
             "candidate_ids": [item["id"] for item in candidates],
             "selected_ids": selected_ids,
             "approved_findings": approved,
             "reason": reason,
         }
+        if (
+            status == "APPROVED"
+            and presentation == "WINDOWS_DIALOG"
+            and any("package_update" in identity for identity in approved.values())
+        ):
+            self.state.fix_selection["package_execution"] = {"status": "QUEUED"}
         self._fix_selection_snapshot = (
-            deepcopy(candidates) if status == "REQUESTED" else None
+            deepcopy(candidates) if status in {"REQUESTED", "AWAITING_HUMAN"} else None
         )
         if not self.state.validation_results:
             self.state.validation_status = (
@@ -1130,13 +1248,16 @@ class Engine:
         self._remember()
         return {
             "status": status,
+            "created": status == "REQUESTED",
             "request_id": self.state.fix_selection["request_id"],
             "selected_ids": selected_ids,
             "skipped_ids": [
                 item["id"] for item in candidates if item["id"] not in approved
             ],
             "reason": reason,
-            "next_tool": "qualify_package_update or approved scoped host edits"
+            "next_tool": "wait_for_human"
+            if status in {"REQUESTED", "AWAITING_HUMAN"}
+            else "qualify_package_update or approved scoped host edits"
             if selected_ids
             else "complete_security_run",
             "message": (
@@ -1146,7 +1267,9 @@ class Engine:
         }
 
     @_serialized
-    def run_approved_fix(self, operation: str, *args, **kwargs) -> dict:
+    def run_approved_fix(
+        self, operation: str, *args, _selection_request_id: str | None = None, **kwargs
+    ) -> dict:
         """Atomically guard MCP editing and validation entry points with human selection."""
         if operation not in {
             "qualify_package_update",
@@ -1159,6 +1282,23 @@ class Engine:
                 "reason": "Not a supported remediation operation",
             }
         selection = self.state.fix_selection
+        if (selection.get("package_execution") or {}).get("status") in {
+            "QUEUED",
+            "RUNNING",
+        } and _selection_request_id != selection.get("request_id"):
+            return {
+                "status": "REMEDIATION_RUNNING",
+                "reason": "The server owns the approved package batch. Do not duplicate its edits or checks.",
+                "next_tool": "wait_for_completion",
+            }
+        if selection.get("presentation") == "WINDOWS_DIALOG" and selection.get(
+            "status"
+        ) in {"REQUESTED", "AWAITING_HUMAN"}:
+            return {
+                "status": "AWAITING_HUMAN",
+                "message": "Wait for the human selection. No edits or builds are authorized; do not poll or reopen the form.",
+                "next_tool": "wait_for_human",
+            }
         approved = selection.get("approved_findings") or {}
         if operation == "run_validation_matrix":
             if (
@@ -1198,6 +1338,213 @@ class Engine:
                 "operation": operation,
             }
         return getattr(self, operation)(*args, **kwargs)
+
+    @_serialized
+    def prepare_package_updates(self, candidates: list[dict], reviews: dict) -> dict:
+        """Require target-specific AI evidence before opening an autonomous package form."""
+        current = self.fix_selection_candidates()
+        if current["status"] != "OK":
+            return current
+        previous = self.state.fix_selection
+        if previous.get("presentation") == "WINDOWS_DIALOG" and previous.get(
+            "status"
+        ) in {"REQUESTED", "AWAITING_HUMAN"}:
+            return {
+                "status": previous["status"],
+                "request_id": previous["request_id"],
+                "next_tool": "wait_for_human",
+                "message": "The selection window is starting or open. Wait for the human; do not reopen or poll.",
+            }
+        if current.get("candidates") != candidates:
+            return {"status": "SELECTION_CHANGED", "next_tool": "get_run_status"}
+        prepared = {}
+        required = []
+        for item in candidates:
+            plan = (self._finding(item["id"]) or {}).get("proposedFix") or {}
+            if plan.get("ecosystem") not in PACKAGE_ECOSYSTEMS:
+                continue
+            review = reviews.get(item["id"])
+            try:
+                if not isinstance(review, dict) or any(
+                    review.get(key) != plan.get(key)
+                    for key in ("ecosystem", "package", "target")
+                ):
+                    raise ValueError(
+                        "Provide the complete compatibility/license review for this exact package and target."
+                    )
+                if "blocked_reason" in review:
+                    if (
+                        not isinstance(review["blocked_reason"], str)
+                        or not review["blocked_reason"].strip()
+                    ):
+                        raise ValueError(
+                            "A blocked package requires an explicit evidence-based reason."
+                        )
+                    prepared[item["id"]] = deepcopy(review)
+                    continue
+                review_package(review)
+                review_major_upgrade(self.repo_root, plan, review)
+                self._package_policy(plan, review)
+            except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                required.append(
+                    {
+                        "finding_id": item["id"],
+                        "plan": deepcopy(plan),
+                        "reason": str(exc),
+                    }
+                )
+            else:
+                prepared[item["id"]] = deepcopy(review)
+        if required:
+            return {
+                "status": "PACKAGE_REVIEW_REQUIRED",
+                "required_reviews": required,
+                "next_tool": "select_security_fixes",
+                "message": "Before opening the Windows checkboxes, the host AI must review the official docs, actual framework/API compatibility and license terms. "
+                "Use the qualify_package_update review schema, then call select_security_fixes with package_reviews keyed by finding ID. "
+                "For a package that cannot safely qualify, provide its exact ecosystem/package/target and an honest blocked_reason; it will be labeled blocked, never edited, and will not prevent other updates. "
+                "Collect evidence only; do not call qualification or edit files before human selection. Never invent missing evidence or approvals.",
+            }
+        return {
+            "status": "READY",
+            "reviews": prepared,
+            "tree": tree_snapshot(self.repo_root) if prepared else {},
+        }
+
+    def execute_selected_package_updates(
+        self,
+        request_id: str,
+        reviews: dict,
+        expected_tree: dict,
+        cancelled: threading.Event,
+    ) -> dict:
+        """Qualify, edit and validate the live human-selected batch without another AI turn."""
+        with self._lock:
+            selection = self.state.fix_selection
+            if (
+                selection.get("request_id") != request_id
+                or selection.get("status") != "APPROVED"
+            ):
+                return {"status": "STALE_SELECTION"}
+            execution = selection.get("package_execution") or {}
+            if execution.get("status") != "QUEUED":
+                return {"status": "ALREADY_EXECUTED"}
+            selected_ids = selection["selected_ids"]
+            package_ids = [
+                finding_id for finding_id in selected_ids if finding_id in reviews
+            ]
+            source_ids = [
+                finding_id for finding_id in selected_ids if finding_id not in reviews
+            ]
+            execution.update(status="RUNNING", results=[], source_ids=source_ids)
+            selection["package_execution"] = execution
+            self._remember()
+
+        def step(operation: str, *args) -> dict:
+            """Bind each serialized step to this run and the last owned checkout snapshot."""
+            nonlocal expected_tree
+            with self._lock:
+                if cancelled.is_set():
+                    raise InterruptedError(
+                        "Server shutdown interrupted the approved package batch."
+                    )
+                if self.state.fix_selection.get("request_id") != request_id:
+                    raise RuntimeError(
+                        "The approved package batch belongs to a replaced run."
+                    )
+                if tree_snapshot(self.repo_root) != expected_tree:
+                    raise ValueError(
+                        "Checkout changed outside the approved batch. Review the changes and obtain fresh documentation evidence."
+                    )
+                started_at = utc_now_iso()
+                started = monotonic()
+                result = self.run_approved_fix(
+                    operation, *args, _selection_request_id=request_id
+                )
+                expected_tree = tree_snapshot(self.repo_root)
+                execution["results"].append(
+                    {
+                        "finding_id": args[0] if args else None,
+                        "stage": operation,
+                        "status": result["status"],
+                        "reason": result.get("reason"),
+                        "started_at": started_at,
+                        "duration_ms": round((monotonic() - started) * 1000, 3),
+                    }
+                )
+                self._remember()
+                return result
+
+        failed = False
+        reason = ""
+        try:
+            for finding_id in package_ids:
+                if reviews[finding_id].get("blocked_reason"):
+                    with self._lock:
+                        execution["results"].append(
+                            {
+                                "finding_id": finding_id,
+                                "stage": "documentation_review",
+                                "status": "BLOCKED",
+                                "reason": reviews[finding_id]["blocked_reason"],
+                            }
+                        )
+                    failed = True
+                    continue
+                qualified = step(
+                    "qualify_package_update", finding_id, reviews[finding_id]
+                )
+                if qualified["status"] != "QUALIFIED":
+                    failed = True
+                    continue
+                applied = step("apply_minimal_fix", finding_id)
+                if applied["status"] != "APPLIED":
+                    failed = True
+                    if (
+                        applied.get("continue_with_next_finding") is False
+                        or self.state.manual_cleanup_required
+                    ):
+                        break
+            with self._lock:
+                pending = any(
+                    change.get("validation_pending")
+                    for change in self._package_changes()
+                )
+            validation = step("run_validation_matrix") if pending else None
+            if validation is not None:
+                failed |= validation["status"] != "VALIDATION_COMPLETE" or bool(
+                    validation.get("rejected_updates")
+                )
+            if cancelled.is_set():
+                raise InterruptedError(
+                    "Server shutdown interrupted the approved package batch."
+                )
+            status = "PARTIAL_FAILURE" if failed else "COMPLETED"
+        except InterruptedError as exc:
+            status, reason = "INTERRUPTED", str(exc)
+            logger.warning("%s", reason)
+        except (OSError, ValueError, TypeError, RuntimeError, SubprocessError) as exc:
+            status, reason = "BLOCKED", str(exc)
+            logger.exception("Approved package execution blocked")
+        with self._lock:
+            if self.state.fix_selection.get("request_id") != request_id:
+                return {"status": "STALE_SELECTION"}
+            if status in {"INTERRUPTED", "BLOCKED"} and any(
+                change.get("validation_pending") for change in self._package_changes()
+            ):
+                self.state.manual_cleanup_required = True
+            execution.update(
+                status=status,
+                reason=reason,
+                validation_status=self.state.validation_status,
+            )
+            self._remember()
+            self.generate_local_report()
+            return {
+                **deepcopy(execution),
+                "finish_run": not source_ids
+                and status not in {"INTERRUPTED", "BLOCKED"},
+            }
 
     @_serialized
     def qualify_package_update(self, finding_id: str, review: dict) -> dict:
@@ -1258,7 +1605,7 @@ class Engine:
             if not lint_recorded:
                 self._progress(
                     finding_id,
-                    "Recording informational lint only; production builds run after the complete batch; application unit tests are disabled",
+                    "Recording initial informational lint before editing (Gradle may compile sources); file writing has not started. Builds and unit tests follow the complete batch.",
                 )
                 baseline = run_validation(
                     self.repo_root,
@@ -1282,7 +1629,7 @@ class Engine:
                 [],
             )
             receipt = {
-                "check_contract": "lint-baseline-build-no-tests-no-code-v3",
+                "check_contract": "lint-baseline-build-unit-tests-no-code-v4",
                 "status": "QUALIFIED",
                 "plan": deepcopy(plan),
                 "review": deepcopy(review),
@@ -1325,7 +1672,7 @@ class Engine:
             "lint_rules_path": str(
                 self.repo_root / ".security-mcp" / "lint-rules.json"
             ),
-            "note": "Apply all reviewed package updates, then run one final production build and non-test checks. Application unit tests are disabled; test compatibility was not verified. Existing lint issues are informational. Failed batches require isolation and guarded rollback.",
+            "note": "Apply all reviewed package updates, then run production builds and unit tests. Both must pass to retain updates. Existing lint issues are informational. Failed batches isolate and revert offending updates while retaining passing updates.",
         }
 
     @_serialized
@@ -1409,7 +1756,7 @@ class Engine:
                     receipt.get("status") != "QUALIFIED"
                     or receipt.get("plan") != proposed
                     or receipt.get("check_contract")
-                    != "lint-baseline-build-no-tests-no-code-v3"
+                    != "lint-baseline-build-unit-tests-no-code-v4"
                 ):
                     raise ValueError(
                         "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
@@ -1532,6 +1879,7 @@ class Engine:
                 "tree": tree_snapshot(self.repo_root),
                 "dependency_before": backup_dependency_files(self.repo_root, proposed),
             }
+        edit_started = monotonic()
         outcome = (
             {
                 "status": "APPLIED",
@@ -1543,6 +1891,11 @@ class Engine:
             if reused_change
             else apply_plan(self.repo_root, plan, self.runner, self.which)
         )
+        edit_duration_ms = round((monotonic() - edit_started) * 1000, 3)
+        self._progress(
+            finding_id,
+            f"Dependency/configuration edit and lockfile refresh finished in {edit_duration_ms:.1f} ms; build/unit-test validation is a separate phase.",
+        )
         if package_update:
             receipt["applied_dependency_hashes"] = dependency_file_hashes(
                 self.repo_root, receipt["dependency_before"]
@@ -1550,6 +1903,7 @@ class Engine:
         change = {
             "finding_id": finding_id,
             "status": outcome["status"],
+            "edit_duration_ms": edit_duration_ms,
             "files": outcome.get("files") or [],
             "type": plan.strategy,
             "strategy": plan.strategy,
@@ -1615,7 +1969,7 @@ class Engine:
             "finding_id": finding_id,
             "change": change,
             "continue_with_next_finding": outcome.get("continue_with_next_finding"),
-            "note": "Initial lint issues are recorded separately. Not accepted until production builds and configured non-test policy checks pass. Application unit tests are disabled; test compatibility was not verified. A policy requiring tests blocks remediation. Production/unit-test code and check scripts must remain unchanged.",
+            "note": "Initial lint issues are recorded separately. Not accepted until production builds, unit tests and configured policy checks pass. Failed updates are isolated and reverted; passing updates remain. Production/unit-test code and check scripts must remain unchanged.",
         }
 
     @_serialized
@@ -1854,7 +2208,7 @@ class Engine:
                 retain(group[middle:])
             else:
                 rejected[group[0]] = (
-                    "Rejected after build or policy failure with retained updates "
+                    "Rejected after build, unit-test or policy failure with retained updates "
                     + repr(accepted)
                     + ": "
                     + "; ".join(
@@ -1909,7 +2263,7 @@ class Engine:
                 final.update(
                     status="FIX_REJECTED",
                     continue_with_next_finding=True,
-                    reason="All candidates rejected; the restored baseline build and non-test checks passed. Test compatibility was not verified.",
+                    reason="All candidates rejected; the restored baseline build, unit tests and configured policy checks passed.",
                 )
                 self.state.status = "FIXES_IN_PROGRESS"
         else:
@@ -1957,7 +2311,7 @@ class Engine:
         for change in package_changes:
             self._progress(
                 change["finding_id"],
-                "Running post-update build and non-test checks; application unit tests are disabled",
+                "Running post-update production builds and unit tests",
             )
         validation_runner = _ValidationRunner(self.runner, self.repo_root)
         outcome = run_validation(
@@ -2001,7 +2355,7 @@ class Engine:
                     raise ValueError("Package qualification is missing")
                 if (
                     receipt.get("check_contract")
-                    != "lint-baseline-build-no-tests-no-code-v3"
+                    != "lint-baseline-build-unit-tests-no-code-v4"
                 ):
                     raise ValueError(
                         "Package qualification predates mandatory lint/no-code checks; requalification is required"
@@ -2020,8 +2374,60 @@ class Engine:
                 )
                 if outcome["status"] != "VALIDATION_COMPLETE":
                     raise ValueError(
-                        "Product build validation failed or is incomplete; candidate cannot be accepted"
+                        "Product build/unit-test validation failed or is incomplete; candidate cannot be accepted"
                     )
+                plan = receipt["plan"]
+                if (
+                    plan.get("strategy") == "override"
+                    and plan.get("manager") == "gradle"
+                ):
+                    resolved = self._resolve_gradle_package(
+                        finding, self._snapshot()[0]
+                    )
+                    versions = (
+                        {
+                            version
+                            for values in (
+                                resolved.configuration_versions or {}
+                            ).values()
+                            for version in values
+                        }
+                        if resolved
+                        else set()
+                    )
+                    if (
+                        not resolved
+                        or resolved.version != plan["target"]
+                        or versions != {plan["target"]}
+                    ):
+                        raise ValueError(
+                            "Gradle override did not resolve the exact fixed version in every reported configuration"
+                        )
+                if (
+                    plan.get("strategy") == "override"
+                    and plan.get("manager") == "maven"
+                ):
+                    component = java_project_root(
+                        self.repo_root, plan["files"][0], "maven"
+                    )
+                    trees = [
+                        row
+                        for row in outcome["results"]
+                        if row.get("kind") == "dependency_tree"
+                        and row.get("cwd") == str(component)
+                    ]
+                    versions = {
+                        match[1]
+                        for row in trees
+                        for match in re.finditer(
+                            rf"(?<![\w.-]){re.escape(plan['package'])}:[^:\s]+:(?:[^:\s]+:)?([^:\s]+):(?:compile|runtime|test|provided|system)\b",
+                            row.get("stdout", "") + row.get("stderr", ""),
+                        )
+                    }
+                    if versions != {plan["target"]}:
+                        raise ValueError(
+                            "Maven dependency tree did not confirm the exact overridden fixed version"
+                        )
                 checks = run_checks(
                     self.repo_root,
                     policy["checks"],
@@ -2074,7 +2480,7 @@ class Engine:
             self._progress(change["finding_id"], f"Post-update validation: {status}")
             if status == "VALIDATED":
                 change["detail"] = (
-                    "Accepted: no production/unit-test API changes; initial lint issues recorded separately; production build and configured non-test policy checks passed. Application unit tests were not run; test compatibility was not verified."
+                    "Accepted: no production/unit-test API changes; initial lint issues recorded separately; production builds, unit tests and configured policy checks passed."
                 )
             else:
                 failures = [
@@ -2170,7 +2576,7 @@ class Engine:
         dismissed = {
             item["id"]
             for item in self.state.gitlab_dismissals
-            if item["status"] == "DISMISSED"
+            if dismissal_is_confirmed(item)
         }
         candidates = []
         excluded = []
@@ -2269,14 +2675,22 @@ class Engine:
                 "reason": "Assessments changed while approval was open; request a fresh approval form",
             }
         results = []
-        for item in approved:
+        findings_by_id = {finding["id"]: finding for finding in self.state.findings}
+        for index, item in enumerate(approved, 1):
+            started = monotonic()
+            self._progress(
+                item["id"],
+                f"Verifying GitLab false-positive dismissal {index} of {len(approved)}",
+            )
             record = {
                 "id": item["id"],
                 "vulnerability_id": item["vulnerability_id"],
                 "project_path": item["project_path"],
                 "reason": item["reason"],
                 "dismissal_reason": "FALSE_POSITIVE",
+                "tracked_ref": findings_by_id[item["id"]].get("trackedRef"),
                 "status": "PENDING",
+                "requested_at": utc_now_iso(),
             }
             self.state.gitlab_dismissals.append(record)
             self._remember()
@@ -2292,7 +2706,15 @@ class Engine:
                         else {}
                     ),
                 )
+                if (
+                    not dismissal_is_confirmed(outcome)
+                    or outcome.get("vulnerability_id") != item["vulnerability_id"]
+                ):
+                    raise RuntimeError(
+                        "GitLab dismissal has no matching independent read-back proof"
+                    )
                 record.update(outcome)
+                findings_by_id[item["id"]]["status"] = "dismissed"
             except (
                 httpx.HTTPError,
                 RuntimeError,
@@ -2310,13 +2732,26 @@ class Engine:
                     item["id"],
                     record["error"],
                 )
+            record["finished_at"] = utc_now_iso()
+            record["duration_ms"] = round((monotonic() - started) * 1000, 3)
             self._remember()
             results.append(deepcopy(record))
+            self._progress(
+                item["id"],
+                f"GitLab dismissal {index} of {len(approved)}: {record['status']}",
+            )
         return {
             "status": "PARTIAL_FAILURE"
             if any(item["status"] != "DISMISSED" for item in results)
             else "OK",
             "results": results,
+            "selected_count": len(approved),
+            "confirmed_dismissals": sum(
+                dismissal_is_confirmed(item) for item in results
+            ),
+            "unconfirmed_dismissals": sum(
+                not dismissal_is_confirmed(item) for item in results
+            ),
         }
 
     @_serialized
@@ -2425,6 +2860,12 @@ class Engine:
         self._refresh_source_reviews()
         self._refresh_package_validation()
         review_queue = pending_source_reviews(self.state.findings, self.state.decisions)
+        attempted = {item["id"] for item in self.state.gitlab_dismissals}
+        confirmed = {
+            item["id"]
+            for item in self.state.gitlab_dismissals
+            if dismissal_is_confirmed(item)
+        }
         return {
             "status": self.state.status,
             "server_version": self.state.server_version,
@@ -2438,6 +2879,11 @@ class Engine:
             "skipped_user_prompt_count": len(self.state.skipped_user_prompt),
             "source_review_required_count": review_queue["finding_count"],
             "source_review_queue": review_queue,
+            "gitlab_dismissal_counts": {
+                "attempted": len(attempted),
+                "confirmed": len(confirmed),
+                "not_confirmed": len(attempted - confirmed),
+            },
             "false_positive_approval_form": deepcopy(
                 self.state.false_positive_approval_form
             ),
@@ -2554,7 +3000,7 @@ class Engine:
                 valid = (
                     snapshot is not None
                     and receipt.get("check_contract")
-                    == "lint-baseline-build-no-tests-no-code-v3"
+                    == "lint-baseline-build-unit-tests-no-code-v4"
                     and receipt.get("validated_tree") == snapshot
                     and receipt.get("policy_sha256") == policy["policy_sha256"]
                 )
@@ -2576,6 +3022,135 @@ class Engine:
                 )
                 self.state.validation_status = "VALIDATION_INCOMPLETE"
                 self.state.status = "VALIDATION_INCOMPLETE"
+
+    def _resolve_maven_package(
+        self, finding: dict, files: list[Path]
+    ) -> PackageHit | None:
+        """Resolve Maven transitives from a complete, checkout-bound dependency tree."""
+        location = (finding.get("location") or {}).get("file")
+        builds = [path for path in files if path.name == "pom.xml"]
+        manifest = (
+            resolve_inside(self.repo_root, location)
+            if isinstance(location, str)
+            else None
+        )
+        if manifest not in builds:
+            manifest = builds[0] if not location and len(builds) == 1 else None
+        if manifest is None:
+            return None
+        row = {
+            "manager": "maven",
+            "manifest": manifest.relative_to(self.repo_root).as_posix(),
+            "status": "UNRESOLVED",
+        }
+        try:
+            tool = java_wrapper(
+                manifest.parent, self.repo_root, "mvnw"
+            ) or resolve_tool("mvn", self.which)
+            if not tool:
+                raise ValueError(
+                    "Maven wrapper and mvn are unavailable; dependency tree not inspected"
+                )
+            with self._gradle_lock:
+                before = tree_snapshot(self.repo_root)
+                key = (manifest.parent, tool)
+                cached = self._gradle_reports.get(key)
+                if cached and cached[0] == before:
+                    parsed, row = cached[1], dict(cached[2])
+                else:
+                    result = self.runner.run(
+                        [tool, "--batch-mode", "dependency:tree"],
+                        timeout=min(self.validation_timeout, 120),
+                        check=False,
+                        cwd=manifest.parent,
+                    )
+                    row.update(
+                        command=result.display(),
+                        stdout_log_path=result.stdout_log_path,
+                        stderr_log_path=result.stderr_log_path,
+                    )
+                    if result.exit_code:
+                        raise ValueError(
+                            f"Maven dependency inspection exited {result.exit_code}: {(result.stderr or result.stdout)[-500:]}"
+                        )
+                    output = result.stdout
+                    if result.truncated:
+                        log = (
+                            resolve_inside(self.repo_root, result.stdout_log_path)
+                            if result.stdout_log_path
+                            else None
+                        )
+                        if log is None or not log.is_relative_to(
+                            self.repo_root / ".security-mcp" / "command-logs"
+                        ):
+                            raise ValueError(
+                                "Truncated Maven dependency output has no complete local log"
+                            )
+                        with log.open("rb") as stream:
+                            raw = stream.read(8 * 1024 * 1024 + 1)
+                        if len(raw) > 8 * 1024 * 1024:
+                            raise ValueError(
+                                "Maven dependency log exceeds the 8 MiB inspection limit"
+                            )
+                        output = raw.decode("utf-8")
+                    parsed = GradleReport()
+                    for match in re.finditer(
+                        r"(?<![\w.-])([\w.+-]+:[\w.+-]+):[^:\s]+:(?:[^:\s]+:)?([^:\s]+):(compile|runtime|test|provided|system)\b",
+                        output,
+                    ):
+                        parsed.versions.setdefault(match[1], {}).setdefault(
+                            match[3], set()
+                        ).add(match[2])
+                    if tree_snapshot(self.repo_root) != before:
+                        raise ValueError(
+                            "Checkout changed during Maven dependency inspection"
+                        )
+                    self._gradle_reports[key] = (before, parsed, dict(row), set())
+                    if len(self._gradle_reports) > MAX_WORKERS:
+                        self._gradle_reports.pop(next(iter(self._gradle_reports)))
+            package = finding["component"].replace("/", ":")
+            configurations = parsed.versions.get(package, {})
+            versions = {
+                version for values in configurations.values() for version in values
+            }
+            if not versions:
+                raise ValueError(
+                    "Maven did not report this coordinate as resolved; absence is not a false positive"
+                )
+            known = {
+                version: parsed
+                for version in versions
+                if (parsed := parse_version(version)) is not None
+            }
+            if len(known) != len(versions):
+                raise ValueError("Maven reported an unsupported resolved version")
+            version = finding.get("installedVersion")
+            if version not in versions:
+                version = min(known, key=known.__getitem__)
+            row.update(
+                status="RESOLVED",
+                version=version,
+                configuration_versions={
+                    key: sorted(values) for key, values in configurations.items()
+                },
+            )
+            finding["dependencyResolution"] = row
+            return PackageHit(
+                "Maven",
+                "maven",
+                package,
+                version,
+                None,
+                row["manifest"],
+                None,
+                False,
+                configuration_versions=row["configuration_versions"],
+            )
+        except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
+            row.update(status="FAILED", detail=str(exc))
+            finding["dependencyResolution"] = row
+            logger.warning("Maven dependency inspection unavailable: %s", exc)
+            return None
 
     def _resolve_gradle_package(
         self, finding: dict, files: list[Path]
@@ -2856,8 +3431,8 @@ class Engine:
                 "the approved checkout, separately from dependency updates. This server's "
                 "apply_minimal_fix cannot apply arbitrary application-code patches.",
                 "Rerun the identical reproduction and boundary/valid-input cases, lint, "
-                "production build and non-test checks. Do not execute application unit tests; "
-                "test compatibility was not verified. Retain before/after evidence. "
+                "production builds and unit tests. Both must pass; "
+                "isolate and revert only offending package updates. Retain before/after evidence. "
                 "Keep the finding unresolved until those checks have passed; do not "
                 "fabricate evidence, dismiss GitLab findings, commit or push.",
             ]
@@ -2948,9 +3523,15 @@ class Engine:
                 finding.get("id"), "Inspecting the resolved Gradle dependency tree"
             )
             hit = self._resolve_gradle_package(finding, files)
+            if (
+                hit is None
+                and (finding.get("dependencyResolution") or {}).get("manager")
+                != "gradle"
+            ):
+                hit = self._resolve_maven_package(finding, files)
             if resolution := finding.get("dependencyResolution"):
                 evidence.append(
-                    f"Gradle dependency inspection: {resolution['status']}. "
+                    f"{'Maven' if resolution['manager'] == 'maven' else 'Gradle'} dependency inspection: {resolution['status']}. "
                     + (
                         resolution.get("detail")
                         or f"Selected version {resolution.get('version')}."
@@ -3202,7 +3783,7 @@ class Engine:
             return "FALSE_POSITIVE", plan_reason, evidence, None, None
         if plan is None:
             if hit and hit.manager == "gradle" and not hit.direct:
-                reason = f"The resolved transitive dependency {hit.name} at {installed} has fixed target {fixed}, but requires a reviewed parent/BOM update or coordinate-specific constraint. The server does not automatically override BOM-managed dependencies."
+                reason = f"The resolved transitive dependency {hit.name} at {installed} has fixed target {fixed}, but no supported coordinate-specific edit could be planned."
                 return (
                     "MANUAL_REVIEW",
                     reason,
@@ -3247,7 +3828,7 @@ class Engine:
             )
         if plan.ecosystem in PACKAGE_ECOSYSTEMS:
             evidence.append(
-                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply all reviewed updates, then require a passing final build and configured non-test checks. Application unit tests are disabled; test compatibility was not verified. A policy requiring tests is a blocker."
+                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply all reviewed updates, then require passing production builds, unit tests and configured policy checks. Isolate and revert offending updates; retain passing updates."
             )
             if major_upgrade:
                 evidence.append(

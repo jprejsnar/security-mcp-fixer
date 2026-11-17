@@ -21,6 +21,7 @@ from gitlab_security_mcp import __version__, server
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.gitlab_client import (
     DISMISS_FALSE_POSITIVE,
+    DISMISSAL_CONFIRMATION_QUERY,
     DISMISSAL_TARGET_QUERY,
     GitLabClient,
     normalize_finding,
@@ -37,12 +38,22 @@ from tests.conftest import documentation_client
 GID = "gid://gitlab/Vulnerability/123"
 
 
+def _verification():
+    """Model the client's independent read-back proof, not a mutation ACK."""
+    return {
+        "state": "DISMISSED",
+        "dismissal_reason": "FALSE_POSITIVE",
+        "verified_at": "2026-11-17T13:00:00+00:00",
+    }
+
+
 def _engine(tmp_path):
     """Provide one eligible assessment and one unresolved finding."""
     client = Mock(spec=GitLabClient)
     client.dismiss_false_positive.return_value = {
         "status": "DISMISSED",
         "vulnerability_id": GID,
+        "verification": _verification(),
     }
     client._clean.side_effect = lambda text: text
     engine = Engine(tmp_path, gitlab=client, advisory=Mock(), docs=Mock())
@@ -613,6 +624,7 @@ def test_complete_assessment_report_distinguishes_pending_gitlab_approval(
                 "id": "finding-1",
                 "status": "DISMISSED",
                 "reason": "Fixture human approval.",
+                "verification": _verification(),
             }
         ]
 
@@ -1489,6 +1501,21 @@ def test_gitlab_mutation_checks_identity_reason_and_confirmed_outcome(
             }
             target.update(target_override)
             return httpx.Response(200, json={"data": {"vulnerability": target}})
+        if body["query"] == DISMISSAL_CONFIRMATION_QUERY:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "vulnerability": {
+                            "id": GID,
+                            "uuid": "finding-1",
+                            "state": "DISMISSED",
+                            "dismissalReason": "FALSE_POSITIVE",
+                            "project": {"fullPath": "group/app"},
+                        }
+                    }
+                },
+            )
         assert body["query"] == DISMISS_FALSE_POSITIVE
         assert body["variables"] == {"id": GID, "comment": reason}
         assert "dismissalReason: FALSE_POSITIVE" in body["query"]
@@ -1517,9 +1544,395 @@ def test_gitlab_mutation_checks_identity_reason_and_confirmed_outcome(
                 client.dismiss_false_positive(GID, "finding-1", "group/app", reason)
 
     # Assert
-    assert len(requests) == 1 + expected_writes
+    assert len(requests) == 1 + expected_writes + int(succeeds)
     if succeeds:
         assert result["status"] == "DISMISSED"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "confirmed",
+        "transition_reason",
+        "detected",
+        "wrong_reason",
+        "wrong_identity",
+        "missing_reason",
+        "timeout",
+        "graphql_error",
+    ],
+)
+def test_dismissal_requires_independent_persisted_state_and_reason(tmp_path, mode):
+    """A successful mutation response alone must never count as a dismissal."""
+    # Arrange
+    queries = []
+    path = tmp_path / "http-timings.jsonl"
+
+    def handler(request):
+        """Acknowledge the write, then provide independently controlled evidence."""
+        body = json.loads(request.content)
+        query = body["query"]
+        queries.append(query)
+        target = {
+            "id": GID,
+            "uuid": "finding-1",
+            "state": "DETECTED",
+            "project": {"fullPath": "group/app"},
+        }
+        if query == DISMISSAL_TARGET_QUERY:
+            return httpx.Response(200, json={"data": {"vulnerability": target}})
+        if query == DISMISS_FALSE_POSITIVE:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "vulnerabilityDismiss": {
+                            "errors": [],
+                            "vulnerability": {"id": GID, "state": "DISMISSED"},
+                        }
+                    }
+                },
+            )
+        assert query == DISMISSAL_CONFIRMATION_QUERY
+        if mode == "timeout":
+            raise httpx.ReadTimeout("Read-back unavailable", request=request)
+        if mode == "graphql_error":
+            return httpx.Response(200, json={"errors": [{"message": "Read denied"}]})
+        target.update(state="DISMISSED", dismissalReason="FALSE_POSITIVE")
+        if mode == "detected":
+            target["state"] = "DETECTED"
+        elif mode == "wrong_reason":
+            target["dismissalReason"] = "ACCEPTABLE_RISK"
+        elif mode == "wrong_identity":
+            target["uuid"] = "different-finding"
+        elif mode in {"transition_reason", "missing_reason"}:
+            target["dismissalReason"] = None
+            target["stateTransitions"] = {
+                "nodes": (
+                    [{"toState": "DISMISSED", "dismissalReason": "FALSE_POSITIVE"}]
+                    if mode == "transition_reason"
+                    else []
+                )
+            }
+        return httpx.Response(200, json={"data": {"vulnerability": target}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = GitLabClient("test-token", http=http, http_log_path=path)
+
+        # Act
+        if mode in {"confirmed", "transition_reason"}:
+            result = client.dismiss_false_positive(
+                GID, "finding-1", "group/app", "Reviewed"
+            )
+        else:
+            with pytest.raises((RuntimeError, httpx.ReadTimeout)):
+                client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed")
+
+    # Assert
+    assert queries == [
+        DISMISSAL_TARGET_QUERY,
+        DISMISS_FALSE_POSITIVE,
+        DISMISSAL_CONFIRMATION_QUERY,
+    ]
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["operation"] for row in events] == [
+        "DismissalTarget",
+        "DismissFalsePositive",
+        "ConfirmFalsePositiveDismissal",
+    ]
+    assert "test-token" not in path.read_text()
+    assert "Reviewed" not in path.read_text()
+    if mode in {"confirmed", "transition_reason"}:
+        assert result["verification"]["dismissal_reason"] == "FALSE_POSITIVE"
+        assert result["verification"]["verified_at"]
+        assert result["vulnerability_url"].endswith(
+            "/group/app/-/security/vulnerabilities/123"
+        )
+
+
+def test_concurrent_dismissal_requests_do_not_repeat_the_write():
+    """Keep check/write/read-back atomic per client and reconcile duplicate calls."""
+    # Arrange
+    from concurrent.futures import ThreadPoolExecutor
+
+    writes = []
+    target = {
+        "id": GID,
+        "uuid": "finding-1",
+        "state": "DETECTED",
+        "project": {"fullPath": "group/app"},
+    }
+
+    def handler(request):
+        """Serve the persisted state through each read and the single mutation."""
+        body = json.loads(request.content)
+        if body["query"] == DISMISS_FALSE_POSITIVE:
+            writes.append(body)
+            target.update(state="DISMISSED", dismissalReason="FALSE_POSITIVE")
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "vulnerabilityDismiss": {
+                            "errors": [],
+                            "vulnerability": {"id": GID, "state": "DISMISSED"},
+                        }
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": {"vulnerability": dict(target)}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = GitLabClient("test-token", http=http)
+
+        # Act
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    client.dismiss_false_positive,
+                    GID,
+                    "finding-1",
+                    "group/app",
+                    "Reviewed",
+                )
+                for _ in range(2)
+            ]
+            results = [future.result(timeout=5) for future in futures]
+
+    # Assert
+    assert len(writes) == 1
+    assert all(result["verification"]["state"] == "DISMISSED" for result in results)
+    assert sum(result.get("already_dismissed") is True for result in results) == 1
+
+
+def test_lost_dismissal_response_can_be_reconciled_without_another_write():
+    """After an uncertain write, a later human-approved call only confirms it."""
+    # Arrange
+    writes = []
+    target = {
+        "id": GID,
+        "uuid": "finding-1",
+        "state": "DETECTED",
+        "project": {"fullPath": "group/app"},
+    }
+
+    def handler(request):
+        """Persist the mutation remotely even though its HTTP response is lost."""
+        body = json.loads(request.content)
+        if body["query"] == DISMISS_FALSE_POSITIVE:
+            writes.append(body)
+            target.update(state="DISMISSED", dismissalReason="FALSE_POSITIVE")
+            raise httpx.ReadTimeout("Lost mutation response", request=request)
+        assert body["query"] in {DISMISSAL_TARGET_QUERY, DISMISSAL_CONFIRMATION_QUERY}
+        return httpx.Response(200, json={"data": {"vulnerability": dict(target)}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = GitLabClient("test-token", http=http)
+
+        # Act
+        with pytest.raises(httpx.ReadTimeout):
+            client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed")
+        result = client.dismiss_false_positive(
+            GID, "finding-1", "group/app", "Reviewed"
+        )
+
+    # Assert
+    assert len(writes) == 1
+    assert result["already_dismissed"] is True
+    assert result["verification"]["state"] == "DISMISSED"
+
+
+@pytest.mark.parametrize("failed_index", [None, 27])
+def test_fifty_five_human_selections_are_verified_individually(
+    tmp_path, monkeypatch, failed_index
+):
+    """Process all selected rows once, leaving unchecked and unverified rows honest."""
+    # Arrange
+    engine = _engine(tmp_path)
+    engine.state.findings = [
+        normalize_finding(
+            {
+                "id": f"gid://gitlab/Vulnerability/{123 + i}",
+                "uuid": f"finding-{i}",
+                "title": f"Finding {i}",
+                "state": "DETECTED",
+            },
+            None,
+        )
+        for i in range(57)
+    ]
+    engine.state.decisions = {
+        item["id"]: {"decision": "FALSE_POSITIVE", "reason": f"Reviewed {item['id']}"}
+        for item in engine.state.findings
+    }
+    remote = {
+        item["vulnerabilityId"]: {
+            "id": item["vulnerabilityId"],
+            "uuid": item["id"],
+            "state": "DETECTED",
+            "project": {"fullPath": "group/app"},
+        }
+        for item in engine.state.findings
+    }
+    writes = []
+    requests = []
+
+    def handler(request):
+        """Reject every operation except identity, fixed dismissal and confirmation."""
+        assert request.method == "POST"
+        assert request.url.path == "/api/graphql"
+        body = json.loads(request.content)
+        requests.append(body["query"])
+        target = remote[body["variables"]["id"]]
+        if body["query"] == DISMISS_FALSE_POSITIVE:
+            writes.append(body)
+            target.update(state="DISMISSED", dismissalReason="FALSE_POSITIVE")
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "vulnerabilityDismiss": {
+                            "errors": [],
+                            "vulnerability": {"id": target["id"], "state": "DISMISSED"},
+                        }
+                    }
+                },
+            )
+        assert body["query"] in {DISMISSAL_TARGET_QUERY, DISMISSAL_CONFIRMATION_QUERY}
+        result = dict(target)
+        if body["query"] == DISMISSAL_CONFIRMATION_QUERY and (
+            target["uuid"] == f"finding-{failed_index}"
+        ):
+            result["state"] = "DETECTED"
+        return httpx.Response(200, json={"data": {"vulnerability": result}})
+
+    async def choose(message, schema):
+        """Return physical-host form selections, not tool arguments or model consent."""
+        assert all(field.default is False for field in schema.model_fields.values())
+        return SimpleNamespace(
+            action="accept",
+            data=schema(**{f"finding_{i}": i < 55 for i in range(57)}),
+        )
+
+    ctx = _context()
+    ctx.elicit = AsyncMock(side_effect=choose)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        engine.gitlab = GitLabClient("test-token", http=http)
+
+        # Act
+        result = asyncio.run(server.submit_false_positive_approvals(ctx, str(tmp_path)))
+        payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    failures = int(failed_index is not None)
+    assert result["status"] == ("PARTIAL_FAILURE" if failures else "OK")
+    assert result["selected_count"] == 55
+    assert result["confirmed_dismissals"] == 55 - failures
+    assert result["unconfirmed_dismissals"] == failures
+    assert engine.get_run_status()["gitlab_dismissal_counts"] == {
+        "attempted": 55,
+        "confirmed": 55 - failures,
+        "not_confirmed": failures,
+    }
+    assert len(writes) == len({row["variables"]["id"] for row in writes}) == 55
+    assert len(requests) == 55 * 3
+    assert (
+        payload["false_positive_approval"]["previously_confirmed_dismissals"]
+        == 55 - failures
+    )
+    assert payload["false_positive_approval"]["not_confirmed_dismissed"] == 2 + failures
+    assert all(
+        remote[f"gid://gitlab/Vulnerability/{123 + i}"]["state"] == "DETECTED"
+        for i in (55, 56)
+    )
+    assert len(engine.state.false_positive_approval_form["selected_ids"]) == 55
+    assert engine.state.findings[0]["status"] == "dismissed"
+    assert engine.state.findings[55]["status"] == "detected"
+    assert "independently verified" in markdown
+    assert "pipeline scan artifacts are not user dismissal status" in markdown
+    if failures:
+        assert result["results"][27]["status"] == "ERROR"
+        assert "read-back did not confirm" in result["results"][27]["error"]
+
+
+@pytest.mark.parametrize(
+    ("method", "route", "query"),
+    [
+        ("POST", "/projects/1/repository/tags", None),
+        ("POST", "/projects/1/repository/branches", None),
+        ("POST", "/projects/1/issues/1/notes", None),
+        ("PUT", "/projects/1", None),
+        ("DELETE", "/projects/1/repository/branches/main", None),
+        ("PATCH", "/projects/1/labels", None),
+        (
+            "POST",
+            "/api/graphql",
+            "mutation UpdateProject { projectUpdate(input: {}) { errors } }",
+        ),
+        (
+            "POST",
+            "/api/graphql",
+            DISMISS_FALSE_POSITIVE + "\nmutation Other { deleteProject }",
+        ),
+    ],
+)
+def test_gitlab_unrelated_write_requests_are_rejected_before_network(
+    method, route, query
+):
+    """No project tag, note, label, branch or unrelated mutation can leave the client."""
+    # Arrange
+    http = Mock(spec=httpx.Client)
+    client = GitLabClient("test-token", http=http)
+    body = {"query": query, "variables": {}} if query else None
+
+    # Act
+    with pytest.raises(PermissionError, match="project attributes"):
+        client._request(method, f"https://gitlab.com{route}", body)
+
+    # Assert
+    http.stream.assert_not_called()
+
+
+def test_mutation_ack_without_readback_proof_is_not_reported_as_success(tmp_path):
+    """Never hide pending dismissals behind legacy success-shaped receipts."""
+    # Arrange
+    engine = _engine(tmp_path)
+    engine.gitlab.dismiss_false_positive.return_value.pop("verification")
+
+    # Act
+    result = engine.dismiss_false_positives(
+        engine.false_positive_candidates()["candidates"]
+    )
+    payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    assert result["status"] == "PARTIAL_FAILURE"
+    assert payload["false_positive_approval"]["previously_confirmed_dismissals"] == 0
+    assert "read-back proof" in markdown
+
+
+def test_legacy_dismissal_receipts_do_not_hide_unverified_findings(tmp_path):
+    """Old success-shaped receipts must not remove findings from approval/reporting."""
+    # Arrange
+    engine = _engine(tmp_path)
+    engine.state.gitlab_dismissals = [
+        {
+            "id": "finding-1",
+            "status": "DISMISSED",
+            "reason": "Old mutation ACK",
+        }
+    ]
+
+    # Act
+    payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+    candidates = engine.false_positive_candidates()["candidates"]
+
+    # Assert
+    assert payload["false_positive_approval"]["previously_confirmed_dismissals"] == 0
+    assert payload["false_positive_approval"]["not_confirmed_dismissed"] == 1
+    assert "UNVERIFIED" in markdown
+    assert [item["id"] for item in candidates] == ["finding-1"]
 
 
 def test_uuid_is_not_used_as_gitlab_mutation_id():
@@ -1576,6 +1989,7 @@ def test_real_sdk_form_dispatch_selects_only_the_checked_finding(
     engine.gitlab.dismiss_false_positive.side_effect = lambda gid, *args: {
         "status": "DISMISSED",
         "vulnerability_id": gid,
+        "verification": _verification(),
     }
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     session = Mock()
@@ -1650,6 +2064,11 @@ def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
     engine.state.decisions["finding-2"] = deepcopy(engine.state.decisions["finding-1"])
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     forms = []
+    engine.gitlab.dismiss_false_positive.side_effect = lambda gid, *args: {
+        "status": "DISMISSED",
+        "vulnerability_id": gid,
+        "verification": _verification(),
+    }
 
     async def human_response(_context, params):
         """Return synthetic human selections while GitLab writes remain mocked."""
@@ -1795,6 +2214,20 @@ def test_branch_resolution_requires_main_evidence_human_approval_and_freshness(
             if change == "ref_changed":
                 target["trackedRef"] = {"id": "different", "name": "different"}
             return httpx.Response(200, json={"data": {"vulnerability": target}})
+        if body["query"] == DISMISSAL_CONFIRMATION_QUERY:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "vulnerability": {
+                            **branch_node,
+                            "project": {"fullPath": "group/app"},
+                            "state": "DISMISSED",
+                            "dismissalReason": "FALSE_POSITIVE",
+                        }
+                    }
+                },
+            )
         assert body["query"] == DISMISS_FALSE_POSITIVE
         mutations.append(body)
         return httpx.Response(

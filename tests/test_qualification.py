@@ -148,7 +148,7 @@ def test_node_validation_stops_after_required_check_fails(
     calls = [call.args[0][1:] for call in runner.run.call_args_list]
     if failed_check is None:
         assert ["run", "build"] in calls
-        assert ["test"] not in calls
+        assert ["test"] in calls
         assert all(row["status"] == "PASSED" for row in rows if row.get("kind"))
         return
     assert ["run", failed_check] in calls
@@ -159,7 +159,9 @@ def test_node_validation_stops_after_required_check_fails(
         next(row for row in rows if row.get("kind") == failed_check)["status"]
         == "FAILED"
     )
-    assert not any(row.get("kind") == "unit_tests" for row in rows)
+    assert not any(
+        row.get("kind") == "unit_tests" and row["status"] == "PASSED" for row in rows
+    )
 
 
 def test_node_validation_stops_when_required_lint_script_is_missing(tmp_path):
@@ -198,6 +200,7 @@ def test_node_validation_stops_when_required_lint_script_is_missing(tmp_path):
     assert {row["kind"] for row in rows if row.get("kind")} == {
         "lint",
         "build",
+        "unit_tests",
     }
     assert all(
         row["status"] == "SKIPPED" and row["required"]
@@ -267,6 +270,11 @@ def test_lint_summaries_do_not_confuse_zero_errors_or_source_filenames(
         ("Tests run: 0", "FAILED"),
         ("> Task :test NO-SOURCE", "FAILED"),
         ("Tests run: 0\nTests run: 5, Failures: 0", "PASSED"),
+        ("CHECK_PASSED", "FAILED"),
+        ("Tests: 5 skipped, 5 total", "FAILED"),
+        ("Tests run: 5, Failures: 0, Errors: 0, Skipped: 5", "FAILED"),
+        ("Tests  3 passed (3)", "PASSED"),
+        ("Passed! - Failed: 0, Passed: 3, Skipped: 0, Total: 3", "PASSED"),
     ],
 )
 def test_unit_test_checks_require_executed_tests_without_rejecting_empty_modules(
@@ -359,10 +367,8 @@ def test_nested_node_qualification_checks_use_component_directory(
     )
 
 
-def test_unit_test_policy_blocks_without_running_or_rewriting_checks(
-    tmp_path, package_policy
-):
-    """Block a corporate test mandate rather than execute or silently bypass it."""
+def test_unit_test_policy_runs_without_rewriting_checks(tmp_path, package_policy):
+    """Honor corporate test requirements without rewriting the policy."""
     # Arrange
     from unittest.mock import Mock
 
@@ -375,31 +381,28 @@ def test_unit_test_policy_blocks_without_running_or_rewriting_checks(
     path.write_text(json.dumps(policy), encoding="utf-8")
     original = path.read_bytes()
     runner = Mock()
+    runner.run.return_value = CommandResult(
+        [], 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "", ""
+    )
 
     # Act
-    with pytest.raises(ValueError, match="unit tests are disabled"):
-        load_policy(tmp_path, path, plan)
+    loaded = load_policy(tmp_path, path, plan)
     rows = run_checks(tmp_path, checks, runner, lambda name: name, 30)
 
     # Assert
-    runner.run.assert_not_called()
+    assert runner.run.call_count == 4
+    assert loaded["checks"] == checks
     assert path.read_bytes() == original
     assert checks["unit_tests"]["argv"] == ["npm", "test"]
-    assert len(rows) == 1
-    assert rows[0]["kind"] == "policy_conflict"
-    assert rows[0]["status"] == "FAILED" and rows[0]["required"]
-    assert "No policy checks were run or bypassed" in rows[0]["detail"]
+    assert len(rows) == 4
+    assert all(row["status"] == "PASSED" and row["required"] for row in rows)
 
 
 @pytest.mark.parametrize("script", ["security:smoke", "postbuild"])
-def test_policy_script_test_runner_blocks_all_commands(
-    tmp_path, package_policy, script
-):
-    """Block tests hidden behind nominal build or runtime policy checks."""
+def test_policy_script_test_runner_is_allowed(tmp_path, package_policy, script):
+    """Allow existing scripts that include tests without changing their definitions."""
     # Arrange
     from unittest.mock import Mock
-
-    from gitlab_security_mcp.qualification import TEST_POLICY_BLOCKER
 
     path, policy, plan = package_policy
     manifest = tmp_path / "package.json"
@@ -420,21 +423,20 @@ def test_policy_script_test_runner_blocks_all_commands(
     original_manifest = manifest.read_bytes()
     original_policy = path.read_bytes()
     runner = Mock()
+    runner.run.return_value = CommandResult(
+        [], 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "", ""
+    )
 
     # Act
-    with pytest.raises(ValueError) as raised:
-        load_policy(tmp_path, path, plan)
+    load_policy(tmp_path, path, plan)
     rows = run_checks(
         tmp_path, policy["checks"]["npm"], runner, lambda name: name, 30, plan=plan
     )
 
     # Assert
-    assert str(raised.value) == TEST_POLICY_BLOCKER
-    assert len(rows) == 1
-    assert rows[0]["kind"] == "policy_conflict"
-    assert rows[0]["status"] == "FAILED" and rows[0]["required"]
-    assert rows[0]["detail"] == TEST_POLICY_BLOCKER
-    runner.run.assert_not_called()
+    assert len(rows) == 3
+    assert all(row["status"] == "PASSED" for row in rows)
+    assert runner.run.call_count == 3
     assert manifest.read_bytes() == original_manifest
     assert path.read_bytes() == original_policy
 
@@ -471,7 +473,7 @@ def package_engine(tmp_path, package_policy):
     }
     runner = Mock()
     runner.run.return_value = CommandResult(
-        [], 0, "CHECK_PASSED", "", 0, False, "out", "err"
+        [], 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "out", "err"
     )
     advisory = Mock()
     advisory.lookup.return_value = AdvisoryLookup(
@@ -497,10 +499,10 @@ def package_engine(tmp_path, package_policy):
     return engine
 
 
-def test_test_requiring_policy_blocks_qualification_before_commands_or_edits(
+def test_test_requiring_policy_allows_qualification_and_package_edits(
     package_engine, package_policy, package_review
 ):
-    """Leave a test-requiring corporate policy and the application unchanged."""
+    """Permit qualified edits under a test mandate, with checks deferred to the batch."""
     # Arrange
     path, policy, _plan = package_policy
     policy["checks"]["npm"]["unit_tests"] = {
@@ -518,12 +520,11 @@ def test_test_requiring_policy_blocks_qualification_before_commands_or_edits(
     applied = package_engine.apply_minimal_fix("package")
 
     # Assert
-    assert qualified["status"] == applied["status"] == "QUALIFICATION_REQUIRED"
-    assert "unit tests are disabled" in qualified["reason"]
-    package_engine.runner.run.assert_not_called()
+    assert qualified["status"] == "QUALIFIED"
+    assert applied["status"] == "APPLIED"
     assert path.read_bytes() == original_policy
-    assert manifest.read_bytes() == original_manifest
-    assert not package_engine.state.changes
+    assert manifest.read_bytes() != original_manifest
+    assert package_engine.state.changes[0]["validation_pending"]
 
 
 @pytest.fixture
@@ -674,7 +675,7 @@ def test_shared_update_failure_restores_original_dependency(duplicate_package_up
         return CommandResult(
             argv,
             int(failed),
-            "CHECK_PASSED",
+            "CHECK_PASSED\nTests: 1 passed",
             "incompatible update" if failed else "",
             0,
             False,
@@ -694,8 +695,8 @@ def test_shared_update_failure_restores_original_dependency(duplicate_package_up
     assert not engine.state.manual_cleanup_required
 
 
-def test_package_batch_builds_once_without_unit_tests(pending_package_batch):
-    """Apply independent updates before one final production build, never unit tests."""
+def test_package_batch_builds_and_tests_once(pending_package_batch):
+    """Apply independent updates before one final production build and test run."""
     # Arrange
     package_engine = pending_package_batch
     before = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
@@ -711,19 +712,18 @@ def test_package_batch_builds_once_without_unit_tests(pending_package_batch):
     assert result["status"] == "VALIDATION_COMPLETE", result
     assert cached["cached"] is True
     assert calls.count(["run", "build"]) == 1
-    assert calls.count(["test"]) == 0
-    skipped = [row for row in result["results"] if row.get("kind") == "unit_tests"]
-    assert len(skipped) == 1
-    assert skipped[0]["status"] == "SKIPPED"
-    assert skipped[0]["required"] is False
-    assert "not verified" in skipped[0]["detail"]
+    assert calls.count(["test"]) == 1
+    tests = [row for row in result["results"] if row.get("kind") == "unit_tests"]
+    assert len(tests) == 1
+    assert tests[0]["status"] == "PASSED"
+    assert tests[0]["required"] is True
     assert all(
         change["qualification_status"] == "VALIDATED"
         for change in package_engine.state.changes
     )
 
 
-@pytest.mark.parametrize("failed_kind", ["build"])
+@pytest.mark.parametrize("failed_kind", ["build", "test"])
 @pytest.mark.parametrize("bad", ["example", "other", "interaction"])
 def test_failed_batch_retains_green_subset(pending_package_batch, failed_kind, bad):
     """Isolate bad updates or interacting pairs and retain a build-validated subset."""
@@ -774,7 +774,7 @@ def test_failed_batch_retains_green_subset(pending_package_batch, failed_kind, b
     )
 
 
-def test_corporate_checks_share_the_final_build_without_unit_tests(
+def test_corporate_checks_share_the_final_build_and_tests(
     package_engine, package_review
 ):
     """Honor policy markers without executing the same product commands twice."""
@@ -794,7 +794,7 @@ def test_corporate_checks_share_the_final_build_without_unit_tests(
     assert result["status"] == "VALIDATION_COMPLETE", result
     assert ["run", "build"] not in before and ["test"] not in before
     assert calls.count(["run", "build"]) == 1
-    assert calls.count(["test"]) == 0
+    assert calls.count(["test"]) == 1
     assert (
         calls.count(["run", "security:smoke"])
         == calls.count(["run", "security:licenses"])
@@ -918,7 +918,7 @@ def test_missing_security_metadata_defers_to_product_validation(
         return CommandResult(
             argv,
             1 if failed else 0,
-            "CHECK_PASSED",
+            "CHECK_PASSED\nTests: 1 passed",
             "fixture product failure" if failed else "",
             0,
             False,
@@ -978,7 +978,9 @@ def test_informational_lint_never_blocks_build_and_runtime_gates(
                 "out",
                 "err",
             )
-        return CommandResult(argv, 0, "CHECK_PASSED", "", 0, False, "out", "err")
+        return CommandResult(
+            argv, 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "out", "err"
+        )
 
     package_engine.runner.run.side_effect = execute
 
@@ -1130,7 +1132,7 @@ def test_security_loop_retains_good_fixes_and_continues_after_rejection(
         return CommandResult(
             argv,
             1 if failed else 0,
-            "CHECK_PASSED",
+            "CHECK_PASSED\nTests: 1 passed",
             "error: incompatible target API" if failed else "",
             0,
             False,
@@ -1241,7 +1243,7 @@ def test_qualification_defers_product_timeouts_to_final_validation(
     assert (package_engine.repo_root / "package.json").read_bytes() == original
 
 
-def test_qualification_defers_build_until_after_fix_without_unit_tests(
+def test_qualification_defers_build_and_unit_tests_until_after_fix(
     package_engine, package_review
 ):
     """Capture lint before edits without running a duplicate product suite."""
@@ -1272,7 +1274,7 @@ def test_qualification_defers_build_until_after_fix_without_unit_tests(
     assert package_engine.run_validation_matrix()["status"] == "VALIDATION_COMPLETE"
     commands = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
     assert commands.count(["run", "build"]) == 1
-    assert commands.count(["test"]) == 0
+    assert commands.count(["test"]) == 1
 
 
 @pytest.mark.parametrize("exit_code", [0, 124])
@@ -1440,6 +1442,19 @@ def test_missing_default_policy_uses_documented_license_review(
     validated = package_engine.run_validation_matrix()
     refreshed = package_engine.get_run_status()
     assert applied["status"] == "APPLIED", applied
+    if missing_script == "test":
+        assert validated["status"] == "VALIDATION_INCOMPLETE", validated
+        tests = [row for row in validated["results"] if row.get("kind") == "unit_tests"]
+        assert len(tests) == 1
+        assert tests[0]["required"] is True and tests[0]["status"] == "SKIPPED"
+        assert "no test script" in tests[0]["detail"]
+        assert package_engine.state.changes[0]["status"] == "ROLLED_BACK"
+        assert package_engine.state.changes[0]["qualification_status"] == "REJECTED"
+        assert (
+            json.loads(path.read_text(encoding="utf-8"))["dependencies"]["example"]
+            == "1.0.0"
+        )
+        return
     assert validated["status"] == "VALIDATION_COMPLETE", validated
     assert package_engine.state.changes[0]["qualification_status"] == "VALIDATED"
     assert refreshed["package_updates"][0]["qualification_status"] == "VALIDATED"
@@ -1465,7 +1480,7 @@ def test_lint_diagnostics_are_retained_once_before_updates(
         output = (
             "warning: existing issue\ninfo: checked rules\nunknown diagnostic\n"
             if argv[1:] == ["run", "lint"]
-            else "CHECK_PASSED"
+            else "CHECK_PASSED\nTests: 1 passed"
         )
         return CommandResult(argv, 0, output, "", 0, False, "out", "err")
 
@@ -1955,7 +1970,9 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
             lock.write_text(
                 f"packages:\n  {package}@{target}: {{}}\n", encoding="utf-8"
             )
-        return CommandResult(argv, 0, "CHECK_PASSED", "", 0, False, "", "")
+        return CommandResult(
+            argv, 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "", ""
+        )
 
     runner.run.side_effect = run
     advisory = Mock()
@@ -2267,7 +2284,14 @@ def test_post_update_checks_control_resolution(
         """Fail the chosen post-update check after an otherwise good baseline."""
         failed = failed_kind is not None and argv == checks[failed_kind]["argv"]
         return CommandResult(
-            argv, 1 if failed else 0, "CHECK_PASSED", "", 0, False, "out", "err"
+            argv,
+            1 if failed else 0,
+            "CHECK_PASSED\nTests: 1 passed",
+            "",
+            0,
+            False,
+            "out",
+            "err",
         )
 
     package_engine.runner.run.side_effect = run
@@ -2566,7 +2590,7 @@ def test_source_changes_are_rejected_even_when_listed_as_allowed(tmp_path, mode)
             "maven",
             "mvn",
             [
-                ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
+                ["--batch-mode", "clean", "verify"],
                 ["--batch-mode", "-Psecurity-smoke", "verify"],
                 ["--batch-mode", "-Psecurity-licenses", "verify"],
             ],
@@ -2585,7 +2609,7 @@ def test_source_changes_are_rejected_even_when_listed_as_allowed(tmp_path, mode)
 def test_other_ecosystems_require_all_allowlisted_checks(
     tmp_path, package_policy, ecosystem, manager, tool, commands
 ):
-    """Keep builds but block corporate checks that invoke test lifecycles."""
+    """Honor all allowlisted corporate checks, including test lifecycles."""
     # Arrange
     path, original, original_plan = package_policy
     policy, plan = deepcopy(original), deepcopy(original_plan)
@@ -2607,24 +2631,17 @@ def test_other_ecosystems_require_all_allowlisted_checks(
     from unittest.mock import Mock
 
     runner = Mock()
-    if manager in {"nuget", "maven"}:
-        with pytest.raises(ValueError, match="unit tests are disabled"):
-            load_policy(tmp_path, path, plan)
-        rows = run_checks(
-            tmp_path, policy["checks"][ecosystem], runner, lambda name: name, 30
-        )
-        qualified = None
-    else:
-        qualified = load_policy(tmp_path, path, plan)
+    runner.run.return_value = CommandResult(
+        [], 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "", ""
+    )
+    qualified = load_policy(tmp_path, path, plan)
+    rows = run_checks(tmp_path, qualified["checks"], runner, lambda name: name, 30)
 
     # Assert
-    if qualified is None:
-        assert len(rows) == 1
-        assert rows[0]["status"] == "FAILED"
-        assert rows[0]["kind"] == "policy_conflict"
-        runner.run.assert_not_called()
-        assert json.loads(path.read_text(encoding="utf-8")) == policy
-        return
+    assert len(rows) == 3
+    assert all(row["status"] == "PASSED" and row["required"] for row in rows)
+    assert runner.run.call_count == 3
+    assert json.loads(path.read_text(encoding="utf-8")) == policy
     assert len(qualified["checks"]) == 3
     for check in qualified["checks"].values():
         assert_allowed(check["argv"], tmp_path)

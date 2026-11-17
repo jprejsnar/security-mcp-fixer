@@ -312,6 +312,8 @@ def _gradle_ok(args: list[str]) -> bool:
         ["--no-daemon", "dependencies"],
         ["--no-daemon", "checkstyleMain", "checkstyleTest"],
         ["--no-daemon", "test"],
+        ["--no-daemon", "test", "--rerun-tasks"],
+        ["--no-daemon", "assemble", "test", "--rerun"],
         ["--no-daemon", "build"],
         ["--no-daemon", "assemble"],
         ["--no-daemon", "securitySmoke"],
@@ -415,6 +417,7 @@ class CommandResult:
     stderr_sha256: str
     stdout_log_path: str | None = None
     stderr_log_path: str | None = None
+    unit_tests_verified: bool = False
 
     def display(self) -> str:
         """Return the command as one quoted string for reports."""

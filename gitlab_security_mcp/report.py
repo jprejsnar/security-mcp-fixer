@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from gitlab_security_mcp.gitlab_client import dismissal_is_confirmed
 from gitlab_security_mcp.source_findings import pending_source_reviews
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import atomic_write_text
@@ -26,6 +27,58 @@ def _finding_label(finding: dict) -> str:
     return f"{finding.get('id')}: {finding.get('title') or 'Untitled finding'}" + (
         f" ({source})" if source else ""
     )
+
+
+def _dismissal_summary(item: dict) -> str:
+    """Separate persisted GitLab proof from an old mutation acknowledgement."""
+    confirmed = dismissal_is_confirmed(item)
+    status = (
+        "DISMISSED (independently verified)"
+        if confirmed
+        else "UNVERIFIED"
+        if item.get("status") == "DISMISSED"
+        else item.get("status")
+    )
+    text = f"- {_table_cell(item['id'])}: {_table_cell(status)}; FALSE_POSITIVE."
+    if confirmed:
+        text += f" Verified at {_table_cell(item['verification']['verified_at'])}."
+    if item.get("tracked_ref"):
+        text += f" Tracked ref: {_table_cell(item['tracked_ref'].get('name'))}."
+    if item.get("vulnerability_url"):
+        text += f" [GitLab vulnerability]({item['vulnerability_url']})."
+    if item.get("error"):
+        text += f" Error: {_table_cell(item['error'])}"
+    if not confirmed:
+        text += " Check GitLab before retrying; the remote outcome may be unknown."
+    return text
+
+
+def _unit_test_validation(state: RunState) -> dict:
+    """Report only the current batch's observed unit-test evidence."""
+    rows = [
+        row
+        for row in state.validation_results
+        if row.get("kind") in {"unit_tests", "build_and_unit_tests"}
+    ]
+    if not rows:
+        return {
+            "status": "NOT_RUN",
+            "reason": "Unit tests have not run. Test compatibility was not verified.",
+        }
+    if any(row["status"] == "FAILED" for row in rows):
+        return {
+            "status": "FAILED",
+            "reason": "Unit-test validation failed; affected package updates are not accepted.",
+        }
+    if any(row["status"] != "PASSED" for row in rows):
+        return {
+            "status": "INCOMPLETE",
+            "reason": "Unit-test evidence is incomplete. Test compatibility was not verified.",
+        }
+    return {
+        "status": "PASSED",
+        "reason": "Executed unit tests passed for the validated checkout.",
+    }
 
 
 def _validation_caveats(state: RunState) -> list[dict]:
@@ -198,9 +251,7 @@ def render(
         if state.decisions.get(finding["id"], {}).get("decision") == "FALSE_POSITIVE"
     }
     dismissed = {
-        item["id"]
-        for item in state.gitlab_dismissals
-        if item.get("status") == "DISMISSED"
+        item["id"] for item in state.gitlab_dismissals if dismissal_is_confirmed(item)
     }
     pending_dismissals = assessed_false_positives - dismissed
     dismissal_review = {
@@ -351,10 +402,7 @@ def render(
         "changes_made": state.changes,
         "fix_selection": state.fix_selection,
         "validation_status": state.validation_status,
-        "unit_test_validation": {
-            "status": "NOT_RUN",
-            "reason": "Application unit tests are disabled during security remediation. Test compatibility was not verified.",
-        },
+        "unit_test_validation": _unit_test_validation(state),
         "validation": state.validation_results,
         "validation_caveats": _validation_caveats(state),
         "batch_isolation": state.batch_isolation,
@@ -444,6 +492,28 @@ def render(
         "## Human Code-Fix Selection",
         f"Status: {_table_cell(state.fix_selection.get('status') or 'NOT_REQUESTED')}",
         f"Selected issue IDs: {_table_cell(', '.join(state.fix_selection.get('selected_ids', [])) or 'none')}",
+        f"Automatic package execution: {_table_cell((state.fix_selection.get('package_execution') or {}).get('status') or 'NOT_STARTED')}",
+        *(
+            [
+                f"Execution blocker: {_table_cell(state.fix_selection['package_execution']['reason'])}",
+            ]
+            if (state.fix_selection.get("package_execution") or {}).get("reason")
+            else []
+        ),
+        *(
+            [
+                f"- {_table_cell(item.get('finding_id') or 'batch')}: {_table_cell(item['stage'])} = {_table_cell(item['status'])}"
+                + (
+                    f" ({_table_cell(item['duration_ms'])} ms)"
+                    if "duration_ms" in item
+                    else ""
+                )
+                + (f": {_table_cell(item['reason'])}" if item.get("reason") else "")
+                for item in (state.fix_selection.get("package_execution") or {}).get(
+                    "results", []
+                )
+            ]
+        ),
         "Only human-selected issues authorize remediation edits. Unselected issues are not thereby false positives.",
         "",
         *(
@@ -517,6 +587,11 @@ def render(
                 f"- {change.get('finding_id')}: {change.get('status')} — {change.get('description')} "
                 f"({', '.join(change.get('files') or []) or 'no files'})"
             )
+            if "edit_duration_ms" in change:
+                lines.append(
+                    f"  Edit/reuse and lockfile refresh: {change['edit_duration_ms']} ms "
+                    "(excludes documentation review, pre-edit lint and subsequent validation)."
+                )
             if change.get("reused_from"):
                 lines.append(
                     f"  Shares the unchanged edit from {change['reused_from']}; no additional dependency write or install."
@@ -677,21 +752,12 @@ def render(
                 [
                     "",
                     "## GitLab False-Positive Dismissals",
-                    *(
-                        f"- {_table_cell(item['id'])}: {_table_cell(item['status'])}; "
-                        f"{_table_cell(item['reason'])}"
-                        + (
-                            f" Error: {_table_cell(item['error'])}"
-                            if item.get("error")
-                            else ""
-                        )
-                        + (
-                            " Check GitLab before retrying; the remote outcome may be unknown."
-                            if item["status"] != "DISMISSED"
-                            else ""
-                        )
-                        for item in state.gitlab_dismissals
-                    ),
+                    "Only independent GitLab read-back counts as confirmation. "
+                    "Use the project Vulnerability report's Dismissed / False positive "
+                    "filter and the matching tracked ref. Scanner falsePositive flags "
+                    "and saved pipeline scan artifacts are not user dismissal status. "
+                    "Approved reasons remain in Finding Assessments and the JSON audit.",
+                    *(_dismissal_summary(item) for item in state.gitlab_dismissals),
                 ]
                 if state.gitlab_dismissals
                 else []
