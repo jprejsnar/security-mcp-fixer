@@ -1051,7 +1051,9 @@ def test_sdk_reviews_all_supported_source_and_configuration_types(
     assert initial["decision"] == "SOURCE_REVIEW_REQUIRED"
     assert initial["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
     cited = initial["ai_source_review"]["cited_source"]
-    assert cited["content"] == source.read_bytes().decode("utf-8")
+    assert "content" not in cited
+    assert cited["cited_text"] in source.read_text(encoding="utf-8")
+    assert cited["path"].replace("\\", "/") == name
     assert cited["sha256"] == review["reviewed_files"][0]["sha256"]
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -1116,9 +1118,10 @@ def test_sdk_verification_requests_ai_source_and_input_flow_review(
     assert result["decision"] == decision
     assert pending["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
     assert engine.state.findings[0]["sourceReview"] == review
-    assert pending["ai_source_review"]["cited_source"][
-        "content"
-    ] == source.read_bytes().decode("utf-8")
+    cited = pending["ai_source_review"]["cited_source"]
+    assert "content" not in cited
+    assert cited["cited_text"] in source.read_text(encoding="utf-8")
+    assert cited["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     engine.gitlab.dismiss_false_positive.assert_not_called()
     assert bool(engine.false_positive_candidates()["candidates"]) is (
         decision == "FALSE_POSITIVE"
@@ -1141,10 +1144,11 @@ def test_host_receives_full_source_and_must_record_review(tmp_path, monkeypatch)
 
     # Assert
     assert pending["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
-    assert pending["ai_source_review"]["cited_source"][
-        "content"
-    ] == source.read_bytes().decode("utf-8")
-    assert "must examine the full cited_source" in pending["reason"]
+    cited = pending["ai_source_review"]["cited_source"]
+    assert "content" not in cited
+    assert cited["cited_text"] in source.read_text(encoding="utf-8")
+    assert cited["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert "read the cited file in the checkout" in pending["reason"]
     assert recorded["decision"] == "FALSE_POSITIVE"
     engine.gitlab.dismiss_false_positive.assert_not_called()
 

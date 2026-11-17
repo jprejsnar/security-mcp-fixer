@@ -12,6 +12,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
+from gitlab_security_mcp.fanout import map_ordered
 from gitlab_security_mcp.util import redact, timed_http_stream
 from gitlab_security_mcp.versions import parse_fixed_versions
 
@@ -388,15 +389,31 @@ class GitLabClient:
         raise RuntimeError("GitLab tracked-ref lookup exceeded the page limit")
 
     def _findings(self, full_path: str) -> tuple[dict | None, list[dict], bool]:
-        """Keep main's active report and add explicitly resolved non-main findings."""
+        """Keep main's active report and add explicitly resolved non-main findings.
+
+        The two reports are independent once the tracked branches are known.
+        Each report still follows its own cursor. A truncated main report is
+        returned alone, matching the previous page limit.
+        """
         branches = self._tracked_branches(full_path)
-        main, truncated = self._report_findings(full_path, [branches["main"]])
+        main_ids = [branches["main"]]
         others = [value for name, value in branches.items() if name != "main"]
-        if truncated or not others:
+        if not others:
+            main, truncated = self._report_findings(full_path, main_ids)
             return None, main, truncated
-        resolved, branch_truncated = self._report_findings(
-            full_path, others, has_resolution=True
+
+        def load(spec: tuple[list[str], bool]) -> tuple[list[dict], bool]:
+            """Page one report without sharing the other report's cursor."""
+            tracked_ids, resolved_only = spec
+            return self._report_findings(
+                full_path, tracked_ids, has_resolution=resolved_only
+            )
+
+        (main, truncated), (resolved, branch_truncated) = map_ordered(
+            load, [(main_ids, False), (others, True)]
         )
+        if truncated:
+            return None, main, truncated
         if resolved:
             snapshot = self._main_branch_snapshot(full_path)
             main_uuids = {item.get("uuid") for item in main if item.get("uuid")}

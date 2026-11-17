@@ -2815,7 +2815,7 @@ class Engine:
                 assessment["reason"],
                 assessment["evidence"],
                 None,
-                " ".join(assessment["workflow"]["steps"])
+                "Follow source_workflow.steps for this finding."
                 if assessment["decision"]
                 in {
                     "SOURCE_REVIEW_REQUIRED",
@@ -2879,7 +2879,7 @@ class Engine:
             evidence.append(reason)
             prompt = (
                 f"Finding {finding.get('id')} requires local fuzzing reproduction. "
-                + " ".join(steps)
+                "Follow fuzzing_workflow.steps. Do not replay payloads against the remote host."
             )
             return "REPRODUCTION_REQUIRED", reason, evidence, None, prompt
         if finding.get("falsePositiveFlag") is True:

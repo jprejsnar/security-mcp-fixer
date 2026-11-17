@@ -945,7 +945,7 @@ def test_documentation_progress_counts_completed_requests():
     try:
         with httpx.Client(transport=transport) as http:
             with OfficialDocs(http=http) as docs:
-                review = docs.read_before_fix({})
+                review = docs.read_before_fix({"location": {"file": "widget.py"}})
     finally:
         progress_sink.reset(token)
 

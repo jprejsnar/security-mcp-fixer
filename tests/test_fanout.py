@@ -15,6 +15,93 @@ from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
 from gitlab_security_mcp.util import timed_http_stream
 
 
+def test_main_and_branch_reports_overlap_and_keep_main_first():
+    """Fetch the main report and the branch report together, then keep main first."""
+    # Arrange
+    state = {"inflight": 0, "max": 0}
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Hold each vulnerability page open so the two reports can overlap."""
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"name": "main", "default": True, "commit": {"id": "a" * 40}},
+            )
+        body = json.loads(request.content)
+        if "securityTrackedRefs(" in body["query"]:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "project": {
+                            "securityTrackedRefs": {
+                                "nodes": [
+                                    {
+                                        "id": "main-id",
+                                        "name": "main",
+                                        "refType": "BRANCH",
+                                    },
+                                    {
+                                        "id": "release-id",
+                                        "name": "release",
+                                        "refType": "BRANCH",
+                                    },
+                                ],
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                },
+            )
+        resolved = body["variables"]["hasResolution"]
+        node = {
+            "id": "gid://gitlab/Vulnerability/9",
+            "uuid": "branch-finding" if resolved else "main-finding",
+            "title": "branch" if resolved else "main",
+            "state": "DETECTED",
+            "reportType": "SAST",
+            "trackedRef": {
+                "id": "release-id" if resolved else "main-id",
+                "name": "release" if resolved else "main",
+            },
+            "resolvedOnDefaultBranch": resolved,
+        }
+        with lock:
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+        try:
+            time.sleep(0.05)
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "project": {
+                            "vulnerabilities": {
+                                "nodes": [node],
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                },
+            )
+        finally:
+            with lock:
+                state["inflight"] -= 1
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
+    # Assert
+    assert state["max"] >= 2
+    assert fetched.ok is True
+    assert [item["id"] for item in fetched.findings] == [
+        "main-finding",
+        "gid://gitlab/Vulnerability/9",
+    ]
+
+
 def test_existing_fix_reuses_catalog_only_and_actual_edits_still_read_fresh(tmp_path):
     """Avoid repeated publisher transfers only when associating an unchanged edit."""
     # Arrange
@@ -29,25 +116,32 @@ def test_existing_fix_reuses_catalog_only_and_actual_edits_still_read_fresh(tmp_
         return httpx.Response(200, text=markers + " " + str(request.url))
 
     path = tmp_path / "http-timings.jsonl"
+    dockerfile = {"location": {"file": "Dockerfile"}}
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         with OfficialDocs(http=http, http_log_path=path) as docs:
-            first = docs.read_before_fix({"identifiers": ["CVE-2020-0001"]})
+            first = docs.read_before_fix(
+                {**dockerfile, "identifiers": ["CVE-2020-0001"]}
+            )
 
             # Act
             second = docs.read_for_existing_fix(
-                {"identifiers": ["CVE-2020-0002"]}, first.as_list(), [rule_page]
+                {**dockerfile, "identifiers": ["CVE-2020-0002"]},
+                first.as_list(),
+                [rule_page],
             )
             after_shared = list(requests)
-            fresh = docs.read_before_fix({"identifiers": ["CVE-2020-0002"]})
+            fresh = docs.read_before_fix(
+                {**dockerfile, "identifiers": ["CVE-2020-0002"]}
+            )
 
     # Assert
     assert first.complete and second.complete and fresh.complete
     assert after_shared.count(rule_page["url"]) == 2
     assert requests.count(rule_page["url"]) == 3
     assert all(
-        after_shared.count(url) == 1 for _name, url, _marker in REQUIRED_DOCS[1:]
+        after_shared.count(url) == 0 for _name, url, _marker in REQUIRED_DOCS[1:]
     )
-    assert all(requests.count(url) == 2 for _name, url, _marker in REQUIRED_DOCS[1:])
+    assert all(requests.count(url) == 0 for _name, url, _marker in REQUIRED_DOCS[1:])
     assert any("CVE-2020-0002" in url for url in after_shared)
     assert not any("CVE-2020-0001" in source.url for source in second.sources)
     assert len(path.read_text().splitlines()) == len(requests)
@@ -61,7 +155,7 @@ def test_parallel_source_reviews_share_run_receipts_but_edits_stay_fresh():
 
     requests = []
     markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS) + " CWE-79"
-    finding = {"identifiers": ["CWE-79"]}
+    finding = {"location": {"file": "widget.py"}, "identifiers": ["CWE-79"]}
     scope = object()
 
     def handler(request):
@@ -85,7 +179,7 @@ def test_parallel_source_reviews_share_run_receipts_but_edits_stay_fresh():
 
     # Assert
     assert all(review.complete for review in reviews)
-    assert len(after_shared) == len(REQUIRED_DOCS) + 1
+    assert len(after_shared) == 2
     assert set(after_shared.values()) == {1}
     assert any(source.as_dict().get("reused") for source in reviews[-1].sources)
     assert not any(source.as_dict().get("reused") for source in new_run.sources)
@@ -96,7 +190,7 @@ def test_parallel_source_reviews_share_run_receipts_but_edits_stay_fresh():
     )
 
 
-@pytest.mark.parametrize("failed", ["python", "cwe:CWE-79", "nsa"])
+@pytest.mark.parametrize("failed", ["python", "cwe:CWE-79"])
 def test_source_receipt_reuse_retries_required_and_named_record_failures(failed):
     """Do not pin a failed required page or CVE/CWE record for the entire run."""
     # Arrange
@@ -119,8 +213,9 @@ def test_source_receipt_reuse_retries_required_and_named_record_failures(failed)
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         with OfficialDocs(http=http) as docs:
             scope = object()
-            first = docs.read_for_source({"identifiers": ["CWE-79"]}, run_key=scope)
-            second = docs.read_for_source({"identifiers": ["CWE-79"]}, run_key=scope)
+            cited = {"location": {"file": "widget.py"}, "identifiers": ["CWE-79"]}
+            first = docs.read_for_source(cited, run_key=scope)
+            second = docs.read_for_source(cited, run_key=scope)
     # Assert
     first_source = next(
         source for source in first.sources if source.url == urls[failed]
@@ -129,8 +224,8 @@ def test_source_receipt_reuse_retries_required_and_named_record_failures(failed)
         source for source in second.sources if source.url == urls[failed]
     )
     assert not first_source.ok
-    assert second_source.ok is (failed != "nsa")
-    assert requests.count(urls[failed]) == (1 if failed == "nsa" else 2)
+    assert second_source.ok
+    assert requests.count(urls[failed]) == 2
     assert all(
         count == 1 for url, count in Counter(requests).items() if url != urls[failed]
     )
@@ -143,7 +238,7 @@ def test_source_receipt_cache_evicts_old_records_not_frequently_used_catalog(
     # Arrange
     from gitlab_security_mcp import official_docs
 
-    monkeypatch.setattr(official_docs, "_MAX_SOURCE_CACHE", len(REQUIRED_DOCS) + 3)
+    monkeypatch.setattr(official_docs, "_MAX_SOURCE_CACHE", 4)
     requests = []
     markers = (
         " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
@@ -161,11 +256,23 @@ def test_source_receipt_cache_evicts_old_records_not_frequently_used_catalog(
         with OfficialDocs(http=http) as docs:
             scope = object()
             for number in range(1, 7):
-                docs.read_for_source({"identifiers": [f"CWE-{number}"]}, run_key=scope)
-            docs.read_for_source({"identifiers": ["CWE-1"]}, run_key=scope)
+                docs.read_for_source(
+                    {
+                        "location": {"file": "widget.py"},
+                        "identifiers": [f"CWE-{number}"],
+                    },
+                    run_key=scope,
+                )
+            docs.read_for_source(
+                {"location": {"file": "widget.py"}, "identifiers": ["CWE-1"]},
+                run_key=scope,
+            )
     # Assert
     assert requests.count("https://cwe.mitre.org/data/definitions/1.html") == 2
-    assert all(requests.count(url) == 1 for _name, url, _marker in REQUIRED_DOCS)
+    python_url = next(url for name, url, _marker in REQUIRED_DOCS if name == "python")
+    java_url = next(url for name, url, _marker in REQUIRED_DOCS if name == "java")
+    assert requests.count(python_url) == 1
+    assert requests.count(java_url) == 0
 
 
 @pytest.mark.parametrize("exit_code", [0, 1])
@@ -589,22 +696,23 @@ def test_required_docs_are_requested_together_and_stay_in_order(tmp_path):
     )
 
     # Act
-    review = docs.read_before_fix({})
+    review = docs.read_before_fix({"location": {"file": "widget.ts"}})
 
     # Assert
     assert state["max"] >= 2
     assert review.complete
-    assert [item.name for item in review.sources] == [
-        name for name, _url, _marker in REQUIRED_DOCS
+    selected = [
+        (name, url)
+        for name, url, _marker in REQUIRED_DOCS
+        if name in {"typescript", "javascript"}
     ]
+    assert [item.name for item in review.sources] == [name for name, _url in selected]
     records = [
         json.loads(line)
         for line in (tmp_path / "http-timings.jsonl").read_text().splitlines()
     ]
-    assert len(records) == len(REQUIRED_DOCS)
-    assert {record["url"] for record in records} == {
-        url for _name, url, _marker in REQUIRED_DOCS
-    }
+    assert len(records) == len(selected)
+    assert {record["url"] for record in records} == {url for _name, url in selected}
     assert all(
         record["source"] == "documentation" and record["status_code"] == 200
         for record in records
@@ -622,20 +730,20 @@ def test_one_doc_failure_keeps_the_other_page_results():
     markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        """Fail only the Docker reference and serve the other markers."""
-        if request.url.host == "docs.docker.com":
+        """Fail only the JavaScript reference and serve the other markers."""
+        if request.url.host == "developer.mozilla.org":
             return httpx.Response(503, text="down")
         return httpx.Response(200, text=markers)
 
     docs = OfficialDocs(http=httpx.Client(transport=httpx.MockTransport(handler)))
 
     # Act
-    review = docs.read_before_fix({})
+    review = docs.read_before_fix({"location": {"file": "widget.ts"}})
 
     # Assert
     assert review.complete is False
-    assert len(review.sources) == len(REQUIRED_DOCS)
-    failed = next(item for item in review.sources if item.name == "docker")
+    assert len(review.sources) == 2
+    failed = next(item for item in review.sources if item.name == "javascript")
     assert failed.ok is False
     assert any(item.ok for item in review.sources)
 
@@ -654,7 +762,9 @@ def test_close_waits_until_the_doc_read_finishes():
         return httpx.Response(200, text=markers)
 
     docs = OfficialDocs(http=httpx.Client(transport=httpx.MockTransport(handler)))
-    reader = threading.Thread(target=docs.read_before_fix, args=({},))
+    reader = threading.Thread(
+        target=docs.read_before_fix, args=({"location": {"file": "widget.py"}},)
+    )
     reader.start()
     assert entered.wait(2)
     closed = threading.Event()
@@ -841,7 +951,7 @@ def test_unexpected_doc_failure_is_logged_and_recorded(caplog):
 
     # Act
     with caplog.at_level(logging.ERROR):
-        review = docs.read_before_fix({})
+        review = docs.read_before_fix({"location": {"file": "widget.py"}})
 
     # Assert
     assert review.complete is False

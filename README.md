@@ -460,7 +460,7 @@ checkout is active.
 | `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. For a new branch, run pnpm clean/install afterward; for a reused branch, defer preparation until its checkout. |
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
-| `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return complete cited source for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
+| `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
 | `select_security_fixes(repo_root=None)` | Open unchecked human issue-selection boxes after read-only assessment. No AI selection arguments. MCP qualification, edit, test-generation and validation tools enforce the selected findings. Skip/decline/cancel/unavailable means no remediation edits; continue to independent false-positive review. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require human issue selection, exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
 | `apply_minimal_fix(finding_id, repo_root=None)` | For human-selected issues only, read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
@@ -711,15 +711,17 @@ Reports explicitly mark unfinished source review rather than implying all findin
 were fully assessed.
 
 `verify_security_finding` uses `ai_source_review.status=HOST_REVIEW_REQUIRED`:
-the calling Copilot/Cursor AI receives the complete cited source, not an excerpt.
+the calling Copilot/Cursor AI receives the cited path, full-file SHA-256, line,
+and a short window. It reads the file in the checkout.
 The deprecated MCP sampling API is never called, even if a host advertises it.
 No separate AI account, API key, provider endpoint, or autonomous GitLab dismissal
 is added. Host permission and model selection remain controlled by VS Code/Cursor.
-The calling AI receives the full cited
-source and must finish the code/input-flow analysis with its own code tools, then
-submit `source_review` in the same workflow. This is unfinished AI work, not a
-request for the user to analyze code. The returned complete-file evidence is
-limited to 256,000 bytes; the host reads relevant callers with its own code tools.
+The calling AI reads the cited file in the checkout and must finish the
+code/input-flow analysis with its own code tools, then submit `source_review`
+in the same workflow. This is unfinished AI work, not a request for the user
+to analyze code. The server still hashes the whole file, up to 256,000 bytes,
+and returns that hash with the cited line; the host reads callers with its own
+code tools.
 The server rechecks full-byte hashes and requires a separate assessment for every
 finding before recording conclusions. These are audited host attestations, not
 proof that the host actually read the files. Denied access, missing/oversized files,
@@ -2286,8 +2288,9 @@ unless the human approves false-positive dismissal through
 Source-code findings such as **Regular expression with non-literal value** are
 not package-advisory findings. `verify_security_finding` returns
 `SOURCE_REVIEW_REQUIRED` with `source_workflow`; the MCP tool additionally returns
-the complete cited source and full-byte SHA256 in
+the cited path, full-byte SHA256, line, and a short window in
 `ai_source_review.cited_source`, with `status: "HOST_REVIEW_REQUIRED"`.
+The file body is not returned.
 The calling host AI must read that source and trace configuration,
 callers, mutation paths and possible untrusted inputs. Neither a test filename,
 missing source nor missing CVE proves safety.

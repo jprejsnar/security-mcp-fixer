@@ -1,9 +1,10 @@
-"""Read current publisher documentation before any local security edit.
+"""Read the cited publisher pages before a local security edit.
 
-A fix is authorized only after this run retrieves every required page.
-Cached or remembered publisher guidance is not enough. Security-reference
-pages are informational and cannot block the write. Bodies are hashed and discarded
-on the engine.
+A fix is authorized only after this run retrieves the pages for the cited
+language, manifest, or configuration. Cached or remembered publisher guidance
+is not enough. Named CVE and CWE record pages are informational and cannot
+block a code edit; a failed named record still blocks a false positive.
+Bodies are hashed and discarded on the engine.
 """
 
 from __future__ import annotations
@@ -445,8 +446,68 @@ def _hashed_prefix(response: httpx.Response) -> tuple[str, str]:
     return hasher.hexdigest(), bytes(prefix).decode(encoding, errors="replace")
 
 
+_MANIFEST_PUBLISHERS = {
+    "package.json": ("node",),
+    "package-lock.json": ("node",),
+    "pnpm-lock.yaml": ("node",),
+    "yarn.lock": ("node",),
+    "pom.xml": ("java",),
+    "build.gradle": ("java",),
+    "build.gradle.kts": ("java",),
+    "settings.gradle": ("java",),
+    "settings.gradle.kts": ("java",),
+    "libs.versions.toml": ("java",),
+    "nuget.config": ("csharp", "dotnet"),
+    "directory.packages.props": ("csharp", "dotnet"),
+    "packages.lock.json": ("csharp", "dotnet"),
+}
+_ECOSYSTEM_PUBLISHERS = {
+    "npm": ("node",),
+    "nuget": ("csharp", "dotnet"),
+    "maven": ("java",),
+}
+
+
+def publisher_names_for(finding: dict) -> tuple[str, ...]:
+    """Select the publisher pages that match the cited file.
+
+    Import the language map here so documentation loading does not cycle
+    through the source-review module that already imports this one.
+    """
+    from gitlab_security_mcp.source_findings import config_kind, source_languages
+
+    selected: set[str] = set()
+    for relative in _cited_paths(finding):
+        selected.update(source_languages(relative))
+        if config_kind(relative) == "gitlab_ci":
+            selected.add("gitlab")
+        name = Path(relative).name.lower()
+        selected.update(_MANIFEST_PUBLISHERS.get(name, ()))
+        if name.endswith((".csproj", ".fsproj", ".vbproj")):
+            selected.update(("csharp", "dotnet"))
+    proposed = finding.get("proposedFix")
+    ecosystem = ""
+    if isinstance(proposed, dict):
+        ecosystem = str(proposed.get("ecosystem") or "")
+    selected.update(_ECOSYSTEM_PUBLISHERS.get(ecosystem.lower(), ()))
+    return tuple(name for name, _url, _marker in REQUIRED_DOCS if name in selected)
+
+
+def _cited_paths(finding: dict) -> list[str]:
+    """Collect the cited file and the manifest paths a package plan will edit."""
+    paths: list[str] = []
+    location = finding.get("location")
+    if isinstance(location, dict) and location.get("file"):
+        paths.append(str(location["file"]))
+    proposed = finding.get("proposedFix")
+    if isinstance(proposed, dict):
+        paths.extend(str(item) for item in proposed.get("files") or [] if str(item))
+    return paths
+
+
 def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
-    """Build publisher/rule requirements and informational security-reference pages."""
+    """Build the cited publisher pages plus named CVE or CWE records."""
+    wanted = set(publisher_names_for(finding))
     pages = [
         {
             "name": name,
@@ -456,6 +517,7 @@ def _pages_for(finding: dict, doc_pages: list[dict]) -> list[dict]:
             "catalog": True,
         }
         for name, url, marker in REQUIRED_DOCS
+        if name in wanted
     ]
     pages.extend(cited_security_pages(finding))
     for page in doc_pages:

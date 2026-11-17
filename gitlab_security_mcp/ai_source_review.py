@@ -90,3 +90,22 @@ class SourceEvidence:
             self.bytes_read += size
             self.reads[key] = row
         return self.reads[key]
+
+
+def cited_lines(row: dict, source: str) -> dict:
+    """Return the cited line and a short window, never the whole file body.
+
+    The host reads the checkout itself. The hash still covers the complete
+    file the server read, so a changed file cannot reuse this citation.
+    """
+    cited = row.get("cited_text", "")
+    if cited and cited not in source:
+        raise ValueError("Cited text is not in the file the server hashed")
+    context = row.get("context")
+    return {
+        "path": row["path"],
+        "sha256": row["sha256"],
+        "line": row.get("line"),
+        "cited_text": cited,
+        "context": list(context) if isinstance(context, list) else [],
+    }

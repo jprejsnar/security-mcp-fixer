@@ -329,7 +329,7 @@ def test_missing_or_outside_nginx_file_requires_evidence_not_a_false_positive(tm
 def test_missing_security_reference_pages_do_not_block_code_edits(tmp_path, status):
     """Apply documented configuration fixes even when all security sites lack data."""
     # Arrange
-    security_hosts = {"www.cve.org", "cwe.mitre.org", "www.nsa.gov", "nvd.nist.gov"}
+    security_hosts = {"www.cve.org", "cwe.mitre.org", "nvd.nist.gov"}
     markers = " ".join(marker for _name, _url, marker in REQUIRED_DOCS)
 
     def handler(request):
@@ -535,7 +535,7 @@ def test_doc_hash_includes_bytes_past_the_retained_prefix():
             return httpx.Response(200, content=body)
 
         docs = OfficialDocs(http=httpx.Client(transport=httpx.MockTransport(handler)))
-        return docs.read_before_fix({})
+        return docs.read_before_fix({"location": {"file": "widget.py"}})
 
     # Act
     first = review(b"TAIL-ONE")

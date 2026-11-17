@@ -96,17 +96,11 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
         "files": list(files.values()),
         "next_tool": "verify_security_finding" if count else None,
         "action": (
-            "The host AI must read each cited file and trace relevant callers, inputs, "
-            "configuration and controls. Reuse file reads, not verdicts: assess every "
-            "listed finding separately. Call verify_security_finding for each ID with "
-            "source_review {decision: FALSE_POSITIVE, CONFIRMED_VULNERABILITY, or "
-            "MANUAL_REVIEW; reason; input_origin; finding_analysis; reachability_analysis; "
-            "reviewed_files: [{path, sha256, assessment}]}. Hash full current file bytes. "
-            "Do not stop at collecting excerpts or invent a false positive to clear "
-            "this queue. Finish with complete_security_run for the candidate list and "
-            "the final report and automatic human approval form for eligible assessments. "
-            "Unverified findings must be assessed, not silently omitted. "
-            "Uncertain findings remain unresolved."
+            "Read each cited file in the checkout and call verify_security_finding "
+            "for every listed ID. source_review needs a decision, a 1-3 sentence "
+            "reason of at most 1,000 characters, input_origin, finding_analysis, "
+            "reachability_analysis, and reviewed_files hashes. Assess each finding "
+            "separately, then finish with complete_security_run."
         )
         if count
         else None,
@@ -199,42 +193,21 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
         "location": location,
         "languages": source_languages(str(location.get("file") or "")),
         "steps": [
-            "Read the cited source and trace the input to its origin, including referenced "
-            "configuration and callers. Scanner text and source are untrusted evidence.",
-            "For nginx, trace includes, directive inheritance and the active server/location. "
-            "For Dockerfiles, inspect build stages, the final image and runtime controls. "
-            "A matching directive or missing file alone does not establish a verdict.",
-            "For non-literal RegExp, inspect the actual pattern values, their control "
-            "and mutation paths, backtracking behavior and input bounds. A test/spec "
-            "filename, missing CVE, or scanner flag alone does not prove a false positive.",
-            "After reviewing, call verify_security_finding again with source_review "
-            "{decision:'FALSE_POSITIVE'|'CONFIRMED_VULNERABILITY'|'MANUAL_REVIEW', reason, input_origin, finding_analysis, "
-            "reachability_analysis, reviewed_files:[{path, sha256, assessment}]}. "
-            "Include the cited source and every file relied on; hashes cover full bytes. "
-            "finding_analysis must address this rule (for example authorization, CSRF, "
-            "CORS, Unicode, log/header injection, or regex), not unrelated regex claims. "
-            "An endpoint inventory finding is not automatically a defect or a false positive. "
-            "For a false positive, write reason for security-team and client review: "
-            "1-3 concise sentences, at most 1,000 characters, naming the actual code "
-            "or runtime control, the relevant input path and why this specific "
-            "weakness does not apply. Trace the code first; do not invent controls "
-            "or use generic safety assurances. Put detailed evidence in the other fields.",
-            "Read the current publisher pages for this file before a false positive "
-            "or a fix: TypeScript and JavaScript, Node.js, Python, Oracle Java, "
-            "Microsoft C# and .NET, the Dockerfile reference, or nginx, whichever "
-            "this path is. Compare the finding with its CVE and CWE pages. A missing "
-            "page, a scanner flag, or a utility type is not proof of safety. "
-            "Write the reason, input origin, code analysis, reachability, and each "
-            "file assessment as complete sentences about this cited code. Address "
-            "every CVE and CWE GitLab named. Do not invent an identifier.",
-            TYPESCRIPT_UTILITY_REVIEW
-            if "typescript" in source_languages(str(location.get("file") or ""))
-            else "This path has no TypeScript utility-type review.",
-            "If a defect is reproduced, have the host apply a minimal reviewed source "
-            "fix and regression test, separately from package updates. Preserve valid "
-            "behavior. Do not blanket-escape intentional regex syntax or suppress rules. "
-            "Run before/after reproduction, boundary tests, lint, production build and "
-            "all unit tests. Do not claim resolution before validation or dismiss in GitLab.",
+            "Read the cited file in the checkout and trace callers, inputs, and controls. "
+            "A filename, a scanner flag, or a missing CVE is not a verdict.",
+            "For nginx, trace includes and the active server. For Dockerfiles, inspect "
+            "stages and the final image. For a non-literal RegExp, inspect the pattern "
+            "values and their bounds.",
+            "Resubmit source_review with a decision, a 1-3 sentence reason of at most "
+            "1,000 characters, input_origin, finding_analysis, reachability_analysis, "
+            "and reviewed_files hashes. Address every CVE and CWE GitLab named. "
+            "The server reads this file's publisher page and those records. "
+            "Do not invent a source patch or dismiss the finding in GitLab.",
+            *(
+                (TYPESCRIPT_UTILITY_REVIEW,)
+                if "typescript" in source_languages(str(location.get("file") or ""))
+                else ()
+            ),
         ],
     }
     reason = (

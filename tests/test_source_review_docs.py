@@ -84,7 +84,7 @@ def test_repeated_source_assessments_reuse_current_run_documentation(tmp_path):
 
     # Assert
     assert first["decision"] == second["decision"] == "FALSE_POSITIVE"
-    assert reader.call_count == len(REQUIRED_DOCS)
+    assert reader.call_count == 1
     assert all(
         source["reused"] for source in second["source_workflow"]["documentation"]
     )
@@ -104,7 +104,26 @@ def test_typescript_review_requires_utility_types_and_read_pages(tmp_path):
     assert pending["source_workflow"]["languages"] == ("typescript", "javascript")
     assert accepted["decision"] == "FALSE_POSITIVE"
     names = {item["name"] for item in accepted["source_workflow"]["documentation"]}
-    assert {"typescript", "javascript", "python", "csharp"} <= names
+    assert names == {"typescript", "javascript"}
+
+
+def test_python_review_does_not_fetch_unrelated_publishers(tmp_path):
+    """Request the Python page and leave Java, Crystal, and Angular unread."""
+    # Arrange
+    engine, review = _engine(tmp_path, "widget.py", "ready = True\n")
+
+    # Act
+    accepted = engine.verify_security_finding("source", source_review=review)
+
+    # Assert
+    names = {item["name"] for item in accepted["source_workflow"]["documentation"]}
+    urls = {item["url"] for item in accepted["source_workflow"]["documentation"]}
+    assert accepted["decision"] == "FALSE_POSITIVE"
+    assert names == {"python"}
+    assert "Crystal" not in " ".join(accepted["source_workflow"]["steps"])
+    assert "https://docs.oracle.com/en/java/javase/" not in urls
+    assert "https://crystal-lang.org/reference/" not in urls
+    assert "https://angular.dev/overview" not in urls
 
 
 def test_unread_language_page_blocks_the_source_conclusion(tmp_path):
