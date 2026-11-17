@@ -16,6 +16,7 @@ from gitlab_security_mcp.manifests import (
     add_nuget_reference,
     bumped_spec,
     dockerfile_images,
+    gradle_uses_enforced_platform,
     gradle_version_files,
     is_modern_yarn,
     spec_already_allows,
@@ -65,6 +66,7 @@ class Plan:
     replacement_line: str | None = None
     doc_pages: tuple[dict, ...] = ()
     gradle_configurations: tuple[str, ...] = ()
+    gradle_force: bool = False
 
     def as_dict(self) -> dict:
         """Return the plan as plain JSON-safe data."""
@@ -91,6 +93,7 @@ class Plan:
                 for page in self.doc_pages
             ],
             "gradle_configurations": list(self.gradle_configurations),
+            "gradle_force": self.gradle_force,
             "qualifiers": {
                 "status": "REQUIRED",
                 "package": self.package,
@@ -186,6 +189,24 @@ def plan_remediation(
                 "A custom Gradle override requires observed configuration evidence.",
             )
         try:
+            manifest = (finding.get("dependencyResolution") or {}).get(
+                "manifest"
+            ) or hit.manifest
+            if (
+                package_plan.strategy == "override"
+                and not package_plan.gradle_configurations
+                and manifest
+                and gradle_uses_enforced_platform(root, manifest)
+            ):
+                package_plan.gradle_force = True
+                package_plan.gradle_configurations = scopes
+                package_plan.files = [manifest]
+                package_plan.description = (
+                    f"Force only {hit.name} from {installed} to {fixed} across configurations "
+                    f"in {manifest}, which declares enforcedPlatform. Preserve the BOM and "
+                    "other coordinates; require exact resolved-version proof and a production "
+                    "build. Runtime compatibility with the platform remains unverified; no tests."
+                )
             package_plan.files = gradle_version_files(
                 root,
                 package_plan.files[0],
@@ -439,6 +460,7 @@ def apply_plan(
                     plan.package,
                     plan.target,
                     configurations=plan.gradle_configurations,
+                    force=plan.gradle_force,
                 )
                 return _applied(plan, plan.files, commands)
             if not update_gradle_version(root, manifest, plan.package, plan.target):

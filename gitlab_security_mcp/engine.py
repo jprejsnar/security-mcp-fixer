@@ -37,7 +37,7 @@ from gitlab_security_mcp.commands import (
     resolve_tool,
 )
 from gitlab_security_mcp.config_findings import assess_config, config_kind
-from gitlab_security_mcp.fanout import MAX_WORKERS
+from gitlab_security_mcp.fanout import MAX_WORKERS, map_ordered
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
 from gitlab_security_mcp.gitlab_client import GitLabClient, dismissal_is_confirmed
 from gitlab_security_mcp.manifests import (
@@ -1803,6 +1803,7 @@ class Engine:
             replacement_line=proposed.get("replacement_line"),
             doc_pages=tuple(proposed.get("doc_pages") or ()),
             gradle_configurations=tuple(proposed.get("gradle_configurations") or ()),
+            gradle_force=bool(proposed.get("gradle_force", False)),
         )
         self._progress(
             finding_id,
@@ -2021,6 +2022,22 @@ class Engine:
         }
         by_id = {change["finding_id"]: change for change in changes}
         identifiers = list(by_id)
+        groups: list[list[str]] = []
+        for finding_id in identifiers:
+            matching = next(
+                (
+                    group
+                    for group in groups
+                    if templates[group[0]]["plan"] == templates[finding_id]["plan"]
+                    and templates[group[0]]["policy_sha256"]
+                    == templates[finding_id]["policy_sha256"]
+                ),
+                None,
+            )
+            if matching is None:
+                groups.append([finding_id])
+            else:
+                matching.append(finding_id)
         baseline_tree = templates[identifiers[0]]["tree"]
         originals = {}
         expected = {}
@@ -2171,18 +2188,22 @@ class Engine:
 
         accepted = []
 
-        def retain(group: list[str]) -> None:
+        def retain(group: list[list[str]]) -> None:
             """Try a whole group before splitting so one offender costs logarithmic probes."""
-            selected = tuple(accepted + group)
+            candidates = set(accepted)
+            candidates.update(finding_id for unit in group for finding_id in unit)
+            selected = tuple(
+                finding_id for finding_id in identifiers if finding_id in candidates
+            )
             result = trial(selected)
             if result["status"] == "VALIDATION_COMPLETE":
-                accepted.extend(group)
+                accepted.extend(finding_id for unit in group for finding_id in unit)
             elif len(group) > 1:
                 middle = len(group) // 2
                 retain(group[:middle])
                 retain(group[middle:])
             else:
-                rejected[group[0]] = (
+                reason = (
                     "Rejected after production build, resolution or policy failure with retained updates "
                     + repr(accepted)
                     + ": "
@@ -2192,8 +2213,11 @@ class Engine:
                         if row.get("required") and row["status"] != "PASSED"
                     )
                 )
+                for finding_id in group[0]:
+                    rejected[finding_id] = reason
 
-        retain(identifiers)
+        retain(groups)
+        accepted = [finding_id for finding_id in identifiers if finding_id in accepted]
         selected = tuple(accepted)
         final = trial(
             selected,
@@ -2677,14 +2701,9 @@ class Engine:
                 "status": "ERROR",
                 "reason": "Assessments changed while approval was open; request a fresh approval form",
             }
-        results = []
+        records = []
         findings_by_id = {finding["id"]: finding for finding in self.state.findings}
-        for index, item in enumerate(approved, 1):
-            started = monotonic()
-            self._progress(
-                item["id"],
-                f"Verifying GitLab false-positive dismissal {index} of {len(approved)}",
-            )
+        for item in approved:
             record = {
                 "id": item["id"],
                 "vulnerability_id": item["vulnerability_id"],
@@ -2696,7 +2715,13 @@ class Engine:
                 "requested_at": utc_now_iso(),
             }
             self.state.gitlab_dismissals.append(record)
-            self._remember()
+            records.append(record)
+        self._remember()
+        self._progress(None, f"Verifying {len(approved)} approved GitLab dismissals with up to {MAX_WORKERS} workers")
+
+        def dismiss(item: dict) -> dict:
+            """Keep HTTP work detached from the caller-owned run state."""
+            started = monotonic()
             try:
                 outcome = self.gitlab.dismiss_false_positive(
                     item["vulnerability_id"],
@@ -2716,8 +2741,6 @@ class Engine:
                     raise RuntimeError(
                         "GitLab dismissal has no matching independent read-back proof"
                     )
-                record.update(outcome)
-                findings_by_id[item["id"]]["status"] = "dismissed"
             except (
                 httpx.HTTPError,
                 RuntimeError,
@@ -2725,7 +2748,7 @@ class Engine:
                 TypeError,
                 AttributeError,
             ) as exc:
-                record.update(
+                outcome = dict(
                     status="ERROR",
                     error=self.gitlab._clean(str(exc)),
                     action="Check GitLab before retrying; a failed response does not prove no remote change occurred.",
@@ -2733,16 +2756,32 @@ class Engine:
                 logger.warning(
                     "GitLab false-positive dismissal failed for %s: %s",
                     item["id"],
-                    record["error"],
+                    outcome["error"],
                 )
-            record["finished_at"] = utc_now_iso()
-            record["duration_ms"] = round((monotonic() - started) * 1000, 3)
+            return {
+                **outcome,
+                "finished_at": utc_now_iso(),
+                "duration_ms": round((monotonic() - started) * 1000, 3),
+            }
+
+        completed = 0
+
+        def record_result(index: int, outcome: dict) -> None:
+            """Persist each completed result on the serialized caller thread."""
+            nonlocal completed
+            record = records[index]
+            record.update(outcome)
+            if dismissal_is_confirmed(record):
+                findings_by_id[record["id"]]["status"] = "dismissed"
             self._remember()
-            results.append(deepcopy(record))
+            completed += 1
             self._progress(
-                item["id"],
-                f"GitLab dismissal {index} of {len(approved)}: {record['status']}",
+                record["id"],
+                f"GitLab dismissal completed {completed} of {len(approved)}: {record['status']}",
             )
+
+        map_ordered(dismiss, approved, on_result=record_result)
+        results = deepcopy(records)
         return {
             "status": "PARTIAL_FAILURE"
             if any(item["status"] != "DISMISSED" for item in results)

@@ -22,18 +22,29 @@ Result = TypeVar("Result")
 
 
 def map_ordered(
-    function: Callable[[Item], Result], items: Iterable[Item]
+    function: Callable[[Item], Result],
+    items: Iterable[Item],
+    *,
+    on_result: Callable[[int, Result], None] | None = None,
 ) -> list[Result]:
     """Apply function to each item and keep the input order.
 
     The caller owns shutdown of any client the function uses. An exception
     from function propagates after the pool finishes work it already started
     and cancels work it has not started.
+    on_result runs on the caller thread as each result arrives, before more
+    work is submitted. Its index identifies the original input position.
     """
     remaining = iter(items)
     sequence = list(islice(remaining, MAX_WORKERS))
     if len(sequence) <= 1:
-        return [function(item) for item in sequence]
+        single_results = []
+        for index, item in enumerate(sequence):
+            result = function(item)
+            if on_result is not None:
+                on_result(index, result)
+            single_results.append(result)
+        return single_results
     workers = min(MAX_WORKERS, len(sequence))
     started = perf_counter()
     error = None
@@ -51,6 +62,8 @@ def map_ordered(
                 for future in completed:
                     index = pending.pop(future)
                     results[index] = future.result()
+                    if on_result is not None:
+                        on_result(index, results[index])
                 for item in islice(remaining, len(completed)):
                     pending[pool.submit(copy_context().run, function, item)] = submitted
                     submitted += 1

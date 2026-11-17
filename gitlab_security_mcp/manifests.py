@@ -1108,6 +1108,7 @@ def add_java_override(
     version: str,
     *,
     configurations: tuple[str, ...] = (),
+    force: bool = False,
 ) -> None:
     """Pin one resolved Java coordinate without changing the enclosing BOM."""
     if not re.fullmatch(r"[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+", package):
@@ -1122,7 +1123,8 @@ def add_java_override(
             f"// security-mcp:end {package}",
         )
         owned = re.compile(
-            rf"(?m)^{re.escape(start)}\r?\n.*?^{re.escape(end)}[ \t]*$", re.DOTALL
+            rf"(?m)^{re.escape(start)}\r?\n.*?^{re.escape(end)}[ \t]*(?=\r?$)",
+            re.DOTALL,
         )
         matches = list(owned.finditer(text))
         existing = _read(properties) if properties.exists() else ""
@@ -1139,7 +1141,13 @@ def add_java_override(
             '            because("Reviewed security remediation; preserve the existing dependency graph.")\n'
             f"        }}\n    }}\n}}\n{end}"
         )
-        if configurations:
+        if force:
+            block = (
+                f"{start}\nconfigurations.configureEach {{\n"
+                f'    resolutionStrategy.force("{package}:" + project.providers.gradleProperty("{key}").get())\n'
+                f"}}\n{end}"
+            )
+        elif configurations:
             names = sorted({scope.rsplit(":", 1)[-1] for scope in configurations})
             if any(
                 re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,100}", name) is None
@@ -1295,6 +1303,19 @@ def _gradle_property_reference(root: Path, manifest: str, package: str) -> str |
         rf'"{re.escape(package)}:\$(?:\{{([A-Za-z_][\w.-]*)\}}|([A-Za-z_]\w*))"', text
     )
     return (match[1] or match[2]) if match else None
+
+
+def gradle_uses_enforced_platform(root: Path, manifest: str) -> bool:
+    """Detect explicit enforcedPlatform calls, excluding comments and quoted examples."""
+    path = _destination(root, manifest)
+    if path.name not in {"build.gradle", "build.gradle.kts"}:
+        return False
+    code = re.sub(
+        r"""(?s)/\*.*?\*/|//[^\r\n]*|(['"])\1\1.*?\1\1\1|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'""",
+        " ",
+        _read(path),
+    )
+    return re.search(r"\benforcedPlatform\s*\(", code) is not None
 
 
 def gradle_version_files(

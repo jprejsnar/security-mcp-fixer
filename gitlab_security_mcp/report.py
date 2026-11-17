@@ -63,7 +63,7 @@ def _unit_test_validation(state: RunState) -> dict:
     if not rows:
         return {
             "status": "NOT_RUN",
-            "reason": "Unit/integration tests are disabled during remediation. Test compatibility was not verified.",
+            "reason": "MCP-managed validation does not run unit/integration tests. This server has no test evidence; checks run separately by the host or developer are outside this result. Test compatibility was not verified by MCP.",
         }
     if any(row["status"] == "FAILED" for row in rows):
         return {
@@ -598,7 +598,10 @@ def render(
                     f"  Shares the unchanged edit from {change['reused_from']}; no additional dependency write or install."
                 )
     else:
-        lines.append("No files were changed.")
+        lines.append(
+            "No MCP-managed remediation edits were recorded. "
+            "Any host/manual working-tree changes are listed under Working tree."
+        )
     lines.extend(
         [
             "",

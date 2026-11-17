@@ -1510,6 +1510,193 @@ def test_source_review_changed_while_form_open_cannot_write(tmp_path, monkeypatc
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
+def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_path, monkeypatch):
+    """Overlap distinct targets, persist each result on the caller, and never retry writes."""
+    from collections import Counter
+
+    from gitlab_security_mcp.fanout import MAX_WORKERS
+
+    engine = _engine(tmp_path)
+    findings = [
+        normalize_finding(
+            {"id": f"gid://gitlab/Vulnerability/{index + 1}", "uuid": f"finding-{index}", "state": "DETECTED"},
+            None,
+        )
+        for index in range(MAX_WORKERS + 3)
+    ]
+    engine.state.findings = findings
+    engine.state.decisions = {
+        finding["id"]: {"decision": "FALSE_POSITIVE", "reason": "Synthetic reviewed finding."}
+        for finding in findings
+    }
+    approved = engine.false_positive_candidates()["candidates"][:-1]
+    caller = threading.get_ident()
+    saves = []
+    save = engine._remember
+
+    def remember():
+        assert threading.get_ident() == caller
+        save()
+        saves.append([item["status"] for item in engine.state.gitlab_dismissals])
+
+    monkeypatch.setattr(engine, "_remember", remember)
+    barrier = threading.Barrier(MAX_WORKERS, timeout=5)
+    lock = threading.Lock()
+    inflight = peak = 0
+    calls = Counter()
+
+    def handler(request):
+        nonlocal inflight, peak
+        data = json.loads(request.content)
+        vulnerability_id = data["variables"]["id"]
+        index = int(vulnerability_id.rsplit("/", 1)[-1]) - 1
+        query = data["query"]
+        operation = "target" if query == DISMISSAL_TARGET_QUERY else (
+            "confirm" if query == DISMISSAL_CONFIRMATION_QUERY else "mutation"
+        )
+        with lock:
+            calls[(index, operation)] += 1
+            inflight += 1
+            peak = max(peak, inflight)
+        try:
+            if operation == "target":
+                if index < MAX_WORKERS:
+                    saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+                    assert len(saved["gitlab_dismissals"]) == len(approved)
+                    assert all(item["status"] == "PENDING" for item in saved["gitlab_dismissals"])
+                    barrier.wait()
+            if operation == "mutation" and index == 2:
+                raise httpx.ReadTimeout("Synthetic lost mutation response", request=request)
+            node = {
+                "id": vulnerability_id,
+                "uuid": f"finding-{index}",
+                "project": {"fullPath": "group/app"},
+                "state": "DETECTED" if operation == "target" else "DISMISSED",
+                "dismissalReason": "FALSE_POSITIVE",
+            }
+            return httpx.Response(
+                200,
+                json={"data": {"vulnerabilityDismiss": {"errors": [], "vulnerability": node}}}
+                if operation == "mutation" else {"data": {"vulnerability": node}},
+            )
+        finally:
+            with lock:
+                inflight -= 1
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with GitLabClient("fixture-token", http=http) as client:
+            engine.gitlab = client
+            result = engine.dismiss_false_positives(approved)
+
+    assert 2 <= peak <= MAX_WORKERS
+    assert result["status"] == "PARTIAL_FAILURE"
+    assert result["confirmed_dismissals"] == len(approved) - 1
+    assert [item["id"] for item in result["results"]] == [item["id"] for item in approved]
+    assert saves[0] == ["PENDING"] * len(approved)
+    assert any("DISMISSED" in snapshot and "PENDING" in snapshot for snapshot in saves)
+    assert all(status != "PENDING" for status in saves[-1])
+    assert result["results"][2]["status"] == "ERROR"
+    assert not any(index == len(findings) - 1 for index, _operation in calls)
+    assert all(count == 1 for count in calls.values())
+    assert calls[(2, "confirm")] == 0
+    assert client._dismissal_locks == {}
+
+
+def test_duplicate_gitlab_target_cannot_mutate_concurrently_or_twice():
+    """A second call for the same target must observe the first persisted dismissal."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    remote = {"dismissed": False, "writes": 0}
+    lock = threading.Lock()
+    start = threading.Barrier(2, timeout=5)
+
+    def handler(request):
+        data = json.loads(request.content)
+        with lock:
+            if data["query"] == DISMISS_FALSE_POSITIVE:
+                remote["writes"] += 1
+                remote["dismissed"] = True
+            node = {
+                "id": GID,
+                "uuid": "finding-1",
+                "project": {"fullPath": "group/app"},
+                "state": "DISMISSED" if remote["dismissed"] else "DETECTED",
+                "dismissalReason": "FALSE_POSITIVE" if remote["dismissed"] else None,
+            }
+        return httpx.Response(
+            200,
+            json={"data": {"vulnerabilityDismiss": {"errors": [], "vulnerability": node}}}
+            if data["query"] == DISMISS_FALSE_POSITIVE else {"data": {"vulnerability": node}},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with GitLabClient("fixture-token", http=http) as client:
+            def dismiss():
+                start.wait()
+                return client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed fixture.")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = [future.result(timeout=5) for future in [pool.submit(dismiss), pool.submit(dismiss)]]
+
+    assert all(item["status"] == "DISMISSED" for item in results)
+    assert remote["writes"] == 1
+    assert sum(bool(item.get("already_dismissed")) for item in results) == 1
+
+
+def test_gitlab_close_waits_for_admitted_dismissals_and_rejects_new_ones():
+    """Never close an owned HTTP pool while a target is using it."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered = threading.Event()
+    release = threading.Event()
+    http = Mock()
+    client = GitLabClient("fixture-token", http=http)
+    client._owns_http = True
+
+    def admitted():
+        with client._dismissal_access(GID):
+            entered.set()
+            assert release.wait(5)
+            http.close.assert_not_called()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        active = pool.submit(admitted)
+        assert entered.wait(3)
+        closing = pool.submit(client.close)
+        try:
+            with client._idle:
+                assert client._idle.wait_for(lambda: client._closing, timeout=1)
+            assert not closing.done()
+            with pytest.raises(RuntimeError, match="closed"):
+                client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed fixture.")
+            http.close.assert_not_called()
+        finally:
+            release.set()
+        active.result(timeout=3)
+        closing.result(timeout=3)
+
+    http.close.assert_called_once()
+    assert client._closed
+
+
+def test_report_distinguishes_host_changes_and_tests_from_mcp_evidence(tmp_path):
+    """Do not contradict the archive's externally edited working tree or test execution."""
+    engine = _engine(tmp_path)
+    payload, markdown = render(
+        engine.state,
+        staged=[],
+        diff_stat="logback.xml | 2 +-",
+        diff_files=" M logback.xml",
+    )
+
+    assert "No MCP-managed remediation edits were recorded." in markdown
+    assert "No files were changed." not in markdown
+    assert "M logback.xml" in markdown
+    assert payload["unit_test_validation"]["status"] == "NOT_RUN"
+    assert "outside this result" in payload["unit_test_validation"]["reason"]
+    assert "not verified by MCP" in payload["unit_test_validation"]["reason"]
+
+
 def test_partial_failures_are_persisted_and_reported(tmp_path):
     """Preserve pending intent before the request and expose unknown remote outcomes."""
     # Arrange

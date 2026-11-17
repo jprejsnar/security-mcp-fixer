@@ -389,6 +389,18 @@ def test_gradle_build_does_not_execute_or_require_tests(tmp_path, mode, modern):
             "<project><dependencies><dependency><groupId>bom</groupId><artifactId>app</artifactId><version>1</version></dependency></dependencies></project>",
             "<artifactId>library</artifactId>",
         ),
+        (
+            "build.gradle",
+            "gradle",
+            "dependencies { implementation enforcedPlatform('bom:app:1') }\n",
+            "configurations.configureEach",
+        ),
+        (
+            "build.gradle.kts",
+            "gradle",
+            'dependencies { implementation(enforcedPlatform("bom:app:1")) }\n',
+            "configurations.configureEach",
+        ),
     ],
 )
 def test_transitive_java_override_preserves_existing_bom(
@@ -410,6 +422,11 @@ def test_transitive_java_override_preserves_existing_bom(
     assert plan.strategy == "override"
     assert result["status"] == "APPLIED"
     assert expected in path.read_text()
+    if "enforcedPlatform" in original:
+        assert plan.as_dict()["gradle_force"] is True
+        assert "resolutionStrategy.force" in path.read_text()
+        assert "strictly(" not in path.read_text()
+        assert "Runtime compatibility with the platform remains unverified" in plan.description
     assert (
         ("bom:app:1" in path.read_text())
         if manager == "gradle"
@@ -418,6 +435,53 @@ def test_transitive_java_override_preserves_existing_bom(
     assert result["files"] == (
         [filename, "gradle.properties"] if manager == "gradle" else [filename]
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("force", [False, True])
+def test_duplicate_gradle_override_preserves_owned_block_and_line_endings(
+    tmp_path, newline, force
+):
+    original = "plugins { id 'java' }\n"
+    if force:
+        original += 'dependencies { implementation(enforcedPlatform("bom:app:1")) }\n'
+    path = tmp_path / "build.gradle"
+    path.write_bytes(original.replace("\n", newline).encode())
+    hit = PackageHit(
+        "Maven", "gradle", "example:library", "1.0.0", None, "build.gradle", None, False
+    )
+    plan, reason = plan_remediation(tmp_path, {}, hit, "1.0.1")
+    assert plan is not None, reason
+
+    assert apply_plan(tmp_path, plan, Mock(), lambda name: name)["status"] == "APPLIED"
+    first = path.read_bytes()
+    assert apply_plan(tmp_path, plan, Mock(), lambda name: name)["status"] == "APPLIED"
+
+    assert path.read_bytes() == first
+    assert first.count(b"// security-mcp:start") == 1
+    assert b"\n" not in first.replace(newline.encode(), b"")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "// implementation enforcedPlatform('bom:app:1')\n",
+        "/* dependencies {\n implementation enforcedPlatform('bom:app:1')\n} */\n",
+        'description = "An enforcedPlatform(example) example"\n',
+        'description = """\nimplementation enforcedPlatform("bom:app:1")\n"""\n',
+        "description = '''\nimplementation enforcedPlatform('bom:app:1')\n'''\n",
+    ],
+)
+def test_quoted_or_commented_platform_does_not_change_override_strategy(tmp_path, source):
+    """Do not introduce a broader force because documentation mentions a platform."""
+    manifest = tmp_path / "build.gradle"
+    manifest.write_text(source)
+    hit = PackageHit("Maven", "gradle", "example:library", "1.0.0", None, manifest.name, None, False)
+
+    plan, reason = plan_remediation(tmp_path, {}, hit, "1.0.1")
+
+    assert plan is not None, reason
+    assert not plan.gradle_force
 
 
 def _review(package, ecosystem):
@@ -555,6 +619,8 @@ def test_build_only_trial_requires_known_nonmajor_versions(tmp_path, installed, 
         "success",
         "mcp",
         "build",
+        "codec_build",
+        "enforced_platform",
         "resolution",
         "checkout_changed",
         "blocked_review",
@@ -572,6 +638,8 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     # Arrange
     manifest = tmp_path / "build.gradle"
     original = "plugins { id 'java' }\ndependencies { }\n"
+    if outcome == "enforced_platform":
+        original += 'dependencies { implementation(enforcedPlatform("bom:app:1")) }\n'
     manifest.write_text(original)
     properties = tmp_path / "gradle.properties"
     properties.write_text("unrelatedPin=7.0.0\n")
@@ -594,8 +662,9 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
         assert_allowed(argv, tmp_path)
         pins = properties.read_text()
         bad = "securityMcp.example.library.version=1.0.1" in pins
-        failed = (
-            bad and outcome in {"build", "build_only_failure"} and "assemble" in argv
+        failed = "assemble" in argv and (
+            (bad and outcome in {"build", "build_only_failure"})
+            or (outcome == "codec_build" and "securityMcp.example.codec.version=1.0.1" in pins)
         )
         output = (
             "runtimeClasspath - runtime\n"
@@ -771,6 +840,8 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
             "success": "COMPLETED",
             "mcp": "COMPLETED",
             "build": "PARTIAL_FAILURE",
+            "codec_build": "PARTIAL_FAILURE",
+            "enforced_platform": "COMPLETED",
             "resolution": "PARTIAL_FAILURE",
             "checkout_changed": "BLOCKED",
             "blocked_review": "COMPLETED",
@@ -782,14 +853,14 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     text = manifest.read_text()
     pins = properties.read_text()
     assert ("securityMcp.example.library.version=1.0.1" in pins) == (
-        outcome in {"success", "mcp", "build_only"}
+        outcome in {"success", "mcp", "build_only", "codec_build", "enforced_platform"}
     )
     assert ("securityMcp.example.codec.version=1.0.1" in pins) == (
-        outcome != "checkout_changed"
+        outcome not in {"checkout_changed", "codec_build"}
     )
     assert "example:unchecked" not in text
     assert "unrelatedPin=7.0.0" in pins
-    if outcome in {"success", "mcp", "build_only"}:
+    if outcome in {"success", "mcp", "build_only", "codec_build", "enforced_platform"}:
         assert (
             "| securityMcp.example.library.version | `1.0.1` | `gradle.properties` |"
             in policy.read_text()
@@ -797,7 +868,16 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     assert engine.state.json_report_path
     if outcome != "checkout_changed":
         assert engine.state.validation_status == "VALIDATION_COMPLETE"
-    if outcome in {"success", "mcp", "build_only"}:
+    if outcome == "codec_build":
+        calls = [call.args[0] for call in runner.run.call_args_list]
+        assert sum("assemble" in argv for argv in calls) == 2
+        assert engine.state.batch_isolation[-1]["finding_ids"] == ["0", "1"]
+        assert [change["status"] for change in engine.state.changes] == ["APPLIED", "APPLIED", "ROLLED_BACK"]
+    if outcome == "enforced_platform":
+        assert "configurations.configureEach" in text
+        assert "resolutionStrategy.force" in text
+        assert "strictly(" not in text
+    if outcome in {"success", "mcp", "build_only", "enforced_platform"}:
         calls = [call.args[0] for call in runner.run.call_args_list]
         assert sum("assemble" in argv for argv in calls) == 1
         assert all("test" not in argv or argv[-2:] == ["-x", "test"] for argv in calls)

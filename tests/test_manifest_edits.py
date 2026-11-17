@@ -223,7 +223,7 @@ def test_report_discloses_unverified_tests_even_without_validation(tmp_path):
     from gitlab_security_mcp.state import RunState
 
     state = RunState()
-    warning = "Test compatibility was not verified."
+    warning = "Test compatibility was not verified by MCP."
 
     # Act
     report = write_report(tmp_path, state, staged=[], diff_stat="", diff_files="")

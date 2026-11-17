@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.32.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.34.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -36,6 +36,33 @@ requirements. An unknown current version is explicitly marked, never invented.
 Source choices show file/line and the proposed scoped action instead of raw
 dictionaries. Approval binds the displayed package versions and file scope;
 changed findings or proposed targets require fresh consent.
+
+Release 1.0.34 fixes transitive Gradle overrides in builds that explicitly use
+`enforcedPlatform(...)`. A strict constraint can conflict with the enforced BOM.
+For these overrides, the reviewed plan instead discloses a coordinate-specific
+`configurations.configureEach { resolutionStrategy.force(...) }`, backed by the
+existing centralized security-version property. The BOM and other coordinates
+are not edited. Comments and quoted examples do not enable this strategy.
+Non-runtime scoped overrides and ordinary non-enforced constraints are unchanged.
+Production builds and exact resolution in the originally observed configurations
+remain mandatory; this is not proof of runtime compatibility with the platform.
+Start a fresh run and review the new plan rather than reusing an older approval.
+
+Failed-batch isolation now groups findings with identical qualified plans and
+policy hashes. One shared dependency update is tested as a unit, avoiding
+redundant builds for duplicate findings while retaining per-finding qualification,
+resolution checks, outcomes and guarded rollback.
+
+Release 1.0.33 processes independently approved false-positive dismissals with at
+most eight workers instead of serializing the entire batch. Each target still
+requires an identity check, a single non-retried mutation and independent
+read-back proof. Concurrent calls for the same target are serialized, and client
+shutdown waits for admitted requests. Pending intents are saved before dispatch;
+completed outcomes are persisted on the calling thread as they arrive, while
+returned results retain selection order. Partial failures remain explicit.
+Reports now distinguish MCP-managed edits/tests from host/developer activity:
+an empty managed-change list does not mean the working tree is unchanged, and
+missing MCP test evidence does not establish whether someone ran tests separately.
 
 Release 1.0.32 positions both Windows checkbox dialogs on the MCP host/editor's
 monitor instead of the default screen. It follows the server's parent processes,
@@ -321,7 +348,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.32. Earlier wheels do not contain
+This summary covers changes through 1.0.34. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -1703,7 +1730,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.32-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.34-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1719,7 +1746,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.32-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.34-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1759,7 +1786,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.32-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.34-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1775,7 +1802,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.32-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.34-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1796,7 +1823,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.32-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.34-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1805,7 +1832,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.32-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.34-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -2105,7 +2132,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.32-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.34-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2139,7 +2166,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.32**
+3. Apply the deployment-specific update and verify installed version **1.0.34**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2148,7 +2175,7 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.32`
+   edits before requesting a new run. Its `server_version` must be `1.0.34`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 

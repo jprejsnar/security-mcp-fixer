@@ -6,6 +6,8 @@ import codecs
 import logging
 import re
 import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,7 +190,8 @@ class GitLabClient:
 
     The client keeps one HTTP connection pool for the life of the process.
     Call ``close`` when the server shuts down. An injected ``http`` client
-    is left for its owner to close.
+    is left for its owner to close. Approved dismissals can overlap across
+    distinct targets; the same target and client shutdown remain coordinated.
     """
 
     def __init__(
@@ -208,18 +211,52 @@ class GitLabClient:
         self.max_findings = max_findings
         self.http_log_path = http_log_path
         self._closed = False
+        self._closing = False
         self._lock = threading.RLock()
+        self._idle = threading.Condition(self._lock)
+        self._active_dismissals = 0
+        self._dismissal_locks: dict[str, tuple[threading.Lock, int]] = {}
 
     def close(self) -> None:
         """Close the owned HTTP client. Repeated calls do nothing."""
         with self._lock:
             if self._closed:
                 return
+            if self._closing:
+                self._idle.wait_for(lambda: self._closed)
+                return
+            self._closing = True
+            self._idle.wait_for(lambda: self._active_dismissals == 0)
             try:
                 if self._owns_http:
                     self.http.close()
             finally:
                 self._closed = True
+                self._idle.notify_all()
+
+    @contextmanager
+    def _dismissal_access(self, vulnerability_id: str) -> Generator[None, None, None]:
+        """Overlap distinct targets while serializing each target and owned shutdown."""
+        with self._idle:
+            if self._closed or self._closing:
+                raise RuntimeError("GitLab client is closed")
+            lock, users = self._dismissal_locks.get(
+                vulnerability_id, (threading.Lock(), 0)
+            )
+            self._dismissal_locks[vulnerability_id] = (lock, users + 1)
+            self._active_dismissals += 1
+        try:
+            with lock:
+                yield
+        finally:
+            with self._idle:
+                _lock, users = self._dismissal_locks[vulnerability_id]
+                if users == 1:
+                    del self._dismissal_locks[vulnerability_id]
+                else:
+                    self._dismissal_locks[vulnerability_id] = (lock, users - 1)
+                self._active_dismissals -= 1
+                self._idle.notify_all()
 
     def __enter__(self) -> GitLabClient:
         """Return this GitLab client for use in a context manager."""
@@ -238,7 +275,7 @@ class GitLabClient:
         calls return an error result; no GitLab mutation is performed.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 return FetchResult(ok=False, error="GitLab client is closed")
             return self._fetch(project_id)
 
@@ -311,9 +348,7 @@ class GitLabClient:
         Writes are never retried. A previously completed false-positive dismissal
         can be confirmed without writing another comment or state transition.
         """
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("GitLab client is closed")
+        with self._dismissal_access(vulnerability_id):
             if not self.token:
                 raise ValueError("GITLAB_TOKEN with API write permission is required")
             if not re.fullmatch(

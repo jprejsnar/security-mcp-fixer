@@ -978,6 +978,29 @@ def test_unexpected_doc_failure_is_logged_and_recorded(caplog):
     assert "publisher unavailable" in caplog.text
 
 
+@pytest.mark.parametrize("count", [1, 2])
+def test_fanout_persists_completions_on_caller_before_waiting_for_earlier_items(count):
+    """Deliver later completions promptly without moving persistence onto worker threads."""
+    caller = threading.get_ident()
+    release_first = threading.Event()
+    completed = []
+
+    def work(item):
+        if count > 1 and item == 0:
+            assert release_first.wait(3)
+        return item * 10
+
+    def persist(index, result):
+        assert threading.get_ident() == caller
+        completed.append((index, result))
+        release_first.set()
+
+    result = map_ordered(work, range(count), on_result=persist)
+
+    assert result == [item * 10 for item in range(count)]
+    assert completed == ([(0, 0)] if count == 1 else [(1, 10), (0, 0)])
+
+
 def test_one_item_stays_on_the_caller_and_keeps_order():
     """Avoid a worker pool when there is nothing to overlap."""
     # Arrange
