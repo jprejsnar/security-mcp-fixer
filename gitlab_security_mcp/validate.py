@@ -519,20 +519,10 @@ def _java(
         builds = [stack.java_build]
     rows: list[dict] = []
     for build in builds:
-        one = StackInfo(
-            java=True,
-            java_build=build,
-            java_builds=[build],
-            target_frameworks=[],
-            nginx_configs=[],
-            dockerfiles=[],
-            lockfiles={},
-        )
         if build == "gradle":
             rows.extend(
                 _java_gradle(
                     root,
-                    one,
                     runner,
                     which,
                     timeout,
@@ -545,7 +535,6 @@ def _java(
             rows.extend(
                 _java_maven(
                     root,
-                    one,
                     runner,
                     which,
                     timeout,
@@ -559,7 +548,6 @@ def _java(
 
 def _java_gradle(
     root: Path,
-    stack: StackInfo,
     runner,
     which,
     timeout: int,
@@ -611,7 +599,6 @@ def _java_gradle(
 
 def _java_maven(
     root: Path,
-    stack: StackInfo,
     runner,
     which,
     timeout: int,
@@ -621,7 +608,6 @@ def _java_maven(
     lint_only: bool = False,
 ) -> list[dict]:
     """Run the Maven wrapper or the installed Maven tool."""
-    del stack
     wrapper = _wrapper(root, "mvnw")
     tool = wrapper or resolve_tool("mvn", which)
     if not tool:

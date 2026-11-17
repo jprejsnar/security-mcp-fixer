@@ -2426,6 +2426,14 @@ security table at the end of the final response, not only file paths.
 
 ## Development and tests
 
+Keep transport and forms in [the MCP server](gitlab_security_mcp/server.py),
+live workflow/authorization in [the engine](gitlab_security_mcp/engine.py), and
+discovery, evidence validation and product checks in their existing helper modules.
+Helpers take only the inputs they use; package review validates evidence without
+returning a source-edit plan. Python 3.11+ supplies `tomllib` directly.
+Retain tests for active safety contracts; remove obsolete scaffolding and tests
+for deleted behavior, not callbacks or platform paths merely absent from one run.
+
 Run development commands from this MCP project's root. Use the equivalent
 `.venv/bin/python` executable on macOS/Linux.
 

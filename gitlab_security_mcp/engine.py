@@ -1241,7 +1241,7 @@ class Engine:
             self._progress(
                 finding_id, "Reviewing exact-target APIs, callers, and license policy"
             )
-            source_before = review_package(self.repo_root, review)
+            review_package(review)
             major_review = review_major_upgrade(self.repo_root, plan, review)
             policy = self._package_policy(plan, review)
             tree = tree_snapshot(self.repo_root)
@@ -1270,7 +1270,7 @@ class Engine:
                 major_review = review_major_upgrade(self.repo_root, plan, review)
             validate_edits(
                 self.repo_root,
-                {"tree": tree, "source_before": {}, "package_script_hashes": scripts},
+                {"tree": tree, "package_script_hashes": scripts},
                 [],
             )
             receipt = {
@@ -1280,7 +1280,6 @@ class Engine:
                 "review": deepcopy(review),
                 "major_review": major_review,
                 **policy,
-                "source_before": source_before,
                 "tree": tree,
                 "package_script_hashes": scripts,
                 "baseline_results": baseline["results"],
@@ -1985,10 +1984,6 @@ class Engine:
             outcome["results"].extend(checks)
             if any(row["status"] != "PASSED" for row in checks):
                 outcome["status"] = "VALIDATION_FAILED"
-        for change in package_changes:
-            finding = self._finding(change["finding_id"])
-            receipt = (finding or {}).get("packageQualification") or {}
-            allowed_files.extend(receipt.get("source_before") or [])
         for change in package_changes:
             finding = self._finding(change["finding_id"])
             receipt = (finding or {}).get("packageQualification") or {}

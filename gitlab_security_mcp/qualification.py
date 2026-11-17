@@ -84,7 +84,7 @@ def _sources(value: object, label: str) -> list[str]:
     return value
 
 
-def review_package(root: Path, review: dict) -> dict[str, str | None]:
+def review_package(review: dict) -> None:
     """Require compatibility evidence without production or test adaptations."""
     if not isinstance(review, dict):
         raise ValueError("Package review must be an object")
@@ -120,7 +120,6 @@ def review_package(root: Path, review: dict) -> dict[str, str | None]:
         raise ValueError(
             "Package version updates cannot require production or unit-test code changes; source_fixes must be []"
         )
-    return {}
 
 
 def _package_reference(package: str) -> re.Pattern[str]:

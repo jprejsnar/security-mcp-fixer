@@ -892,20 +892,6 @@ def _source_engine(tmp_path):
     return engine, source, review
 
 
-def _source_context(sampling=False):
-    """Provide an SDK context that forbids deprecated sampling requests."""
-    session = Mock()
-    session.client_capabilities = ClientCapabilities.model_validate(
-        {"sampling": {}} if sampling else {}
-    )
-    session.create_message = AsyncMock(
-        side_effect=AssertionError("Deprecated sampling must not be used")
-    )
-    return Context(
-        request_context=SimpleNamespace(session=session, request_id="verification")
-    )
-
-
 @pytest.mark.parametrize("receipt", ["valid", "missing", "wrong_url", "over_limit"])
 def test_source_record_coverage_requires_every_named_record_receipt(receipt):
     """Missing or capped-away records cannot pass a vacuous all-success check."""
@@ -1031,9 +1017,8 @@ def test_false_positive_explanation_length_requires_concise_reassessment(
         ("nginx/conf.d/site.conf", "server_tokens off;\n"),
     ],
 )
-@pytest.mark.parametrize("sampling", [True, False])
 def test_sdk_reviews_all_supported_source_and_configuration_types(
-    tmp_path, monkeypatch, name, content, sampling
+    tmp_path, monkeypatch, name, content
 ):
     """Supply complete cited files to host AI for every requested code/config type."""
     # Arrange
@@ -1051,7 +1036,7 @@ def test_sdk_reviews_all_supported_source_and_configuration_types(
             "assessment": "Read the full cited fixture; it does not implement the reported Spring endpoint.",
         }
     ]
-    ctx = _source_context(sampling=sampling)
+    ctx = Context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     tool = Tool.from_function(server.verify_security_finding)
 
@@ -1066,7 +1051,6 @@ def test_sdk_reviews_all_supported_source_and_configuration_types(
     assert initial["decision"] == "SOURCE_REVIEW_REQUIRED"
     assert initial["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
     cited = initial["ai_source_review"]["cited_source"]
-    ctx.session.create_message.assert_not_called()
     assert cited["content"] == source.read_bytes().decode("utf-8")
     assert cited["sha256"] == review["reviewed_files"][0]["sha256"]
     engine.gitlab.dismiss_false_positive.assert_not_called()
@@ -1109,7 +1093,7 @@ def test_sdk_verification_requests_ai_source_and_input_flow_review(
             "assessment": "Traced the caller's literal route.",
         }
     )
-    ctx = _source_context()
+    ctx = Context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     tool = Tool.from_function(server.verify_security_finding)
 
@@ -1135,20 +1119,17 @@ def test_sdk_verification_requests_ai_source_and_input_flow_review(
     assert pending["ai_source_review"]["cited_source"][
         "content"
     ] == source.read_bytes().decode("utf-8")
-    ctx.session.create_message.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
     assert bool(engine.false_positive_candidates()["candidates"]) is (
         decision == "FALSE_POSITIVE"
     )
 
 
-def test_host_without_sampling_receives_full_source_and_must_record_review(
-    tmp_path, monkeypatch
-):
+def test_host_receives_full_source_and_must_record_review(tmp_path, monkeypatch):
     """Give the calling AI actual source, not a generic terminal placeholder."""
     # Arrange
     engine, source, review = _source_engine(tmp_path)
-    ctx = _source_context()
+    ctx = Context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     tool = Tool.from_function(server.verify_security_finding)
 
@@ -1165,35 +1146,6 @@ def test_host_without_sampling_receives_full_source_and_must_record_review(
     ] == source.read_bytes().decode("utf-8")
     assert "must examine the full cited_source" in pending["reason"]
     assert recorded["decision"] == "FALSE_POSITIVE"
-    ctx.session.create_message.assert_not_called()
-    engine.gitlab.dismiss_false_positive.assert_not_called()
-
-
-def test_source_review_never_uses_deprecated_sampling(tmp_path, monkeypatch):
-    """Keep SDK back-channel requests unused even when sampling is advertised."""
-    # Arrange
-    engine, _source, review = _source_engine(tmp_path)
-    ctx = _source_context(sampling=True)
-    ctx.session.send_request = AsyncMock()
-    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
-
-    # Act
-    pending = asyncio.run(
-        Tool.from_function(server.verify_security_finding).run(
-            {"finding_id": "finding-1"}, ctx
-        )
-    )
-    result = asyncio.run(
-        Tool.from_function(server.verify_security_finding).run(
-            {"finding_id": "finding-1", "source_review": review}, ctx
-        )
-    )
-
-    # Assert
-    assert result["decision"] == "FALSE_POSITIVE"
-    assert pending["ai_source_review"]["status"] == "HOST_REVIEW_REQUIRED"
-    ctx.session.send_request.assert_not_called()
-    ctx.session.create_message.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
@@ -1212,7 +1164,7 @@ def test_ai_review_failures_cannot_become_false_positives(
         review["reviewed_files"][0]["path"] = "../outside.java"
     elif failure == "invalid-review":
         review = {"execute": "arbitrary command"}
-    ctx = _source_context()
+    ctx = Context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act
@@ -1227,7 +1179,6 @@ def test_ai_review_failures_cannot_become_false_positives(
     # Assert
     assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
     assert saved["decisions"]["finding-1"]["decision"] == "SOURCE_REVIEW_REQUIRED"
-    ctx.session.create_message.assert_not_called()
     assert engine.false_positive_candidates()["candidates"] == []
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -1236,7 +1187,7 @@ def test_ai_review_rejects_source_changed_during_host_review(tmp_path, monkeypat
     """Recheck full-byte evidence before storing the calling AI's conclusion."""
     # Arrange
     engine, source, review = _source_engine(tmp_path)
-    ctx = _source_context()
+    ctx = Context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act
@@ -1266,7 +1217,7 @@ def test_missing_or_oversized_source_is_not_sent_for_ai_review(
         source.unlink()
     else:
         source.write_bytes(b"x" * (MAX_REVIEW_BYTES + 1))
-    ctx = _source_context()
+    ctx = Context()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
 
     # Act
@@ -1279,7 +1230,6 @@ def test_missing_or_oversized_source_is_not_sent_for_ai_review(
     # Assert
     assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
     assert result["ai_source_review"]["status"] == "FAILED"
-    ctx.session.create_message.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 

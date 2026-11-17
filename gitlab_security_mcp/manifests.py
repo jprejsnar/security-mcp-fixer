@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from io import StringIO
@@ -491,9 +492,7 @@ def _split_maven_name(name: str) -> tuple[str | None, str | None]:
     return None, name
 
 
-def locate_gradle(
-    root: Path, name: str, hinted: str | None, files: list[Path]
-) -> PackageHit | None:
+def locate_gradle(root: Path, name: str, files: list[Path]) -> PackageHit | None:
     """Locate a Gradle coordinate in build files or a version catalog."""
     group, artifact = _split_maven_name(name)
     coordinate = f"{group}:{artifact}" if group else None
@@ -665,10 +664,6 @@ def gradle_report_package(
 def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None:
     """Resolve supported inline or referenced Gradle catalog versions."""
     try:
-        import tomllib
-    except ModuleNotFoundError:
-        return None
-    try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"Could not parse {path}") from exc
@@ -676,7 +671,7 @@ def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None
     libraries = data.get("libraries") or {}
     if not isinstance(versions, dict) or not isinstance(libraries, dict):
         raise ValueError(f"{path}: versions and libraries must be TOML tables")
-    for _key, library in libraries.items():
+    for library in libraries.values():
         if not isinstance(library, dict):
             continue
         module = library.get("module")
@@ -708,9 +703,7 @@ def _nested_nuget(name: str) -> str:
     )
 
 
-def locate_nuget(
-    root: Path, name: str, hinted: str | None, files: list[Path]
-) -> PackageHit | None:
+def locate_nuget(root: Path, name: str, files: list[Path]) -> PackageHit | None:
     """Locate a NuGet reference in project or central package metadata."""
     pattern = re.compile(
         rf'<PackageReference\s+Include="{re.escape(name)}"\s+Version="([^"]+)"',
@@ -798,10 +791,10 @@ def locate_package(
         truncated = False
     hit = (
         locate_npm(root, name, hinted_version, files)
-        or locate_nuget(root, name, hinted_version, files)
+        or locate_nuget(root, name, files)
         or locate_nuget_lock(root, name, files)
         or locate_maven(root, name, hinted_version, files)
-        or locate_gradle(root, name, hinted_version, files)
+        or locate_gradle(root, name, files)
     )
     search_truncated = bool(truncated)
     if hit is not None:
@@ -1150,10 +1143,6 @@ def _replace_plugin(text: str, plugin_id: str, version: str) -> tuple[str, int]:
 
 def _toml_plugin_version(path: Path, plugin_id: str) -> tuple[str, str] | None:
     """Return a catalog plugin version and ``inline`` or its version ref."""
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        return None
     try:
         data = tomllib.loads(_read(path))
     except tomllib.TOMLDecodeError:

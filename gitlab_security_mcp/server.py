@@ -796,7 +796,6 @@ def list_security_findings(
 )
 async def verify_security_finding(
     finding_id: str,
-    ctx: Context,
     repo_root: str | None = None,
     source_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -841,7 +840,7 @@ async def verify_security_finding(
             "next_tool": "verify_security_finding",
         }
         return result
-    except (MCPError, OSError, ValueError, TimeoutError) as exc:
+    except (OSError, ValueError) as exc:
         reason = (
             f"AI source review could not complete: {selected.gitlab._clean(str(exc))}. "
             "The host AI must examine the source and submit an evidence-backed "

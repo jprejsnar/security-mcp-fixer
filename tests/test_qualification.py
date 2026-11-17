@@ -1272,7 +1272,7 @@ def test_existing_lint_issues_are_saved_before_security_updates(
 @pytest.mark.parametrize("target", ["2.0.0", "1.1.0", "1.0.1", "1.0.0.1"])
 @pytest.mark.parametrize("source_path", ["app.ts", "app.test.ts"])
 def test_every_package_increment_rejects_code_adaptations(
-    tmp_path, package_review, target, source_path
+    package_review, target, source_path
 ):
     """Every package increment rejects code adaptations."""
     # Arrange
@@ -1285,7 +1285,7 @@ def test_every_package_increment_rejects_code_adaptations(
     with pytest.raises(
         ValueError, match="cannot require production or unit-test code changes"
     ) as raised:
-        review_package(tmp_path, package_review)
+        review_package(package_review)
 
     # Assert
     assert "cannot require production or unit-test code changes" in str(raised.value)
@@ -1964,16 +1964,14 @@ def test_unapproved_license_or_version_is_refused(tmp_path, package_policy, key,
         ("source_fixes", None),
     ],
 )
-def test_unknown_or_breaking_compatibility_is_refused(
-    tmp_path, package_review, field, value
-):
+def test_unknown_or_breaking_compatibility_is_refused(package_review, field, value):
     """Never infer framework compatibility from a same-major version bump."""
     # Arrange
     package_review[field] = value
 
     # Act
     with pytest.raises(ValueError) as raised:
-        review_package(tmp_path, package_review)
+        review_package(package_review)
 
     # Assert
     assert isinstance(raised.value, ValueError)
@@ -2332,7 +2330,7 @@ def test_documentation_and_check_definitions_are_required(
 
     # Act
     with pytest.raises(ValueError):
-        review_package(tmp_path, package_review)
+        review_package(package_review)
     # Assert
     with pytest.raises(ValueError):
         load_policy(tmp_path, path, plan)
@@ -2372,17 +2370,12 @@ def test_checks_require_positive_untruncated_success(
 @pytest.mark.parametrize(
     "mode", ["small", "rewrite", "rewrite_increments", "undeclared", "delete"]
 )
-def test_source_changes_are_rejected_even_when_listed_as_allowed(
-    tmp_path, package_review, mode
-):
+def test_source_changes_are_rejected_even_when_listed_as_allowed(tmp_path, mode):
     """Reject every source adaptation, including small edits and deletions."""
     # Arrange
     source = tmp_path / "app.ts"
     source.write_text("oldApi();\n", encoding="utf-8")
-    receipt = {
-        "source_before": review_package(tmp_path, package_review),
-        "tree": tree_snapshot(tmp_path),
-    }
+    receipt = {"tree": tree_snapshot(tmp_path)}
     replacement = "++counter;\n" if mode == "rewrite_increments" else "newApi();\n"
     source.write_text(
         replacement * (201 if mode.startswith("rewrite") else 1), encoding="utf-8"
