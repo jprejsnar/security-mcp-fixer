@@ -172,13 +172,29 @@ class DesktopApproval:
         return response
 
     async def close(self) -> None:
-        """Close and reap only this server-owned dialog process."""
-        if self.process.returncode is None:
+        """Close the dialog pipes and reap only this server-owned process."""
+        process = self.process
+        if process.returncode is None:
             try:
-                self.process.terminate()
+                process.terminate()
             except ProcessLookupError:
                 pass
-        await self.process.wait()
+        _close_stream(process.stdin)
+        _close_stream(process.stdout)
+        _close_stream(process.stderr)
+        await process.wait()
+
+
+def _close_stream(stream: object) -> None:
+    """Close one subprocess pipe transport once. A second close is a no-op."""
+    if stream is None:
+        return
+    transport = getattr(stream, "transport", None)
+    if transport is None:
+        transport = getattr(stream, "_transport", None)
+    if transport is None or transport.is_closing():
+        return
+    transport.close()
 
 
 async def open_dialog(message: str, properties: dict) -> DesktopApproval:

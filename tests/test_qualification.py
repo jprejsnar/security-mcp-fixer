@@ -2367,6 +2367,36 @@ def test_checks_require_positive_untruncated_success(
     assert all(row["status"] == expected and row["required"] for row in rows)
 
 
+def test_tree_snapshot_stops_at_the_byte_budget_before_later_files(
+    tmp_path, monkeypatch
+):
+    """Do not open another file after the bytes already read cross the limit."""
+    # Arrange
+    from pathlib import Path
+
+    from gitlab_security_mcp import qualification
+
+    monkeypatch.setattr(qualification, "MAX_TREE_BYTES", 10)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_bytes(b"123456")
+    opened = []
+    real_open = Path.open
+
+    def tracking_open(self, *args, **kwargs):
+        """Record content reads without changing how the file is hashed."""
+        opened.append(self.name)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    # Act
+    with pytest.raises(ValueError, match="qualification size limit"):
+        qualification.tree_snapshot(tmp_path)
+
+    # Assert
+    assert len(opened) == 2
+
+
 @pytest.mark.parametrize(
     "mode", ["small", "rewrite", "rewrite_increments", "undeclared", "delete"]
 )

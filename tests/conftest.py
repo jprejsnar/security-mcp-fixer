@@ -69,6 +69,28 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
+@pytest.fixture(autouse=True)
+def _close_http_clients(monkeypatch):
+    """Close every httpx client a test opens, including clients the product must not own."""
+    import httpx
+
+    opened: list[httpx.Client] = []
+    client_type = httpx.Client
+
+    class TrackingClient(client_type):
+        """Remember clients so the test fixture can close them."""
+
+        def __init__(self, *args, **kwargs):
+            """Open the client and retain it for fixture cleanup."""
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    monkeypatch.setattr(httpx, "Client", TrackingClient)
+    yield
+    for client in opened:
+        client.close()
+
+
 def documentation_client(pages: dict[str, str] | None = None):
     """Serve publisher markers locally so tests can authorize an edit offline."""
     import httpx

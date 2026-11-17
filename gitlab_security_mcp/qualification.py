@@ -563,7 +563,11 @@ def run_checks(
 
 
 def tree_snapshot(root: Path) -> dict[str, str]:
-    """Hash a bounded, pruned checkout to invalidate stale qualification."""
+    """Hash a bounded, pruned checkout to invalidate stale qualification.
+
+    The byte budget is the running total of bytes read. The next file is not
+    opened after that total crosses the limit, and no partial snapshot is returned.
+    """
     files, truncated = iter_files(root)
     if truncated:
         raise ValueError(
@@ -572,8 +576,8 @@ def tree_snapshot(root: Path) -> dict[str, str]:
     hashes = {}
     total = 0
     for path in files:
-        relative = path.relative_to(root).as_posix()
-        if any(part in ARTIFACT_DIRS for part in path.relative_to(root).parts):
+        relative = path.relative_to(root)
+        if any(part in ARTIFACT_DIRS for part in relative.parts):
             continue
         digest = hashlib.sha256()
         with path.open("rb") as stream:
@@ -584,7 +588,7 @@ def tree_snapshot(root: Path) -> dict[str, str]:
                         "Checkout snapshot exceeds the qualification size limit"
                     )
                 digest.update(block)
-        hashes[relative] = digest.hexdigest()
+        hashes[relative.as_posix()] = digest.hexdigest()
     return hashes
 
 

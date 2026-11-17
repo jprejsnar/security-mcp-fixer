@@ -903,11 +903,12 @@ def add_npm_override(
             if not isinstance(overrides, dict):
                 raise ValueError("pnpm workspace overrides must contain a mapping")
             overrides[package] = version
-            stream = StringIO()
-            yaml.dump(data, stream)
+            with StringIO() as stream:
+                yaml.dump(data, stream)
+                rendered = stream.getvalue()
         except YAMLError as exc:
             raise ValueError("Could not parse pnpm-workspace.yaml safely") from exc
-        _write(path, stream.getvalue())
+        _write(path, rendered)
         return manifest
     data = _read_json(path)
     if manager == "pnpm":

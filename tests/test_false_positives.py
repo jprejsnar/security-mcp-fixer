@@ -282,6 +282,84 @@ $timer.Dispose()
     )
 
 
+def test_desktop_close_reaps_the_process_and_closes_its_pipes():
+    """Close stdin, stdout, and stderr when the approval process is stopped."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp.desktop_approval import DesktopApproval
+
+    async def exercise():
+        """Stop a live child before it can exit on its own."""
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        dialog = DesktopApproval(process)
+        await dialog.close()
+        return process
+
+    # Act
+    process = asyncio.run(exercise())
+
+    # Assert
+    def closed(stream: object) -> bool:
+        """Return whether the pipe transport has been closed or dropped."""
+        transport = getattr(stream, "transport", None)
+        if transport is None:
+            transport = getattr(stream, "_transport", None)
+        return transport is None or transport.is_closing()
+
+    assert process.returncode is not None
+    assert closed(process.stdin)
+    assert closed(process.stdout)
+    assert closed(process.stderr)
+
+
+def test_desktop_close_after_the_response_closes_pipes_again():
+    """Close pipes again after the response reader has already closed them."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp.desktop_approval import DesktopApproval
+
+    async def exercise():
+        """Read a cancel response, then close the finished dialog."""
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import json,sys; sys.stdout.write(json.dumps({'action':'cancel'}))",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        dialog = DesktopApproval(process)
+        response = await dialog.wait()
+        await dialog.close()
+        return response, process
+
+    def closed(stream: object) -> bool:
+        """Return whether the pipe transport has been closed or dropped."""
+        transport = getattr(stream, "transport", None)
+        if transport is None:
+            transport = getattr(stream, "_transport", None)
+        return transport is None or transport.is_closing()
+
+    # Act
+    response, process = asyncio.run(exercise())
+
+    # Assert
+    assert response == {"action": "cancel"}
+    assert process.returncode == 0
+    assert closed(process.stdin)
+    assert closed(process.stdout)
+    assert closed(process.stderr)
+
+
 def test_concurrent_desktop_requests_share_one_starting_window(tmp_path, monkeypatch):
     """Reserve a window atomically before awaiting its native startup."""
     # Arrange
