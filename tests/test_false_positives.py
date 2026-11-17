@@ -1085,9 +1085,18 @@ def test_false_positive_explanation_length_requires_concise_reassessment(
     ("name", "content"),
     [
         ("Endpoint.java", 'class Endpoint { String route = "/status"; }\n'),
+        (
+            "backend/src/main/java/Endpoint.java",
+            'class Endpoint { String route = "/status"; }\n',
+        ),
         ("Endpoint.cs", 'class Endpoint { public const string Route = "/status"; }\n'),
         ("endpoint.ts", 'export const route: string = "/status";\n'),
         ("endpoint.js", 'const route = "/status";\n'),
+        ("frontend/endpoint.js", 'const route = "/status";\n'),
+        (
+            "backend/Endpoint.cs",
+            'class Endpoint { public const string Route = "/status"; }\n',
+        ),
         ("endpoint.py", 'route = "/status"\n'),
         ("Dockerfile", "FROM scratch\n"),
         ("Dockerfile.production", "FROM scratch\n"),

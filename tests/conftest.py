@@ -114,7 +114,7 @@ def approve_package_for_test(root: Path, plan: dict) -> dict:
     """Write synthetic approval and review evidence only in fixture roots."""
     import json
 
-    from gitlab_security_mcp.qualification import CHECK_KINDS, _check_args
+    from gitlab_security_mcp.qualification import _check_args
 
     manager = plan["manager"]
     if manager in {"npm", "pnpm", "yarn"}:
@@ -156,7 +156,7 @@ def approve_package_for_test(root: Path, plan: dict) -> dict:
                     "argv": [tool, *_check_args(manager, kind)],
                     "success_marker": "ok",
                 }
-                for kind in CHECK_KINDS
+                for kind in ("build", "runtime", "license_audit")
             }
         },
     }

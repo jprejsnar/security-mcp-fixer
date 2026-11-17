@@ -94,7 +94,7 @@ class Plan:
                     "Review complete official package documentation and API changes.",
                     "Require no production/unit-test API adaptations or check-script changes for any version increment.",
                     "Review target-version license terms; obey configured corporate policy when present.",
-                    "Record baseline/post lint diagnostics; require no lint errors, successful production builds and executed passing unit tests, plus all configured policy checks.",
+                    "Record informational baseline lint diagnostics; require successful production builds and configured non-test policy checks. Application unit tests are disabled; test compatibility was not verified. A corporate policy requiring tests blocks remediation.",
                 ],
             }
             if self.ecosystem in {"npm", "NuGet", "Maven"}
@@ -549,6 +549,12 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
             )
         edited.append(manifest)
     if any(path.endswith("packages.lock.json") for path in plan.files):
+        lock = next(path for path in plan.files if path.endswith("packages.lock.json"))
+        resolved = resolve_inside(root, lock)
+        if resolved is None:
+            raise ValueError(
+                f"Refusing a lockfile refresh outside the repository: {lock}"
+            )
         tool = resolve_tool("dotnet", which)
         if not tool:
             return _failed(
@@ -557,7 +563,12 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
                 "dotnet is not on PATH, so packages.lock.json was not refreshed.",
                 edited,
             )
-        result = runner.run([tool, "restore"], timeout=PACKAGE_TIMEOUT, check=False)
+        result = runner.run(
+            [tool, "restore"],
+            timeout=PACKAGE_TIMEOUT,
+            check=False,
+            cwd=resolved.parent,
+        )
         commands.append(result.display())
         if result.exit_code != 0:
             return _failed(
@@ -567,7 +578,6 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
                 edited,
                 commands,
             )
-        lock = next(path for path in plan.files if path.endswith("packages.lock.json"))
         edited.append(lock)
     return _applied(plan, edited, commands)
 

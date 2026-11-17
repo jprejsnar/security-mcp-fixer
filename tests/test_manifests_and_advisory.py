@@ -294,6 +294,86 @@ def test_nested_pnpm_plan_applies_only_in_frontend(
     assert not (tmp_path / "package.json").exists()
 
 
+@pytest.mark.parametrize("directory", ["backend", "backend/Api"])
+@pytest.mark.parametrize("direct", [True, False])
+def test_nested_nuget_update_restores_backend_without_changing_frontend(
+    tmp_path, directory, direct
+):
+    """Refresh the owning backend's lockfile in a split Node/.NET checkout."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.remediate import apply_plan
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    frontend_manifest = frontend / "package.json"
+    frontend_contents = '{"dependencies":{"lodash":"4.17.21"}}'
+    frontend_manifest.write_text(frontend_contents, encoding="utf-8")
+    backend = tmp_path.joinpath(*directory.split("/"))
+    backend.mkdir(parents=True)
+    project = backend / "App.csproj"
+    reference = (
+        '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />'
+        if direct
+        else ""
+    )
+    project.write_text(
+        "<Project>\n<PropertyGroup><TargetFramework>net10.0</TargetFramework>"
+        f"</PropertyGroup>\n<ItemGroup>\n{reference}\n</ItemGroup>\n</Project>\n",
+        encoding="utf-8",
+    )
+    lock = backend / "packages.lock.json"
+    lock.write_text(
+        json.dumps(
+            {"dependencies": {"net10.0": {"Newtonsoft.Json": {"resolved": "13.0.1"}}}}
+        ),
+        encoding="utf-8",
+    )
+    hit, _truncated = locate_package(tmp_path, "Newtonsoft.Json", "13.0.1")
+    plan, reason = plan_remediation(tmp_path, {}, hit, "13.0.3")
+    assert plan is not None, reason
+    runner = Mock()
+
+    def restore(argv, **kwargs):
+        """Model dotnet restore requiring a project in its working directory."""
+        correct_directory = kwargs.get("cwd", tmp_path) == backend
+        if correct_directory:
+            data = json.loads(lock.read_text(encoding="utf-8"))
+            data["dependencies"]["net10.0"]["Newtonsoft.Json"]["resolved"] = "13.0.3"
+            lock.write_text(json.dumps(data), encoding="utf-8")
+        return CommandResult(
+            argv,
+            0 if correct_directory else 1,
+            "",
+            "" if correct_directory else "No project or solution in this directory",
+            0,
+            False,
+            "",
+            "",
+        )
+
+    runner.run.side_effect = restore
+
+    # Act
+    result = apply_plan(tmp_path, plan, runner, lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED", result
+    assert runner.run.call_args.args[0] == ["dotnet", "restore"]
+    assert runner.run.call_args.kwargs["cwd"] == backend
+    assert 'Version="13.0.3"' in project.read_text(encoding="utf-8")
+    assert (
+        json.loads(lock.read_text(encoding="utf-8"))["dependencies"]["net10.0"][
+            "Newtonsoft.Json"
+        ]["resolved"]
+        == "13.0.3"
+    )
+    assert frontend_manifest.read_text(encoding="utf-8") == frontend_contents
+    assert not (tmp_path / "packages.lock.json").exists()
+
+
 @pytest.mark.parametrize("ecosystem", ["npm", "NuGet", "Maven"])
 def test_package_plans_require_version_specific_qualifiers(ecosystem):
     """Attach compatibility, approval, and test obligations to package fixes."""

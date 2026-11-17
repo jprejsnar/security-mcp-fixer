@@ -154,9 +154,13 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
             info.java = True
             if "maven" not in info.java_builds:
                 info.java_builds.append("maven")
-        elif (
-            name in {"build.gradle", "build.gradle.kts"} or name == "libs.versions.toml"
-        ):
+        elif name in {
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "libs.versions.toml",
+        }:
             info.java = True
             if "gradle" not in info.java_builds:
                 info.java_builds.append("gradle")
@@ -180,6 +184,106 @@ def detect_stack(root: Path, files: list[Path] | None = None) -> StackInfo:
         # single-build label and retain every detected build for validation.
         info.java_build = info.java_builds[-1]
     return info
+
+
+def java_build_roots(
+    root: Path, manager: str, files: list[Path] | None = None
+) -> list[Path]:
+    """Find independent Java builds without repeating declared reactor modules."""
+    if files is None:
+        files, truncated = iter_files(root)
+        if truncated:
+            raise ValueError(
+                "Java build discovery was truncated; manual review is required"
+            )
+    if manager == "gradle":
+        settings = {
+            path.parent
+            for path in files
+            if path.name in {"settings.gradle", "settings.gradle.kts"}
+        }
+        directories = (
+            settings
+            | {
+                path.parent
+                for path in files
+                if path.name in {"build.gradle", "build.gradle.kts"}
+            }
+            | {
+                path.parent.parent if path.parent.name == "gradle" else path.parent
+                for path in files
+                if path.name == "libs.versions.toml"
+            }
+        )
+        return sorted(
+            {
+                next(
+                    (
+                        parent
+                        for parent in (directory, *directory.parents)
+                        if parent in settings
+                    ),
+                    directory,
+                )
+                for directory in directories
+            }
+        )
+    if manager != "maven":
+        raise ValueError(f"Unknown Java build manager: {manager}")
+    poms = {path.resolve() for path in files if path.name == "pom.xml"}
+    included = set()
+    members: dict[Path, set[Path]] = {}
+    for path in poms:
+        members[path] = set()
+        try:
+            project = ET.parse(path).getroot()
+        except ET.ParseError as exc:
+            raise ValueError(f"Could not parse {path}") from exc
+        for modules in project:
+            if _local(modules.tag) != "modules":
+                continue
+            for module in modules:
+                if _local(module.tag) != "module" or not module.text:
+                    continue
+                directory = resolve_inside(root, path.parent / module.text.strip())
+                if directory is None:
+                    raise ValueError("Maven module must stay inside the repository")
+                pom = (
+                    directory if directory.name == "pom.xml" else directory / "pom.xml"
+                )
+                if pom in poms:
+                    included.add(pom)
+                    members[path].add(pom)
+    roots = sorted(path.parent for path in poms - included)
+    pending = list(poms - included)
+    visited = set()
+    while pending:
+        path = pending.pop()
+        if path not in visited:
+            visited.add(path)
+            pending.extend(members[path] - visited)
+    if poms - visited:
+        raise ValueError("Maven reactor modules contain a cycle")
+    return roots
+
+
+def java_project_root(
+    root: Path, manifest: str | Path, manager: str, files: list[Path] | None = None
+) -> Path:
+    """Resolve a manifest or catalog to its owning Java build."""
+    path = resolve_inside(root, manifest)
+    if path is None:
+        raise ValueError("Java project must stay inside the repository")
+    candidates = [
+        directory
+        for directory in java_build_roots(root, manager, files)
+        if path.is_relative_to(directory)
+    ]
+    if candidates:
+        return max(candidates, key=lambda directory: len(directory.parts))
+    if path.name == "libs.versions.toml" and path.parent.name == "gradle":
+        return path.parent.parent
+    return path.parent
 
 
 def is_modern_yarn(root: Path) -> bool:

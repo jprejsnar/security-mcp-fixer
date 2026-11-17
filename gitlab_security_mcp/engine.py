@@ -80,7 +80,12 @@ from gitlab_security_mcp.util import (
     logged_lock,
     resolve_inside,
 )
-from gitlab_security_mcp.validate import _wrapper, lint_rule_inventory, run_validation
+from gitlab_security_mcp.validate import (
+    java_wrapper,
+    lint_rule_inventory,
+    node_test_blocker,
+    run_validation,
+)
 from gitlab_security_mcp.versions import (
     is_major_upgrade,
     lowest_fixed,
@@ -690,6 +695,9 @@ class Engine:
                     "pnpm is required for post-pull clean/install but is not on PATH"
                 )
             for step in ("clean", "install"):
+                reason = node_test_blocker(root, [tool, step])
+                if reason:
+                    raise RuntimeError(reason)
                 self._progress(
                     None, f"Post-pull pnpm {step} in {root.relative_to(self.repo_root)}"
                 )
@@ -1250,7 +1258,7 @@ class Engine:
             if not lint_recorded:
                 self._progress(
                     finding_id,
-                    "Recording informational lint only; build and all unit tests run after the complete batch",
+                    "Recording informational lint only; production builds run after the complete batch; application unit tests are disabled",
                 )
                 baseline = run_validation(
                     self.repo_root,
@@ -1274,7 +1282,7 @@ class Engine:
                 [],
             )
             receipt = {
-                "check_contract": "lint-baseline-build-unit-no-code-v2",
+                "check_contract": "lint-baseline-build-no-tests-no-code-v3",
                 "status": "QUALIFIED",
                 "plan": deepcopy(plan),
                 "review": deepcopy(review),
@@ -1317,7 +1325,7 @@ class Engine:
             "lint_rules_path": str(
                 self.repo_root / ".security-mcp" / "lint-rules.json"
             ),
-            "note": "Apply all reviewed package updates, then run one final production build and all unit tests. Existing lint issues are informational. Failed batches require isolation and guarded rollback.",
+            "note": "Apply all reviewed package updates, then run one final production build and non-test checks. Application unit tests are disabled; test compatibility was not verified. Existing lint issues are informational. Failed batches require isolation and guarded rollback.",
         }
 
     @_serialized
@@ -1401,7 +1409,7 @@ class Engine:
                     receipt.get("status") != "QUALIFIED"
                     or receipt.get("plan") != proposed
                     or receipt.get("check_contract")
-                    != "lint-baseline-build-unit-no-code-v2"
+                    != "lint-baseline-build-no-tests-no-code-v3"
                 ):
                     raise ValueError(
                         "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
@@ -1607,7 +1615,7 @@ class Engine:
             "finding_id": finding_id,
             "change": change,
             "continue_with_next_finding": outcome.get("continue_with_next_finding"),
-            "note": "Initial lint issues are recorded separately. Not accepted until production builds, all unit tests, and configured policy checks pass. Production/unit-test code and check scripts must remain unchanged.",
+            "note": "Initial lint issues are recorded separately. Not accepted until production builds and configured non-test policy checks pass. Application unit tests are disabled; test compatibility was not verified. A policy requiring tests blocks remediation. Production/unit-test code and check scripts must remain unchanged.",
         }
 
     @_serialized
@@ -1846,7 +1854,7 @@ class Engine:
                 retain(group[middle:])
             else:
                 rejected[group[0]] = (
-                    "Rejected after build/test or policy failure with retained updates "
+                    "Rejected after build or policy failure with retained updates "
                     + repr(accepted)
                     + ": "
                     + "; ".join(
@@ -1901,7 +1909,7 @@ class Engine:
                 final.update(
                     status="FIX_REJECTED",
                     continue_with_next_finding=True,
-                    reason="All candidates rejected; the restored baseline build and all unit tests passed.",
+                    reason="All candidates rejected; the restored baseline build and non-test checks passed. Test compatibility was not verified.",
                 )
                 self.state.status = "FIXES_IN_PROGRESS"
         else:
@@ -1948,7 +1956,8 @@ class Engine:
         }
         for change in package_changes:
             self._progress(
-                change["finding_id"], "Running post-update build and all unit tests"
+                change["finding_id"],
+                "Running post-update build and non-test checks; application unit tests are disabled",
             )
         validation_runner = _ValidationRunner(self.runner, self.repo_root)
         outcome = run_validation(
@@ -1992,7 +2001,7 @@ class Engine:
                     raise ValueError("Package qualification is missing")
                 if (
                     receipt.get("check_contract")
-                    != "lint-baseline-build-unit-no-code-v2"
+                    != "lint-baseline-build-no-tests-no-code-v3"
                 ):
                     raise ValueError(
                         "Package qualification predates mandatory lint/no-code checks; requalification is required"
@@ -2011,7 +2020,7 @@ class Engine:
                 )
                 if outcome["status"] != "VALIDATION_COMPLETE":
                     raise ValueError(
-                        "Product build/unit validation failed or is incomplete; candidate cannot be accepted"
+                        "Product build validation failed or is incomplete; candidate cannot be accepted"
                     )
                 checks = run_checks(
                     self.repo_root,
@@ -2065,7 +2074,7 @@ class Engine:
             self._progress(change["finding_id"], f"Post-update validation: {status}")
             if status == "VALIDATED":
                 change["detail"] = (
-                    "Accepted: no production/unit-test API changes; initial lint issues recorded separately; production build and all unit tests passed; configured policy checks passed"
+                    "Accepted: no production/unit-test API changes; initial lint issues recorded separately; production build and configured non-test policy checks passed. Application unit tests were not run; test compatibility was not verified."
                 )
             else:
                 failures = [
@@ -2545,7 +2554,7 @@ class Engine:
                 valid = (
                     snapshot is not None
                     and receipt.get("check_contract")
-                    == "lint-baseline-build-unit-no-code-v2"
+                    == "lint-baseline-build-no-tests-no-code-v3"
                     and receipt.get("validated_tree") == snapshot
                     and receipt.get("policy_sha256") == policy["policy_sha256"]
                 )
@@ -2592,11 +2601,9 @@ class Engine:
         }
         entry = None
         try:
-            tool = (
-                _wrapper(manifest.parent, "gradlew")
-                or _wrapper(self.repo_root, "gradlew")
-                or resolve_tool("gradle", self.which)
-            )
+            tool = java_wrapper(
+                manifest.parent, self.repo_root, "gradlew"
+            ) or resolve_tool("gradle", self.which)
             if not tool:
                 raise ValueError(
                     "Gradle wrapper and gradle are unavailable; dependency tree not inspected."
@@ -2849,7 +2856,8 @@ class Engine:
                 "the approved checkout, separately from dependency updates. This server's "
                 "apply_minimal_fix cannot apply arbitrary application-code patches.",
                 "Rerun the identical reproduction and boundary/valid-input cases, lint, "
-                "production build and executed unit tests. Retain before/after evidence. "
+                "production build and non-test checks. Do not execute application unit tests; "
+                "test compatibility was not verified. Retain before/after evidence. "
                 "Keep the finding unresolved until those checks have passed; do not "
                 "fabricate evidence, dismiss GitLab findings, commit or push.",
             ]
@@ -3239,7 +3247,7 @@ class Engine:
             )
         if plan.ecosystem in PACKAGE_ECOSYSTEMS:
             evidence.append(
-                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply all reviewed updates, then require a passing final build, all unit tests and configured checks."
+                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply all reviewed updates, then require a passing final build and configured non-test checks. Application unit tests are disabled; test compatibility was not verified. A policy requiring tests is a blocker."
             )
             if major_upgrade:
                 evidence.append(

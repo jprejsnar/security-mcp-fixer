@@ -292,6 +292,7 @@ def _maven_ok(args: list[str]) -> bool:
     return args in (
         ["--version"],
         ["--batch-mode", "clean", "verify"],
+        ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
         ["--batch-mode", "dependency:tree"],
         [
             "--batch-mode",
@@ -312,6 +313,7 @@ def _gradle_ok(args: list[str]) -> bool:
         ["--no-daemon", "checkstyleMain", "checkstyleTest"],
         ["--no-daemon", "test"],
         ["--no-daemon", "build"],
+        ["--no-daemon", "assemble"],
         ["--no-daemon", "securitySmoke"],
         ["--no-daemon", "securityLicenses"],
     )

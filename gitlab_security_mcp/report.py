@@ -351,6 +351,10 @@ def render(
         "changes_made": state.changes,
         "fix_selection": state.fix_selection,
         "validation_status": state.validation_status,
+        "unit_test_validation": {
+            "status": "NOT_RUN",
+            "reason": "Application unit tests are disabled during security remediation. Test compatibility was not verified.",
+        },
         "validation": state.validation_results,
         "validation_caveats": _validation_caveats(state),
         "batch_isolation": state.batch_isolation,
@@ -529,7 +533,7 @@ def render(
             "Observed rule names: .security-mcp/lint-rules.json"
             if state.lint_baseline is not None
             else "No rule inventory recorded.",
-            "Existing lint issues are recorded separately from final batch build and unit-test acceptance.",
+            "Existing lint issues are recorded separately from final batch build acceptance.",
         ]
     )
     if payload["dependency_resolutions"]:
@@ -601,6 +605,9 @@ def render(
                         lines.append(f"  {key}: {failure[key]}")
     payload["final_summary_markdown"] = "\n".join(
         [
+            "## Unit-test validation",
+            payload["unit_test_validation"]["reason"],
+            "",
             *(
                 [
                     "## Validation caveats",
@@ -744,6 +751,7 @@ def write_report(
         "review_status": payload["review_status"],
         "source_review_queue": payload["source_review_queue"],
         "final_summary_markdown": payload["final_summary_markdown"],
+        "unit_test_validation": payload["unit_test_validation"],
         "human_report": str(human_path),
         "json_report": str(json_path),
         "http_timings_path": str(root / payload["http_timings_file"]),

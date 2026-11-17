@@ -66,6 +66,12 @@ Each tool description is the procedure for that step.
 9. generate_aaa_test only for a supported base-image change
 10. run_validation_matrix once for the batch
 11. complete_security_run, which offers the human approval checkboxes once
+Never run application unit tests during remediation, including test discovery,
+test commands embedded in build scripts, or diagnostic/rollback retries.
+Keep production builds and non-test checks. If configured corporate policy
+requires tests, report a blocker; never run or silently bypass that requirement.
+Reports must state that test compatibility was not verified. These rules apply
+to host-led source fixes too, not only server-managed package updates.
 Do not open an approval form during finding verification. Only the human may
 select or submit. Do not infer approval, poll AWAITING_HUMAN, or commit, push,
 or open a merge request. Only the human form may dismiss a finding. Unknown
@@ -644,7 +650,7 @@ def qualify_package_update(
     compatible_without_code_changes=true, api_changes,
     frameworks [{name, version, source_url, assessment}], source_fixes=[].
     Neither production nor test callers may need adaptations. Lint capture is
-    informational; apply the batch before build/unit tests.
+    informational; apply the batch before production builds. Unit tests are disabled.
     Without corporate policy, include license {expression, sources,
     commercial_use_permitted:true, no_license_fees:true, obligations, assessment}.
     For proposed major_upgrade=true, include major_upgrade {scan_id from
@@ -694,7 +700,7 @@ def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str
     )
 )
 def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
-    """Validate all pending updates with one final build, all unit tests and policy checks.
+    """Validate pending updates with a production build and non-test policy checks.
 
     Read isolation_trials/rejected_updates; stop on incomplete recovery or cleanup.
     """

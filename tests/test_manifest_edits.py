@@ -1,6 +1,7 @@
 """Check minimal manifest edits, atomic publication, and failure cleanup."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -88,6 +89,132 @@ def test_invalid_validation_metadata_fails_closed(tmp_path, contents):
     assert any(
         row["required"] and row["status"] == "FAILED" for row in result["results"]
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "contents", "expected"),
+    [
+        ("package.json", '{"scripts":{"build":"vite build"}}', ["npm", "run", "build"]),
+        (
+            "App.csproj",
+            "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>",
+            ["dotnet", "build", "--configuration", "Release", "--nologo"],
+        ),
+        (
+            "pom.xml",
+            "<project/>",
+            ["mvn", "--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
+        ),
+        (
+            "build.gradle",
+            "plugins { id 'java' }",
+            ["gradle", "--no-daemon", "assemble"],
+        ),
+    ],
+)
+def test_remediation_builds_each_stack_without_executing_unit_tests(
+    tmp_path, name, contents, expected
+):
+    """Keep actual build checks while omitting test tasks and discovery entirely."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult, assert_allowed
+    from gitlab_security_mcp.validate import run_validation
+
+    (tmp_path / name).write_text(contents, encoding="utf-8")
+    runner = Mock()
+
+    def execute(argv, **kwargs):
+        """Validate real command shapes without invoking application toolchains."""
+        assert_allowed(argv, tmp_path)
+        assert "test" not in argv and "--listTests" not in argv
+        assert "verify" not in argv
+        text = 'openjdk version "17.0.1"' if argv[0] == "java" else "10.0.100"
+        return CommandResult(argv, 0, text, "", 0, False, "", "")
+
+    runner.run.side_effect = execute
+
+    # Act
+    result = run_validation(
+        tmp_path,
+        runner,
+        lambda name: name,
+        timeout=30,
+        package_checks=True,
+        skip_lint=True,
+    )
+
+    # Assert
+    commands = [call.args[0] for call in runner.run.call_args_list]
+    assert expected in commands
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    skipped = next(row for row in result["results"] if row.get("kind") == "unit_tests")
+    assert skipped["status"] == "SKIPPED" and not skipped["required"]
+    assert "Test compatibility was not verified" in skipped["detail"]
+
+
+@pytest.mark.parametrize(
+    "scripts",
+    [
+        {"build": "npm test"},
+        {"build": "vite build", "postbuild": "vitest run"},
+        {"build": "pnpm run verify", "verify": "pnpm run ci", "ci": "jest"},
+        {"build": "pnpm verify", "verify": "node --test"},
+        {"build": "vite build", "postinstall": "npm test"},
+    ],
+)
+def test_node_build_or_install_cannot_indirectly_run_tests(tmp_path, scripts):
+    """Block known script chains and hooks instead of silently running unit tests."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.validate import run_validation
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": scripts}), encoding="utf-8"
+    )
+    runner = Mock()
+    runner.run.return_value = CommandResult([], 0, "", "", 0, False, "", "")
+
+    # Act
+    result = run_validation(
+        tmp_path,
+        runner,
+        lambda name: name,
+        timeout=30,
+        package_checks=True,
+        skip_lint=True,
+    )
+
+    # Assert
+    assert result["status"] == "VALIDATION_FAILED"
+    commands = [call.args[0] for call in runner.run.call_args_list]
+    assert ["npm", "run", "build"] not in commands
+    if "postinstall" in scripts:
+        assert ["npm", "ci"] not in commands
+    assert any("disabled" in row.get("detail", "") for row in result["results"])
+
+
+def test_report_discloses_unverified_tests_even_without_validation(tmp_path):
+    """Persist the unit-test limitation even when no fixes were approved."""
+    # Arrange
+    from gitlab_security_mcp.report import write_report
+    from gitlab_security_mcp.state import RunState
+
+    state = RunState()
+    warning = "Test compatibility was not verified."
+
+    # Act
+    report = write_report(tmp_path, state, staged=[], diff_stat="", diff_files="")
+    saved = json.loads(Path(report["json_report"]).read_text(encoding="utf-8"))
+
+    # Assert
+    assert report["unit_test_validation"]["status"] == "NOT_RUN"
+    assert warning in report["final_summary_markdown"]
+    assert saved["unit_test_validation"] == report["unit_test_validation"]
+    assert warning in Path(report["human_report"]).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("contents", ["null", "[]", '{"scripts":[]}', "bad-json"])
@@ -423,6 +550,184 @@ def test_maven_and_gradle_builds_are_both_validated(tmp_path):
     assert "mvn" in tools
     assert "gradle" in tools
     assert result["status"] == "VALIDATION_COMPLETE"
+
+
+@pytest.mark.parametrize("manager", ["gradle", "maven"])
+@pytest.mark.parametrize("wrapper_at_checkout", [False, True])
+def test_nested_java_validation_uses_component_and_available_wrapper(
+    tmp_path, manager, wrapper_at_checkout
+):
+    """Run nested Java builds and dependency inspection in the owning directory."""
+    # Arrange
+    import os
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult, assert_allowed
+    from gitlab_security_mcp.validate import run_validation
+
+    component = tmp_path / "services" / "backend"
+    component.mkdir(parents=True)
+    filename = "build.gradle.kts" if manager == "gradle" else "pom.xml"
+    contents = "plugins { java }\n" if manager == "gradle" else "<project />"
+    (component / filename).write_text(contents, encoding="utf-8")
+    wrapper_dir = tmp_path if wrapper_at_checkout else component
+    wrapper_name = "gradlew" if manager == "gradle" else "mvnw"
+    suffix = (".bat" if manager == "gradle" else ".cmd") if os.name == "nt" else ""
+    wrapper = wrapper_dir / (wrapper_name + suffix)
+    wrapper.write_text("", encoding="utf-8")
+    runner = Mock()
+
+    def run(argv, **kwargs):
+        """Check the real allowlist without executing repository build code."""
+        assert_allowed(argv, tmp_path)
+        return CommandResult(argv, 0, 'openjdk version "17.0.1"', "", 0, False, "", "")
+
+    runner.run.side_effect = run
+
+    # Act
+    result = run_validation(
+        tmp_path,
+        runner,
+        lambda name: name if name == "java" else None,
+        timeout=30,
+        package_checks=True,
+        skip_lint=True,
+    )
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    calls = [call for call in runner.run.call_args_list if call.args[0][0] != "java"]
+    assert len(calls) == 2
+    assert all(call.args[0][0] == str(wrapper) for call in calls)
+    assert all(call.kwargs["cwd"] == component for call in calls)
+    assert all("test" not in call.args[0][1:] for call in calls)
+
+
+@pytest.mark.parametrize("manager", ["gradle", "maven"])
+def test_java_reactors_build_once_without_hiding_independent_projects(
+    tmp_path, manager
+):
+    """Build included modules together and independently configured builds separately."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.validate import run_validation
+
+    component = tmp_path / "backend"
+    child = component / "api"
+    independent = component / "independent"
+    child.mkdir(parents=True)
+    independent.mkdir()
+    if manager == "gradle":
+        (component / "settings.gradle.kts").write_text(
+            'include("api")\n', encoding="utf-8"
+        )
+        (child / "build.gradle.kts").write_text("plugins { java }\n", encoding="utf-8")
+        (independent / "settings.gradle.kts").write_text(
+            'rootProject.name = "independent"\n', encoding="utf-8"
+        )
+        (independent / "build.gradle.kts").write_text(
+            "plugins { java }\n", encoding="utf-8"
+        )
+    else:
+        (component / "pom.xml").write_text(
+            "<project><modules><module>api</module></modules></project>",
+            encoding="utf-8",
+        )
+        (child / "pom.xml").write_text("<project />", encoding="utf-8")
+        (independent / "pom.xml").write_text("<project />", encoding="utf-8")
+    runner = Mock()
+    runner.run.side_effect = lambda argv, **kwargs: CommandResult(
+        argv, 0, 'openjdk version "17.0.1"', "", 0, False, "", ""
+    )
+
+    # Act
+    result = run_validation(
+        tmp_path,
+        runner,
+        lambda name: name,
+        timeout=30,
+        package_checks=True,
+        skip_lint=True,
+    )
+
+    # Assert
+    assert result["status"] == "VALIDATION_COMPLETE", result
+    builds = [
+        call
+        for call in runner.run.call_args_list
+        if "assemble" in call.args[0] or "package" in call.args[0]
+    ]
+    assert [call.kwargs["cwd"] for call in builds] == [component, independent]
+
+
+def test_gradle_catalog_policy_checks_use_build_root_and_nested_wrapper(tmp_path):
+    """A version-catalog edit runs corporate checks from its Gradle settings root."""
+    # Arrange
+    import os
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.commands import CommandResult
+    from gitlab_security_mcp.qualification import run_checks
+
+    component = tmp_path / "backend"
+    catalog_dir = component / "gradle"
+    catalog_dir.mkdir(parents=True)
+    (component / "settings.gradle").write_text("", encoding="utf-8")
+    (catalog_dir / "libs.versions.toml").write_text("[versions]\n", encoding="utf-8")
+    wrapper = component / ("gradlew.bat" if os.name == "nt" else "gradlew")
+    wrapper.write_text("", encoding="utf-8")
+    checks = {
+        kind: {
+            "argv": ["gradlew", "--no-daemon", task],
+            "success_marker": "CHECK_PASSED",
+        }
+        for kind, task in (
+            ("build", "assemble"),
+            ("runtime", "securitySmoke"),
+            ("license_audit", "securityLicenses"),
+        )
+    }
+    runner = Mock()
+    runner.run.side_effect = lambda argv, **kwargs: CommandResult(
+        argv, 0, "CHECK_PASSED", "", 0, False, "", ""
+    )
+    plan = {"manager": "gradle", "files": ["backend/gradle/libs.versions.toml"]}
+
+    # Act
+    rows = run_checks(tmp_path, checks, runner, lambda name: None, 30, plan=plan)
+
+    # Assert
+    assert all(row["status"] == "PASSED" for row in rows), rows
+    assert runner.run.call_count == 3
+    assert all(call.args[0][0] == str(wrapper) for call in runner.run.call_args_list)
+    assert all(call.kwargs["cwd"] == component for call in runner.run.call_args_list)
+
+
+def test_java_discovery_does_not_hide_cyclic_maven_reactors(tmp_path):
+    """Reject an unreachable cyclic reactor even when another build is valid."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp.validate import run_validation
+
+    for name, module in (("a", "../b"), ("b", "../a"), ("independent", None)):
+        directory = tmp_path / name
+        directory.mkdir()
+        modules = f"<modules><module>{module}</module></modules>" if module else ""
+        (directory / "pom.xml").write_text(
+            f"<project>{modules}</project>", encoding="utf-8"
+        )
+    runner = Mock()
+
+    # Act
+    result = run_validation(tmp_path, runner, lambda name: None, timeout=30)
+
+    # Assert
+    assert result["status"] == "VALIDATION_FAILED"
+    assert "cycle" in result["results"][0]["detail"]
+    runner.run.assert_not_called()
 
 
 def test_gradle_plugin_version_updates_one_declaration(tmp_path):

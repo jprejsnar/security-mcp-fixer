@@ -16,12 +16,17 @@ from subprocess import SubprocessError
 from urllib.parse import urlparse
 
 from gitlab_security_mcp.commands import assert_allowed, resolve_tool, tool_name
-from gitlab_security_mcp.manifests import iter_files
+from gitlab_security_mcp.manifests import iter_files, java_project_root
 from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
-from gitlab_security_mcp.validate import _run_result, _wrapper
+from gitlab_security_mcp.validate import _run_result, java_wrapper, node_test_blocker
 
 PACKAGE_ECOSYSTEMS = {"npm", "NuGet", "Maven"}
 CHECK_KINDS = ("build", "unit_tests", "runtime", "license_audit")
+TEST_POLICY_BLOCKER = (
+    "Corporate policy requires application test execution, but unit tests are "
+    "disabled during security remediation. No policy checks were run or bypassed. "
+    "Have the policy owner resolve this conflict outside remediation."
+)
 ARTIFACT_DIRS = {
     ".gradle",
     ".angular",
@@ -287,7 +292,7 @@ def _check_args(manager: str, kind: str) -> list[str]:
         return args
     if manager == "maven":
         return {
-            "build": ["--batch-mode", "clean", "verify"],
+            "build": ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
             "unit_tests": ["--batch-mode", "test"],
             "runtime": ["--batch-mode", "-Psecurity-smoke", "verify"],
             "license_audit": ["--batch-mode", "-Psecurity-licenses", "verify"],
@@ -296,7 +301,7 @@ def _check_args(manager: str, kind: str) -> list[str]:
         return [
             "--no-daemon",
             {
-                "build": "build",
+                "build": "assemble",
                 "unit_tests": "test",
                 "runtime": "securitySmoke",
                 "license_audit": "securityLicenses",
@@ -369,10 +374,10 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
         ).get("scripts", {})
         if not isinstance(scripts, dict) or any(
             not isinstance(scripts.get(kind), str) or not scripts[kind].strip()
-            for kind in ("build", "test")
+            for kind in ("build",)
         ):
             raise ValueError(
-                "Package updates require existing build and test scripts; missing checks cannot count as passing"
+                "Package updates require an existing build script; missing checks cannot count as passing"
             )
     fingerprint = {
         "mode": "documentation_review",
@@ -390,6 +395,31 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
             json.dumps(fingerprint, sort_keys=True).encode()
         ).hexdigest(),
     }
+
+
+def _policy_requires_tests(checks: dict) -> bool:
+    """Reject explicit test checks and build lifecycles that implicitly run tests."""
+    if "unit_tests" in checks:
+        return True
+    for check in checks.values():
+        if not isinstance(check, dict) or not isinstance(check.get("argv"), list):
+            continue
+        argv = check["argv"]
+        if not argv or not all(isinstance(arg, str) for arg in argv):
+            continue
+        manager = tool_name(argv[0])
+        args = argv[1:]
+        if any(arg == "test" or arg.startswith("test:") for arg in args):
+            return True
+        if manager in {"mvn", "mvnw"} and any(
+            arg in {"verify", "install", "deploy", "integration-test"} for arg in args
+        ):
+            return True
+        if manager in {"gradle", "gradlew"} and any(
+            arg in {"build", "check", "test"} for arg in args
+        ):
+            return True
+    return False
 
 
 def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
@@ -445,10 +475,12 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     _sources(approval.get("license_sources"), "License terms")
     all_checks = policy.get("checks")
     checks = all_checks.get(plan["ecosystem"]) if isinstance(all_checks, dict) else None
-    if not isinstance(checks, dict) or set(checks) != set(CHECK_KINDS):
-        raise ValueError(
-            "Policy must require build, unit_tests, runtime, and license_audit checks"
-        )
+    if not isinstance(checks, dict) or not (
+        {"build", "runtime", "license_audit"} <= set(checks) <= set(CHECK_KINDS)
+    ):
+        raise ValueError("Policy must require build, runtime, and license_audit checks")
+    if _policy_requires_tests(checks):
+        raise ValueError(TEST_POLICY_BLOCKER)
     manager = plan.get("manager")
     tools = {
         "npm": {"npm"},
@@ -458,6 +490,7 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         "maven": {"mvn", "mvnw"},
         "gradle": {"gradle", "gradlew"},
     }.get(manager, set())
+    workdir = _check_workdir(root, plan)
     for kind, check in checks.items():
         if not isinstance(check, dict):
             raise ValueError("Qualification checks must be objects")
@@ -476,12 +509,39 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
             )
         _text(check.get("success_marker"), f"{kind} success marker")
         assert_allowed(argv, root)
+        if node_test_blocker(workdir, argv):
+            raise ValueError(TEST_POLICY_BLOCKER)
     return {
         "approval": approval,
         "policy_mode": "corporate_policy",
         "checks": checks,
         "policy_sha256": hashlib.sha256(raw).hexdigest(),
     }
+
+
+def _check_workdir(root: Path, plan: dict | None) -> Path:
+    """Resolve checks to the owning component or Java reactor."""
+    if plan and plan.get("manager") in {"gradle", "maven"}:
+        filename = "build.gradle" if plan["manager"] == "gradle" else "pom.xml"
+        return java_project_root(
+            root, next(iter(plan.get("files", [])), filename), plan["manager"]
+        )
+    if not plan or plan.get("manager") not in {"npm", "pnpm", "yarn"}:
+        return root
+    entry = next(
+        (
+            path
+            for path in plan.get("files", [])
+            if Path(path).name in {"pnpm-lock.yaml", "yarn.lock", "package-lock.json"}
+        ),
+        next(iter(plan.get("files", [])), "package.json"),
+    )
+    resolved = resolve_inside(root, entry)
+    if resolved is None:
+        raise ValueError(
+            "Qualification working directory must stay inside the repository"
+        )
+    return resolved.parent
 
 
 def run_checks(
@@ -495,23 +555,25 @@ def run_checks(
     that prove actual checks ran rather than accepting empty test runs.
     Record expected execution errors per check; interrupts still propagate.
     """
-    workdir = root
-    if plan and plan.get("manager") in {"npm", "pnpm", "yarn"}:
-        entry = next(
-            (
-                path
-                for path in plan.get("files", [])
-                if Path(path).name
-                in {"pnpm-lock.yaml", "yarn.lock", "package-lock.json"}
-            ),
-            next(iter(plan.get("files", [])), "package.json"),
-        )
-        resolved = resolve_inside(root, entry)
-        if resolved is None:
-            raise ValueError(
-                "Qualification working directory must stay inside the repository"
-            )
-        workdir = resolved.parent
+    if _policy_requires_tests(checks):
+        return [
+            {
+                "status": "FAILED",
+                "required": True,
+                "kind": "policy_conflict",
+                "detail": TEST_POLICY_BLOCKER,
+            }
+        ]
+    workdir = _check_workdir(root, plan)
+    if any(node_test_blocker(workdir, check["argv"]) for check in checks.values()):
+        return [
+            {
+                "status": "FAILED",
+                "required": True,
+                "kind": "policy_conflict",
+                "detail": TEST_POLICY_BLOCKER,
+            }
+        ]
     rows = []
     for kind in CHECK_KINDS:
         if kind not in checks:
@@ -520,7 +582,7 @@ def run_checks(
         executable = check["argv"][0]
         try:
             if tool_name(executable) in {"mvnw", "gradlew"}:
-                tool = _wrapper(root, tool_name(executable))
+                tool = java_wrapper(workdir, root, tool_name(executable))
             else:
                 tool = resolve_tool(executable, which)
             if not tool:

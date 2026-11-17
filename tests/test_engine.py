@@ -1610,7 +1610,9 @@ def test_report_tool_delivers_security_report_as_mcp_text(repo, monkeypatch):
     assert isinstance(result, CallToolResult)
     text = result.content[-1].text
     assert text == result.structured_content["final_summary_markdown"]
-    assert text.startswith("## Finding Assessments")
+    assert text.startswith("## Unit-test validation")
+    assert "Test compatibility was not verified" in text
+    assert "## Finding Assessments" in text
     assert text.rstrip().endswith(result.structured_content["unresolved_issues_table"])
 
 
@@ -2047,7 +2049,9 @@ def test_unresolved_table_does_not_claim_unverified_findings_are_resolved():
         ("dotnet", "10.0.100", "VALIDATION_COMPLETE"),
         ("dotnet", "9.0.305", "VALIDATION_FAILED"),
         ("java", 'openjdk version "17.0.16" 2025-07-15', "VALIDATION_COMPLETE"),
-        ("java", 'openjdk version "21.0.8" 2025-07-15', "VALIDATION_FAILED"),
+        ("java", 'openjdk version "21.0.8" 2025-07-15', "VALIDATION_COMPLETE"),
+        ("java", 'openjdk version "25.0.1" 2026-10-20', "VALIDATION_COMPLETE"),
+        ("java", 'openjdk version "11.0.8"', "VALIDATION_FAILED"),
         ("java", "unreadable runtime version", "VALIDATION_FAILED"),
     ],
 )
@@ -2130,9 +2134,13 @@ def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename
     assert result["status"] == "VALIDATION_COMPLETE"
     assert runner.run.call_args_list[0].args[0] == ["dotnet", "--version"]
     assert ["dotnet", "restore"] in [call.args[0] for call in runner.run.call_args_list]
-    assert ["dotnet", "test", "--configuration", "Release", "--nologo"] in [
+    assert ["dotnet", "build", "--configuration", "Release", "--nologo"] in [
         call.args[0] for call in runner.run.call_args_list
     ]
+    assert all("test" not in call.args[0] for call in runner.run.call_args_list)
+    skipped = [row for row in result["results"] if row.get("kind") == "unit_tests"]
+    assert len(skipped) == 1 and skipped[0]["status"] == "SKIPPED"
+    assert skipped[0]["required"] is False
 
 
 @pytest.mark.parametrize(
@@ -2222,13 +2230,23 @@ def test_advisory_verified_dependency_fix_across_stacks(
     engine.package_policy_path = (
         tmp_path / ".security-mcp" / "package-update-policy.json"
     )
+    if manager in {"nuget", "maven"}:
+        engine.package_policy_path.unlink()
+        review["license"] = {
+            "expression": "MIT",
+            "sources": ["https://example.test/license"],
+            "commercial_use_permitted": True,
+            "no_license_fees": True,
+            "obligations": "Retain notices",
+            "assessment": "Reviewed fixture target license terms",
+        }
     qualified = engine.qualify_package_update("cross-stack", review)
     applied = engine.apply_minimal_fix("cross-stack")
 
     # Assert
     assert verified["decision"] == "CHANGE_REQUIRED"
     assert verified["proposed_fix"]["manager"] == manager
-    assert qualified["status"] == "QUALIFIED"
+    assert qualified["status"] == "QUALIFIED", qualified
     assert applied["status"] == "APPLIED"
     assert target in (tmp_path / filename).read_text(encoding="utf-8")
     assert installed not in (tmp_path / filename).read_text(encoding="utf-8")
@@ -2413,6 +2431,65 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
         assert finding["dependencyResolution"]["status"] != "RESOLVED"
         assert any("Gradle" in evidence for evidence in first["evidence"])
     assert not engine.state.false_positives
+
+
+def test_nested_gradle_dependency_inspection_finds_enclosing_wrapper(tmp_path):
+    """Keep subproject dependency scope while resolving an ancestor's wrapper."""
+    # Arrange
+    import os
+    from unittest.mock import Mock
+
+    backend = tmp_path / "backend"
+    module = backend / "api"
+    module.mkdir(parents=True)
+    (backend / "settings.gradle").write_text("include 'api'\n", encoding="utf-8")
+    (module / "build.gradle").write_text("dependencies { }\n", encoding="utf-8")
+    wrapper = backend / ("gradlew.bat" if os.name == "nt" else "gradlew")
+    wrapper.write_text("", encoding="utf-8")
+    finding = _finding("nested", "io.example/library", "CVE-TEST", "1.0.0")
+    finding["location"] = {"file": "backend/api/build.gradle"}
+    finding["solution"] = "Upgrade to version 1.2.0."
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        [str(wrapper), "--no-daemon", "dependencies"],
+        0,
+        "+--- io.example:library:1.0.0 -> 1.1.0\n",
+        "",
+        0,
+        False,
+        "",
+        "",
+    )
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved",
+        affected=True,
+        lowest_fixed_version="1.2.0",
+        fixed_versions=["1.2.0"],
+        summary="Fixed in 1.2.0.",
+    )
+    engine = Engine(
+        tmp_path,
+        runner=runner,
+        gitlab=Mock(),
+        advisory=advisory,
+        which=lambda name: None,
+    )
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [finding]
+
+    # Act
+    result = engine.verify_security_finding("nested")
+
+    # Assert
+    assert result["decision"] == "MANUAL_REVIEW"
+    assert finding["dependencyResolution"]["status"] == "RESOLVED"
+    assert finding["dependencyResolution"]["version"] == "1.1.0"
+    assert runner.run.call_args.args[0][0] == str(wrapper)
+    assert runner.run.call_args.kwargs["cwd"] == module
+    advisory.lookup.assert_called_once_with(
+        finding, "Maven", "io.example:library", "1.1.0"
+    )
 
 
 def test_canonical_maven_coordinate_can_use_explicit_gitlab_target(tmp_path):

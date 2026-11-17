@@ -9,13 +9,19 @@ from collections.abc import Callable
 from pathlib import Path
 from subprocess import SubprocessError
 
-from gitlab_security_mcp.commands import CommandResult, CommandRunner, resolve_tool
+from gitlab_security_mcp.commands import (
+    CommandResult,
+    CommandRunner,
+    resolve_tool,
+    tool_name,
+)
 from gitlab_security_mcp.manifests import (
     StackInfo,
     _read_json,
     detect_stack,
     is_modern_yarn,
     iter_files,
+    java_build_roots,
 )
 
 
@@ -30,7 +36,7 @@ def run_validation(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> dict:
-    """Run product checks, or capture informational lint without product work."""
+    """Run builds and non-test checks; application unit tests are never invoked."""
     try:
         return _run_validation(
             root,
@@ -157,16 +163,8 @@ def _run_validation(
         )
     if package_checks:
         present = {row.get("kind") for row in results}
-        if "build_and_unit_tests" in present:
-            present.update({"build", "unit_tests"})
         kinds = (
-            ("lint",)
-            if lint_only
-            else (
-                ("build", "unit_tests")
-                if skip_lint
-                else ("lint", "build", "unit_tests")
-            )
+            ("lint",) if lint_only else (("build",) if skip_lint else ("lint", "build"))
         )
         for kind in kinds:
             if kind not in present:
@@ -178,6 +176,19 @@ def _run_validation(
                 )
                 row["kind"] = kind
                 results.append(row)
+    if not lint_only:
+        results.append(
+            {
+                **_row(
+                    None,
+                    "SKIPPED",
+                    False,
+                    "Application unit tests are disabled during security remediation. "
+                    "Test compatibility was not verified.",
+                ),
+                "kind": "unit_tests",
+            }
+        )
     if record_lint or lint_only:
         for row in results:
             if lint_only:
@@ -215,7 +226,7 @@ def _run_validation(
 
 
 def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
-    """Probe runtimes and enforce Java 17 and net10.0 SDK requirements."""
+    """Probe runtimes and enforce Java 17+ and net10.0 SDK requirements."""
     probes = []
     if stack.node:
         probes.append(("node", ["--version"]))
@@ -238,7 +249,9 @@ def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
         compatible = True
         if name == "java" and not _java_major(text, 17):
             compatible = False
-            detail = f"{detail}. Expected Java 17 for this validation matrix."
+            detail = (
+                f"{detail}. Java 17 or newer is required for this validation matrix."
+            )
         if requires_net10:
             sdk = re.match(r"(\d+)\.\d+\.\d+", text)
             if sdk is None or int(sdk.group(1)) < 10:
@@ -264,11 +277,74 @@ def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
 
 
 def _java_major(text: str, expected: int) -> bool:
-    """Require a readable Java version matching the requested major."""
+    """Require a readable Java version meeting the minimum major."""
     match = re.search(r'version "(?P<major>\d+)', text)
     if not match:
         return False
-    return int(match.group("major")) == expected
+    return int(match.group("major")) >= expected
+
+
+def node_test_blocker(root: Path, argv: list[str]) -> str | None:
+    """Block known test runners in Node scripts and their reachable lifecycle hooks.
+
+    Repository scripts are trusted executable code, not a sandbox. This catches
+    explicit test commands and script chains; the host must inspect custom tools.
+    """
+    if not argv or tool_name(argv[0]) not in {"npm", "pnpm", "yarn"}:
+        return None
+    args = argv[1:]
+    if not args:
+        return None
+    scripts = (_read_json(root / "package.json") or {}).get("scripts", {})
+    if not isinstance(scripts, dict):
+        raise ValueError("package.json scripts must be an object")
+    pending = []
+    if args[0] in {"ci", "install"}:
+        if "--ignore-scripts" in args:
+            return None
+        pending.extend(
+            ("preinstall", "install", "postinstall", "prepublish", "prepare")
+        )
+    elif args[0] == "run" and len(args) > 1:
+        pending.append(args[1])
+    else:
+        pending.append(args[0])
+    visited = set()
+    runner_pattern = re.compile(
+        r"(?<![\w-])(?:jest|vitest|mocha|jasmine|ava|tap|pytest|unittest|"
+        r"karma\s+start|ng\s+test|(?:npm|pnpm|yarn)(?:\s+run)?\s+test(?:[:\w-]*)|"
+        r"node\s+--test|dotnet\s+test)\b",
+        re.IGNORECASE,
+    )
+    while pending:
+        script = pending.pop()
+        if script in visited:
+            continue
+        visited.add(script)
+        if script == "test" or script.startswith("test:"):
+            return "Application unit tests are disabled during security remediation."
+        command = scripts.get(script, "")
+        if not isinstance(command, str):
+            raise ValueError("package.json scripts must be strings")
+        if runner_pattern.search(command):
+            return (
+                f"The {script} script invokes a test runner. Application unit tests "
+                "are disabled during security remediation; review the build/check "
+                "outside remediation instead of changing scripts to bypass it."
+            )
+        pending.extend(re.findall(r"\b(?:npm|pnpm|yarn)\s+run\s+([\w:-]+)", command))
+        pending.extend(
+            candidate
+            for candidate in scripts
+            if re.search(
+                rf"\b(?:pnpm|yarn)\s+{re.escape(candidate)}(?:\s|$|[;&|])",
+                command,
+            )
+        )
+        for hook in (f"pre{script}", f"post{script}"):
+            if hook in scripts and hook not in visited:
+                pending.append(hook)
+    return None
 
 
 def _node(
@@ -386,13 +462,13 @@ def _node(
                 None,
                 "SKIPPED",
                 False,
-                "Skipped lint, build, and test because install failed.",
+                "Skipped lint and build because install failed.",
             )
         )
         return rows
     blocked = None
-    for script in ("lint", "build", "test"):
-        kind = "unit_tests" if script == "test" else script
+    for script in ("lint", "build"):
+        kind = script
         if kind == "lint" and skip_lint:
             continue
         if blocked is not None:
@@ -446,7 +522,7 @@ def _dotnet(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> list[dict]:
-    """Restore NuGet dependencies and run Release build and test checks."""
+    """Restore NuGet dependencies and build Release without running unit tests."""
     tool = resolve_tool("dotnet", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "dotnet is not on PATH.")]
@@ -466,9 +542,7 @@ def _dotnet(
     rows = [restore]
     if restore["status"] == "FAILED":
         rows.append(
-            _row(
-                None, "SKIPPED", False, "Skipped build and test because restore failed."
-            )
+            _row(None, "SKIPPED", False, "Skipped build because restore failed.")
         )
         return rows
     if package_checks and not skip_lint:
@@ -485,15 +559,6 @@ def _dotnet(
         _run(
             runner,
             [tool, "build", "--configuration", "Release", "--nologo"],
-            timeout,
-            required=True,
-            cwd=root,
-        )
-    )
-    rows.append(
-        _run(
-            runner,
-            [tool, "test", "--configuration", "Release", "--nologo"],
             timeout,
             required=True,
             cwd=root,
@@ -518,31 +583,39 @@ def _java(
     if not builds and stack.java_build:
         builds = [stack.java_build]
     rows: list[dict] = []
+    files, truncated = iter_files(root)
+    if truncated:
+        raise ValueError(
+            "Java build discovery was truncated; manual review is required"
+        )
     for build in builds:
-        if build == "gradle":
-            rows.extend(
-                _java_gradle(
-                    root,
-                    runner,
-                    which,
-                    timeout,
-                    package_checks=package_checks,
-                    skip_lint=skip_lint,
-                    lint_only=lint_only,
+        for component in java_build_roots(root, build, files):
+            if build == "gradle":
+                rows.extend(
+                    _java_gradle(
+                        component,
+                        runner,
+                        which,
+                        timeout,
+                        package_checks=package_checks,
+                        skip_lint=skip_lint,
+                        lint_only=lint_only,
+                        checkout_root=root,
+                    )
                 )
-            )
-        elif build == "maven":
-            rows.extend(
-                _java_maven(
-                    root,
-                    runner,
-                    which,
-                    timeout,
-                    package_checks=package_checks,
-                    skip_lint=skip_lint,
-                    lint_only=lint_only,
+            elif build == "maven":
+                rows.extend(
+                    _java_maven(
+                        component,
+                        runner,
+                        which,
+                        timeout,
+                        package_checks=package_checks,
+                        skip_lint=skip_lint,
+                        lint_only=lint_only,
+                        checkout_root=root,
+                    )
                 )
-            )
     return rows
 
 
@@ -555,9 +628,10 @@ def _java_gradle(
     package_checks: bool = False,
     skip_lint: bool = False,
     lint_only: bool = False,
+    checkout_root: Path | None = None,
 ) -> list[dict]:
     """Run the Gradle wrapper or the installed Gradle tool."""
-    wrapper = _wrapper(root, "gradlew")
+    wrapper = java_wrapper(root, checkout_root or root, "gradlew")
     tool = wrapper or resolve_tool("gradle", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
@@ -571,14 +645,22 @@ def _java_gradle(
                 "lint",
             )
         ]
-    rows = [_run(runner, [tool, "--no-daemon", "dependencies"], timeout, required=True)]
+    rows = [
+        _run(
+            runner,
+            [tool, "--no-daemon", "dependencies"],
+            timeout,
+            required=True,
+            cwd=root,
+        )
+    ]
     if rows[0]["status"] == "FAILED":
         rows.append(
             _row(
                 None,
                 "SKIPPED",
                 False,
-                "Skipped Gradle test because dependencies failed.",
+                "Skipped Gradle build because dependency inspection failed.",
             )
         )
         return rows
@@ -592,8 +674,11 @@ def _java_gradle(
                 "lint",
             )
         )
-    rows.append(_run(runner, [tool, "--no-daemon", "test"], timeout, required=True))
-    rows.append(_run(runner, [tool, "--no-daemon", "build"], timeout, required=True))
+    rows.append(
+        _execute_product_check(
+            runner, [tool, "--no-daemon", "assemble"], timeout, root, "build"
+        )
+    )
     return rows
 
 
@@ -606,9 +691,10 @@ def _java_maven(
     package_checks: bool = False,
     skip_lint: bool = False,
     lint_only: bool = False,
+    checkout_root: Path | None = None,
 ) -> list[dict]:
     """Run the Maven wrapper or the installed Maven tool."""
-    wrapper = _wrapper(root, "mvnw")
+    wrapper = java_wrapper(root, checkout_root or root, "mvnw")
     tool = wrapper or resolve_tool("mvn", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "mvnw or mvn is not available.")]
@@ -631,10 +717,22 @@ def _java_maven(
     if lint_only:
         return lint
     rows = [
-        _run(runner, [tool, "--batch-mode", "clean", "verify"], timeout, required=True)
+        _execute_product_check(
+            runner,
+            [tool, "--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
+            timeout,
+            root,
+            "build",
+        )
     ]
     rows.append(
-        _run(runner, [tool, "--batch-mode", "dependency:tree"], timeout, required=True)
+        _run(
+            runner,
+            [tool, "--batch-mode", "dependency:tree"],
+            timeout,
+            required=True,
+            cwd=root,
+        )
     )
     return lint + rows
 
@@ -707,6 +805,20 @@ def _docker(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[d
     return rows
 
 
+def java_wrapper(component: Path, checkout_root: Path, name: str) -> str | None:
+    """Find the nearest Java wrapper without searching outside the checkout."""
+    component = component.resolve()
+    checkout_root = checkout_root.resolve()
+    component.relative_to(checkout_root)
+    for directory in (component, *component.parents):
+        wrapper = _wrapper(directory, name)
+        if wrapper:
+            return wrapper
+        if directory == checkout_root:
+            break
+    return None
+
+
 def _wrapper(root: Path, name: str) -> str | None:
     """Find a build wrapper, preferring Windows command-file extensions."""
     if os.name == "nt":
@@ -730,6 +842,13 @@ def _run(
     cwd: Path | None = None,
 ) -> dict:
     """Run one allowlisted check and convert its exit code to a row."""
+    reason = (
+        node_test_blocker(cwd or runner.repo_root, argv)
+        if (argv and tool_name(argv[0]) in {"npm", "pnpm", "yarn"})
+        else None
+    )
+    if reason:
+        return {**_row(None, "FAILED", required, reason), "command": argv}
     if required and "test" in argv:
         return _execute_product_check(runner, argv, timeout, cwd, "unit_tests")
     if required and "build" in argv:
@@ -752,6 +871,17 @@ def _execute_product_check(
     runner, argv: list[str], timeout: int, cwd: Path | None, kind: str
 ) -> dict:
     """Keep earlier diagnostics when an individual product command cannot start."""
+    reason = (
+        node_test_blocker(cwd or runner.repo_root, argv)
+        if (argv and tool_name(argv[0]) in {"npm", "pnpm", "yarn"})
+        else None
+    )
+    if reason:
+        return {
+            **_row(None, "FAILED", True, reason),
+            "command": argv,
+            "kind": kind,
+        }
     try:
         result = runner.run(
             argv,
