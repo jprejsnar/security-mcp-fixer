@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.16.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.17.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -50,6 +50,12 @@ catalog home pages and references omitted by the bounded fetch limit cannot pass
 Concurrent approval requests reserve one native window per checkout before startup;
 cancelled startup is recorded explicitly, and stale startup responses cannot replace
 a newer run's receipt. Rejected startup windows are closed and reaped.
+
+Release 1.0.17 removes unused helper inputs, throwaway validation objects,
+unsupported pre-3.11 TOML fallbacks and obsolete sampling test scaffolding.
+All fifteen MCP tool schemas and workflow instructions are unchanged. Cleanup
+validation completed with **880 passed, 3 skipped**, with native Windows tests
+enabled and strict lifecycle warnings; lint and formatting passed.
 
 Release 1.0.16 supports code-fix selection on modern MCP hosts without a
 server-request back-channel. MCP 2026-07-28 and newer use `input_required` and
@@ -109,7 +115,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.16. Earlier wheels do not contain
+This summary covers changes through 1.0.17. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -917,8 +923,11 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
 
 - Python 3.11 or newer and Git on Windows, macOS, or Linux.
 - Runtime floors: `mcp[cli]>=2.3.0,<3`, `httpx>=0.28.1`, `packaging>=26.3`,
-  and `ruamel.yaml>=0.19.1,<0.20`. Development floors are `pytest>=9.2.0` and
-  `ruff>=0.17.5,<1`.
+  `pydantic>=2.14.3,<3`, and `ruamel.yaml>=0.19.1,<0.20`. Development floors are
+  `anyio>=4.16.0,<5`, `pytest>=9.2.0` and `ruff>=0.17.5,<1`.
+  Isolated wheel builds use `setuptools>=84.2.1` through the declared PEP 517
+  backend. Pydantic and AnyIO are explicit dependencies because production and
+  test code import them directly, respectively.
 - A GitLab token with `read_api` and access to the project's vulnerability report.
   Optional false-positive dismissal requires `api` write scope and a GitLab role
   permitted to dismiss the finding; a read-only token does not enable writes.
@@ -1380,7 +1389,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.16-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.17-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1396,7 +1405,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.16-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.17-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1436,7 +1445,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.16-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.17-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1452,7 +1461,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.16-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.17-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1473,7 +1482,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.16-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.17-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1482,7 +1491,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.16-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.17-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -1782,7 +1791,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.16-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.17-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -1816,7 +1825,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.16**
+3. Apply the deployment-specific update and verify installed version **1.0.17**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -1825,7 +1834,7 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.16`
+   edits before requesting a new run. Its `server_version` must be `1.0.17`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 

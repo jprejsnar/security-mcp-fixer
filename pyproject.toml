@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=84.2.1"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "gitlab-security-mcp"
-version = "1.0.16"
+version = "1.0.17"
 description = "Local-only MCP server that verifies GitLab security findings and applies minimal fixes."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,11 +12,12 @@ dependencies = [
     "mcp[cli]>=2.3.0,<3",
     "httpx>=0.28.1",
     "packaging>=26.3",
+    "pydantic>=2.14.3,<3",
     "ruamel.yaml>=0.19.1,<0.20",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.2.0", "ruff>=0.17.5,<1"]
+dev = ["anyio>=4.16.0,<5", "pytest>=9.2.0", "ruff>=0.17.5,<1"]
 
 [project.scripts]
 gitlab-security-mcp = "gitlab_security_mcp.server:main"
