@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.35.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.36.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -36,6 +36,14 @@ requirements. An unknown current version is explicitly marked, never invented.
 Source choices show file/line and the proposed scoped action instead of raw
 dictionaries. Approval binds the displayed package versions and file scope;
 changed findings or proposed targets require fresh consent.
+
+Release 1.0.36 forwards Windows approval-window diagnostics to the server log.
+Previously, a dialog that opened successfully discarded its PowerShell stderr,
+including the "using the active monitor" placement fallback. That text is now
+logged as a warning with the dialog's process ID. Window start, visibility,
+close action and forced close are logged. Unreadable dialog output reports the
+process ID, byte count and exit code instead of only a JSON parser message.
+Approval semantics are unchanged: nothing is selected or dismissed by logging.
 
 Release 1.0.35 closes approval pipes even when process termination fails, records
 unexpected background approval failures without authorizing edits/dismissals,
@@ -81,7 +89,8 @@ monitor instead of the default screen. It follows the server's parent processes,
 prefers an active host window, and otherwise uses the nearest ancestor with a
 main window. The dialog is centered and sized to that monitor's working area,
 including monitors to the left/above the primary screen. If the host window
-cannot be found, it uses the active monitor and writes a diagnostic to stderr.
+cannot be found, it uses the active monitor and logs that diagnostic as a server
+warning with the dialog's process ID (1.0.36 and later).
 Selection and submission still require explicit human input.
 
 Release 1.0.31 corrects container assessment reporting. When an advisory supplies
@@ -360,7 +369,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.35. Earlier wheels do not contain
+This summary covers changes through 1.0.36. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -377,8 +386,8 @@ all of these changes; updating source files does not update an installed wheel.
 | Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in console/notification/transcript channels. Owned Windows log consoles close after completion/failure and reopen for later work; unrelated prompts remain untouched. |
 | Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Missing NVD version bounds require review, not a no-fix verdict. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
 | Dependency edits | Qualified plans may refresh lockfiles, update manifests or add supported transitive constraints/overrides. Current manager documentation, compatibility/license review, passing production builds and resolution checks remain mandatory. Tests are not executed. Failed updates are isolated; passing updates remain. |
-| Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Checkout edits, validation/rollback and dismissals wait for active verifications. |
-| Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
+| Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches and human-approved GitLab dismissals use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Dismissal intents are saved before dispatch, each completion is saved on the caller thread, the same vulnerability is never written concurrently, and mutations are never retried. Checkout edits, validation/rollback and dismissals wait for active verifications. |
+| Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Approval-window pipes close even if terminating the window fails. A command child that cannot be reaped is reported as a cleanup failure rather than a normal result. Background approval tasks persist unexpected failures and their completion callbacks log any exception escaping cleanup. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
 | Python quality | Python 3.11 remains the minimum. Ruff formatting/lint, docstrings, AAA tests and warning-strict lifecycle regressions enforce the repository's standards; no newer-only syntax is required. |
 
@@ -1134,8 +1143,10 @@ are retained in state and reports; full-log parsing is bounded to 8 MiB.
 Gradle deprecation notices are included once in final report caveats even when
 multiple findings share the same command. They do not imply failed dependency
 resolution or passed product validation.
-Failures are shared across different findings, but re-verifying the same
-unresolved finding retries inspection instead of permanently caching the error.
+Failed inspection commands are not reused: re-verifying the same finding retries
+the command. A successfully parsed report, including one showing a conflict or
+unresolved selection, is reused until the checkout changes; such a report still
+cannot prove absence or authorize a fix.
 Public advisory checks still run when Java/NuGet local resolution is incomplete.
 Unresolved packages remain manual review even if an online lookup says unaffected.
 Resolved Java transitives with available fixes may receive a reviewed
@@ -1742,7 +1753,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.35-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.36-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1758,7 +1769,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.35-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.36-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1798,7 +1809,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.35-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.36-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1814,7 +1825,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.35-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.36-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1835,7 +1846,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.35-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.36-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1844,7 +1855,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.35-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.36-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -2144,7 +2155,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.35-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.36-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2178,7 +2189,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.35**
+3. Apply the deployment-specific update and verify installed version **1.0.36**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2187,7 +2198,7 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.35`
+   edits before requesting a new run. Its `server_version` must be `1.0.36`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -2350,10 +2361,17 @@ record: wall-clock duration, process CPU time and percent, working-set memory
 and its change, and garbage-collection counts, objects collected, and
 uncollectable objects for each generation. Contended engine, command, and
 registry locks log their wait. Fan-out batches log worker count, item count,
-duration, and the exception class when a worker fails. Command-reader and
-uncaught thread failures log the exception class and thread name. A logging
-failure does not fail the task. Child-process CPU is not included.
-Unexpected exceptions produce a failure message. The host AI's own reasoning
+duration, and the exception class when a worker fails or is cancelled.
+Command-reader and uncaught thread failures log the exception class and thread
+name; commands that fail before producing a result log the tool, checkout, child
+process ID and traceback. Approval-window start, visibility, close and PowerShell
+diagnostics are logged with the dialog process ID. A logging failure does not
+fail the task. Child-process CPU is not included.
+Stderr lines use `YYYY-MM-DDTHH:MM:SSZ LEVEL logger [thread]: message` in UTC.
+Values of `GITLAB_TOKEN`, `GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`,
+`GH_TOKEN` and `NVD_API_KEY`, including URL-encoded forms and tracebacks, are
+replaced with `[REDACTED]`; other secrets in application output are not scrubbed.
+Unexpected exceptions produce a failure message with a traceback. The host AI's own reasoning
 and browsing between tool calls are not visible to this server.
 
 Finding updates include per-severity positions, for example
@@ -2920,7 +2938,7 @@ for deployment and restart differences.
 | Server does not start | Check absolute launcher/Python paths, installed runtime dependencies, and host logs. Stdout must contain only MCP messages. |
 | Retrieval fails or tracked main is unavailable | Check token scope/access, exact project path, GitLab URL and tracked branch. Do not use an unfiltered fallback. |
 | `truncated: true` | Treat retrieval/discovery as incomplete; do not claim all findings or absent packages were verified. |
-| `PRECHECK_FAILED` | Use clean `main` or today's exact security branch and finish Git operations manually. Tracked metadata modifications are dirty work; unsafe artifact paths also block reuse. Prior execution errors alone do not block a fresh run. |
+| `PRECHECK_FAILED` | Use clean `main` or today's exact security branch and finish Git operations manually. Tracked metadata modifications are dirty work; unsafe artifact paths also block reuse. Prior execution errors alone do not block a fresh run. `Could not verify the security branch on origin` means `git ls-remote` failed or was truncated; check VPN, network and Git credentials. Remote branch absence is never assumed. |
 | `PREPARATION_FAILED` | Inspect the precise failed gate and command logs; check corporate DNS/VPN. Current remediation does not run eager pnpm clean/install. Do not invent clean scripts or delete directories as a workaround. |
 | Dated branch already exists | Today's exact clean branch is reused after guarded generated-artifact cleanup, including failed-run output. Policies, configuration, tracked and unknown files are preserved. Other dated branches are not reused. |
 | `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability, a package-name mismatch, or an undocumented configuration line does not prove a false positive. |
@@ -2943,6 +2961,8 @@ for deployment and restart differences.
 | `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI must read the supplied complete source, trace inputs/callers/configuration and submit `source_review` within the same request. This is not a request for the user to analyze code. Deprecated sampling is intentionally disabled. |
 | Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval`, `gitlab_dismissal_counts` and saved `gitlab_dismissals` verification. Only an independent read of persisted `DISMISSED` / `FALSE_POSITIVE` establishes confirmation; mutation acknowledgements alone remain unverified. Check the Vulnerability report's Dismissed/False positive filters and tracked ref, not historical scanner artifacts. Inspect unknown outcomes; never automatically retry writes. |
 | NVD returns 429/503 or times out | Review recorded errors and pacing/retry progress. Bounded retries honor shared cooldowns and `Retry-After`; long cooldowns fail explicitly. Do not bypass rate limits or treat an outage as proof of safety. |
+| Approval window opens on an unexpected monitor | Search server stderr for `Approval window pid=... reported diagnostics`. It names why the MCP host window could not be identified; the dialog then uses the active monitor. |
+| `Desktop task failed` or `Approval window pid=... returned unreadable output` | The background approval owner or native dialog failed. The saved form/selection status records the failure and nothing was authorized. Use the logged traceback, process ID and exit code, then reopen the form. |
 | Windows command containment cannot be established | The command fails explicitly before its suspended child resumes; owned resources are cleaned up. Inspect the error and host/job/security-policy restrictions with your administrator rather than disabling containment or launching an uncontained fallback. |
 | Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |
 | `SOURCE_REVIEW_REQUIRED` | Read `source_workflow`, trace the cited source and input origins, and supply source-bound review evidence or reproduce/fix/validate the source defect. Missing advisories are not a SAST disposition. |

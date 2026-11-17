@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger("gitlab_security_mcp")
+_MAX_DIAGNOSTIC_CHARS = 2000
 
 SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
@@ -226,19 +230,44 @@ class DesktopApproval:
     process: asyncio.subprocess.Process
 
     async def wait(self) -> dict:
-        """Wait without an approval deadline; validate transport errors explicitly."""
-        stdout, stderr = await self.process.communicate()
-        if self.process.returncode != 0:
+        """Wait without an approval deadline; validate transport errors explicitly.
+
+        Dialog stderr diagnostics, such as the monitor fallback, are logged
+        even when the human response is valid.
+        """
+        process = self.process
+        stdout, stderr = await process.communicate()
+        diagnostics = _diagnostic_text(stderr)
+        if process.returncode != 0:
             raise RuntimeError(
-                f"Approval window exited with code {self.process.returncode}: "
-                f"{stderr.decode(errors='replace')[-2000:]}"
+                f"Approval window pid={process.pid} exited with code "
+                f"{process.returncode}: {diagnostics}"
             )
-        response = json.loads(stdout.decode("utf-8-sig"))
+        if diagnostics:
+            logger.warning(
+                "Approval window pid=%s reported diagnostics: %s",
+                process.pid,
+                diagnostics,
+            )
+        try:
+            response = json.loads(stdout.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Approval window pid={process.pid} returned unreadable output "
+                f"({len(stdout)} bytes, exit {process.returncode})"
+            ) from exc
         if not isinstance(response, dict) or response.get("action") not in {
             "accept",
             "cancel",
         }:
-            raise ValueError("The approval window returned an invalid response")
+            raise ValueError(
+                f"Approval window pid={process.pid} returned an invalid response"
+            )
+        logger.info(
+            "Approval window pid=%s closed with action=%s",
+            process.pid,
+            response["action"],
+        )
         return response
 
     async def close(self) -> None:
@@ -246,6 +275,7 @@ class DesktopApproval:
         process = self.process
         try:
             if process.returncode is None:
+                logger.info("Closing open approval window pid=%s", process.pid)
                 try:
                     process.terminate()
                 except ProcessLookupError:
@@ -255,6 +285,11 @@ class DesktopApproval:
             _close_stream(process.stdout)
             _close_stream(process.stderr)
         await process.wait()
+
+
+def _diagnostic_text(stderr: bytes) -> str:
+    """Return the bounded end of dialog stderr, where PowerShell writes the cause."""
+    return stderr.decode(errors="replace").strip()[-_MAX_DIAGNOSTIC_CHARS:]
 
 
 def _close_stream(stream: object) -> None:
@@ -290,6 +325,12 @@ async def open_dialog(
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     dialog = DesktopApproval(process)
+    logger.info(
+        "Starting approval window pid=%s title=%r choices=%s",
+        process.pid,
+        title,
+        len(properties),
+    )
     try:
         if process.stdin is None or process.stdout is None:
             raise RuntimeError("Approval window pipes were not created")
@@ -316,9 +357,10 @@ async def open_dialog(
         if (await process.stdout.readline()).strip() != b"READY":
             _, stderr = await process.communicate()
             raise RuntimeError(
-                "The Windows approval window could not be shown: "
-                + stderr.decode(errors="replace")[-2000:]
+                f"The Windows approval window pid={process.pid} could not be shown "
+                f"(exit {process.returncode}): {_diagnostic_text(stderr)}"
             )
+        logger.info("Approval window pid=%s is visible", process.pid)
         return dialog
     except BaseException:
         await dialog.close()

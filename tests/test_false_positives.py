@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import threading
 from copy import deepcopy
@@ -701,6 +702,37 @@ def test_desktop_termination_failure_still_closes_pipes():
     for stream in streams:
         stream.transport.close.assert_called_once()
     process.wait.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stdout", [b'{"action":"cancel"}', b"", b"\xff"])
+def test_desktop_dialog_diagnostics_reach_server_logs(stdout, caplog):
+    """Log successful-window stderr and give unreadable output process context."""
+    # Arrange
+    from gitlab_security_mcp.desktop_approval import DesktopApproval
+
+    process = Mock(pid=4321, returncode=0)
+    process.communicate = AsyncMock(
+        return_value=(stdout, b"Could not locate the MCP host monitor; using active")
+    )
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        if stdout.startswith(b"{"):
+            response = asyncio.run(DesktopApproval(process).wait())
+        else:
+            with pytest.raises(ValueError, match="unreadable output") as failure:
+                asyncio.run(DesktopApproval(process).wait())
+
+    # Assert
+    assert "pid=4321 reported diagnostics" in caplog.text
+    assert "host monitor" in caplog.text
+    if stdout.startswith(b"{"):
+        assert response == {"action": "cancel"}
+        assert "action=cancel" in caplog.text
+    else:
+        assert "pid=4321" in str(failure.value)
+        assert f"{len(stdout)} bytes, exit 0" in str(failure.value)
+        assert failure.value.__cause__ is not None
 
 
 def test_background_cleanup_failure_is_retrieved_and_logged(
