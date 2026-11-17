@@ -2203,11 +2203,7 @@ class Engine:
                         "the older branch is safe."
                     )
                 elif isinstance(source_review, dict):
-                    location = finding["location"]
-                    description = (
-                        f"{location['file']}:{location['startLine']}: "
-                        f"{source_review['reason'].strip()}"
-                    )
+                    description = source_review["reason"].strip()
                 candidates.append(
                     {
                         "id": finding["id"],

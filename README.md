@@ -636,12 +636,12 @@ server, or repeatedly request completion while reviewing. A late response cannot
 authorize a new run or different finding snapshots.
 
 The window has two columns: **Issue** (including its unchecked approval box) and
-**Why this is a false positive**. For source findings, the second column cites
-the reviewed file and line and shows `source_review.reason`. That field must be
-written after reading and tracing the code: 1-3 concise sentences, at most
-1,000 characters, explaining the actual code or runtime control, the relevant
-input path, and why the specific reported weakness does not apply. Generic
-assurances, invented controls and missing advisories are not supporting evidence.
+**Why this is a false positive**. GitLab already names the file and line. The
+host opens that code, reads it, and writes `source_review.reason` for a
+non-developer: at most 2 sentences and 400 characters, saying what the warning
+claims and why that code does not do it. The column shows that reason without
+a path or line number. Generic assurances, invented controls and missing
+advisories are not supporting evidence.
 An overlong explanation remains `SOURCE_REVIEW_REQUIRED` until reassessed; it
 is never silently truncated. Detailed analysis belongs in `finding_analysis`,
 `reachability_analysis`, `input_origin` and the reviewed-file assessments.

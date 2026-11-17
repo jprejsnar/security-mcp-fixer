@@ -1043,7 +1043,7 @@ def test_source_approval_description_uses_reviewed_code_and_preserves_audit(tmp_
     result = engine.dismiss_false_positives(candidates)
 
     # Assert
-    assert candidates[0]["description"] == f"Endpoint.java:1: {review['reason']}"
+    assert candidates[0]["description"] == review["reason"]
     assert "Files reviewed:" not in candidates[0]["description"]
     comment = candidates[0]["reason"]
     assert review["reason"] in comment
@@ -1055,7 +1055,7 @@ def test_source_approval_description_uses_reviewed_code_and_preserves_audit(tmp_
     )
 
 
-@pytest.mark.parametrize("reason_length", [1000, 1001])
+@pytest.mark.parametrize("reason_length", [400, 401])
 def test_false_positive_explanation_length_requires_concise_reassessment(
     tmp_path, reason_length
 ):
@@ -1070,13 +1070,13 @@ def test_false_positive_explanation_length_requires_concise_reassessment(
 
     # Assert
     assert result["decision"] == (
-        "FALSE_POSITIVE" if reason_length == 1000 else "SOURCE_REVIEW_REQUIRED"
+        "FALSE_POSITIVE" if reason_length == 400 else "SOURCE_REVIEW_REQUIRED"
     )
     candidates = engine.false_positive_candidates()["candidates"]
-    if reason_length == 1000:
-        assert candidates[0]["description"] == f"Endpoint.java:1: {review['reason']}"
+    if reason_length == 400:
+        assert candidates[0]["description"] == review["reason"]
     else:
-        assert "1,000 characters" in result["reason"]
+        assert "400 characters" in result["reason"]
         assert candidates == []
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -1226,6 +1226,7 @@ def test_host_receives_full_source_and_must_record_review(tmp_path, monkeypatch)
     assert "content" not in cited
     assert cited["cited_text"] in source.read_text(encoding="utf-8")
     assert cited["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert "open the file and line GitLab already reported" in pending["reason"]
     assert "read the cited file in the checkout" in pending["reason"]
     assert recorded["decision"] == "FALSE_POSITIVE"
     engine.gitlab.dismiss_false_positive.assert_not_called()

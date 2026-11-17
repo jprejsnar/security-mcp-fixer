@@ -57,7 +57,9 @@ Each tool description is the procedure for that step.
 2. pull_main_twice
 3. create_security_branch
 4. list_security_findings
-5. verify_security_finding for every finding. Read cited files in the checkout.
+5. verify_security_finding for every finding. Open the file and line GitLab
+   already reported and read that code. A false-positive reason is at most
+   2 everyday sentences about why the warning does not apply.
 6. select_security_fixes before any remediation edit
 7. qualify_package_update for each selected package update
 8. apply_minimal_fix for each selected eligible fix, with no build between edits
@@ -567,9 +569,9 @@ async def verify_security_finding(
 ) -> dict[str, Any]:
     """Assess a finding read-only; follow its source or reproduction workflow.
 
-    HOST_REVIEW_REQUIRED cites path, hash, line, and a short window. Read that
-    file in the checkout, trace callers and inputs, then resubmit source_review.
-    SOURCE_REVIEW_REQUIRED is unfinished work, never a false-positive verdict.
+    GitLab already names the file and line. Open that code, read it, and trace
+    callers and inputs. source_review.reason is the non-developer explanation:
+    at most 2 sentences and 400 characters. HOST_REVIEW_REQUIRED is unfinished.
     """
     result = await asyncio.to_thread(
         _run,
@@ -589,10 +591,11 @@ async def verify_security_finding(
         request = result["source_review_request"]
         cited = await asyncio.to_thread(evidence.read, request["location"]["file"])
         reason = (
-            "The host AI must read the cited file in the checkout, trace "
-            "callers and inputs, and call verify_security_finding with "
-            "source_review. cited_source is the path, full-file sha256, line, "
-            "and a short window. Deprecated MCP sampling is not used. "
+            "The host AI must open the file and line GitLab already reported, "
+            "read the cited file in the checkout, and call verify_security_finding "
+            "with source_review. Write reason in everyday words, at most 2 "
+            "sentences and 400 characters: what was flagged and why that code "
+            "does not do it. cited_source only locates the line. "
             "No false-positive conclusion has been recorded."
         )
         result.update(

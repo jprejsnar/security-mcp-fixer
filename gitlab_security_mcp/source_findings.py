@@ -10,7 +10,7 @@ from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_page
 from gitlab_security_mcp.util import resolve_inside
 
 _MIN_AUDIT_SENTENCE = 24
-_MAX_APPROVAL_REASON = 1000
+_MAX_APPROVAL_REASON = 400
 
 MAX_SOURCE_BYTES = 1_000_000
 # Names and review limits from the TypeScript utility-types reference
@@ -96,11 +96,12 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
         "files": list(files.values()),
         "next_tool": "verify_security_finding" if count else None,
         "action": (
-            "Read each cited file in the checkout and call verify_security_finding "
-            "for every listed ID. source_review needs a decision, a 1-3 sentence "
-            "reason of at most 1,000 characters, input_origin, finding_analysis, "
-            "reachability_analysis, and reviewed_files hashes. Assess each finding "
-            "separately, then finish with complete_security_run."
+            "Open the file and line GitLab already reported, read that code, and "
+            "call verify_security_finding for every listed ID. source_review.reason "
+            "is the text a non-developer sees: at most 2 sentences and 400 "
+            "characters, saying what was flagged and why that code does not do it. "
+            "Put the trace in input_origin, finding_analysis, "
+            "reachability_analysis, and reviewed_files. Then complete_security_run."
         )
         if count
         else None,
@@ -134,9 +135,10 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
         if len(review["reason"].strip()) > _MAX_APPROVAL_REASON:
             raise ValueError(
                 f"False-positive reason must be at most {_MAX_APPROVAL_REASON:,} characters. "
-                "Use 1-3 concise sentences explaining the reviewed code and why this "
-                "specific weakness does not apply; keep detailed evidence in "
-                "finding_analysis, reachability_analysis and reviewed_files."
+                "Use at most 2 short sentences in everyday words: what the warning "
+                "claims and why the code at the line GitLab reported does not do "
+                "that. Keep the code trace in finding_analysis, "
+                "reachability_analysis, input_origin and reviewed_files."
             )
         for key in ("reason", "input_origin", analysis_key, "reachability_analysis"):
             if len(review[key].strip()) < _MIN_AUDIT_SENTENCE:
@@ -193,16 +195,18 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
         "location": location,
         "languages": source_languages(str(location.get("file") or "")),
         "steps": [
-            "Read the cited file in the checkout and trace callers, inputs, and controls. "
-            "A filename, a scanner flag, or a missing CVE is not a verdict.",
-            "For nginx, trace includes and the active server. For Dockerfiles, inspect "
-            "stages and the final image. For a non-literal RegExp, inspect the pattern "
-            "values and their bounds.",
-            "Resubmit source_review with a decision, a 1-3 sentence reason of at most "
-            "1,000 characters, input_origin, finding_analysis, reachability_analysis, "
-            "and reviewed_files hashes. Address every CVE and CWE GitLab named. "
-            "The server reads this file's publisher page and those records. "
-            "Do not invent a source patch or dismiss the finding in GitLab.",
+            "Open the file and line GitLab already reported and read that code, "
+            "including callers and inputs. A filename or a missing CVE is not a verdict.",
+            "For nginx, read includes and the active server. For Dockerfiles, read "
+            "the stages and the final image. For a non-literal pattern, read the "
+            "values that reach it and their bounds.",
+            "Write source_review.reason for a non-developer: at most 2 sentences "
+            "and 400 characters, saying what was flagged and why this code does "
+            "not do that. Do not put the file path or line number in that text. "
+            "Put the trace, every CVE and CWE GitLab named, input_origin, "
+            "finding_analysis, reachability_analysis, and reviewed_files hashes "
+            "in the other source_review fields. Do not invent a patch or dismiss "
+            "the finding.",
             *(
                 (TYPESCRIPT_UTILITY_REVIEW,)
                 if "typescript" in source_languages(str(location.get("file") or ""))
