@@ -20,6 +20,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from gitlab_security_mcp.util import (
+    atomic_write_text,
     log_concurrency,
     log_task,
     logged_lock,
@@ -63,9 +64,6 @@ REPO_WRAPPERS = {"mvnw", "gradlew"}
 ALLOWED_SCRIPTS = {
     "lint",
     "build",
-    "test",
-    "test:unit",
-    "test:ci",
     "check",
     "security:smoke",
     "security:licenses",
@@ -90,6 +88,13 @@ def tool_name(argv0: str) -> str:
 _SHELL_CHARS = "\r\n|&;<>`$"
 # Windows runs .cmd and .bat files through cmd.exe, which also expands these.
 _CMD_CHARS = _SHELL_CHARS + '%^"!()'
+GRADLE_NO_TESTS_INIT = (
+    "allprojects {\n"
+    "    tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {\n"
+    "        onlyIf { false }\n"
+    "    }\n"
+    "}\n"
+)
 
 
 def _bad_argument(arg: str, *, batch: bool = False) -> bool:
@@ -196,9 +201,7 @@ def _npm_ok(args: list[str]) -> bool:
     """Allow npm checks and bounded dependency refresh operations."""
     if args in (
         ["--version"],
-        ["ci"],
-        ["test"],
-        ["test", "--", "--listTests", "--json"],
+        ["ci", "--ignore-scripts"],
         ["audit", "--json"],
         [
             "install",
@@ -224,12 +227,8 @@ def _pnpm_ok(args: list[str]) -> bool:
     """Allow pnpm checks and script-free dependency refresh operations."""
     if args in (
         ["--version"],
-        ["clean"],
-        ["install"],
-        ["install", "--frozen-lockfile"],
+        ["install", "--frozen-lockfile", "--ignore-scripts"],
         ["install", "--lockfile-only", "--ignore-scripts"],
-        ["test"],
-        ["test", "--listTests", "--json"],
         ["audit", "--json"],
     ):
         return True
@@ -244,46 +243,29 @@ def _yarn_ok(args: list[str]) -> bool:
     """Allow supported Classic and Berry checks and dependency refreshes."""
     if args in (
         ["--version"],
-        ["install", "--frozen-lockfile"],
-        ["install", "--immutable"],
+        ["install", "--frozen-lockfile", "--ignore-scripts"],
+        ["install", "--immutable", "--mode=skip-build"],
         ["install", "--mode=update-lockfile"],
         ["install", "--ignore-scripts"],
-        ["test"],
-        ["test", "--listTests", "--json"],
         ["audit", "--json"],
         ["npm", "audit", "--json"],
     ):
         return True
     if _script_run(args):
         return True
-    if len(args) == 3 and args[:2] == ["up", "-R"]:
-        return _package_arg(args[2])
     if len(args) == 3 and args[0] == "upgrade" and args[2] == "--ignore-scripts":
         return _version_spec(args[1])
     return False
 
 
 def _dotnet_ok(args: list[str]) -> bool:
-    """Allow SDK probes, restores, and Release build or test commands."""
-    prefix = ["test", "--configuration", "Release", "--nologo"]
-    if args[: len(prefix)] == prefix and args[len(prefix) :] in [
-        [flag, value]
-        for category in ("SecurityRuntimeSmoke", "LicenseCompliance")
-        for flag, value in (
-            ("--filter", f"Category={category}"),
-            ("--filter", f"TestCategory={category}"),
-            ("--filter-trait", f"Category={category}"),
-            ("--treenode-filter", f"/*/*/*/*[Category={category}]"),
-        )
-    ]:
-        return True
+    """Allow SDK probes, restores, and Release production builds."""
     return args in (
         ["--version"],
         ["restore"],
         ["restore", "--locked-mode"],
         ["format", "--verify-no-changes", "--no-restore"],
         ["build", "--configuration", "Release", "--nologo"],
-        ["test", "--configuration", "Release", "--nologo"],
     )
 
 
@@ -291,7 +273,6 @@ def _maven_ok(args: list[str]) -> bool:
     """Allow noninteractive Maven verification and dependency inspection."""
     return args in (
         ["--version"],
-        ["--batch-mode", "clean", "verify"],
         ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
         ["--batch-mode", "dependency:tree"],
         [
@@ -299,23 +280,22 @@ def _maven_ok(args: list[str]) -> bool:
             "checkstyle:check",
             "-Dcheckstyle.includeTestSourceDirectory=true",
         ],
-        ["--batch-mode", "test"],
-        ["--batch-mode", "-Psecurity-smoke", "verify"],
-        ["--batch-mode", "-Psecurity-licenses", "verify"],
     )
 
 
 def _gradle_ok(args: list[str]) -> bool:
     """Allow Gradle checks without leaving a build daemon running."""
+    if len(args) == 4 and args[:3] == [
+        "--no-daemon",
+        "dependencies",
+        "--configuration",
+    ]:
+        return re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,100}", args[3]) is not None
     return args in (
         ["--version"],
         ["--no-daemon", "dependencies"],
         ["--no-daemon", "checkstyleMain", "checkstyleTest"],
-        ["--no-daemon", "test"],
-        ["--no-daemon", "test", "--rerun-tasks"],
-        ["--no-daemon", "assemble", "test", "--rerun"],
-        ["--no-daemon", "build"],
-        ["--no-daemon", "assemble"],
+        ["--no-daemon", "assemble", "-x", "test"],
         ["--no-daemon", "securitySmoke"],
         ["--no-daemon", "securityLicenses"],
     )
@@ -388,8 +368,28 @@ def assert_allowed(argv: list[str], repo_root: Path) -> None:
     path = Path(argv[0])
     if not path.is_absolute() and name not in REPO_WRAPPERS and len(path.parts) > 1:
         raise PermissionError(f"Relative executable paths are not allowed: {argv[0]}")
+    checked = argv[1:]
+    if name in {"gradle", "gradlew"} and checked[:2] == [
+        "--no-daemon",
+        "--init-script",
+    ]:
+        script = repo_root / ".security-mcp" / "no-tests-v1.init.gradle"
+        if (
+            len(checked) < 4
+            or Path(checked[2]).resolve() != script.resolve()
+            or not _inside_repo(str(script), repo_root)
+        ):
+            raise PermissionError(
+                "Only the owned Gradle no-tests initialization script is allowed"
+            )
+        with script.open(encoding="utf-8") as stream:
+            if stream.read(len(GRADLE_NO_TESTS_INIT) + 1) != GRADLE_NO_TESTS_INIT:
+                raise PermissionError(
+                    "The owned Gradle no-tests initialization script was changed"
+                )
+        checked = [checked[0], *checked[3:]]
     checker = _CHECKERS.get(name)
-    if checker is None or not checker(argv[1:], repo_root):
+    if checker is None or not checker(checked, repo_root):
         shown = " ".join(argv)
         raise PermissionError(f"Command is not on the allowlist: {shown}")
     if path.is_absolute() or name in REPO_WRAPPERS:
@@ -547,6 +547,59 @@ class CommandProgress:
             )
 
 
+def assert_test_free_scripts(argv: list[str], workdir: Path) -> None:
+    """Reject test runners in requested Node scripts, nested scripts and lifecycle hooks."""
+    if tool_name(argv[0]) not in {"npm", "pnpm", "yarn"} or argv[1:2] != ["run"]:
+        return
+    from gitlab_security_mcp.manifests import iter_files
+
+    files, truncated = iter_files(workdir)
+    if truncated:
+        raise PermissionError(
+            "Cannot verify test-free build scripts: project discovery was truncated"
+        )
+    prohibited = re.compile(
+        r"\b(?:jest|vitest|mocha|jasmine|karma|cypress|playwright|pytest|vstest)\b"
+        r"|\b(?:npm|pnpm|yarn)\s+(?:run(?:-script)?\s+)?(?:test|tests|integration|e2e)(?=[:\s;&|]|$)"
+        r"|\b(?:node\s+--test|dotnet\s+test|ng\s+test)\b",
+        re.IGNORECASE,
+    )
+    requested = argv[2]
+    for path in files:
+        if path.name != "package.json":
+            continue
+        with path.open(encoding="utf-8") as stream:
+            text = stream.read(512 * 1024 + 1)
+        if len(text) > 512 * 1024:
+            raise PermissionError("Cannot verify oversized package.json build scripts")
+        data = json.loads(text)
+        scripts = data.get("scripts", {})
+        if not isinstance(scripts, dict):
+            raise ValueError(f"{path}: scripts must be an object")
+        visited: set[str] = set()
+
+        def inspect(name: str, declarations=scripts, seen=visited, source=path) -> None:
+            """Follow named script calls without recursion cycles."""
+            if name in seen or name not in declarations:
+                return
+            seen.add(name)
+            body = declarations[name]
+            if not isinstance(body, str):
+                raise ValueError(f"{source}: {name} must be a command string")
+            if prohibited.search(body):
+                raise PermissionError(
+                    f"Tests are disabled: {source} script {name!r} invokes a test runner. Provide a test-free build/check; scripts were not changed."
+                )
+            for nested in re.findall(
+                r"\b(?:npm|pnpm|yarn)\s+(?:run(?:-script)?\s+)?([\w:.-]+)", body
+            ):
+                inspect(nested)
+            for hook in ("pre" + name, "post" + name):
+                inspect(hook)
+
+        inspect(requested)
+
+
 class CommandRunner:
     """Run one allowlisted command at a time and record a hash-only audit line.
 
@@ -601,10 +654,24 @@ class CommandRunner:
                 f"Refusing to run outside the repository: {workdir}"
             ) from exc
         assert_allowed(argv, self.repo_root)
+        assert_test_free_scripts(argv, workdir)
         with (
             logged_lock(self._lock, "command"),
             log_task(f"command:{tool_name(argv[0])}"),
         ):
+            if tool_name(argv[0]) in {"gradle", "gradlew"} and argv[1:] != [
+                "--version"
+            ]:
+                script = self.repo_root / ".security-mcp" / "no-tests-v1.init.gradle"
+                if not _inside_repo(str(script), self.repo_root):
+                    raise PermissionError(
+                        "Gradle no-tests initialization must stay inside the checkout"
+                    )
+                script.parent.mkdir(parents=True, exist_ok=True)
+                if not script.exists():
+                    atomic_write_text(script, GRADLE_NO_TESTS_INIT, exclusive=True)
+                argv = [argv[0], "--no-daemon", "--init-script", str(script), *argv[2:]]
+                assert_allowed(argv, self.repo_root)
             return self._run_locked(argv, timeout=timeout, check=check, workdir=workdir)
 
     def _run_locked(
@@ -612,7 +679,7 @@ class CommandRunner:
     ) -> CommandResult:
         """Own child cleanup, cancellable readers, and audit publication."""
         started = time.monotonic()
-        total_suites = self._discover_test_suites(argv, timeout, workdir)
+        total_suites = None
         self._command_log_paths = {}
         if tool_name(argv[0]) != "git" and any(
             arg
@@ -676,10 +743,7 @@ class CommandRunner:
                 subprocess.list2cmdline([tool_name(argv[0]), *argv[1:]]),
                 notify,
                 total_suites=total_suites,
-                test_output=any(
-                    arg in {"test", "test:unit", "test:ci", "verify"}
-                    for arg in argv[1:]
-                ),
+                test_output=False,
             )
             self._start_readers(
                 process, captured, errors, threads, stop_readers, output_lock

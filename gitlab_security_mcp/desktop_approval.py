@@ -13,12 +13,81 @@ SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ApprovalWindowHost {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+}
+'@
+function Get-ApprovalHostWindow {
+    param(
+        [int]$HostProcessId,
+        [object[]]$ProcessTree,
+        [IntPtr]$ForegroundWindow,
+        [int]$ForegroundProcessId
+    )
+    $parents = @{}
+    foreach ($entry in $ProcessTree) {
+        $parents[[int]$entry.ProcessId] = [int]$entry.ParentProcessId
+    }
+    $ancestors = New-Object 'System.Collections.Generic.List[int]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    while ($HostProcessId -gt 0 -and $seen.Add($HostProcessId)) {
+        $ancestors.Add($HostProcessId)
+        if (-not $parents.ContainsKey($HostProcessId)) { break }
+        $HostProcessId = $parents[$HostProcessId]
+    }
+    if ($ForegroundWindow -ne [IntPtr]::Zero -and $ancestors.Contains($ForegroundProcessId)) {
+        return $ForegroundWindow
+    }
+    foreach ($ancestor in $ancestors) {
+        try {
+            $process = Get-Process -Id $ancestor -ErrorAction Stop
+            $handle = $process.MainWindowHandle
+            if ($handle -ne [IntPtr]::Zero) { return $handle }
+        } catch {
+            [Console]::Error.WriteLine("Could not inspect approval host process ${ancestor}: $($_.Exception.Message)")
+        } finally {
+            if ($null -ne $process) { $process.Dispose(); $process = $null }
+        }
+    }
+    return [IntPtr]::Zero
+}
+function Get-ApprovalBounds {
+    param(
+        [System.Drawing.Rectangle]$WorkingArea,
+        [System.Drawing.Size]$RequestedSize
+    )
+    $width = [Math]::Min($RequestedSize.Width, $WorkingArea.Width)
+    $height = [Math]::Min($RequestedSize.Height, $WorkingArea.Height)
+    $left = $WorkingArea.Left + [int][Math]::Floor(($WorkingArea.Width - $width) / 2)
+    $top = $WorkingArea.Top + [int][Math]::Floor(($WorkingArea.Height - $height) / 2)
+    return New-Object System.Drawing.Rectangle($left, $top, $width, $height)
+}
 if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
 $inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $form = New-Object System.Windows.Forms.Form
 $form.Text = [string]$inputData.title
 $form.Size = New-Object System.Drawing.Size(1200, 760)
-$form.StartPosition = 'CenterScreen'
+$foreground = [ApprovalWindowHost]::GetForegroundWindow()
+[uint32]$foregroundProcessId = 0
+[void][ApprovalWindowHost]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId)
+try {
+    $processTree = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop)
+    $hostWindow = Get-ApprovalHostWindow -HostProcessId $inputData.host_process_id `
+        -ProcessTree $processTree -ForegroundWindow $foreground -ForegroundProcessId $foregroundProcessId
+    if ($hostWindow -eq [IntPtr]::Zero) { throw 'No visible window belongs to the MCP host process ancestry.' }
+    $screen = [System.Windows.Forms.Screen]::FromHandle($hostWindow)
+} catch {
+    [Console]::Error.WriteLine("Could not locate the MCP host monitor; using the active monitor: $($_.Exception.Message)")
+    $screen = [System.Windows.Forms.Screen]::FromHandle($foreground)
+}
+$form.StartPosition = 'Manual'
+$form.Bounds = Get-ApprovalBounds -WorkingArea $screen.WorkingArea -RequestedSize $form.Size
 $form.TopMost = $true
 $message = New-Object System.Windows.Forms.TextBox
 $message.Multiline = $true
@@ -60,6 +129,7 @@ for ($i = 0; $i -lt $choices.Count; $i++) {
     $check = New-Object System.Windows.Forms.CheckBox
     $check.AccessibleName = [string]$choices[$i].title
     $check.Checked = $false
+    $check.Enabled = [bool]$choices[$i].enabled
     $check.AutoSize = $true
     $issueText = New-Object System.Windows.Forms.Label
     $issueText.Text = [string]$choices[$i].title
@@ -222,6 +292,7 @@ async def open_dialog(
         if process.stdin is None or process.stdout is None:
             raise RuntimeError("Approval window pipes were not created")
         payload = {
+            "host_process_id": os.getpid(),
             "message": message,
             "title": title,
             "detail_header": detail_header,
@@ -231,6 +302,7 @@ async def open_dialog(
                     "key": key,
                     "title": value["title"],
                     "summary": value["summary"],
+                    "enabled": value.get("enabled", True),
                 }
                 for key, value in properties.items()
             ],

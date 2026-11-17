@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.25.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.32.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -31,21 +31,126 @@ Only explicitly selected findings are dismissed in GitLab.
 
 Release 1.0.23 makes the earlier **fix selection** precise: each package option
 shows its name, current version and evidence source, exact proposed version,
-affected files, rationale, major-upgrade risk and build/unit-test acceptance
+affected files, rationale, major-upgrade risk and production-build acceptance
 requirements. An unknown current version is explicitly marked, never invented.
 Source choices show file/line and the proposed scoped action instead of raw
 dictionaries. Approval binds the displayed package versions and file scope;
 changed findings or proposed targets require fresh consent.
 
-Release 1.0.25 reduces Gradle package-validation overhead for wrappers declaring
-Gradle 7.6+: one `--no-daemon assemble test --rerun` invocation replaces the
-unused upfront dependency scan and separate build/test invocations. Tests
-execute afresh while unchanged compilation prerequisites remain incremental.
-Exact resolved-version checks still run after validation for transitive overrides.
-Older, custom-version and unknown wrappers retain the compatible path.
+Release 1.0.32 positions both Windows checkbox dialogs on the MCP host/editor's
+monitor instead of the default screen. It follows the server's parent processes,
+prefers an active host window, and otherwise uses the nearest ancestor with a
+main window. The dialog is centered and sized to that monitor's working area,
+including monitors to the left/above the primary screen. If the host window
+cannot be found, it uses the active monitor and writes a diagnostic to stderr.
+Selection and submission still require explicit human input.
+
+Release 1.0.31 corrects container assessment reporting. When an advisory supplies
+a fixed package version but the server has no supported automatic container edit,
+the finding requires manual review; it is not listed as having no safe fix.
+The explanation requests a reviewed package/base-image update followed by a
+rebuild and rescan, never an unrelated image tag guessed from a package version.
+NVD false-positive explanations now identify the installed version and affected
+ranges, rather than only naming the fixed-version bound. Existing request
+deduplication, bounded concurrency and NVD rate limiting are unchanged.
+
+Release 1.0.30 adds a version-alignment exception to package qualification.
+Existing in-checkout linked paths to an approved file are treated as the same
+edit, not extra unauthorized changes. Existing AI Markdown/rules documents may
+also synchronize exact reviewed current-to-target versions, without changing
+any other text. Supported locations include `.github/instructions`, skills and
+prompts; Cursor, Claude, Windsurf and `.agents` rules/skills; `AGENTS.md`,
+`CLAUDE.md`, `GEMINI.md`, legacy Cursor/Windsurf rule files and GitHub version/
+Copilot instruction documents. Executable skill files, new/deleted documents,
+unknown or ambiguous package versions and unrelated instruction edits still
+require review. Production/test code and build/check scripts remain protected.
+
+The exception permits existing host/rule-driven synchronization; it does not
+execute repository AI instructions. Start a fresh run so qualification can
+capture the original documents. Accepted version-only edits are recorded in the
+report. If a batch fails, selective rollback restores those edits and replays
+only the documented versions for retained packages; later unrelated edits are
+preserved for manual review. Production builds and exact Gradle resolution remain
+mandatory. This does not bypass enforced-platform conflicts.
+
+Release 1.0.29 adds Gradle security resolution overrides for dependencies outside
+`runtimeClasspath`. After a scoped miss, the server inspects all configurations
+in the owning project with `dependencies`, sharing that report across findings.
+The approval describes the current/target versions and actual affected
+configurations. After approval, Groovy/Kotlin build files receive scoped
+`configurations.named(...).resolutionStrategy.force(...)` rules backed by the
+central security-version property. A production build and exact target resolution
+in **every originally observed configuration** are required; a dependency that
+disappears from one of those configurations fails validation. Existing selective
+rollback retains passing updates. No application tests are run.
+
+Release 1.0.28 clarified unresolved Gradle update descriptions: they identify the
+limited lookup, distinguish it from an unavailable/incompatible version, and
+give the next investigation step. This wording change does not add configuration
+discovery or authorize an unverified dependency edit.
+
+Release 1.0.27 fixes a misleading approval path: packages with `blocked_reason`
+are disabled, not selectable promises of an update. A forged selection of a
+disabled package invalidates the response before any edit. An entirely blocked
+batch returns `PACKAGE_REVIEW_REQUIRED` instead of opening unusable checkboxes.
+
+Non-major upgrades with uncertain transitive caller behavior can now use an
+explicit **BUILD-ONLY TRIAL**. The host must still read current documentation,
+review frameworks and license terms, declare no known incompatibilities, and
+disclose what remains unverified before approval. Production builds, exact Gradle
+version proof and existing selective rollback decide retention; runtime/test
+compatibility is not claimed. Known incompatibilities, required source changes
+and major upgrades cannot use this mode. Separate advisories on the same package
+are assessed independently: a documentation-only fix for one issue must not block
+a real version fix for another, nor be reported as fixing the code-dependent issue.
+
+Release 1.0.26 supersedes earlier test-running policies: remediation performs
+production builds and necessary dependency checks, **not unit or integration
+tests**, including during selective rollback and restored-baseline validation.
+It also removes eager pnpm clean/install and pre-edit informational lint.
+Installation disables Node lifecycle scripts; build scripts are checked for
+known test runners and nested test scripts. An owned Gradle initialization script
+suppresses Gradle `Test` tasks, including integration-test tasks attached to builds.
+Repository build code remains trusted executable code, not a sandbox.
+
+Every Gradle coordinate update requires an observed dependency before planning
+and the **exact target** in the approved configuration(s) after the build.
+The initial configuration is scanner-supplied or defaults to `runtimeClasspath`;
+a miss now triggers an all-configuration report for that same project.
+A literal `force` line alone proves neither presence nor remediation.
+A module absent from that report remains manual review: inspect other subprojects,
+the buildscript classpath or the scanned artifact rather than introducing a
+dependency to make the finding match. Normal runtime/compile transitive floors
+use strict dependency constraints; discovered non-runtime/custom classpaths use
+scoped resolution rules instead of guessing an `implementation` constraint bucket.
+Both approaches use
+a collision-checked `securityMcp.<group>.<artifact>.version` property in
+`gradle.properties`, and the existing `.github/versions.md` pins table when present.
+Existing explicit property/catalog references are preserved; ambiguous mappings
+require review. Constraints do not add dependencies.
+
+An unresolved Gradle update description names the package, initial configuration
+and all-configuration lookup already attempted. It distinguishes missing graph
+evidence from a version-availability or compatibility rejection and explains what
+to investigate next. It explicitly states that no update was applied; the blocker
+is not a false-positive assessment. Resolution rules, like constraints, do not add
+a missing dependency.
+
+Manager-specific current official documentation is mandatory: Gradle constraints,
+resolution, inspection and properties; Microsoft TypeScript and pnpm settings
+plus the selected Node manager; VS Code/Rider NuGet workflows and Microsoft
+PackageReference/central package management. The host review must cite these
+pages and explain the actual strategy; the server independently fetches current
+pages before editing. Fetching pages alone is not an API/compatibility assessment.
+pnpm overrides target root `pnpm-workspace.yaml`, preserving prior pins.
+Modern Yarn recursive lockfile-only refresh is blocked because its documented
+command cannot guarantee suppression of install hooks; supported manifest and
+resolution refresh paths remain available.
+
+Release 1.0.25 introduced validation latency reporting.
 Reports now record approval-execution phase durations and dependency-edit/
 lockfile-refresh durations separately. Pre-edit Checkstyle can compile sources;
-that baseline and subsequent build/tests are not file-writing time.
+compilation and dependency resolution are not file-writing time.
 Tool-discovery descriptions remain within the existing context budget without
 removing tools, required review fields or human-approval safeguards.
 
@@ -99,15 +204,14 @@ Concurrent approval requests reserve one native window per checkout before start
 cancelled startup is recorded explicitly, and stale startup responses cannot replace
 a newer run's receipt. Rejected startup windows are closed and reaped.
 
-Release 1.0.22 supersedes the earlier build-only policy: approved package security
-updates for Node, .NET/C# and Java are retained only when production builds,
-executed unit tests and configured policy checks pass. Empty, skipped or missing
-test execution is not success. A failed batch is diagnosed using guarded
+Release 1.0.22 introduced batch isolation; its unit-test requirement is superseded
+by 1.0.26. Approved updates are retained after production builds, dependency checks
+and applicable test-free policy checks pass. A failed batch is diagnosed using guarded
 dependency-file restores and reviewed subset reapplication; the final checkout
 retains passing updates and reverts offending updates, without overwriting later
 user edits. If the restored baseline also fails, the run remains blocked.
 Known fixed transitive Java dependencies can now receive a coordinate-specific
-Gradle force rule or Maven dependency-management entry, subject to documentation,
+Gradle strict constraint or Maven dependency-management entry, subject to documentation,
 license and resolved-version verification. BOM versions and application/test
 source stay unchanged. No commits, pushes or unrelated GitLab writes are added.
 
@@ -129,7 +233,7 @@ Declared Maven modules and Gradle settings-based subprojects build together,
 while independent builds are still checked separately. JDK 17+ is accepted;
 the actual wrapper, compiler and project toolchain must still build successfully.
 That release used `assemble` and Maven `clean package -Dmaven.test.skip=true`
-without unit tests; **1.0.22 supersedes that validation policy**.
+without unit tests; **1.0.26 again uses build-only validation**.
 Java source false-positive review retains
 the same cited-source evidence and human-dismissal approval requirements.
 
@@ -142,7 +246,7 @@ to the common Git checkout root, not either component directory. GitLab
 false-positive dismissal still requires human approval.
 
 Historically, release 1.0.18 disabled application unit-test execution during security remediation.
-**The following build-only behavior is superseded by 1.0.22.**
+**Release 1.0.26 restores the following no-test execution policy.**
 Production builds and non-test checks remain required. Reports explicitly state
 **Test compatibility was not verified**; a green build is not a tested-compatibility
 claim. This also applies to batch isolation, restored-baseline checks and host-led
@@ -217,7 +321,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.25. Earlier wheels do not contain
+This summary covers changes through 1.0.32. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -230,10 +334,10 @@ all of these changes; updating source files does not update an installed wheel.
 | Automatic repository selection | The server uses Git's resolved origin to discover `namespace/project`; numeric project IDs are optional. The trusted GitLab API URL and credentials remain independently configured. |
 | Same-day branch reuse | Today's exact clean security branch can start fresh, including after a prior failed run. Cleanup removes recognized generated untracked/ignored artifacts and empty directories, not tracked files, policies, configuration or unrelated work. Unsafe filesystem state still blocks cleanup. |
 | Resolved-on-main branch findings | Other tracked branches are checked for GitLab-confirmed main resolution at this run's pulled main commit. Eligible entries require human checkbox approval and fresh remote main/ref/resolution checks; an absent finding alone is not proof. |
-| VPN and dependency preparation | Corporate DNS is checked before work, each pull and pnpm preparation. The server runs `pnpm clean` then `pnpm install` once per pnpm root; reused branches are prepared after their checkout. |
+| VPN and dependency preparation | Corporate DNS is checked before work and pulls. No eager pnpm clean/install runs; dependency preparation occurs only when an approved update/build needs it. |
 | Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in console/notification/transcript channels. Owned Windows log consoles close after completion/failure and reopen for later work; unrelated prompts remain untouched. |
 | Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Missing NVD version bounds require review, not a no-fix verdict. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
-| Dependency edits | Qualified plans may refresh lockfiles, update manifests or add supported transitive overrides, including Gradle/Maven coordinates. Compatibility/license review, passing production builds and executed unit tests remain mandatory. Failed updates are isolated; passing updates remain. |
+| Dependency edits | Qualified plans may refresh lockfiles, update manifests or add supported transitive constraints/overrides. Current manager documentation, compatibility/license review, passing production builds and resolution checks remain mandatory. Tests are not executed. Failed updates are isolated; passing updates remain. |
 | Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Checkout edits, validation/rollback and dismissals wait for active verifications. |
 | Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
 | Distribution and upgrades | Share the wheel and Windows installer helper. The helper detects a locked launcher before pip changes the environment; it never kills IDEs or servers. Source and installed-package deployments have different update steps below. |
@@ -363,7 +467,7 @@ flowchart TB
   commands --> checkout
   commands -->|"Resolved origin selects project path; trusted API stays configured"| origin["Git origin"]
   commands -->|"Two fast-forward pulls and guarded same-day branch reuse"| checkout
-  commands -->|"Post-pull pnpm clean/install, then final batch build and unit tests"| product["Installed toolchains and package managers"]
+  commands -->|"Necessary dependency refresh and production builds; no test execution"| product["Installed toolchains and package managers"]
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
   server -->|"After approval outcome: final reports, snapshots and audit"| artifacts["Target checkout: .security-mcp"]
@@ -489,23 +593,15 @@ flowchart TD
   precheckGate -->|"Yes"| pulls["pull_main_twice: git pull --ff-only twice"]
   pulls --> pullGate{"Both pulls passed and tree remains clean?"}
   pullGate -->|"No"| stopRun
-  pullGate -->|"Yes"| pnpmGate{"New branch run with pnpm roots?"}
-  pnpmGate -->|"Yes"| clean["pnpm clean at each pnpm project or workspace root"]
-  clean --> cleanGate{"Clean succeeded?"}
-  cleanGate -->|"No: PREPARATION_FAILED"| stopRun
-  cleanGate -->|"Yes"| install["pnpm install in the same directory"]
-  install --> installGate{"Every preparation command succeeded?"}
-  installGate -->|"No: PREPARATION_FAILED"| stopRun
-  installGate -->|"Yes"| branch["create_security_branch: create or safely reuse today's exact dated branch"]
-  pnpmGate -->|"No: skip or defer preparation"| branch
-  branch --> reusePrep["For reuse: review logs, guarded cleanup, then pnpm clean/install on reused branch"]
-  reusePrep --> branchGate{"Branch and applicable preparation passed?"}
+  pullGate -->|"Yes"| branch["create_security_branch: create or safely reuse today's exact dated branch"]
+  branch --> reusePrep["For reuse: review logs and guarded cleanup; no eager dependency commands"]
+  reusePrep --> branchGate{"Branch ready?"}
   branchGate -->|"No"| stopRun
   branchGate -->|"Yes"| listing["list_security_findings: active main and explicitly resolved non-main findings"]
   listing --> retrievalGate{"Retrieval succeeded without truncation?"}
   retrievalGate -->|"No"| stopRun
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
-  moreFindings -->|"No"| fixSelection["select_security_fixes: human receives unchecked issue selections"]
+  moreFindings -->|"No"| fixSelection["select_security_fixes: unchecked eligible choices; blocked rows disabled; build-only trials disclosed"]
   fixSelection --> selectionMode{"Windows native selection?"}
   selectionMode -->|"Yes"| selectionWait["No review deadline: submit choices; reviewed packages execute automatically"]
   selectionMode -->|"No: host-controlled form"| approvedFixes{"Human selected any issues?"}
@@ -546,7 +642,7 @@ flowchart TD
   appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
   regression --> nextFix{"More selected fixes? Retain exact reasons for rejected edits."}
   nextFix -->|"Yes"| editKind
-  nextFix -->|"No"| postChecks["run_validation_matrix: production builds, executed unit tests and policy checks"]
+  nextFix -->|"No"| postChecks["run_validation_matrix: production builds, dependency proof and test-free policy checks"]
   postChecks --> validationGate{"VALIDATION_COMPLETE?"}
   validationGate -->|"Yes"| reports["complete_security_run: reuse current assessments"]
   validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
@@ -570,7 +666,7 @@ checkout is active.
 | Tool | Responsibility and gate |
 | --- | --- |
 | `run_prechecks(repo_root=None)` | Require clean `main` or today's exact security branch; reject Git operations in progress. Prior runtime errors block same-day reuse without overwriting the previous snapshot. |
-| `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. For a new branch, run pnpm clean/install afterward; for a reused branch, defer preparation until its checkout. |
+| `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. Dependency preparation is deferred until an approved update/build needs it. |
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
@@ -705,9 +801,9 @@ A finding is auto-fixed only when all of these are true:
 - An online advisory publishes a fixed version newer than what is installed, or GitLab explicitly recommends a newer fix for the matching local dependency. Missing data, missing records and failed public lookups do not veto GitLab's recommendation. Positive evidence that the proposed target remains affected is distinct from missing data.
 - The edit is a lockfile refresh, a manifest version bump, a package override, an unpinned `FROM` tag bump, or one cited nginx or GitLab CI line that the current publisher page still documents.
 - Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing post-update checks. Major image-tag changes still require manual review.
-- Every package update requires no production/unit-test API adaptations and passing post-update builds, executed unit tests and configured corporate checks. Missing or skipped tests cannot qualify an update. Pre-change lint capture is informational only: errors, missing scripts or incomplete capture never block security fixes. Same-major does not prove compatibility.
+- Every package update requires no production/unit-test API adaptations and passing post-update production builds, dependency checks and applicable test-free corporate checks. Unit/integration tests are disabled and test compatibility is not verified. Same-major does not prove compatibility.
 
-An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before the normal qualification workflow. Failed lookups of either the installed or target version are informational when GitLab provides a concrete newer fix. Production builds, executed unit tests and configured policy checks determine acceptance; failures isolate and restore offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
+An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before qualification. Failed lookups are informational when GitLab provides a concrete newer fix. Production builds, dependency checks and test-free policy checks determine acceptance; failures isolate offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
 
 CVE, CWE, NSA and NIST security-reference pages are best-effort information,
 not an authorization gate for version or supported code/configuration fixes.
@@ -1007,7 +1103,7 @@ Resolved Java transitives with available fixes may receive a reviewed
 coordinate-specific override: Gradle `resolutionStrategy.force` in the owning build,
 or Maven `dependencyManagement` in a supported POM. Parent/BOM versions are not
 silently upgraded. A fresh resolved tree must confirm the fixed version before
-acceptance, in addition to passing builds and unit tests. Unsupported profiles,
+acceptance, in addition to passing builds and dependency checks. Unsupported profiles,
 ambiguous declarations or unresolved coordinates remain explicit review items.
 
 An advisory that explicitly says upgrading alone does not fix affected code is
@@ -1101,7 +1197,7 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   trusted GitLab API host. The server discovers the project path from Git;
   an explicit project path or numeric ID is an optional override, not a prerequisite.
 - The package managers and toolchains required by the target application.
-- Meaningful production builds, executed unit tests and documented license review; independently
+- Meaningful production builds, dependency checks and documented license review; independently
   approved corporate policy only when required/configured for your organization.
 
 Point `REPO_ROOT` at the application Git checkout, not this MCP project.
@@ -1129,7 +1225,7 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
    API/migration guides, runtime/peer requirements, and license terms. It inspects
    the actual product's frameworks and callers, not only the GitLab suggestion.
 2. The update must preserve product build, startup/runtime behavior, and the
-   existing unit-suite APIs, with passing builds and executed unit tests.
+   existing unit-suite APIs, with passing production builds and dependency checks.
    Review Angular/Node/TypeScript/RxJS/Crystal compatibility,
    Quarkus platform/BOM and extension alignment, Java requirements, and .NET
    target frameworks as applicable. Never force peer resolution or change the
@@ -1140,25 +1236,36 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
   terms review, not corporate approval. Unknown/unlicensed terms block editing.
   When a corporate policy is configured or present, independent exact-version
   approval and all its checks remain required; the AI must not invent approvals.
-4. Before the first edit, lint runs and all emitted errors, warnings,
-  informational and unknown diagnostics, stdout and stderr are saved in
-  `.security-mcp/lint-issues.json`. Observed rule names, occurrence counts and
-  severities are exported to `.security-mcp/lint-rules.json`, independently of
-  the project's lint configuration. Errors, missing lint scripts, timeouts,
-  truncated output or lint execution failures never block editing. Completeness
-  is recorded honestly; an incomplete capture cannot list unseen rule IDs.
-  Apply all reviewed version updates first, then run production builds,
-  unit tests and configured policy checks for the complete batch.
-  Lint-only capture does not install or audit dependencies first.
-  Node components must define both `build` and a terminating `test` script.
-  Reports never present skipped tests as passing evidence.
-  Initial lint evidence is retained rather than rerun on
-  qualification retries or after updates. No sleeps, cooldowns or polling delays
-  are required. Corporate approvals remain mandatory; configured commands run
-  in the final matrix, sharing exact build results rather than rerunning them.
-  Corporate unit-test requirements are honored, never removed or bypassed.
-  Corporate-policy mode additionally requires positive, untruncated runtime
-  smoke and full resolved-dependency license checks with configured markers.
+4. Apply reviewed updates first, then run production builds, necessary dependency
+  resolution and test-free policy checks once for the complete batch. No eager
+  clean/install, informational pre-edit lint, unit/integration test execution or
+  test discovery runs. Node components need an existing production `build` script,
+  not a `test` script. Reports explicitly state that test compatibility is unverified.
+  Corporate approvals remain mandatory; legacy `unit_tests` entries are explicitly
+  disabled without rewriting policy files. A runtime/license check implemented as
+  `dotnet test` or Maven `verify` blocks qualification rather than being silently
+  waived. Ask its policy owner for a supported test-free check or policy resolution.
+
+For a non-major target with no known incompatibility but uncertain caller behavior,
+the host may explicitly choose the following review fields instead of falsely
+asserting compatibility. Keep all normal package/manager documentation, API-change,
+framework, license and `source_fixes: []` evidence:
+
+```json
+{
+  "validation_mode": "build_only",
+  "compatible": null,
+  "compatible_without_code_changes": null,
+  "known_incompatibilities": [],
+  "compatibility_limitations": "Actual caller/runtime behavior that remains unverified"
+}
+```
+
+The checkbox is labeled **BUILD-ONLY TRIAL** with those limitations. Approval
+authorizes only the dependency edit and build/resolution checks. A failed trial
+uses the same guarded selective rollback; a passing build is not proof of runtime
+or test compatibility. An explicit `false` compatibility flag, known incompatibility,
+missing evidence, unknown upgrade size or major upgrade still blocks this mode.
 
 When separately qualified findings propose the exact same package plan, the server
 can associate them with an already-applied edit only while every backed-up
@@ -1216,7 +1323,7 @@ sequenceDiagram
 
   Approver->>Policy: Provision exact-version approvals and mandatory checks
   Host->>MCP: run_prechecks then pull_main_twice
-  MCP->>Repo: Pull main twice, then pnpm clean and pnpm install when applicable
+  MCP->>Repo: Pull main twice; do not clean/install before approved work
   alt Pull or preparation fails
     MCP-->>Host: Stop before branch creation and security checks
   else Checkout prepared
@@ -1273,14 +1380,14 @@ sequenceDiagram
   end
   Host->>MCP: run_validation_matrix once after all updates
   MCP->>Policy: Recheck approval, markers and policy hash
-  MCP->>Repo: Production builds, executed unit tests and configured checks
-  MCP-->>Host: Live command bars and fresh Jest suite progress
+  MCP->>Repo: Production builds, exact dependency proof and test-free checks
+  MCP-->>Host: Live command output and timing; tests disabled
   alt Complete batch passes
     MCP-->>Host: VALIDATION_COMPLETE, all retained packages VALIDATED
   else Failed batch
     loop Split failed groups, test accepted plus candidate subsets
       MCP->>Repo: Guarded dependency restore and reviewed subset replay
-      MCP->>Repo: Diagnostic builds, unit tests and mandatory policy checks
+      MCP->>Repo: Diagnostic production builds, resolution and test-free policy checks
     end
     MCP->>Repo: Verify final passing subset, or restored baseline if all rejected
     MCP-->>Host: Retained updates, rejected updates and isolation trials, or blocked recovery
@@ -1312,8 +1419,8 @@ Corporate-policy mode is optional. Set `PACKAGE_UPDATE_POLICY` to a controlled
 JSON file's absolute path, or provision `.security-mcp/package-update-policy.json`
 under `REPO_ROOT`. An explicit path or an existing default file is enforced;
 missing/invalid explicit policy fails closed. When neither exists, qualification
-uses documented license review, informational lint, production builds and unit
-tests without creating a policy.
+uses documented license review, production builds and dependency checks without
+creating a policy or executing unit/integration tests.
 Keep approvals access-controlled, preferably outside the AI-writable checkout.
 The AI/server must never create or modify actual approvals. The server reads and
 hashes this file; it cannot authenticate a corporate signer or grant legal rights.
@@ -1349,8 +1456,8 @@ approve both Boolean fields before any update is permitted:
 
 Use ecosystem keys exactly `npm`, `NuGet`, or `Maven` (Gradle also uses `Maven`).
 Every entry must contain `build`, `runtime`, and `license_audit`, using the detected
-manager. An existing `unit_tests` requirement is honored alongside the mandatory
-stack unit tests; identical command results are shared. Configure real
+manager. Legacy `unit_tests` entries are explicitly disabled; identical production
+build results are shared. Configure real, test-free
 repository-owned scripts/profiles before starting
 on clean main; they are not supplied automatically by this MCP server. Markers
 must be emitted only after meaningful product checks and complete license-policy
@@ -1360,22 +1467,20 @@ In corporate-policy mode, missing tools, checks, markers, or approvals block edi
 | Manager | Production Build | Runtime Smoke | Resolved-Graph License Audit |
 | --- | --- | --- | --- |
 | npm/pnpm/yarn | `MANAGER run build` | `MANAGER run security:smoke` | `MANAGER run security:licenses` |
-| NuGet/.NET | `dotnet build --configuration Release --nologo` | `dotnet test --configuration Release --nologo --filter Category=SecurityRuntimeSmoke` | `dotnet test --configuration Release --nologo --filter Category=LicenseCompliance` |
-| Maven/mvnw | `TOOL --batch-mode clean verify` | `TOOL --batch-mode -Psecurity-smoke verify` | `TOOL --batch-mode -Psecurity-licenses verify` |
-| Gradle/gradlew | `TOOL --no-daemon assemble` | `TOOL --no-daemon securitySmoke` | `TOOL --no-daemon securityLicenses` |
+| NuGet/.NET | `dotnet build --configuration Release --nologo` | Legacy test-based checks block; policy-owner action required | Legacy test-based checks block; policy-owner action required |
+| Maven/mvnw | `TOOL --batch-mode clean package -Dmaven.test.skip=true` | Legacy verify profiles block; policy-owner action required | Legacy verify profiles block; policy-owner action required |
+| Gradle/gradlew | `TOOL --no-daemon assemble -x test` plus owned no-tests initialization | `TOOL --no-daemon securitySmoke`, if test-free | `TOOL --no-daemon securityLicenses`, if test-free |
 
-Unit tests run after production builds, including diagnostic subset/baseline
-validation when needed. Known Gradle 7.6+ wrappers combine `assemble test --rerun`
-in one process, forcing tests without forcing all prerequisites to recompile.
-Older/unknown wrappers use separate build and `test --rerun-tasks` invocations.
-Legacy corporate checks reuse successful verified build/test evidence from the
-same validation pass, working directory and executable, preserving command
-provenance and required positive markers. Fresh JUnit reports prove execution
-when Gradle prints no test counts. Final override resolution remains independent.
-Java wrappers are resolved inside the checkout using the current OS's wrapper
-form. Existing Node scripts and lifecycle hooks may run tests; they are not
-rewritten or silently skipped. Repository scripts remain trusted executable code,
-not an operating-system sandbox.
+Unit/integration suites and test discovery do not run, including diagnostic
+subset/baseline validation. Maven's `maven.test.skip=true` skips compilation and
+execution through the standard compiler/Surefire/Failsafe plugins. Gradle suppresses
+all `Test` tasks, not just the task named `test`. Custom build dependencies may still
+compile test sources. Arbitrary custom tasks/scripts remain trusted executable code,
+not an operating-system sandbox. Known Node test-running build chains are rejected,
+not rewritten. Node installs use ignored lifecycle scripts or Yarn's `skip-build`
+mode. Java wrappers are resolved inside the checkout using the current OS's form.
+Every Gradle coordinate update additionally needs independent final configuration-
+specific exact-version proof; a pin or successful compilation is not enough.
 
 #### Documentation review input
 
@@ -1413,6 +1518,11 @@ actual review. This illustrative input is not evidence for a real package:
 }
 ```
 
+Read every URL returned in `proposed_fix.qualifiers.manager_documentation` and
+include those exact URLs in `review.documentation.sources`, alongside the
+target package's own documentation. Explain the actual update/override strategy
+in the documentation summary; language home pages alone do not satisfy this gate.
+
 Include every relevant framework/runtime/BOM and publisher source. Keep
 `source_fixes: []` for every version increment. Confirm that both production
 and unit-test APIs need no adaptations. If either requires changes, reject the
@@ -1445,7 +1555,7 @@ read. These example values are placeholders, not compatibility evidence:
 For transitive packages, include the relevant installed dependency source files
 as well as repository references, not only an application file. Supply this
 object alongside the normal exact-target documentation/framework review and
-`source_fixes: []`. Evidence is checked again after lint/policy review and
+`source_fixes: []`. Evidence is checked again after policy review and
 before applying the plan; reverify if the checkout/callers change.
 
 `QUALIFICATION_REQUIRED` blocks an edit. `QUALIFIED` authorizes only the exact
@@ -1461,7 +1571,7 @@ application failures still require local inspection.
 These gates enforce reviewed evidence and repository-owned checks, not a proof
 of every possible runtime behavior. The server does read the required publisher
 pages before an edit, and that read is separate from the host's exact-version
-package review. Their assurance depends on test coverage, truthful review,
+package review. Their assurance depends on production-build/dependency evidence, truthful review,
 correct configured license auditing and authentic corporate approvals when used. Snapshot
 checks prune dependency/build/cache directories and stop at the file/size cap;
 they are not cross-process locks or verification of all generated binaries.
@@ -1480,13 +1590,26 @@ and [NuGet license metadata](https://learn.microsoft.com/en-us/nuget/reference/n
 Read the specific updated package's documentation too; these general references
 do not establish compatibility or commercial approval for an individual update.
 
+Manager guidance (fetched live before edits):
+
+- Gradle: [constraints](https://docs.gradle.org/current/userguide/dependency_constraints.html),
+  [resolution rules](https://docs.gradle.org/current/userguide/resolution_rules.html),
+  [configuration-specific inspection](https://docs.gradle.org/current/userguide/viewing_debugging_dependencies.html),
+  [project properties](https://docs.gradle.org/current/userguide/build_environment.html).
+- Node: [Microsoft TypeScript builds](https://www.typescriptlang.org/docs/handbook/project-references.html),
+  [pnpm root overrides](https://pnpm.io/settings/dependency-resolution), plus the selected manager's documentation.
+- .NET: [VS Code NuGet management](https://code.visualstudio.com/docs/csharp/package-management),
+  [Rider NuGet management](https://www.jetbrains.com/help/rider/Using_NuGet.html),
+  [central package management](https://learn.microsoft.com/en-us/nuget/consume-packages/central-package-management),
+  [PackageReference](https://learn.microsoft.com/en-us/nuget/consume-packages/package-references-in-project-files).
+
 ### Repository Compatibility
 
 | Repository | Automatic dependency fixes | Validation |
 | --- | --- | --- |
-| Node.js | npm, pnpm, Yarn Classic and modern Yarn; direct version bumps, supported lock refreshes, overrides/resolutions | Install, advisory audit, informational lint, production build and unit tests |
-| .NET 10 | NuGet project references and existing central `Directory.Packages.props` versions | SDK compatibility check, restore, Release build and unit tests; `.sln`, `.slnx`, C#, F#, and VB project detection |
-| Java 17+ | Maven versions/properties, Gradle coordinates/plugins/catalogs and supported coordinate-specific transitive overrides | Component-aware Maven verify/dependency tree or Gradle dependencies/assemble/test; nearest checkout wrapper preferred |
+| Node.js | npm, pnpm, Yarn Classic and supported modern Yarn manifest/resolution refreshes | Script-disabled install, advisory audit, production build; no test command |
+| .NET 10 | NuGet project references and existing central `Directory.Packages.props` versions | SDK compatibility, restore, Release build; `.sln`, `.slnx`, C#, F#, and VB discovery; no test command |
+| Java 17+ | Maven versions/properties, Gradle coordinates/plugins/catalogs and supported transitive floors | Component-aware Maven package/dependency tree or Gradle assemble/scoped graph proof; no test execution |
 
 These are safe dependency-remediation paths, not a promise to fix every security
 finding. A matching advisory or locally verified GitLab recommendation, a compatible
@@ -1536,7 +1659,7 @@ reported remote hostname. An API route is not a local source-file path.
 After reproduction and review, the host may apply a scoped application-code
 fix and regression test separately from dependency updates. It must retain
 before/after reproduction evidence, valid and boundary cases, and passing
-informational lint, production builds and executed unit tests.
+production builds and necessary task-specific checks, without executing unit/integration suites.
 Missing artifacts or an
 unavailable environment block this workflow. Scanner text is not a patch.
 
@@ -1580,7 +1703,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.25-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.32-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1596,7 +1719,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.25-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.32-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1636,7 +1759,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.25-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.32-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
@@ -1652,7 +1775,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.25-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.32-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1673,7 +1796,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.25-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.32-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1682,7 +1805,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.25-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.32-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -1982,7 +2105,7 @@ For Windows wheel deployments, close all VS Code/Cursor windows, including
 Agents/background windows, and use **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.25-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.32-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2016,7 +2139,7 @@ an unrelated environment or install the application into the MCP environment.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.25**
+3. Apply the deployment-specific update and verify installed version **1.0.32**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2025,7 +2148,7 @@ an unrelated environment or install the application into the MCP environment.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.25`
+   edits before requesting a new run. Its `server_version` must be `1.0.32`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -2094,7 +2217,7 @@ GitLab permissions or clear the host's internal conversation errors.
    request `submit_false_positive_approvals` to reopen it.
    Do not authorize the AI to answer it.
 7. Review the final Finding Assessments, actual dismissal outcomes, unresolved
-   findings, production-build/unit-test evidence and local diff. Commit/push manually if accepted.
+   findings, production-build/dependency evidence and local diff. Commit/push manually if accepted.
 
 **If the Command Palette does not show MCP controls:** use the Chat view's
 **Open Customizations > MCP Servers** navigation when available. Check the
@@ -2241,19 +2364,14 @@ The host controls whether MCP progress/log notifications appear in chat;
 notifications alone cannot force an editor console to become visible. Full raw
 command stdout/stderr remain available in `.security-mcp/command-logs`.
 
-For a plain Jest `test` script, the server first runs the package manager's
-`test --listTests --json` (with npm's required `--` separator). This discovers
-the current test files without executing them. PASS/FAIL events advance a
-suite-based bar; individual case results are counted when emitted. Jest cannot
-reliably enumerate every dynamically generated case before execution, so the
-suite denominator is explicitly labeled, not presented as a case total. Fresh
-discovery handles added/removed files. Failed or unavailable discovery falls back
-to honest unknown-total progress and never prevents the real tests from running.
+Test discovery and test-runner progress do not run during remediation. Build
+progress reports actual output bytes and command completion, never a guessed
+test total or elapsed-time completion percentage.
 
 Example live message:
 
 ```text
-pnpm test: [##########..........] 170/339 test suites (50%); 2500 test cases reported; case total unavailable
+pnpm run build: output bytes received; command finished; exit 0
 ```
 
 When a host starts the server, use its MCP/server output or diagnostic logs to
@@ -2337,7 +2455,7 @@ command transcripts, and absence of an audit record does not prove a fix passed.
 ## Run gitlab-security on this repo
 
 Connect to corporate VPN first. Before any precheck work, before each Git pull,
-and before pnpm clean/install preparation, the server requires DNS resolution of
+and before network-dependent preparation, the server requires DNS resolution of
 `nexus.ert.com`. If DNS fails, it stops and tells you to connect to corporate VPN
 first; reconnect and rerun `run_prechecks`. DNS resolution is a prerequisite,
 not proof that VPN, Nexus authentication, or downloads are working. Earlier
@@ -2367,18 +2485,13 @@ checkout root and passes it as `repo_root`; it must not select the MCP server's
 installation directory. A nested `frontend` is discovered automatically.
 When multiple repositories are open, identify the intended checkout explicitly.
 
-The host runs prechecks and two pulls. For a fresh security branch, the server
-runs `pnpm clean` followed by `pnpm install` for each pnpm project/workspace
-after the pulls and before branching. For today's reused branch, it defers those
-commands until that branch is checked out and prior logs pass review; preparation
-uses the reused branch's own manifests. Finding checks start after applicable
-preparation. Non-pnpm checkouts skip that preparation. A failed pull, missing pnpm or
-clean script, or failed clean/install stops the run; no deletion workaround or
-duplicate host-issued preparation is needed.
+The host runs prechecks and two pulls, then creates or safely reuses the security
+branch. No eager pnpm clean/install runs. Only approved updates/builds trigger
+necessary dependency preparation, with Node lifecycle hooks disabled.
 
 Follow the live MCP progress notifications or the server output/log panel.
-Apply all reviewed version updates first, then run production builds, unit tests
-and configured policy checks. Additional diagnostic build/test runs occur only
+Apply reviewed updates first, then run production builds, dependency checks
+and test-free policy checks. Additional diagnostic build/resolution runs occur only
 when that batch fails.
 There is no pre-edit product suite or timer-based progress estimate. The final
 response displays unresolved findings and consulted security sites. Review local
@@ -2390,7 +2503,7 @@ a command-line replacement for the agent request above.
 ## Running remediation
 
 1. Install runtime dependencies and configure your MCP host.
-2. Review exact-target license terms and provide production-build/unit-test checks; provision corporate approvals/checks if configured or required by your organization.
+2. Review exact-target license terms and manager documentation; provide production builds and test-free corporate approvals/checks when configured.
 3. Use clean `main` or today's allowed security branch in `REPO_ROOT`; finish
    any in-progress Git operation. Prior errors block same-day reuse.
 4. Start/reload `gitlab-security` and enable its tools.
@@ -2403,9 +2516,8 @@ Example agent request:
 ```text
 Use the gitlab-security MCP tools in order for one checkout. Pass the same
 absolute repo_root on every call when more than one checkout is active. Run
-prechecks and pull main twice. Let pull_main_twice run pnpm clean followed by
-pnpm install in each pnpm project/workspace root before any security checks;
-do not issue duplicate preparation commands. Stop on PREPARATION_FAILED.
+prechecks and pull main twice. Do not run eager pnpm clean/install, test discovery
+or pre-edit informational lint.
 Then create the security branch, list findings, and
 verify each finding. For package updates, review the exact target docs and call
 qualify_package_update with compatibility and documented license evidence,
@@ -2414,20 +2526,18 @@ publisher pages before every edit. Treat DOCS_REQUIRED as no change. Cited
 nginx and GitLab CI lines may change only when the current page still documents
 that one-line edit. Never invent approvals or force incompatible framework
 versions. Never change production code, unit tests or check scripts to support
-any package version. Run lint before changes and retain every diagnostic and
-raw output in .security-mcp/lint-issues.json and observed violation rule IDs in
-.security-mcp/lint-rules.json. Lint capture is best-effort and never gates a fix,
-including missing scripts, execution failures and incomplete output. Apply all
-reviewed version updates first, then run production builds and unit tests
-once for the complete batch, including mandatory configured policy checks.
-Require executed unit tests as well as builds; never waive configured policy checks.
+any package version. Read current manager-specific official documentation and
+cite it in the compatibility review. Apply reviewed updates first, then run
+production builds, necessary dependency resolution and test-free policy checks
+once for the complete batch. Never execute unit/integration suites, including
+during rollback diagnosis. Do not silently waive conflicting corporate checks.
 Do not run a pre-fix build/test suite. Keep live MCP progress
 bars visible; never insert sleeps, polling waits or elapsed-time percentages.
-Accept only with passing builds, executed unit tests and required policy checks.
-Only a failed final batch permits diagnostic build/test reruns. The server
+Accept only with passing builds, dependency proof and required test-free policy checks.
+Only a failed final batch permits diagnostic build/resolution reruns. The server
 splits failed groups, replays reviewed subsets with guarded dependency restores,
 and retains a passing combination. Reject incompatible updates and interactions.
-Require green final builds and unit tests, even when every update is
+Require green final builds and dependency checks, even when every update is
 rejected and the original baseline is restored. Never claim a broken baseline
 is recovered. Do not retry rejected targets blindly or adapt source/tests.
 Finish with complete_security_run to save the local report and automatically
@@ -2537,7 +2647,7 @@ false positive.
 
 For a reproduced defect, the host applies a scoped source fix and regression
 test separately from package updates, then runs the same reproduction, boundary
-cases, informational lint, production builds and executed unit tests.
+cases and production builds, without executing unit/integration suites.
 `apply_minimal_fix` does not
 rewrite arbitrary source code. Do not blanket-escape intentional regular
 expressions or replace test assertions merely to remove a scanner warning.
@@ -2578,7 +2688,7 @@ edit both a manifest and a workspace file:
 
 An available version alone does not authorize an edit. Exact-target
 compatibility/license review, any configured corporate policy, fresh publisher
-documentation and final production-build/unit-test validation still apply.
+documentation and final production-build/dependency validation still apply.
 The host must not modify production or unit-test APIs to make a package upgrade
 pass. Review `change.files`, qualification evidence, lockfile diff and final
 validation before publishing.
@@ -2589,9 +2699,9 @@ A Gradle plugin edit changes one `id ... version` declaration in `build.gradle`,
 
 | Stack | Commands |
 | --- | --- |
-| Node | After pulls, pnpm projects run `pnpm clean` then `pnpm install`. Before edits, capture informational lint once. After all version updates, frozen dependency install, production `build`, unit `test` and informational advisory audit. Both scripts are required for accepting package updates. |
-| .NET | Restore, informational pre-edit `dotnet format --verify-no-changes --no-restore`, Release production build and `dotnet test --configuration Release --nologo`. A non-`net10.0` target is reported. |
-| Java | Informational pre-edit Checkstyle. Each build root runs Maven `clean verify` and `dependency:tree`; or, with a known Gradle 7.6+ wrapper, one `assemble test --rerun` invocation with incremental prerequisites. Older/unknown wrappers retain dependency inspection and separate build/forced-test commands. Transitive overrides additionally require fresh final dependency resolution. JDK 17+ and project-specific toolchain compatibility are required. Fresh successful JUnit reports prove Gradle tests ran when console counts are absent. |
+| Node | After approved updates: frozen install with `--ignore-scripts` (modern Yarn: `--mode=skip-build`), production `build`, informational advisory audit. No eager clean/install, lint baseline, test discovery or test execution. |
+| .NET | Restore and Release production build; no `dotnet test`. A non-`net10.0` target is reported. |
+| Java | Maven `clean package -Dmaven.test.skip=true` and `dependency:tree`; Gradle `assemble -x test` with an owned no-tests initialization script. Every Gradle coordinate update requires fresh exact-target resolution in the scanner configuration (default `runtimeClasspath`). JDK 17+ and project toolchain compatibility remain required. |
 | NGINX | `nginx -t` when `nginx` is installed and a config file is present |
 | Container | `FROM` is required. `docker build --check` runs when Docker is available. A missing daemon is recorded as skipped. |
 
@@ -2607,34 +2717,31 @@ restoration sets `manual_cleanup_required` and blocks further edits until cleanu
 and validation succeed. The Node audit is informational, not a substitute for
 the mandatory compatibility and resolved-license checks.
 
-The engine attempts lint once before any edit, retaining the issues and an
-observed-rule inventory. No lint result gates a fix, including missing scripts,
-execution failures, timeouts or truncated output. It never reruns lint during
-post-fix validation or qualification retries. The complete batch must then
-pass production builds, executed unit tests and configured policy checks.
-Missing, empty or entirely skipped test execution is not passing evidence.
+The engine skips pre-edit informational lint and test execution. The batch must
+pass production builds, dependency checks and applicable test-free policy checks.
+Reports never claim that unexecuted tests passed or that test compatibility was verified.
 Node build failure stops downstream checks; missing
 mandatory scripts also stop later checks. Unexecuted checks are explicitly
 skipped, never passed. The validator's standalone strict mode still treats lint
-failure as a blocking check; the remediation engine uses baseline-recording mode.
+failure as a blocking check when explicitly requested; remediation does not request it.
 
-Apply every reviewed version update before final validation. A build alone is
-insufficient. Initial lint output remains unchanged for the run. Configured
+Apply reviewed updates before final validation. A build does not replace required
+dependency proof or license/compatibility review. Configured
 corporate checks remain mandatory in the final matrix; identical commands at
 the same working directory share one execution while each success marker is
 checked independently. An unchanged successful matrix is reused on repeat calls.
 On failure only, grouped subset testing identifies offending updates and
 interactions without exhaustively enumerating combinations. The retained subset
-must pass the final builds and unit tests. If none pass, verify the restored
+must pass final production builds and dependency checks. If none pass, verify the restored
 baseline too; an already-broken baseline remains a failed run. Later edits are
 preserved and unsafe recovery requires manual cleanup. Diagnostic trials retain
 failed commands, details and log paths in the JSON report's `batch_isolation`
-and the Markdown **Batch Isolation** section. This is a build-and-test-validated subset,
+and the Markdown **Batch Isolation** section. This is a build/resolution-validated subset,
 not a claim to have found the globally largest passing combination.
 New checkout or policy changes invalidate accepted package receipts.
 
 Verbose build output exceeding the preview cap is not a product
-failure. Actual command exit codes and executed-test evidence determine success.
+failure. Actual command exit codes, dependency proof and required policy evidence determine success.
 Complete local stdout/stderr logs and bounded beginning/end
 previews preserve final summaries. Rejection details include the failed command,
 exit code, final diagnostics and log paths. A failure reproduced on the original
@@ -2765,7 +2872,7 @@ for deployment and restart differences.
 | Retrieval fails or tracked main is unavailable | Check token scope/access, exact project path, GitLab URL and tracked branch. Do not use an unfiltered fallback. |
 | `truncated: true` | Treat retrieval/discovery as incomplete; do not claim all findings or absent packages were verified. |
 | `PRECHECK_FAILED` | Use clean `main` or today's exact security branch and finish Git operations manually. Tracked metadata modifications are dirty work; unsafe artifact paths also block reuse. Prior execution errors alone do not block a fresh run. |
-| `PREPARATION_FAILED` | Inspect post-pull `pnpm clean` / `pnpm install` results and full command logs. Provide the repository's existing clean script and pnpm on PATH; resolve failures before security checks. Do not invent a clean script or delete directories as a workaround. |
+| `PREPARATION_FAILED` | Inspect the precise failed gate and command logs; check corporate DNS/VPN. Current remediation does not run eager pnpm clean/install. Do not invent clean scripts or delete directories as a workaround. |
 | Dated branch already exists | Today's exact clean branch is reused after guarded generated-artifact cleanup, including failed-run output. Policies, configuration, tracked and unknown files are preserved. Other dated branches are not reused. |
 | `MANUAL_REVIEW` or `NO_SAFE_FIX` | Inspect local/advisory evidence and the unresolved table. Unknown reachability, a package-name mismatch, or an undocumented configuration line does not prove a false positive. |
 | `DOCS_REQUIRED` | The required publisher pages were not read completely. Nothing was written. Retry when those pages can be fetched. Do not apply the edit from memory. |

@@ -508,9 +508,7 @@ def _locate_npm_component(
         manifest=manifest,
         lockfile=lock_rel,
         direct=direct,
-        override_manifest="pnpm-workspace.yaml"
-        if manager == "pnpm" and (root / "pnpm-workspace.yaml").is_file()
-        else None,
+        override_manifest="pnpm-workspace.yaml" if manager == "pnpm" else None,
     )
 
 
@@ -992,20 +990,32 @@ def add_npm_override(
     The file is rewritten as JSON, keeping its indent, line endings, and
     non-ASCII text, so the diff is the new override block.
     """
+    if manager == "pnpm" and Path(manifest).name == "package.json":
+        manifest = (Path(manifest).parent / "pnpm-workspace.yaml").as_posix()
     path = _destination(root, manifest)
-    text = _read(path)
+    text = "" if manager == "pnpm" and not path.exists() else _read(path)
     if manager == "pnpm" and path.name == "pnpm-workspace.yaml":
         yaml = YAML()
         yaml.preserve_quotes = True
         yaml.indent(mapping=2, sequence=4, offset=2)
         yaml.line_break = "\r\n" if "\r\n" in text else "\n"
         try:
-            data = yaml.load(text)
+            data = yaml.load(text) if text.strip() else {}
             if not isinstance(data, dict):
                 raise ValueError("pnpm-workspace.yaml must contain a mapping")
             overrides = data.setdefault("overrides", {})
             if not isinstance(overrides, dict):
                 raise ValueError("pnpm workspace overrides must contain a mapping")
+            package_data = _read_json(path.parent / "package.json") or {}
+            legacy = (package_data.get("pnpm") or {}).get("overrides") or {}
+            if not isinstance(legacy, dict):
+                raise ValueError("Legacy pnpm overrides must contain a mapping")
+            for name, value in legacy.items():
+                if name != package and name in overrides and overrides[name] != value:
+                    raise ValueError(
+                        "Conflicting legacy/workspace pnpm overrides require review"
+                    )
+                overrides.setdefault(name, value)
             overrides[package] = version
             with StringIO() as stream:
                 yaml.dump(data, stream)
@@ -1091,22 +1101,75 @@ def add_nuget_reference(
     return _rel(root, path)
 
 
-def add_java_override(root: Path, manifest: str, package: str, version: str) -> None:
+def add_java_override(
+    root: Path,
+    manifest: str,
+    package: str,
+    version: str,
+    *,
+    configurations: tuple[str, ...] = (),
+) -> None:
     """Pin one resolved Java coordinate without changing the enclosing BOM."""
     if not re.fullmatch(r"[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+", package):
         raise ValueError("A Java override requires an exact group:artifact coordinate")
     path = _destination(root, manifest)
     text = _read(path)
     if path.name in {"build.gradle", "build.gradle.kts"}:
-        _write(
-            path,
-            text.rstrip()
-            + (
-                "\n\nconfigurations.configureEach {\n"
-                f'    resolutionStrategy.force("{package}:{version}")\n'
-                "}\n"
-            ),
+        key = _gradle_floor_key(package)
+        properties = java_project_root(root, manifest, "gradle") / "gradle.properties"
+        start, end = (
+            f"// security-mcp:start {package}",
+            f"// security-mcp:end {package}",
         )
+        owned = re.compile(
+            rf"(?m)^{re.escape(start)}\r?\n.*?^{re.escape(end)}[ \t]*$", re.DOTALL
+        )
+        matches = list(owned.finditer(text))
+        existing = _read(properties) if properties.exists() else ""
+        if len(matches) > 1 or (
+            not matches and re.search(rf"(?m)^{re.escape(key)}[ \t]*=", existing)
+        ):
+            raise ValueError(
+                "Ambiguous/existing Gradle security property requires review; it will not be overwritten"
+            )
+        block = (
+            f"{start}\ndependencies {{\n    constraints {{\n"
+            f'        add("implementation", "{package}") {{\n'
+            f'            version {{ strictly(project.providers.gradleProperty("{key}").get()) }}\n'
+            '            because("Reviewed security remediation; preserve the existing dependency graph.")\n'
+            f"        }}\n    }}\n}}\n{end}"
+        )
+        if configurations:
+            names = sorted({scope.rsplit(":", 1)[-1] for scope in configurations})
+            if any(
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,100}", name) is None
+                for name in names
+            ):
+                raise ValueError(
+                    "A Gradle resolution override requires exact configuration names"
+                )
+            rules = "\n".join(
+                f'configurations.named("{name}") {{\n'
+                f'    resolutionStrategy.force("{package}:" + project.providers.gradleProperty("{key}").get())\n'
+                "}"
+                for name in names
+            )
+            block = f"{start}\n{rules}\n{end}"
+        newline = "\r\n" if "\r\n" in text else "\n"
+        block = block.replace("\n", newline)
+        updated = (
+            owned.sub(lambda _match: block, text, count=1)
+            if matches
+            else text.rstrip() + newline * 2 + block + newline
+        )
+        property_text = _gradle_property_text(existing, key, version)
+        documentation = _gradle_version_documentation(
+            root, key, version, _rel(root, properties)
+        )
+        _write(path, updated)
+        _write(properties, property_text)
+        if documentation is not None:
+            _write(root / ".github" / "versions.md", documentation)
         return
     if path.name != "pom.xml":
         raise ValueError(
@@ -1220,13 +1283,136 @@ def update_pom_version(root: Path, manifest: str, package: str, version: str) ->
     return False
 
 
+def _gradle_floor_key(package: str) -> str:
+    """Use a new explicit namespace rather than guessing an existing policy key."""
+    return "securityMcp." + package.replace(":", ".") + ".version"
+
+
+def _gradle_property_reference(root: Path, manifest: str, package: str) -> str | None:
+    """Recognize only explicit Gradle-property interpolation for this coordinate."""
+    text = _read(_destination(root, manifest))
+    match = re.search(
+        rf'"{re.escape(package)}:\$(?:\{{([A-Za-z_][\w.-]*)\}}|([A-Za-z_]\w*))"', text
+    )
+    return (match[1] or match[2]) if match else None
+
+
+def gradle_version_files(
+    root: Path, manifest: str, package: str, *, override: bool
+) -> list[str]:
+    """Declare every property/policy edit before human approval and backup."""
+    files = [manifest]
+    if not override and Path(manifest).name == "libs.versions.toml":
+        hit = _toml_library_version(_destination(root, manifest), package)
+        if (root / ".github" / "versions.md").is_file():
+            if hit is None or hit[1] == "inline":
+                raise ValueError(
+                    "Central version policy requires an explicit catalog version.ref"
+                )
+            _gradle_version_documentation(root, hit[1], "0.0.0", manifest)
+            files.append(".github/versions.md")
+        return files
+    key = (
+        _gradle_floor_key(package)
+        if override
+        else _gradle_property_reference(root, manifest, package)
+    )
+    if key:
+        properties = java_project_root(root, manifest, "gradle") / "gradle.properties"
+        files.append(_rel(root, properties))
+        if (root / ".github" / "versions.md").is_file():
+            _gradle_version_documentation(root, key, "0.0.0", _rel(root, properties))
+            files.append(".github/versions.md")
+    elif (root / ".github" / "versions.md").is_file():
+        raise ValueError(
+            "Repository version policy requires an explicit property/catalog mapping; do not guess a new literal version pin"
+        )
+    return files
+
+
+def _gradle_property_text(text: str, key: str, version: str) -> str:
+    """Update an unambiguous exact property without changing other pins."""
+    pattern = re.compile(rf"(?m)^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)[^\r\n]*(\r?)$")
+    if len(list(pattern.finditer(text))) > 1:
+        raise ValueError("Duplicate Gradle version properties require review")
+    if pattern.search(text):
+        return pattern.sub(lambda match: match[1] + version + match[2], text, count=1)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return text.rstrip("\r\n") + newline + key + "=" + version + newline
+
+
+def _gradle_version_documentation(
+    root: Path, key: str, version: str, source: str
+) -> str | None:
+    """Update the matching central pin row, or add it to a recognized pins table."""
+    path = root / ".github" / "versions.md"
+    if not path.is_file():
+        return None
+    text = _read(path)
+    lines = text.splitlines(keepends=True)
+    matching = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("|") and line.split("|")[1].strip().strip("`") == key
+    ]
+    if len(matching) > 1:
+        raise ValueError("Duplicate central version-policy rows require review")
+    newline = "\r\n" if "\r\n" in text else "\n"
+    row = f"| {key} | `{version}` | `{source}` |{newline}"
+    if matching:
+        lines[matching[0]] = row
+        return "".join(lines)
+    for index, line in enumerate(lines[:-1]):
+        columns = [column.strip().casefold() for column in line.split("|")[1:-1]]
+        if (
+            len(columns) == 3
+            and columns[1] in {"version", "value"}
+            and columns[2] == "source"
+            and re.fullmatch(r"[|\s:-]+", lines[index + 1])
+        ):
+            lines.insert(index + 2, row)
+            return "".join(lines)
+    raise ValueError(
+        "Unrecognized .github/versions.md pins table; manual policy mapping is required"
+    )
+
+
 def update_gradle_version(
     root: Path, manifest: str, package: str, version: str
 ) -> bool:
     """Bump one Gradle coordinate or version-catalog entry."""
     path = _destination(root, manifest)
     if path.name == "libs.versions.toml":
-        return _update_toml_version(path, package, version)
+        hit = _toml_library_version(path, package)
+        documentation = None
+        if (root / ".github" / "versions.md").is_file():
+            if hit is None or hit[1] == "inline":
+                raise ValueError(
+                    "Central version policy requires an explicit catalog version.ref"
+                )
+            documentation = _gradle_version_documentation(
+                root, hit[1], version, manifest
+            )
+        updated = _update_toml_version(path, package, version)
+        if updated and documentation is not None:
+            _write(root / ".github" / "versions.md", documentation)
+        return updated
+    if key := _gradle_property_reference(root, manifest, package):
+        properties = java_project_root(root, manifest, "gradle") / "gradle.properties"
+        if not properties.is_file() or not re.search(
+            rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=", _read(properties)
+        ):
+            raise ValueError(
+                "Referenced Gradle version property was not found; no replacement was guessed"
+            )
+        updated = _gradle_property_text(_read(properties), key, version)
+        documentation = _gradle_version_documentation(
+            root, key, version, _rel(root, properties)
+        )
+        _write(properties, updated)
+        if documentation is not None:
+            _write(root / ".github" / "versions.md", documentation)
+        return True
     text = _read(path)
     pattern = re.compile(rf"""(['\"]{re.escape(package)}:)[^'\"\s]+(['\"])""")
     updated, count = pattern.subn(

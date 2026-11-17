@@ -40,13 +40,14 @@ def test_read_only_package_lint_commands_are_allowlisted(tmp_path, argv):
 
 
 @pytest.mark.parametrize("step", ["clean", "install"])
-def test_exact_pnpm_preparation_commands_are_allowlisted(tmp_path, step):
-    """Permit the requested preparation commands without allowing force options."""
+def test_unnecessary_pnpm_preparation_cannot_run_hooks(tmp_path, step):
+    """Reject unguarded clean/install lifecycle commands during remediation."""
     # Arrange
     argv = ["pnpm", step]
 
     # Act
-    assert_allowed(argv, tmp_path)
+    with pytest.raises(PermissionError):
+        assert_allowed(argv, tmp_path)
 
     # Assert
     with pytest.raises(PermissionError):
@@ -182,7 +183,7 @@ def test_reader_failure_stops_child_without_waiting_for_timeout(
         if argv[0] != "pnpm":
             return real_popen(argv, **kwargs)
         output = (
-            "print('Tests: 1 passed, 1 total', flush=True); "
+            "time.sleep(0.4); print('Build output', flush=True); "
             if failure == "cancel"
             else ""
         )
@@ -204,7 +205,7 @@ def test_reader_failure_stops_child_without_waiting_for_timeout(
 
     def cancel_progress(text):
         """Reproduce cancellation raised by a reader's progress callback."""
-        if failure == "cancel" and "1/1 tests" in text:
+        if failure == "cancel" and "output bytes received" in text:
             raise KeyboardInterrupt("cancel reader")
 
     monkeypatch.setattr(commands.subprocess, "Popen", launch)
@@ -214,7 +215,7 @@ def test_reader_failure_stops_child_without_waiting_for_timeout(
 
     # Act
     with pytest.raises(RuntimeError, match="Could not read command output"):
-        runner.run(["pnpm", "test"], timeout=4)
+        runner.run(["pnpm", "run", "build"], timeout=4)
 
     # Assert
     assert time.monotonic() - started < 3
@@ -769,7 +770,7 @@ def test_timeout_kills_the_command_and_reports_124(repo):
 @pytest.mark.parametrize(
     "tool,operation",
     [
-        ("pnpm", ["test"]),
+        ("pnpm", ["run", "build"]),
         ("pnpm", ["audit", "--json"]),
         ("gradle", ["--no-daemon", "dependencies"]),
     ],
@@ -790,7 +791,11 @@ def test_product_logs_preserve_all_output_and_final_summary(
 
     def product_process(argv, **kwargs):
         """Replace only the test's pnpm command with a deterministic noisy child."""
-        assert argv == [tool, *operation]
+        if tool == "gradle":
+            assert argv[:3] == [tool, "--no-daemon", "--init-script"]
+            assert argv[4:] == operation[1:]
+        else:
+            assert argv == [tool, *operation]
         return real_popen([sys.executable, "-c", script], **kwargs)
 
     monkeypatch.setattr(commands.subprocess, "Popen", product_process)
@@ -818,14 +823,13 @@ def test_product_logs_preserve_all_output_and_final_summary(
     )
     assert record["stdout_log_path"] == result.stdout_log_path
     assert record["stderr_log_path"] == result.stderr_log_path
-    if operation == ["test"]:
-        assert any("4910/4910 tests (100%)" in text for text in updates)
+    assert not any("4910/4910 tests" in text for text in updates)
     assert updates[-1].endswith(f"command finished; exit {code}")
     assert ("!" * 20 if code else "#" * 20) in updates[-1]
 
 
-def test_test_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch):
-    """Publish real completed-test counts while the child is still executing."""
+def test_build_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch):
+    """Publish live build output without inventing executed-test counts."""
     # Arrange
     import sys
 
@@ -834,9 +838,10 @@ def test_test_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch)
     real_popen = commands.subprocess.Popen
     children = []
     updates = []
+    acknowledged = False
     script = (
-        "import sys; print('Tests: 1 passed, 2 total', flush=True); "
-        "sys.stdin.readline(); print('Tests: 2 passed, 2 total', flush=True)"
+        "import sys, time; time.sleep(0.4); print('Compiled sources', flush=True); "
+        "sys.stdin.readline(); print('Build complete', flush=True)"
     )
 
     def product_process(argv, **kwargs):
@@ -847,9 +852,11 @@ def test_test_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch)
         return child
 
     def record_progress(text):
-        """Release the child only after its first test result was reported."""
+        """Release the child only after live output was reported."""
+        nonlocal acknowledged
         updates.append(text)
-        if "1/2 tests" in text:
+        if "output bytes received" in text and not acknowledged:
+            acknowledged = True
             assert children[0].poll() is None
             children[0].stdin.write("\n")
             children[0].stdin.flush()
@@ -858,61 +865,47 @@ def test_test_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch)
     runner = CommandRunner(tmp_path, progress_callback=record_progress)
 
     # Act
-    result = runner.run(["pnpm", "test"], timeout=10, check=False)
+    result = runner.run(["pnpm", "run", "build"], timeout=10, check=False)
     children[0].stdin.close()
 
     # Assert
     assert result.exit_code == 0
-    assert any("1/2 tests" in text and "50%" in text for text in updates)
-    assert any("2/2 tests" in text and "100%" in text for text in updates)
+    assert acknowledged
+    assert not any("tests (" in text for text in updates)
 
 
-@pytest.mark.parametrize("suite_count", [2, 3])
-def test_jest_progress_uses_current_discovered_suite_total(
-    tmp_path, monkeypatch, suite_count
-):
-    """Use current Jest discovery rather than a stale count or guessed case total."""
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pnpm", "test"],
+        ["npm", "test"],
+        ["yarn", "test"],
+        ["dotnet", "test", "--configuration", "Release", "--nologo"],
+        ["gradle", "--no-daemon", "test"],
+        ["gradle", "--no-daemon", "assemble", "test", "--rerun"],
+        ["mvn", "--batch-mode", "test"],
+        ["mvn", "--batch-mode", "clean", "verify"],
+    ],
+)
+def test_test_commands_never_start_children_or_discovery(tmp_path, monkeypatch, argv):
+    """Reject test commands before spawning a runner or enumerating its suites."""
     # Arrange
-    import sys
+    from unittest.mock import Mock
 
     from gitlab_security_mcp import commands
 
-    (tmp_path / "package.json").write_text(
-        json.dumps({"scripts": {"test": "jest --watch=false --coverage"}}),
-        encoding="utf-8",
-    )
-    paths = [f"test-{index}.spec.ts" for index in range(suite_count)]
-    calls = []
-    updates = []
-    real_popen = commands.subprocess.Popen
-
-    def product_process(argv, **kwargs):
-        """Return discovery or suite events without launching a real product runner."""
-        calls.append(argv)
-        output = (
-            json.dumps(paths)
-            if "--listTests" in argv
-            else "\n".join(f"PASS {path}\n  \\u2713 case" for path in paths).replace(
-                "\\u2713", "\u2713"
-            )
-        )
-        script = f"import sys; sys.stdout.buffer.write({output.encode('utf-8')!r})"
-        return real_popen([sys.executable, "-c", script], **kwargs)
-
-    monkeypatch.setattr(commands.subprocess, "Popen", product_process)
-    runner = CommandRunner(tmp_path, progress_callback=updates.append)
+    launch = Mock()
+    discovery = Mock()
+    monkeypatch.setattr(commands.subprocess, "Popen", launch)
+    monkeypatch.setattr(commands.CommandRunner, "_discover_test_suites", discovery)
 
     # Act
-    result = runner.run(["pnpm", "test"], timeout=10, check=False)
+    with pytest.raises(PermissionError):
+        CommandRunner(tmp_path).run(argv, timeout=10)
 
     # Assert
-    assert result.exit_code == 0
-    assert calls == [["pnpm", "test", "--listTests", "--json"], ["pnpm", "test"]]
-    assert any(f"0/{suite_count} test suites" in text for text in updates)
-    assert any(
-        f"{suite_count}/{suite_count} test suites (100%)" in text for text in updates
-    )
-    assert any("case total unavailable" in text for text in updates)
+    launch.assert_not_called()
+    discovery.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -949,11 +942,11 @@ def test_jest_discovery_does_not_repeat_hooks_or_compound_scripts(
     monkeypatch.setattr(commands.subprocess, "Popen", product_process)
 
     # Act
-    result = CommandRunner(tmp_path).run(["pnpm", "test"], timeout=10, check=False)
+    with pytest.raises(PermissionError):
+        CommandRunner(tmp_path).run(["pnpm", "test"], timeout=10, check=False)
 
     # Assert
-    assert result.exit_code == 0
-    assert calls == [["pnpm", "test"]]
+    assert calls == []
 
 
 def test_documentation_progress_counts_completed_requests():

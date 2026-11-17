@@ -63,7 +63,7 @@ def _unit_test_validation(state: RunState) -> dict:
     if not rows:
         return {
             "status": "NOT_RUN",
-            "reason": "Unit tests have not run. Test compatibility was not verified.",
+            "reason": "Unit/integration tests are disabled during remediation. Test compatibility was not verified.",
         }
     if any(row["status"] == "FAILED" for row in rows):
         return {
@@ -430,6 +430,7 @@ def render(
                     "post_results",
                     "check_contract",
                     "rollback",
+                    "version_alignment_files",
                 )
             }
             for finding in state.findings
@@ -647,6 +648,18 @@ def render(
             lines.append(
                 f"  Reviewed sources: {', '.join(documentation.get('sources') or []) or 'missing'}."
             )
+            if qualification.get("version_alignment_files"):
+                lines.append(
+                    "  Version-only AI alignment documents: "
+                    + ", ".join(qualification["version_alignment_files"])
+                    + "."
+                )
+            review = qualification.get("review") or {}
+            if review.get("validation_mode") == "build_only":
+                lines.append(
+                    "  Build-only trial: runtime/test compatibility was not verified. "
+                    + _table_cell(review.get("compatibility_limitations"))
+                )
     else:
         lines.append("No package qualification evidence recorded.")
     lines.extend(

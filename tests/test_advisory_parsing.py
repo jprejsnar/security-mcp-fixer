@@ -14,6 +14,46 @@ FINDING = {"identifiers": ["CVE-2021-23337"], "title": "lodash"}
 
 
 @pytest.mark.parametrize(
+    "version, affected", [("2.7.5-r0", False), ("2.8.3-r0", True), ("2.8.4-r0", False)]
+)
+def test_nvd_unaffected_reason_explains_installed_version_and_bounds(version, affected):
+    """Explain the archived libexpat decision without mistaking a fix for its cause."""
+    from gitlab_security_mcp.advisory import _from_nvd
+
+    record = {
+        "cve": {
+            "configurations": [
+                {
+                    "nodes": [
+                        {
+                            "cpeMatch": [
+                                {
+                                    "vulnerable": True,
+                                    "criteria": "cpe:2.3:a:libexpat:libexpat:*:*:*:*:*:*:*:*",
+                                    "versionStartIncluding": "2.8.2",
+                                    "versionEndExcluding": "2.8.4",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    result = _from_nvd(record, "libexpat", version, ["nvd:CVE-fixture"], [])
+
+    assert result.affected is affected
+    assert result.ranges == [">=2.8.2,<2.8.4"]
+    if not affected:
+        assert f"Installed libexpat {version} is outside" in result.summary
+        assert ">=2.8.2,<2.8.4" in result.summary
+    else:
+        assert "outside" not in result.summary
+        assert result.lowest_fixed_version == "2.8.4"
+
+
+@pytest.mark.parametrize(
     "configurations",
     [
         [],

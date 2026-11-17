@@ -281,7 +281,7 @@ def test_nested_pnpm_plan_applies_only_in_frontend(
 
     # Assert
     assert result["status"] == "APPLIED"
-    assert plan.files == ["frontend/package.json", "frontend/pnpm-lock.yaml"]
+    assert plan.files == ["frontend/pnpm-workspace.yaml", "frontend/pnpm-lock.yaml"]
     assert runner.run.call_args.kwargs["cwd"] == frontend.resolve()
     assert runner.run.call_args.args[0] == [
         "pnpm",
@@ -289,8 +289,15 @@ def test_nested_pnpm_plan_applies_only_in_frontend(
         "--lockfile-only",
         "--ignore-scripts",
     ]
-    data = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
-    assert data["pnpm"]["overrides"][package] == target
+    from ruamel.yaml import YAML
+
+    data = YAML(typ="safe").load(
+        (frontend / "pnpm-workspace.yaml").read_text(encoding="utf-8")
+    )
+    assert data["overrides"][package] == target
+    assert json.loads((frontend / "package.json").read_text(encoding="utf-8")) == {
+        "name": "frontend"
+    }
     assert not (tmp_path / "package.json").exists()
 
 

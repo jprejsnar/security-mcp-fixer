@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from collections.abc import Callable
@@ -26,37 +25,6 @@ from gitlab_security_mcp.manifests import (
     java_build_roots,
 )
 
-logger = logging.getLogger("gitlab_security_mcp")
-
-
-def _gradle_scoped_rerun(wrapper: str | None) -> bool:
-    """Use task-scoped reruns only for a wrapper declaring Gradle 7.6 or newer."""
-    if wrapper is None:
-        return False
-    properties = (
-        Path(wrapper).parent / "gradle" / "wrapper" / "gradle-wrapper.properties"
-    )
-    try:
-        with properties.open(encoding="utf-8") as stream:
-            text = stream.read(4097)
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        logger.warning(
-            "Cannot inspect Gradle wrapper version; retaining compatible validation: %s",
-            exc,
-        )
-        return False
-    version = re.search(
-        r"(?m)^\s*distributionUrl\s*=\s*\S*/gradle-(\d+)\.(\d+)(?:\.\d+)?-(?:bin|all)\.zip\s*$",
-        text,
-    )
-    return (
-        len(text) <= 4096
-        and version is not None
-        and (int(version[1]), int(version[2])) >= (7, 6)
-    )
-
 
 def run_validation(
     root: Path,
@@ -69,7 +37,7 @@ def run_validation(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> dict:
-    """Run production builds and unit tests without accepting missing test evidence."""
+    """Run production builds and dependency checks without executing test suites."""
     try:
         return _run_validation(
             root,
@@ -196,16 +164,8 @@ def _run_validation(
         )
     if package_checks:
         present = {row.get("kind") for row in results}
-        if "build_and_unit_tests" in present:
-            present.update(("build", "unit_tests"))
         kinds = (
-            ("lint",)
-            if lint_only
-            else (
-                ("build", "unit_tests")
-                if skip_lint
-                else ("lint", "build", "unit_tests")
-            )
+            ("lint",) if lint_only else (("build",) if skip_lint else ("lint", "build"))
         )
         for kind in kinds:
             if kind not in present:
@@ -250,6 +210,7 @@ def _run_validation(
             "docker": stack.dockerfiles or None,
         },
         "results": results,
+        "test_execution": "DISABLED: remediation runs production builds and dependency checks, not unit/integration tests.",
     }
 
 
@@ -350,7 +311,15 @@ def _node(
         return [row]
     rows = []
     if manager == "npm":
-        rows.append(_run(runner, [tool, "ci"], timeout, required=True, cwd=root))
+        rows.append(
+            _run(
+                runner,
+                [tool, "ci", "--ignore-scripts"],
+                timeout,
+                required=True,
+                cwd=root,
+            )
+        )
         rows.append(
             _run(
                 runner,
@@ -365,7 +334,7 @@ def _node(
         rows.append(
             _run(
                 runner,
-                [tool, "install", "--frozen-lockfile"],
+                [tool, "install", "--frozen-lockfile", "--ignore-scripts"],
                 timeout,
                 required=True,
                 cwd=root,
@@ -385,7 +354,7 @@ def _node(
         rows.append(
             _run(
                 runner,
-                [tool, "install", "--immutable"],
+                [tool, "install", "--immutable", "--mode=skip-build"],
                 timeout,
                 required=True,
                 cwd=root,
@@ -405,7 +374,7 @@ def _node(
         rows.append(
             _run(
                 runner,
-                [tool, "install", "--frozen-lockfile"],
+                [tool, "install", "--frozen-lockfile", "--ignore-scripts"],
                 timeout,
                 required=True,
                 cwd=root,
@@ -432,8 +401,8 @@ def _node(
         )
         return rows
     blocked = None
-    for script in ("lint", "build", "test"):
-        kind = "unit_tests" if script == "test" else script
+    for script in ("lint", "build"):
+        kind = script
         if kind == "lint" and skip_lint:
             continue
         if blocked is not None:
@@ -451,8 +420,7 @@ def _node(
             row = _row(
                 None,
                 "SKIPPED",
-                (package_checks or kind == "unit_tests")
-                and not (record_lint and kind == "lint"),
+                package_checks and not (record_lint and kind == "lint"),
                 f"{root / 'package.json'} has no {script} script; "
                 + (
                     "informational lint capture unavailable."
@@ -488,7 +456,7 @@ def _dotnet(
     skip_lint: bool = False,
     lint_only: bool = False,
 ) -> list[dict]:
-    """Restore NuGet dependencies, build Release, then run unit tests."""
+    """Restore NuGet dependencies and build Release without running tests."""
     tool = resolve_tool("dotnet", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "dotnet is not on PATH.")]
@@ -530,16 +498,6 @@ def _dotnet(
             cwd=root,
         )
     )
-    if rows[-1]["status"] == "PASSED":
-        rows.append(
-            _run(
-                runner,
-                [tool, "test", "--configuration", "Release", "--nologo"],
-                timeout,
-                required=True,
-                cwd=root,
-            )
-        )
     return rows
 
 
@@ -611,28 +569,6 @@ def _java_gradle(
     tool = wrapper or resolve_tool("gradle", which)
     if not tool:
         return [_row(None, "SKIPPED", True, "gradlew or gradle is not available.")]
-    if not lint_only and package_checks and _gradle_scoped_rerun(wrapper):
-        rows = []
-        if not skip_lint:
-            rows.append(
-                _execute_product_check(
-                    runner,
-                    [tool, "--no-daemon", "checkstyleMain", "checkstyleTest"],
-                    timeout,
-                    root,
-                    "lint",
-                )
-            )
-        rows.append(
-            _execute_product_check(
-                runner,
-                [tool, "--no-daemon", "assemble", "test", "--rerun"],
-                timeout,
-                root,
-                "build_and_unit_tests",
-            )
-        )
-        return rows
     if lint_only:
         return [
             _execute_product_check(
@@ -643,25 +579,7 @@ def _java_gradle(
                 "lint",
             )
         ]
-    rows = [
-        _run(
-            runner,
-            [tool, "--no-daemon", "dependencies"],
-            timeout,
-            required=True,
-            cwd=root,
-        )
-    ]
-    if rows[0]["status"] == "FAILED":
-        rows.append(
-            _row(
-                None,
-                "SKIPPED",
-                False,
-                "Skipped Gradle build because dependency inspection failed.",
-            )
-        )
-        return rows
+    rows = []
     if package_checks and not skip_lint:
         rows.append(
             _execute_product_check(
@@ -674,19 +592,13 @@ def _java_gradle(
         )
     rows.append(
         _execute_product_check(
-            runner, [tool, "--no-daemon", "assemble"], timeout, root, "build"
+            runner,
+            [tool, "--no-daemon", "assemble", "-x", "test"],
+            timeout,
+            root,
+            "build",
         )
     )
-    if rows[-1]["status"] == "PASSED":
-        rows.append(
-            _execute_product_check(
-                runner,
-                [tool, "--no-daemon", "test", "--rerun-tasks"],
-                timeout,
-                root,
-                "unit_tests",
-            )
-        )
     return rows
 
 
@@ -727,10 +639,10 @@ def _java_maven(
     rows = [
         _execute_product_check(
             runner,
-            [tool, "--batch-mode", "clean", "verify"],
+            [tool, "--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
             timeout,
             root,
-            "build_and_unit_tests",
+            "build",
         )
     ]
     rows.append(

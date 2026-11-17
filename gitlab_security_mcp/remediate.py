@@ -16,6 +16,7 @@ from gitlab_security_mcp.manifests import (
     add_nuget_reference,
     bumped_spec,
     dockerfile_images,
+    gradle_version_files,
     is_modern_yarn,
     spec_already_allows,
     update_csproj_version,
@@ -24,6 +25,7 @@ from gitlab_security_mcp.manifests import (
     update_npm_spec,
     update_pom_version,
 )
+from gitlab_security_mcp.official_docs import manager_documentation
 from gitlab_security_mcp.util import json_object, resolve_inside
 from gitlab_security_mcp.versions import parse_version
 
@@ -62,6 +64,7 @@ class Plan:
     expected_line: str | None = None
     replacement_line: str | None = None
     doc_pages: tuple[dict, ...] = ()
+    gradle_configurations: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         """Return the plan as plain JSON-safe data."""
@@ -87,16 +90,20 @@ class Plan:
                 }
                 for page in self.doc_pages
             ],
+            "gradle_configurations": list(self.gradle_configurations),
             "qualifiers": {
                 "status": "REQUIRED",
                 "package": self.package,
                 "target": self.target,
                 "requirements": [
                     "Review complete official package documentation and API changes.",
-                    "Require no production/unit-test API adaptations or check-script changes for any version increment.",
+                    "Do not adapt production/unit-test APIs or check scripts; reject known incompatibilities.",
                     "Review target-version license terms; obey configured corporate policy when present.",
-                    "Record informational baseline lint diagnostics; require successful production builds, executed unit tests and configured policy checks. Isolate and revert offending updates while retaining passing updates.",
+                    "Require production builds, exact resolved-dependency proof and test-free configured policy checks. Never run unit/integration tests. Revert offending updates while retaining passing updates.",
                 ],
+                "manager_documentation": manager_documentation(
+                    {"manager": self.manager}
+                ),
             }
             if self.ecosystem in {"npm", "NuGet", "Maven"}
             else None,
@@ -130,6 +137,63 @@ def plan_remediation(
 
     image_plan = _image_plan(root, finding, fixed, files)
     package_plan = _package_plan(hit, fixed) if hit else None
+    if (
+        package_plan
+        and package_plan.manager == "gradle"
+        and ":" in package_plan.package
+    ):
+        configuration = (finding.get("location") or {}).get(
+            "configuration"
+        ) or "runtimeClasspath"
+        scopes = tuple(sorted(hit.configuration_versions or {}))
+        names = {scope.rsplit(":", 1)[-1] for scope in scopes}
+        if scopes and (
+            configuration not in names
+            or names - {"runtimeClasspath", "compileClasspath"}
+        ):
+            if any(
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,100}", name) is None
+                for name in names
+            ):
+                return (
+                    None,
+                    "Gradle reported an unsupported configuration name; no override scope was guessed.",
+                )
+            package_plan.strategy = "override"
+            package_plan.score = 3
+            package_plan.gradle_configurations = scopes
+            manifest = (finding.get("dependencyResolution") or {}).get(
+                "manifest"
+            ) or hit.manifest
+            if Path(manifest).name not in {"build.gradle", "build.gradle.kts"}:
+                return (
+                    None,
+                    "A scoped Gradle resolution override requires the owning build file.",
+                )
+            package_plan.files = [manifest]
+            package_plan.description = (
+                f"Add a scoped Gradle resolutionStrategy.force security override for "
+                f"{hit.name} from {installed} to {fixed} in {manifest}; "
+                f"configurations: {', '.join(scopes)}. Preserve the existing dependency graph "
+                "and require the exact target in every observed configuration after a production build; no tests."
+            )
+        elif package_plan.strategy == "override" and configuration not in {
+            "runtimeClasspath",
+            "compileClasspath",
+        }:
+            return (
+                None,
+                "A custom Gradle override requires observed configuration evidence.",
+            )
+        try:
+            package_plan.files = gradle_version_files(
+                root,
+                package_plan.files[0],
+                hit.name,
+                override=package_plan.strategy == "override",
+            )
+        except (OSError, ValueError) as exc:
+            return None, str(exc)
     candidates = [item for item in (package_plan, image_plan) if item is not None]
     if not candidates:
         if hit is None:
@@ -208,7 +272,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
             target=fixed,
             files=[hit.manifest],
             manager=hit.manager,
-            description=f"Pin resolved transitive {hit.name} to {fixed} in {hit.manifest}; require resolved-version, build and unit-test verification.",
+            description=f"Constrain observed transitive {hit.name} to {fixed} in {hit.manifest}; require configuration-specific resolution and a production build, without tests.",
         )
     if hit.manager == "maven" and hit.manifest and hit.direct:
         return Plan(
@@ -369,11 +433,17 @@ def apply_plan(
         if plan.manager == "gradle":
             manifest = plan.files[0]
             if plan.strategy == "override":
-                add_java_override(root, manifest, plan.package, plan.target)
-                return _applied(plan, [manifest], commands)
+                add_java_override(
+                    root,
+                    manifest,
+                    plan.package,
+                    plan.target,
+                    configurations=plan.gradle_configurations,
+                )
+                return _applied(plan, plan.files, commands)
             if not update_gradle_version(root, manifest, plan.package, plan.target):
                 return _failed("FIX_FAILED", plan, f"Could not update {manifest}.")
-            return _applied(plan, [manifest], commands)
+            return _applied(plan, plan.files, commands)
         if plan.manager == "nuget":
             return _apply_nuget(root, plan, runner, which, edited, commands)
     except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as exc:
@@ -502,7 +572,13 @@ def _refresh_node_lock(
         )
     if plan.manager == "yarn" and is_modern_yarn(workdir):
         if plan.strategy == "lockfile_only":
-            argv = [tool, "up", "-R", plan.package]
+            return _failed(
+                fallback_status,
+                plan,
+                "Recursive Yarn refresh cannot guarantee script-free execution. Use a reviewed explicit version/resolution update instead; no tests or hooks were run.",
+                edited,
+                commands,
+            )
         else:
             argv = [tool, "install", "--mode=update-lockfile"]
     elif plan.strategy == "lockfile_only" and plan.manager == "npm":

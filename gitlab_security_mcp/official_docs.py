@@ -44,6 +44,55 @@ REQUIRED_DOCS = (
     ),
     ("typescript", "https://www.typescriptlang.org/docs/", "TypeScript"),
     (
+        "typescript_build",
+        "https://www.typescriptlang.org/docs/handbook/project-references.html",
+        "Project References",
+    ),
+    ("pnpm", "https://pnpm.io/settings/dependency-resolution", "overrides"),
+    ("npm", "https://docs.npmjs.com/cli/v11/configuring-npm/package-json", "overrides"),
+    ("yarn", "https://yarnpkg.com/configuration/manifest", "resolutions"),
+    (
+        "gradle_constraints",
+        "https://docs.gradle.org/current/userguide/dependency_constraints.html",
+        "constraint",
+    ),
+    (
+        "gradle_resolution",
+        "https://docs.gradle.org/current/userguide/resolution_rules.html",
+        "Forcing Dependency Versions",
+    ),
+    (
+        "gradle_inspection",
+        "https://docs.gradle.org/current/userguide/viewing_debugging_dependencies.html",
+        "dependencyInsight",
+    ),
+    (
+        "gradle_properties",
+        "https://docs.gradle.org/current/userguide/build_environment.html",
+        "gradle.properties",
+    ),
+    (
+        "maven",
+        "https://maven.apache.org/guides/introduction/introduction-to-dependency-mechanism.html",
+        "Dependency Management",
+    ),
+    (
+        "vscode_nuget",
+        "https://code.visualstudio.com/docs/csharp/package-management",
+        "NuGet",
+    ),
+    ("rider_nuget", "https://www.jetbrains.com/help/rider/Using_NuGet.html", "NuGet"),
+    (
+        "nuget_central",
+        "https://learn.microsoft.com/en-us/nuget/consume-packages/central-package-management",
+        "Directory.Packages.props",
+    ),
+    (
+        "nuget_references",
+        "https://learn.microsoft.com/en-us/nuget/consume-packages/package-references-in-project-files",
+        "PackageReference",
+    ),
+    (
         "javascript",
         "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
         "JavaScript",
@@ -68,6 +117,13 @@ ALLOWED_HOSTS = frozenset(
         "crystal-lang.org",
         "learn.microsoft.com",
         "www.typescriptlang.org",
+        "pnpm.io",
+        "docs.npmjs.com",
+        "yarnpkg.com",
+        "docs.gradle.org",
+        "maven.apache.org",
+        "code.visualstudio.com",
+        "www.jetbrains.com",
         "www.cve.org",
         "cwe.mitre.org",
         "www.nsa.gov",
@@ -462,10 +518,36 @@ _MANIFEST_PUBLISHERS = {
     "packages.lock.json": ("csharp", "dotnet"),
 }
 _ECOSYSTEM_PUBLISHERS = {
-    "npm": ("node",),
-    "nuget": ("csharp", "dotnet"),
+    "npm": ("node", "typescript_build", "pnpm"),
+    "nuget": (
+        "csharp",
+        "dotnet",
+        "vscode_nuget",
+        "rider_nuget",
+        "nuget_central",
+        "nuget_references",
+    ),
     "maven": ("java",),
 }
+MANAGER_PUBLISHERS = {
+    "gradle": (
+        "gradle_constraints",
+        "gradle_resolution",
+        "gradle_inspection",
+        "gradle_properties",
+    ),
+    "maven": ("maven",),
+    "npm": ("typescript_build", "pnpm", "npm"),
+    "pnpm": ("typescript_build", "pnpm"),
+    "yarn": ("typescript_build", "pnpm", "yarn"),
+    "nuget": ("vscode_nuget", "rider_nuget", "nuget_central", "nuget_references"),
+}
+
+
+def manager_documentation(plan: dict) -> list[str]:
+    """Name the live manager guidance the hosting AI must review, not merely fetch."""
+    wanted = MANAGER_PUBLISHERS.get(str(plan.get("manager") or ""), ())
+    return [url for name, url, _marker in REQUIRED_DOCS if name in wanted]
 
 
 def publisher_names_for(finding: dict) -> tuple[str, ...]:
@@ -489,6 +571,18 @@ def publisher_names_for(finding: dict) -> tuple[str, ...]:
     ecosystem = ""
     if isinstance(proposed, dict):
         ecosystem = str(proposed.get("ecosystem") or "")
+        selected.update(MANAGER_PUBLISHERS.get(str(proposed.get("manager") or ""), ()))
+    if any(
+        Path(path).name
+        in {
+            "build.gradle",
+            "build.gradle.kts",
+            "gradle.properties",
+            "libs.versions.toml",
+        }
+        for path in _cited_paths(finding)
+    ):
+        selected.update(MANAGER_PUBLISHERS["gradle"])
     selected.update(_ECOSYSTEM_PUBLISHERS.get(ecosystem.lower(), ()))
     return tuple(name for name, _url, _marker in REQUIRED_DOCS if name in selected)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import threading
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import date
 from inspect import signature
 from pathlib import Path
@@ -34,7 +35,6 @@ from gitlab_security_mcp.commands import (
     CommandRunner,
     progress_sink,
     resolve_tool,
-    tool_name,
 )
 from gitlab_security_mcp.config_findings import assess_config, config_kind
 from gitlab_security_mcp.fanout import MAX_WORKERS
@@ -59,10 +59,13 @@ from gitlab_security_mcp.official_docs import (
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
     backup_dependency_files,
+    capture_version_alignment,
     dependency_file_hashes,
     load_policy,
     package_script_hashes,
+    render_version_alignment,
     review_major_upgrade,
+    review_manager_guidance,
     review_package,
     reviewed_license_policy,
     rollback_dependency_files,
@@ -179,27 +182,6 @@ class _ValidationRunner:
     def run(self, argv, **kwargs):
         """Execute each exact command once per working directory."""
         key = (tuple(argv), Path(kwargs.get("cwd", self.root)).resolve())
-        if (
-            key not in self.results
-            and tool_name(argv[0]) in {"gradle", "gradlew"}
-            and argv[1:]
-            in (
-                ["--no-daemon", "assemble"],
-                ["--no-daemon", "test", "--rerun-tasks"],
-            )
-        ):
-            combined = self.results.get(
-                (
-                    (argv[0], "--no-daemon", "assemble", "test", "--rerun"),
-                    key[1],
-                )
-            )
-            if (
-                combined is not None
-                and combined.exit_code == 0
-                and combined.unit_tests_verified
-            ):
-                self.results[key] = combined
         if key not in self.results:
             self.results[key] = self.runner.run(argv, **kwargs)
         return self.results[key]
@@ -302,7 +284,7 @@ class Engine:
         self._files_truncated = False
         self._gradle_lock = threading.Lock()
         self._gradle_reports: dict[
-            tuple[Path, str], tuple[dict, GradleReport, dict, set[str]]
+            tuple[Path, str, str | None], tuple[dict, GradleReport, dict, set[str]]
         ] = {}
         self._product_baseline: dict | None = None
         self._closed = False
@@ -702,55 +684,11 @@ class Engine:
         }
 
     def _prepare_pnpm(self) -> list[dict]:
-        """Clean then install each pnpm project, once per workspace root."""
-        files, truncated = self._snapshot()
-        if truncated:
-            raise RuntimeError(
-                "Cannot prepare pnpm projects: checkout file discovery was truncated"
-            )
-        roots = sorted({path.parent for path in files if path.name == "package.json"})
-        pnpm_roots = [
-            root
-            for root in roots
-            if detect_stack(
-                root, [path for path in files if path.parent == root]
-            ).node_manager
-            == "pnpm"
-            or (root / "pnpm-workspace.yaml").is_file()
-        ]
-        results = []
-        for root in pnpm_roots:
-            if any(
-                parent in pnpm_roots and (parent / "pnpm-workspace.yaml").is_file()
-                for parent in root.parents
-            ):
-                continue
-            tool = resolve_tool("pnpm", self.which)
-            if not tool:
-                raise RuntimeError(
-                    "pnpm is required for post-pull clean/install but is not on PATH"
-                )
-            for step in ("clean", "install"):
-                self._progress(
-                    None, f"Post-pull pnpm {step} in {root.relative_to(self.repo_root)}"
-                )
-                result = self.runner.run(
-                    [tool, step], timeout=self.validation_timeout, check=False, cwd=root
-                )
-                results.append(
-                    {
-                        "argv": list(result.argv),
-                        "cwd": str(root),
-                        "exit_code": result.exit_code,
-                        "stdout": result.stdout[-500:],
-                        "stderr": result.stderr[-500:],
-                        "stdout_log_path": result.stdout_log_path,
-                        "stderr_log_path": result.stderr_log_path,
-                    }
-                )
-                if result.exit_code != 0:
-                    return results
-        return results
+        """Defer installation until an approved update needs a production build."""
+        logger.info(
+            "Skipping post-pull clean/install; discovery must not run repository lifecycle hooks."
+        )
+        return []
 
     @_serialized
     def create_security_branch(self) -> dict:
@@ -1395,6 +1333,19 @@ class Engine:
                 )
             else:
                 prepared[item["id"]] = deepcopy(review)
+        if candidates and all(
+            prepared.get(item["id"], {}).get("blocked_reason") for item in candidates
+        ):
+            required.extend(
+                {
+                    "finding_id": item["id"],
+                    "plan": deepcopy(
+                        (self._finding(item["id"]) or {}).get("proposedFix")
+                    ),
+                    "reason": prepared[item["id"]]["blocked_reason"],
+                }
+                for item in candidates
+            )
         if required:
             return {
                 "status": "PACKAGE_REVIEW_REQUIRED",
@@ -1403,6 +1354,8 @@ class Engine:
                 "message": "Before opening the Windows checkboxes, the host AI must review the official docs, actual framework/API compatibility and license terms. "
                 "Use the qualify_package_update review schema, then call select_security_fixes with package_reviews keyed by finding ID. "
                 "For a package that cannot safely qualify, provide its exact ecosystem/package/target and an honest blocked_reason; it will be labeled blocked, never edited, and will not prevent other updates. "
+                "For a non-major target with uncertain callers but no known incompatibility, use an explicit validation_mode=build_only review with known_incompatibilities=[] and compatibility_limitations; keep unknown compatibility flags null. "
+                "Assess each finding separately: another advisory requiring source changes does not block a version fix for this finding. "
                 "Collect evidence only; do not call qualification or edit files before human selection. Never invent missing evidence or approvals.",
             }
         return {
@@ -1600,23 +1553,15 @@ class Engine:
             major_review = review_major_upgrade(self.repo_root, plan, review)
             policy = self._package_policy(plan, review)
             tree = tree_snapshot(self.repo_root)
+            alignment_before = capture_version_alignment(self.repo_root, tree)
             scripts = package_script_hashes(self.repo_root, tree)
             lint_recorded = self.state.lint_baseline is not None
             if not lint_recorded:
-                self._progress(
-                    finding_id,
-                    "Recording initial informational lint before editing (Gradle may compile sources); file writing has not started. Builds and unit tests follow the complete batch.",
+                baseline = {"results": []}
+                logger.info(
+                    "Skipping informational pre-edit lint; remediation runs only required production builds and dependency checks."
                 )
-                baseline = run_validation(
-                    self.repo_root,
-                    self.runner,
-                    self.which,
-                    timeout=self.validation_timeout,
-                    package_checks=True,
-                    record_lint=True,
-                    lint_only=True,
-                )
-                self._capture_lint_baseline(finding_id, baseline["results"])
+                self._capture_lint_baseline(finding_id, [])
             self._progress(
                 finding_id,
                 "Configured product checks are deferred to final batch validation",
@@ -1629,13 +1574,14 @@ class Engine:
                 [],
             )
             receipt = {
-                "check_contract": "lint-baseline-build-unit-tests-no-code-v4",
+                "check_contract": "production-build-resolution-no-tests-v6",
                 "status": "QUALIFIED",
                 "plan": deepcopy(plan),
                 "review": deepcopy(review),
                 "major_review": major_review,
                 **policy,
                 "tree": tree,
+                "version_alignment_before": alignment_before,
                 "package_script_hashes": scripts,
                 "baseline_results": baseline["results"],
             }
@@ -1665,6 +1611,8 @@ class Engine:
             "eligible_for_auto_fix": True,
             "approval": policy["approval"],
             "policy_mode": policy["policy_mode"],
+            "validation_mode": review.get("validation_mode", "reviewed"),
+            "compatibility_limitations": review.get("compatibility_limitations"),
             "baseline_results": receipt["baseline_results"],
             "lint_issues_path": str(
                 self.repo_root / ".security-mcp" / "lint-issues.json"
@@ -1672,7 +1620,7 @@ class Engine:
             "lint_rules_path": str(
                 self.repo_root / ".security-mcp" / "lint-rules.json"
             ),
-            "note": "Apply all reviewed package updates, then run production builds and unit tests. Both must pass to retain updates. Existing lint issues are informational. Failed batches isolate and revert offending updates while retaining passing updates.",
+            "note": "Apply reviewed updates; require production builds, exact dependency resolution and test-free policy checks. Unit/integration tests are disabled. Revert offending updates; retain passing updates.",
         }
 
     @_serialized
@@ -1756,7 +1704,7 @@ class Engine:
                     receipt.get("status") != "QUALIFIED"
                     or receipt.get("plan") != proposed
                     or receipt.get("check_contract")
-                    != "lint-baseline-build-unit-tests-no-code-v4"
+                    != "production-build-resolution-no-tests-v6"
                 ):
                     raise ValueError(
                         "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
@@ -1854,6 +1802,7 @@ class Engine:
             expected_line=proposed.get("expected_line"),
             replacement_line=proposed.get("replacement_line"),
             doc_pages=tuple(proposed.get("doc_pages") or ()),
+            gradle_configurations=tuple(proposed.get("gradle_configurations") or ()),
         )
         self._progress(
             finding_id,
@@ -1894,7 +1843,7 @@ class Engine:
         edit_duration_ms = round((monotonic() - edit_started) * 1000, 3)
         self._progress(
             finding_id,
-            f"Dependency/configuration edit and lockfile refresh finished in {edit_duration_ms:.1f} ms; build/unit-test validation is a separate phase.",
+            f"Dependency/configuration edit and lockfile refresh finished in {edit_duration_ms:.1f} ms; production build/dependency verification follows without tests.",
         )
         if package_update:
             receipt["applied_dependency_hashes"] = dependency_file_hashes(
@@ -1969,7 +1918,7 @@ class Engine:
             "finding_id": finding_id,
             "change": change,
             "continue_with_next_finding": outcome.get("continue_with_next_finding"),
-            "note": "Initial lint issues are recorded separately. Not accepted until production builds, unit tests and configured policy checks pass. Failed updates are isolated and reverted; passing updates remain. Production/unit-test code and check scripts must remain unchanged.",
+            "note": "Require production builds, exact dependency resolution and test-free policy checks. Do not run unit/integration tests. Revert offending updates; retain passing updates. Source and check scripts remain unchanged.",
         }
 
     @_serialized
@@ -2079,6 +2028,13 @@ class Engine:
             for path, text in receipt["dependency_before"].items():
                 originals.setdefault(path, text)
             expected.update(receipt["applied_dependency_hashes"])
+        alignment = {}
+        for receipt in templates.values():
+            for path, change in receipt.get("version_alignment", {}).items():
+                alignment.setdefault(path, change)
+        for path, change in alignment.items():
+            originals.setdefault(path, change["before"])
+            expected[path] = hashlib.sha256(change["after"].encode("utf-8")).hexdigest()
         active = tuple(identifiers)
         cache = {active: deepcopy(initial)}
         trials = []
@@ -2147,6 +2103,11 @@ class Engine:
                 if not review.complete:
                     raise ValueError(review.reason())
                 receipt["tree"] = tree_snapshot(self.repo_root)
+                receipt["version_alignment_before"] = capture_version_alignment(
+                    self.repo_root, receipt["tree"]
+                )
+                receipt.pop("version_alignment", None)
+                receipt.pop("version_alignment_files", None)
                 receipt["dependency_before"] = backup_dependency_files(
                     self.repo_root, proposed
                 )
@@ -2173,6 +2134,20 @@ class Engine:
                     qualification_status="PENDING_VALIDATION",
                     validation_pending=True,
                 )
+            selected_plans = [
+                self._finding(finding_id)["packageQualification"]["plan"]
+                for finding_id in selected
+            ]
+            for path, change in alignment.items():
+                destination = resolve_inside(self.repo_root, path)
+                if destination is None:
+                    raise ValueError(
+                        "Version-alignment document moved outside the checkout"
+                    )
+                atomic_write_text(
+                    destination, render_version_alignment(change, selected_plans)
+                )
+            expected = dependency_file_hashes(self.repo_root, originals)
             active = selected
             self._drop_snapshot()
 
@@ -2208,7 +2183,7 @@ class Engine:
                 retain(group[middle:])
             else:
                 rejected[group[0]] = (
-                    "Rejected after build, unit-test or policy failure with retained updates "
+                    "Rejected after production build, resolution or policy failure with retained updates "
                     + repr(accepted)
                     + ": "
                     + "; ".join(
@@ -2263,7 +2238,7 @@ class Engine:
                 final.update(
                     status="FIX_REJECTED",
                     continue_with_next_finding=True,
-                    reason="All candidates rejected; the restored baseline build, unit tests and configured policy checks passed.",
+                    reason="All candidates rejected; restored baseline production build and test-free policy checks passed.",
                 )
                 self.state.status = "FIXES_IN_PROGRESS"
         else:
@@ -2311,7 +2286,7 @@ class Engine:
         for change in package_changes:
             self._progress(
                 change["finding_id"],
-                "Running post-update production builds and unit tests",
+                "Running production builds and resolved-dependency checks; tests are disabled",
             )
         validation_runner = _ValidationRunner(self.runner, self.repo_root)
         outcome = run_validation(
@@ -2324,6 +2299,14 @@ class Engine:
         )
         allowed_files = [
             path for change in self.state.changes for path in change.get("files") or []
+        ]
+        version_updates = [
+            (
+                (self._finding(change["finding_id"]) or {}).get("packageQualification")
+                or {}
+            ).get("plan")
+            or {}
+            for change in package_changes
         ]
         expected_dependencies = {
             path: digest
@@ -2345,7 +2328,10 @@ class Engine:
                 plan=receipt["plan"],
             )
             outcome["results"].extend(checks)
-            if any(row["status"] != "PASSED" for row in checks):
+            if any(
+                row["status"] != "PASSED" and row.get("required", True)
+                for row in checks
+            ):
                 outcome["status"] = "VALIDATION_FAILED"
         for change in package_changes:
             finding = self._finding(change["finding_id"])
@@ -2355,10 +2341,10 @@ class Engine:
                     raise ValueError("Package qualification is missing")
                 if (
                     receipt.get("check_contract")
-                    != "lint-baseline-build-unit-tests-no-code-v4"
+                    != "production-build-resolution-no-tests-v6"
                 ):
                     raise ValueError(
-                        "Package qualification predates mandatory lint/no-code checks; requalification is required"
+                        "Package qualification predates build-only/no-code checks; requalification is required"
                     )
                 receipt["post_results"] = deepcopy(outcome["results"])
                 policy = self._package_policy(receipt["plan"], receipt["review"])
@@ -2371,18 +2357,21 @@ class Engine:
                     receipt,
                     allowed_files,
                     expected_dependencies=expected_dependencies,
+                    version_updates=version_updates,
                 )
                 if outcome["status"] != "VALIDATION_COMPLETE":
                     raise ValueError(
-                        "Product build/unit-test validation failed or is incomplete; candidate cannot be accepted"
+                        "Production build validation failed or is incomplete; candidate cannot be accepted"
                     )
                 plan = receipt["plan"]
-                if (
-                    plan.get("strategy") == "override"
-                    and plan.get("manager") == "gradle"
-                ):
+                if plan.get("manager") == "gradle" and ":" in plan.get("package", ""):
+                    required_configurations = set(
+                        plan.get("gradle_configurations") or ()
+                    )
                     resolved = self._resolve_gradle_package(
-                        finding, self._snapshot()[0]
+                        finding,
+                        self._snapshot()[0],
+                        configurations=tuple(sorted(required_configurations)),
                     )
                     versions = (
                         {
@@ -2399,10 +2388,20 @@ class Engine:
                         not resolved
                         or resolved.version != plan["target"]
                         or versions != {plan["target"]}
+                        or not required_configurations.issubset(
+                            resolved.configuration_versions or {}
+                        )
                     ):
                         raise ValueError(
-                            "Gradle override did not resolve the exact fixed version in every reported configuration"
+                            "Gradle did not resolve the exact fixed version in every required configuration; a missing dependency/configuration or a declaration/pin alone is not remediation"
                         )
+                    receipt["resolved_dependency"] = {
+                        "package": plan["package"],
+                        "expected": plan["target"],
+                        "configuration_versions": resolved.configuration_versions,
+                        "verified": True,
+                        "inspection": deepcopy(finding["dependencyResolution"]),
+                    }
                 if (
                     plan.get("strategy") == "override"
                     and plan.get("manager") == "maven"
@@ -2438,7 +2437,10 @@ class Engine:
                 )
                 receipt["post_results"].extend(checks)
                 outcome["results"].extend(checks)
-                if any(row["status"] != "PASSED" for row in checks):
+                if any(
+                    row["status"] != "PASSED" and row.get("required", True)
+                    for row in checks
+                ):
                     raise ValueError(
                         "Post-update configured product checks did not pass"
                     )
@@ -2447,6 +2449,7 @@ class Engine:
                     receipt,
                     allowed_files,
                     expected_dependencies=expected_dependencies,
+                    version_updates=version_updates,
                 )
                 if outcome["status"] == "VALIDATION_COMPLETE":
                     receipt["validated_tree"] = validated_tree
@@ -2480,7 +2483,7 @@ class Engine:
             self._progress(change["finding_id"], f"Post-update validation: {status}")
             if status == "VALIDATED":
                 change["detail"] = (
-                    "Accepted: no production/unit-test API changes; initial lint issues recorded separately; production builds, unit tests and configured policy checks passed."
+                    "Accepted: source/check scripts unchanged; production builds, exact dependency resolution and test-free policy checks passed. Unit/integration tests were not run."
                 )
             else:
                 failures = [
@@ -2967,6 +2970,7 @@ class Engine:
 
     def _package_policy(self, plan: dict, review: dict) -> dict:
         """Enforce configured/existing policy, otherwise require license review."""
+        review_manager_guidance(plan, review)
         if self._package_policy_required or self.package_policy_path.exists():
             return load_policy(self.repo_root, self.package_policy_path, plan)
         return reviewed_license_policy(self.repo_root, plan, review)
@@ -3000,7 +3004,7 @@ class Engine:
                 valid = (
                     snapshot is not None
                     and receipt.get("check_contract")
-                    == "lint-baseline-build-unit-tests-no-code-v4"
+                    == "production-build-resolution-no-tests-v6"
                     and receipt.get("validated_tree") == snapshot
                     and receipt.get("policy_sha256") == policy["policy_sha256"]
                 )
@@ -3053,7 +3057,7 @@ class Engine:
                 )
             with self._gradle_lock:
                 before = tree_snapshot(self.repo_root)
-                key = (manifest.parent, tool)
+                key = (manifest.parent, tool, "maven")
                 cached = self._gradle_reports.get(key)
                 if cached and cached[0] == before:
                     parsed, row = cached[1], dict(cached[2])
@@ -3152,10 +3156,113 @@ class Engine:
             logger.warning("Maven dependency inspection unavailable: %s", exc)
             return None
 
+    def _gradle_dependency_report(
+        self,
+        manifest: Path,
+        tool: str,
+        configuration: str | None,
+        finding_id: str,
+    ) -> tuple[GradleReport, dict]:
+        """Cache scoped or all-configuration reports against the current checkout."""
+        with self._gradle_lock:
+            before = tree_snapshot(self.repo_root)
+            key = (manifest.parent, tool, configuration)
+            cached = self._gradle_reports.get(key)
+            if cached and cached[0] == before and finding_id not in cached[3]:
+                if cached[2]["status"] == "FAILED":
+                    cached[3].add(finding_id)
+                return cached[1], dict(cached[2])
+            row: dict = {
+                "manager": "gradle",
+                "manifest": manifest.relative_to(self.repo_root).as_posix(),
+                "configuration": configuration or "all",
+                "status": "UNRESOLVED",
+            }
+            argv = [tool, "--no-daemon", "dependencies"]
+            if configuration is not None:
+                argv.extend(["--configuration", configuration])
+            result = self.runner.run(
+                argv,
+                timeout=min(self.validation_timeout, 120),
+                check=False,
+                **(
+                    {"cwd": manifest.parent}
+                    if manifest.parent != self.repo_root
+                    else {}
+                ),
+            )
+            row.update(
+                command=result.display(),
+                stdout_log_path=result.stdout_log_path,
+                stderr_log_path=result.stderr_log_path,
+            )
+            report = result.stdout
+            if result.exit_code:
+                row.update(
+                    status="FAILED",
+                    detail=f"Gradle dependency inspection exited {result.exit_code}: "
+                    + (result.stderr or result.stdout)[-500:],
+                )
+            elif result.truncated:
+                log = (
+                    resolve_inside(self.repo_root, result.stdout_log_path)
+                    if result.stdout_log_path
+                    else None
+                )
+                directory = self.repo_root / ".security-mcp" / "command-logs"
+                if log is None or not log.is_relative_to(directory):
+                    row.update(
+                        status="FAILED",
+                        detail="Gradle dependency output is truncated and has no complete local log.",
+                    )
+                else:
+                    with log.open("rb") as stream:
+                        raw = stream.read(8 * 1024 * 1024 + 1)
+                    if len(raw) > 8 * 1024 * 1024:
+                        row.update(
+                            status="FAILED",
+                            detail="Gradle dependency log exceeds the 8 MiB inspection limit.",
+                        )
+                    else:
+                        report = raw.decode("utf-8")
+            if tree_snapshot(self.repo_root) != before:
+                raise ValueError(
+                    "Checkout changed during Gradle dependency inspection; retry against a stable tree."
+                )
+            parsed = (
+                parse_gradle_report(report)
+                if row["status"] != "FAILED"
+                else GradleReport()
+            )
+            if configuration is not None:
+                parsed.versions = {
+                    coordinate: {
+                        scope: versions
+                        for scope, versions in scopes.items()
+                        if scope.rsplit(":", 1)[-1] == configuration
+                    }
+                    for coordinate, scopes in parsed.versions.items()
+                }
+            if parsed.warnings:
+                row["warnings"] = parsed.warnings
+            self._gradle_reports[key] = (
+                before,
+                parsed,
+                dict(row),
+                {finding_id} if row["status"] == "FAILED" else set(),
+            )
+            if len(self._gradle_reports) > MAX_WORKERS:
+                self._gradle_reports.pop(next(iter(self._gradle_reports)))
+            return parsed, row
+
     def _resolve_gradle_package(
-        self, finding: dict, files: list[Path]
+        self,
+        finding: dict,
+        files: list[Path],
+        *,
+        configurations: tuple[str, ...] = (),
     ) -> PackageHit | None:
-        """Share a complete, tree-bound dependency inspection across finding workers."""
+        """Find the actual classpaths before choosing a configuration-specific edit."""
         location = (finding.get("location") or {}).get("file")
         manifest = (
             resolve_inside(self.repo_root, location)
@@ -3166,7 +3273,15 @@ class Engine:
             path for path in files if path.name in {"build.gradle", "build.gradle.kts"}
         ]
         if manifest not in builds:
-            manifest = builds[0] if not location and len(builds) == 1 else None
+            known_version_file = manifest is not None and manifest.name in {
+                "libs.versions.toml",
+                "gradle.properties",
+            }
+            manifest = (
+                builds[0]
+                if len(builds) == 1 and (not location or known_version_file)
+                else None
+            )
         if manifest is None:
             return None
         row = {
@@ -3174,8 +3289,18 @@ class Engine:
             "manifest": manifest.relative_to(self.repo_root).as_posix(),
             "status": "UNRESOLVED",
         }
-        entry = None
         try:
+            configuration = (finding.get("location") or {}).get(
+                "configuration"
+            ) or "runtimeClasspath"
+            if (
+                not isinstance(configuration, str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,100}", configuration) is None
+            ):
+                raise ValueError(
+                    "Gradle configuration must be an exact scanner-supplied configuration name"
+                )
+            row["configuration"] = configuration
             tool = java_wrapper(
                 manifest.parent, self.repo_root, "gradlew"
             ) or resolve_tool("gradle", self.which)
@@ -3183,98 +3308,60 @@ class Engine:
                 raise ValueError(
                     "Gradle wrapper and gradle are unavailable; dependency tree not inspected."
                 )
-            with self._gradle_lock:
-                before = tree_snapshot(self.repo_root)
-                key = (manifest.parent, tool)
-                cached = self._gradle_reports.get(key)
-                # Share failures across findings, but let the same finding retry.
-                if cached and cached[0] == before and finding["id"] not in cached[3]:
-                    entry = cached
-                    parsed, row = cached[1], dict(cached[2])
-                else:
-                    result = self.runner.run(
-                        [tool, "--no-daemon", "dependencies"],
-                        timeout=min(self.validation_timeout, 120),
-                        check=False,
-                        **(
-                            {"cwd": manifest.parent}
-                            if manifest.parent != self.repo_root
-                            else {}
-                        ),
+            scoped_inspection = None
+            for scope in (None,) if configurations else (configuration, None):
+                if scope is None and not configurations:
+                    scoped_inspection = deepcopy(row)
+                    self._progress(
+                        finding["id"],
+                        f"{finding['component']} is absent from {configuration}; inspecting the project's other Gradle configurations",
                     )
-                    row.update(
-                        command=result.display(),
-                        stdout_log_path=result.stdout_log_path,
-                        stderr_log_path=result.stderr_log_path,
-                    )
-                    report = result.stdout
-                    if result.exit_code:
-                        row.update(
-                            status="FAILED",
-                            detail=f"Gradle dependency inspection exited {result.exit_code}: "
-                            + (result.stderr or result.stdout)[-500:],
-                        )
-                    elif result.truncated:
-                        log = (
-                            resolve_inside(self.repo_root, result.stdout_log_path)
-                            if result.stdout_log_path
-                            else None
-                        )
-                        directory = self.repo_root / ".security-mcp" / "command-logs"
-                        if log is None or not log.is_relative_to(directory):
-                            row.update(
-                                status="FAILED",
-                                detail="Gradle dependency output is truncated and has no complete local log.",
-                            )
-                        else:
-                            with log.open("rb") as stream:
-                                raw = stream.read(8 * 1024 * 1024 + 1)
-                            if len(raw) > 8 * 1024 * 1024:
-                                row.update(
-                                    status="FAILED",
-                                    detail="Gradle dependency log exceeds the 8 MiB inspection limit.",
-                                )
-                            else:
-                                report = raw.decode("utf-8")
-                    if tree_snapshot(self.repo_root) != before:
-                        raise ValueError(
-                            "Checkout changed during Gradle dependency inspection; retry against a stable tree."
-                        )
-                    parsed = (
-                        parse_gradle_report(report)
-                        if row["status"] != "FAILED"
-                        else GradleReport()
-                    )
-                    if parsed.warnings:
-                        row["warnings"] = parsed.warnings
-                    entry = (before, parsed, dict(row), set())
-                    self._gradle_reports[key] = entry
-                    if len(self._gradle_reports) > MAX_WORKERS:
-                        self._gradle_reports.pop(next(iter(self._gradle_reports)))
-            if row["status"] == "FAILED":
-                raise ValueError(row["detail"])
-            hit = gradle_report_package(
-                self.repo_root,
-                manifest,
-                finding["component"],
-                parsed,
-                hinted=finding.get("installedVersion"),
-            )
-            if hit:
-                row.update(status="RESOLVED", version=hit.version)
-                row["configuration_versions"] = hit.configuration_versions
-            else:
-                row["detail"] = (
-                    "Gradle did not report this coordinate as a resolved dependency; absence is not a false positive."
+                parsed, row = self._gradle_dependency_report(
+                    manifest, tool, scope, finding["id"]
                 )
-                with self._gradle_lock:
-                    entry[3].add(finding["id"])
+                if scoped_inspection is not None:
+                    row["initial_inspection"] = scoped_inspection
+                if row["status"] == "FAILED":
+                    raise ValueError(row["detail"])
+                if configurations:
+                    parsed = replace(
+                        parsed,
+                        versions={
+                            coordinate: {
+                                name: versions
+                                for name, versions in scopes.items()
+                                if name in configurations
+                            }
+                            for coordinate, scopes in parsed.versions.items()
+                        },
+                    )
+                hit = gradle_report_package(
+                    self.repo_root,
+                    manifest,
+                    finding["component"],
+                    parsed,
+                    hinted=finding.get("installedVersion"),
+                )
+                if hit:
+                    row.update(
+                        status="RESOLVED",
+                        version=hit.version,
+                        configuration_versions=hit.configuration_versions,
+                    )
+                    finding["dependencyResolution"] = row
+                    return hit
+            row["detail"] = (
+                f"Update selection blocked for {finding['component']}: the dependency was not found "
+                f"in '{configuration}' or the owning project's all-configuration dependency report. "
+                "This does not mean the requested fixed version is unavailable or incompatible. "
+                "Next: inspect the scanner's artifact, other subprojects or the buildscript classpath "
+                "to locate the reported vulnerable version. No update was applied. "
+                "A resolution override changes an existing dependency; it does not add a missing module "
+                "or prove remediation when the dependency is absent. This does not establish a false positive."
+            )
             finding["dependencyResolution"] = row
-            return hit
+            return None
         except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
-            if entry is not None:
-                with self._gradle_lock:
-                    entry[3].add(finding["id"])
             row.update(status="FAILED", detail=str(exc))
             logger.warning("Gradle dependency inspection unavailable: %s", exc)
             finding["dependencyResolution"] = row
@@ -3431,7 +3518,7 @@ class Engine:
                 "the approved checkout, separately from dependency updates. This server's "
                 "apply_minimal_fix cannot apply arbitrary application-code patches.",
                 "Rerun the identical reproduction and boundary/valid-input cases, lint, "
-                "production builds and unit tests. Both must pass; "
+                "production builds and dependency resolution. Do not execute unit/integration tests; "
                 "isolate and revert only offending package updates. Retain before/after evidence. "
                 "Keep the finding unresolved until those checks have passed; do not "
                 "fabricate evidence, dismiss GitLab findings, commit or push.",
@@ -3518,7 +3605,27 @@ class Engine:
             files,
             truncated=files_truncated,
         )
-        if hit is None and category == "dependency_scanning" and component:
+        declared_gradle = (
+            hit is not None and hit.manager == "gradle" and ":" in hit.name
+        )
+        if hit is not None and declared_gradle:
+            declared = hit
+            resolved = self._resolve_gradle_package(finding, files)
+            hit = (
+                replace(
+                    declared,
+                    version=resolved.version,
+                    configuration_versions=resolved.configuration_versions,
+                )
+                if resolved
+                else None
+            )
+        if (
+            hit is None
+            and category == "dependency_scanning"
+            and component
+            and not declared_gradle
+        ):
             self._progress(
                 finding.get("id"), "Inspecting the resolved Gradle dependency tree"
             )
@@ -3537,7 +3644,12 @@ class Engine:
                         or f"Selected version {resolution.get('version')}."
                     )
                 )
-        local_review_reason = None
+        local_review_reason = (
+            (finding.get("dependencyResolution") or {}).get("detail")
+            if hit is None
+            and (finding.get("dependencyResolution") or {}).get("manager") == "gradle"
+            else None
+        )
         if hit:
             evidence.append(
                 f"Local {hit.ecosystem} {hit.manager} package {hit.name} version {hit.version or 'unknown'} "
@@ -3567,7 +3679,10 @@ class Engine:
                 }
                 for path in files
             ):
-                local_review_reason = "The package was not resolved locally. Java and NuGet manifests do not enumerate every transitive dependency; manual dependency-tree review is required."
+                local_review_reason = (
+                    local_review_reason
+                    or "The package was not resolved locally. Java and NuGet manifests do not enumerate every transitive dependency; manual dependency-tree review is required."
+                )
             else:
                 evidence.append(
                     f"{component} was not found in the parsed manifests or lockfiles."
@@ -3782,6 +3897,20 @@ class Engine:
         if plan is None and "already at or above" in plan_reason:
             return "FALSE_POSITIVE", plan_reason, evidence, None, None
         if plan is None:
+            if category == "container_scanning":
+                reason = (
+                    f"{package_name} has advisory fix {fixed}, but no supported automatic "
+                    "manifest or image edit was found. Review the container recipe, update "
+                    "the affected package or choose a verified rebuilt base image, then "
+                    "rebuild and rescan. A package version must not be used as an unrelated image tag."
+                )
+                return (
+                    "MANUAL_REVIEW",
+                    reason,
+                    [*evidence, plan_reason],
+                    None,
+                    self._prompt(finding, looked_up, reason),
+                )
             if hit and hit.manager == "gradle" and not hit.direct:
                 reason = f"The resolved transitive dependency {hit.name} at {installed} has fixed target {fixed}, but no supported coordinate-specific edit could be planned."
                 return (
@@ -3828,7 +3957,7 @@ class Engine:
             )
         if plan.ecosystem in PACKAGE_ECOSYSTEMS:
             evidence.append(
-                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply all reviewed updates, then require passing production builds, unit tests and configured policy checks. Isolate and revert offending updates; retain passing updates."
+                "Candidate only: version numbering does not establish framework/API compatibility or license suitability. qualify_package_update requires documented license review or a configured corporate policy. Apply reviewed updates, then require production builds, dependency resolution and test-free policy checks. Never execute unit/integration tests. Isolate offending updates; retain passing updates."
             )
             if major_upgrade:
                 evidence.append(

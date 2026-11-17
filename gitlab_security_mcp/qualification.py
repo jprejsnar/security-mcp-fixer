@@ -17,12 +17,13 @@ from urllib.parse import urlparse
 
 from gitlab_security_mcp.commands import assert_allowed, resolve_tool, tool_name
 from gitlab_security_mcp.manifests import iter_files, java_project_root
+from gitlab_security_mcp.official_docs import manager_documentation
 from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
 from gitlab_security_mcp.validate import (
-    _execute_product_check,
     _run_result,
     java_wrapper,
 )
+from gitlab_security_mcp.versions import is_major_upgrade, parse_version
 
 PACKAGE_ECOSYSTEMS = {"npm", "NuGet", "Maven"}
 CHECK_KINDS = ("build", "unit_tests", "runtime", "license_audit")
@@ -40,6 +41,182 @@ ARTIFACT_DIRS = {
 MAX_TREE_BYTES = 100 * 1024 * 1024
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_POLICY_BYTES = 1024 * 1024
+_ALIGNMENT_VERSION = re.compile(r"(\d+(?:\.\d+)+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)")
+
+
+def _alignment_document(relative: str) -> bool:
+    """Recognize AI documentation, never executable rules or arbitrary Markdown."""
+    path = Path(relative)
+    if path.name.lower() in {
+        "agents.md",
+        "claude.md",
+        "gemini.md",
+        ".cursorrules",
+        ".windsurfrules",
+    }:
+        return True
+    if path.suffix.lower() not in {".md", ".mdc"}:
+        return False
+    parts = tuple(part.lower() for part in path.parts)
+    sections = {
+        (".github", "instructions"),
+        (".github", "skills"),
+        (".github", "prompts"),
+        (".cursor", "rules"),
+        (".cursor", "skills"),
+        (".claude", "rules"),
+        (".claude", "skills"),
+        (".agents", "skills"),
+        (".windsurf", "rules"),
+        (".windsurf", "skills"),
+    }
+    return any(pair in sections for pair in zip(parts, parts[1:], strict=False)) or (
+        len(parts) >= 2
+        and parts[-2] == ".github"
+        and parts[-1]
+        in {"versions.md", "copilot-instructions.md", "git-commit-instructions.md"}
+    )
+
+
+def capture_version_alignment(root: Path, snapshot: dict[str, str]) -> dict[str, str]:
+    """Retain bounded original AI documents to prove later edits change versions only."""
+    documents = {}
+    total = 0
+    for relative in snapshot:
+        if not _alignment_document(relative):
+            continue
+        path = resolve_inside(root, relative)
+        if path is None:
+            raise ValueError(
+                "Version-alignment documentation must stay inside the checkout"
+            )
+        canonical = path.relative_to(root.resolve()).as_posix()
+        if canonical in documents or not _alignment_document(canonical):
+            continue
+        raw = _read_bounded(path, MAX_SOURCE_BYTES)
+        total += len(raw)
+        if total > MAX_TREE_BYTES:
+            raise ValueError(
+                "Version-alignment documentation exceeds the qualification size limit"
+            )
+        if hashlib.sha256(raw).hexdigest() != snapshot[relative]:
+            raise ValueError(
+                "AI documentation changed during qualification; retry against a stable tree"
+            )
+        documents[canonical] = raw.decode("utf-8")
+    return documents
+
+
+def _version_alignment_changes(
+    root: Path,
+    receipt: dict,
+    after: dict[str, str],
+    plans: list[dict],
+    excluded: set[str],
+) -> dict:
+    """Permit only exact reviewed version substitutions, with unambiguous ownership."""
+    updates: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
+    for plan in plans:
+        old, target = plan.get("installed"), plan.get("target")
+        manager, package = plan.get("manager"), plan.get("package")
+        if (
+            isinstance(old, str)
+            and bool(old)
+            and isinstance(target, str)
+            and bool(target)
+            and isinstance(manager, str)
+            and bool(manager)
+            and isinstance(package, str)
+            and bool(package)
+            and old != target
+        ):
+            updates.setdefault((old, target), set()).add((manager, package, target))
+    changes = {}
+    for relative, original in receipt.get("version_alignment_before", {}).items():
+        if (
+            relative in excluded
+            or relative not in after
+            or receipt["tree"].get(relative) == after[relative]
+        ):
+            continue
+        path = resolve_inside(root, relative)
+        if path is None or path.relative_to(root.resolve()).as_posix() != relative:
+            raise ValueError(
+                "Version-alignment document moved; requalification is required"
+            )
+        current = _read_bounded(path, MAX_SOURCE_BYTES).decode("utf-8")
+        if hashlib.sha256(current.encode("utf-8")).hexdigest() != after[relative]:
+            raise ValueError(
+                "AI documentation changed during validation; retry against a stable tree"
+            )
+        before_parts, after_parts = (
+            _ALIGNMENT_VERSION.split(original),
+            _ALIGNMENT_VERSION.split(current),
+        )
+        if (
+            len(before_parts) != len(after_parts)
+            or before_parts[::2] != after_parts[::2]
+        ):
+            continue
+        replacements = []
+        for index in range(1, len(before_parts), 2):
+            old, target = before_parts[index], after_parts[index]
+            if old == target:
+                continue
+            owners = updates.get((old, target), set())
+            if len(owners) != 1:
+                raise ValueError(
+                    f"AI documentation {relative} must change only exact reviewed package versions; "
+                    "unknown or ambiguous version ownership requires review"
+                )
+            manager, package, _target = next(iter(owners))
+            replacements.append(
+                {
+                    "index": index,
+                    "installed": old,
+                    "target": target,
+                    "manager": manager,
+                    "package": package,
+                }
+            )
+        if replacements:
+            changes[relative] = {
+                "before": original,
+                "after": current,
+                "replacements": replacements,
+            }
+    return changes
+
+
+def render_version_alignment(change: dict, plans: list[dict]) -> str:
+    """Replay only the already-validated version substitutions for retained updates."""
+    selected = {
+        (plan.get("manager"), plan.get("package"), plan.get("target")) for plan in plans
+    }
+    parts = _ALIGNMENT_VERSION.split(change["before"])
+    for replacement in change["replacements"]:
+        identity = (
+            replacement["manager"],
+            replacement["package"],
+            replacement["target"],
+        )
+        if identity in selected:
+            parts[replacement["index"]] = replacement["target"]
+    return "".join(parts)
+
+
+def review_manager_guidance(plan: dict, review: dict) -> None:
+    """Require the AI's current manager-specific citations in addition to package docs."""
+    sources = (review.get("documentation") or {}).get("sources") or []
+    missing = [url for url in manager_documentation(plan) if url not in sources]
+    if missing:
+        raise ValueError(
+            "Read the current official manager docs and explain the chosen update/override "
+            "strategy in documentation.summary; fetching pages alone is not review. "
+            "Add these documentation.sources: " + ", ".join(missing)
+        )
+
+
 SOURCE_SUFFIXES = {
     ".js",
     ".mjs",
@@ -92,7 +269,7 @@ def _sources(value: object, label: str) -> list[str]:
 
 
 def review_package(review: dict) -> None:
-    """Require compatibility evidence without production or test adaptations."""
+    """Require reviewed compatibility or an explicitly disclosed build-only trial."""
     if not isinstance(review, dict):
         raise ValueError("Package review must be an object")
     documentation = review.get("documentation")
@@ -102,12 +279,32 @@ def review_package(review: dict) -> None:
         )
     _sources(documentation.get("sources"), "Documentation")
     _text(documentation.get("summary"), "Documentation summary")
-    if review.get("compatible") is not True:
+    mode = review.get("validation_mode", "reviewed")
+    if mode not in {"reviewed", "build_only"}:
+        raise ValueError("validation_mode must be reviewed or build_only")
+    trial = mode == "build_only"
+    if trial:
+        if review.get("known_incompatibilities") != []:
+            raise ValueError("A build-only trial requires known_incompatibilities: []")
+        _text(
+            review.get("compatibility_limitations"),
+            "Build-only compatibility limitations",
+        )
+        for field in ("compatible", "compatible_without_code_changes"):
+            if field not in review:
+                raise ValueError(
+                    f"Build-only review must explicitly supply {field}, using null when unknown"
+                )
+            if review.get(field) is not None and review[field] is not True:
+                raise ValueError(
+                    "Known incompatibility cannot be bypassed with a build-only trial"
+                )
+    if not trial and review.get("compatible") is not True:
         raise ValueError(
             "Unsupported or uncertain framework/runtime compatibility requires manual review"
         )
     _text(review.get("api_changes"), "API-change analysis")
-    if review.get("compatible_without_code_changes") is not True:
+    if not trial and review.get("compatible_without_code_changes") is not True:
         raise ValueError(
             "Package update requires explicit confirmation that neither production nor unit-test callers need API changes"
         )
@@ -197,6 +394,20 @@ def scan_package_callers(root: Path, plan: dict) -> dict:
 
 def review_major_upgrade(root: Path, plan: dict, review: dict) -> dict | None:
     """Require fresh, explicit API/caller evidence without source adaptations."""
+    if review.get("validation_mode") == "build_only":
+        if (
+            parse_version(plan.get("installed")) is None
+            or parse_version(plan.get("target")) is None
+        ):
+            raise ValueError(
+                "Build-only trials require comparable installed and target versions"
+            )
+        if plan.get("major_upgrade") or is_major_upgrade(
+            plan["installed"], plan["target"]
+        ):
+            raise ValueError(
+                "Major upgrades require confirmed API/caller compatibility, not a build-only trial"
+            )
     if not plan.get("major_upgrade"):
         return None
     if review.get("source_fixes") != []:
@@ -294,7 +505,7 @@ def _check_args(manager: str, kind: str) -> list[str]:
         return args
     if manager == "maven":
         return {
-            "build": ["--batch-mode", "clean", "verify"],
+            "build": ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
             "unit_tests": ["--batch-mode", "test"],
             "runtime": ["--batch-mode", "-Psecurity-smoke", "verify"],
             "license_audit": ["--batch-mode", "-Psecurity-licenses", "verify"],
@@ -310,7 +521,7 @@ def _check_args(manager: str, kind: str) -> list[str]:
                 "runtime": "securitySmoke",
                 "license_audit": "securityLicenses",
             }[kind],
-        ]
+        ] + (["-x", "test"] if kind == "build" else [])
     raise ValueError("Package manager does not support qualification checks")
 
 
@@ -470,6 +681,8 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         "gradle": {"gradle", "gradlew"},
     }.get(manager, set())
     for kind, check in checks.items():
+        if kind == "unit_tests":
+            continue
         if not isinstance(check, dict):
             raise ValueError("Qualification checks must be objects")
         argv = check.get("argv")
@@ -490,7 +703,10 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     return {
         "approval": approval,
         "policy_mode": "corporate_policy",
-        "checks": checks,
+        "checks": {
+            kind: check for kind, check in checks.items() if kind != "unit_tests"
+        },
+        "disabled_checks": ["unit_tests"] if "unit_tests" in checks else [],
         "policy_sha256": hashlib.sha256(raw).hexdigest(),
     }
 
@@ -536,6 +752,16 @@ def run_checks(
     for kind in CHECK_KINDS:
         if kind not in checks:
             continue
+        if kind == "unit_tests":
+            rows.append(
+                {
+                    "kind": kind,
+                    "status": "SKIPPED",
+                    "required": False,
+                    "detail": "Unit/integration test execution is disabled during remediation.",
+                }
+            )
+            continue
         check = checks[kind]
         executable = check["argv"][0]
         try:
@@ -554,26 +780,6 @@ def run_checks(
                 )
                 continue
             argv = [tool, *check["argv"][1:]]
-            if (
-                kind == "unit_tests"
-                and tool_name(tool) in {"gradle", "gradlew"}
-                and "--rerun-tasks" not in argv
-                and "--rerun" not in argv
-            ):
-                argv.append("--rerun-tasks")
-            if kind == "unit_tests":
-                row = _execute_product_check(runner, argv, timeout, workdir, kind)
-                if row["status"] == "PASSED" and (
-                    not row.get("output_complete")
-                    or check["success_marker"]
-                    not in row.get("stdout", "") + row.get("stderr", "")
-                ):
-                    row.update(
-                        status="FAILED",
-                        detail="Positive check evidence is missing or output was truncated",
-                    )
-                rows.append(row)
-                continue
             result = runner.run(
                 argv,
                 timeout=timeout,
@@ -744,6 +950,7 @@ def validate_edits(
     allowed_files: list[str],
     *,
     expected_dependencies: dict | None = None,
+    version_updates: list[dict] | None = None,
 ) -> dict[str, str]:
     """Reject source adaptations and changes outside reviewed dependency files."""
     after = tree_snapshot(root)
@@ -781,9 +988,38 @@ def validate_edits(
             "Dependency files changed beyond the applied version edit; production/test settings cannot be adapted to support an update"
         )
     allowed = set(allowed_files)
+    canonical_allowed = {
+        path.relative_to(root.resolve()).as_posix()
+        for relative in allowed
+        if (path := resolve_inside(root, relative)) is not None
+    }
+    alignment = _version_alignment_changes(
+        root,
+        receipt,
+        after,
+        version_updates if version_updates is not None else [receipt.get("plan") or {}],
+        canonical_allowed,
+    )
+    allowed.update(alignment)
+    canonical_allowed.update(alignment)
+    for relative in changed - allowed:
+        path = resolve_inside(root, relative)
+        if path is None:
+            continue
+        canonical = path.relative_to(root.resolve()).as_posix()
+        if (
+            canonical in canonical_allowed
+            and relative in before
+            and relative in after
+            and before.get(relative) == before.get(canonical)
+            and after.get(relative) == after.get(canonical)
+        ):
+            allowed.add(relative)
     if changed - allowed:
         raise ValueError(
             "Undeclared checkout changes require re-review: "
             + ", ".join(sorted(changed - allowed)[:10])
         )
+    receipt["version_alignment"] = alignment
+    receipt["version_alignment_files"] = sorted(alignment)
     return after

@@ -180,6 +180,83 @@ def test_desktop_approval_returns_before_human_response_and_refreshes_report(
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Requires the Windows PowerShell runtime")
+@pytest.mark.parametrize(
+    "foreground_pid,handles,cycle,area,expected_window,expected_bounds",
+    [
+        (20, {"10": 111, "20": 222}, False, [-1920, 0, 1920, 1040], 999, [-1560, 140, 1200, 760]),
+        (99, {"20": 222}, False, [1920, 40, 1280, 984], 222, [1960, 152, 1200, 760]),
+        (99, {"10": 111}, False, [0, 0, 800, 600], 111, [0, 0, 800, 600]),
+        (99, {}, False, [-1280, -1024, 1280, 1024], 0, [-1240, -892, 1200, 760]),
+        (99, {}, True, [0, 0, 1201, 761], 0, [0, 0, 1200, 760]),
+    ],
+)
+def test_approval_uses_host_ancestry_and_bounds_without_opening_windows(
+    foreground_pid, handles, cycle, area, expected_window, expected_bounds
+):
+    """Prefer the host monitor, ignore unrelated apps, and fit negative/small screens."""
+    import subprocess
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$data = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($data.script, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$functions = @($ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -in @('Get-ApprovalHostWindow', 'Get-ApprovalBounds')
+}, $true))
+if ($functions.Count -ne 2) { throw 'Placement functions missing' }
+foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }
+function Get-Process {
+    param([int]$Id, $ErrorAction)
+    $value = $data.handles.PSObject.Properties[[string]$Id]
+    $handle = if ($null -eq $value) { 0 } else { $value.Value }
+    $result = [pscustomobject]@{ MainWindowHandle = [IntPtr][int]$handle }
+    $result | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+    return $result
+}
+$tree = @(
+    [pscustomobject]@{ ProcessId = 30; ParentProcessId = 20 }
+    [pscustomobject]@{ ProcessId = 20; ParentProcessId = $(if ($data.cycle) { 30 } else { 10 }) }
+    [pscustomobject]@{ ProcessId = 10; ParentProcessId = 0 }
+)
+$selected = Get-ApprovalHostWindow -HostProcessId 30 -ProcessTree $tree `
+    -ForegroundWindow ([IntPtr]999) -ForegroundProcessId $data.foreground_pid
+$area = New-Object System.Drawing.Rectangle($data.area[0], $data.area[1], $data.area[2], $data.area[3])
+$bounds = Get-ApprovalBounds -WorkingArea $area -RequestedSize (New-Object System.Drawing.Size(1200, 760))
+@{ window = $selected.ToInt64(); bounds = @($bounds.X, $bounds.Y, $bounds.Width, $bounds.Height) } |
+    ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [str(server.desktop_approval.powershell()), "-NoProfile", "-Command", script],
+        input=json.dumps(
+            {
+                "script": server.desktop_approval.SCRIPT,
+                "foreground_pid": foreground_pid,
+                "handles": handles,
+                "cycle": cycle,
+                "area": area,
+            }
+        ),
+        text=True,
+        capture_output=True,
+        timeout=20,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "window": expected_window,
+        "bounds": expected_bounds,
+    }
+
+
 @pytest.mark.skipif(
     os.name != "nt" or os.environ.get("SECURITY_MCP_DESKTOP_TESTS") != "1",
     reason="Requires an interactive Windows desktop and SECURITY_MCP_DESKTOP_TESTS=1",

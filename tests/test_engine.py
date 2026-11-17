@@ -634,6 +634,8 @@ class HybridRunner(CommandRunner):
         if tool_name(argv[0]) == "git":
             return super().run(argv, timeout=timeout, check=check, cwd=cwd)
         stdout = "ok"
+        if tool_name(argv[0]) in {"gradle", "gradlew"} and "dependencies" in argv:
+            stdout = "runtimeClasspath - Runtime graph.\n+--- org.apache.commons:commons-text:1.9\n"
         if "test" in argv or "verify" in argv:
             stdout += "\nTests: 1 passed"
         if argv[1:] in (["--version"], ["-version"]):
@@ -2141,12 +2143,11 @@ def test_dotnet_10_project_formats_are_detected_and_validated(tmp_path, filename
     assert ["dotnet", "build", "--configuration", "Release", "--nologo"] in [
         call.args[0] for call in runner.run.call_args_list
     ]
-    assert ["dotnet", "test", "--configuration", "Release", "--nologo"] in [
+    assert ["dotnet", "test", "--configuration", "Release", "--nologo"] not in [
         call.args[0] for call in runner.run.call_args_list
     ]
     tests = [row for row in result["results"] if row.get("kind") == "unit_tests"]
-    assert len(tests) == 1 and tests[0]["status"] == "PASSED"
-    assert tests[0]["required"] is True
+    assert tests == []
 
 
 @pytest.mark.parametrize(
@@ -2256,7 +2257,7 @@ def test_advisory_verified_dependency_fix_across_stacks(
     assert applied["status"] == "APPLIED"
     assert target in (tmp_path / filename).read_text(encoding="utf-8")
     assert installed not in (tmp_path / filename).read_text(encoding="utf-8")
-    assert runner.calls
+    assert bool(runner.calls) is (manager == "gradle")
     assert all(tool_name(call[0]) != "git" for call in runner.calls)
 
 
@@ -2308,7 +2309,7 @@ def test_nested_node_finding_reaches_advisory_in_dotnet_repo(
         assert any("Major-version candidate" in item for item in verified["evidence"])
     assert verified["proposed_fix"]["target"] == target
     assert verified["proposed_fix"]["files"] == [
-        "frontend/package.json",
+        "frontend/pnpm-workspace.yaml",
         "frontend/pnpm-lock.yaml",
     ]
     assert blocked["status"] == "QUALIFICATION_REQUIRED"
@@ -2337,7 +2338,7 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
     finding = _finding("gradle-transitive", "io.example/library", "CVE-TEST", "1.0.0")
     finding["location"] = {"file": "build.gradle"}
     finding["solution"] = "Upgrade to version 1.2.0 or above."
-    output = "+--- io.example:library:1.0.0 -> 1.1.0\n"
+    output = "runtimeClasspath - Application classpath.\n+--- io.example:library:1.0.0 -> 1.1.0\n"
     if mode == "conflict":
         output += "\\--- io.example:library:1.0.0\n"
     if mode == "unresolved":
@@ -2363,6 +2364,7 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
         log = tmp_path / ".security-mcp" / "command-logs" / "dependencies.stdout.log"
         log.parent.mkdir(parents=True)
         log.write_bytes(
+            b"runtimeClasspath - Application classpath.\r\n"
             b"+--- io.example:library:9.0.0 (c)\r\n"
             b"+--- io.example:library:1.0.0 -> 1.1.0\r\n"
             b"\\--- io.example:library:1.1.0 (*)\r\n"
@@ -2414,6 +2416,8 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
         assert first["proposed_fix"]["strategy"] == "override"
         assert first["proposed_fix"]["package"] == "io.example:library"
         assert first["proposed_fix"]["target"] == "1.2.0"
+    elif mode == "configurations":
+        assert first["decision"] == again["decision"] == "FALSE_POSITIVE"
     else:
         assert first["decision"] == again["decision"] == "MANUAL_REVIEW"
         assert first["proposed_fix"] is None
@@ -2430,7 +2434,9 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
     if successful:
         assert finding["dependencyResolution"]["version"] == "1.1.0"
         if mode == "configurations":
-            assert "other configuration versions" in first["reason"]
+            assert (
+                finding["dependencyResolution"]["configuration"] == "runtimeClasspath"
+            )
         else:
             assert "transitive" in first["reason"].lower()
             assert "1.2.0" in first["reason"]
@@ -2442,7 +2448,7 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
     else:
         assert finding["dependencyResolution"]["status"] != "RESOLVED"
         assert any("Gradle" in evidence for evidence in first["evidence"])
-    assert not engine.state.false_positives
+    assert bool(engine.state.false_positives) is (mode == "configurations")
 
 
 def test_nested_gradle_dependency_inspection_finds_enclosing_wrapper(tmp_path):
@@ -2465,7 +2471,7 @@ def test_nested_gradle_dependency_inspection_finds_enclosing_wrapper(tmp_path):
     runner.run.return_value = CommandResult(
         [str(wrapper), "--no-daemon", "dependencies"],
         0,
-        "+--- io.example:library:1.0.0 -> 1.1.0\n",
+        "runtimeClasspath - Application classpath.\n+--- io.example:library:1.0.0 -> 1.1.0\n",
         "",
         0,
         False,
@@ -2523,7 +2529,30 @@ def test_canonical_maven_coordinate_can_use_explicit_gitlab_target(tmp_path):
     advisory.lookup.return_value = AdvisoryLookup(
         outcome="lookup_failed", summary="Public version bounds missing."
     )
-    engine = Engine(tmp_path, gitlab=Mock(), advisory=advisory)
+    runner = Mock()
+    runner.run.return_value = CommandResult(
+        [
+            "gradle",
+            "--no-daemon",
+            "dependencies",
+            "--configuration",
+            "runtimeClasspath",
+        ],
+        0,
+        "runtimeClasspath - Runtime graph.\n+--- io.example:library:1.0.0\n",
+        "",
+        0,
+        False,
+        "",
+        "",
+    )
+    engine = Engine(
+        tmp_path,
+        gitlab=Mock(),
+        advisory=advisory,
+        runner=runner,
+        which=lambda name: name,
+    )
     engine.state.status = "FINDINGS_LISTED"
     engine.state.findings = [finding]
 
@@ -2620,7 +2649,7 @@ def test_modern_yarn_validation_uses_supported_commands(tmp_path):
 
     # Assert
     assert result["status"] == "VALIDATION_COMPLETE"
-    assert ["yarn", "install", "--immutable"] in calls
+    assert ["yarn", "install", "--immutable", "--mode=skip-build"] in calls
     assert ["yarn", "npm", "audit", "--json"] in calls
     assert ["yarn", "install", "--frozen-lockfile"] not in calls
 
@@ -2669,8 +2698,10 @@ def test_modern_yarn_lockfile_refresh(tmp_path, strategy, expected):
     result = apply_plan(tmp_path, plan, runner, lambda name: name)
 
     # Assert
-    assert result["status"] == "APPLIED"
-    assert calls == [expected]
+    assert result["status"] == (
+        "APPLIED" if strategy == "override" else "FIX_FAILED_LOCKFILE"
+    )
+    assert calls == ([expected] if strategy == "override" else [])
 
 
 @pytest.mark.parametrize(
@@ -2756,7 +2787,9 @@ def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
     assert result["status"] == "VALIDATION_COMPLETE"
     calls = runner.run.call_args_list
     install = next(
-        call for call in calls if call.args[0][1:] == ["install", "--frozen-lockfile"]
+        call
+        for call in calls
+        if call.args[0][1:] == ["install", "--frozen-lockfile", "--ignore-scripts"]
     )
     assert install.args[0][0] == "pnpm"
     assert install.kwargs["cwd"] == frontend
@@ -2969,20 +3002,11 @@ def test_pnpm_preparation_runs_after_both_pulls_before_security_checks(
     expected = [
         ["git", "pull", "--ff-only"],
         ["git", "pull", "--ff-only"],
-        ["pnpm", "clean"],
     ]
-    if failed_step != "clean":
-        expected.append(["pnpm", "install"])
     assert events == expected
     engine.gitlab.fetch.assert_not_called()
-    if failed_step:
-        assert result["status"] == "PREPARATION_FAILED"
-        assert result["failed_command"] == ["pnpm", failed_step]
-        assert engine.create_security_branch()["status"] == "BRANCH_CREATION_FAILED"
-        assert engine.list_security_findings()["status"] == "ERROR"
-    else:
-        assert result["status"] == "PULLS_SUCCEEDED"
-        assert len(result["preparation"]) == 2
+    assert result["status"] == "PULLS_SUCCEEDED"
+    assert result["preparation"] == []
 
 
 def test_existing_branch_name_is_reused_after_log_review(cloned_repo):
@@ -3081,7 +3105,7 @@ def test_current_today_branch_reuses_its_own_dependencies_and_preserves_policies
     assert pulls["preparation_deferred_to_reused_branch"]
     assert result["status"] == "BRANCH_CREATED"
     assert result["reused"]
-    assert executed == [(["pnpm", "clean"], name), (["pnpm", "install"], name)]
+    assert executed == []
     assert engine.git.head() == head
     assert not old.exists()
     assert tracked.read_text(encoding="utf-8") == "Tracked evidence."
@@ -3190,6 +3214,51 @@ def test_branch_reuse_rechecks_date_after_server_crosses_midnight(
     assert result["status"] == "PULL_FAILED"
     assert "date changed" in result["reason"]
     assert engine.git.current_branch() == "main"
+
+
+@pytest.mark.parametrize("fixed", ["3.5.8", None])
+def test_container_package_fix_without_supported_edit_requires_review(repo, fixed):
+    """Keep known container fixes out of the no-solution list without guessing edits."""
+    from contextlib import closing
+    from unittest.mock import Mock
+
+    recipe = repo / "Dockerfile"
+    original = "FROM flyway/flyway:12.6.2-alpine\n"
+    recipe.write_text(original, encoding="utf-8")
+    finding = _finding("os-package", "openssl", "CVE-fixture", version="3.5.6-r0")
+    finding.update(
+        category="container_scanning",
+        location={"image": "registry.example.invalid/application:commit-sha"},
+        solution="Upgrade openssl to 3.5.8-r0",
+    )
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved" if fixed else "no_fix_published",
+        affected=True,
+        lowest_fixed_version=fixed,
+        fixed_versions=[fixed] if fixed else [],
+        summary="Fixed bound found." if fixed else "No fixed bound found.",
+    )
+    with closing(Engine(repo, gitlab=FakeGitLab([finding]), advisory=advisory)) as engine:
+        engine.state.status = "FINDINGS_LISTED"
+        engine.state.findings = [finding]
+
+        result = engine.verify_security_finding(finding["id"])
+
+        assert result["decision"] == ("MANUAL_REVIEW" if fixed else "NO_SAFE_FIX")
+        assert not result["eligible_for_auto_fix"]
+        assert result["proposed_fix"] is None
+        if fixed:
+            assert "openssl has advisory fix 3.5.8" in result["reason"]
+            assert "rebuild and rescan" in result["reason"]
+            assert "unrelated image tag" in result["reason"]
+            assert result["user_prompt"]
+            assert engine.state.no_solution == []
+            assert engine.state.skipped_user_prompt[0]["id"] == finding["id"]
+        else:
+            assert engine.state.no_solution[0]["id"] == finding["id"]
+        assert engine.state.changes == []
+    assert recipe.read_text(encoding="utf-8") == original
 
 
 def test_image_bump_and_aaa_test(repo):

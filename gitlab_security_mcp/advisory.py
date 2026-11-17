@@ -925,7 +925,12 @@ def _from_nvd(
         lowest_fixed_version=floor,
         affected=affected,
         ranges=ranges,
-        summary=f"NVD versionEndExcluding values: {', '.join(unique_fixed) or 'none'}.",
+        summary=(
+            f"Installed {package or 'product'} {version} is outside NVD's affected "
+            f"ranges: {'; '.join(ranges)}."
+            if affected is False
+            else f"NVD versionEndExcluding values: {', '.join(unique_fixed) or 'none'}."
+        ),
         sources=sources,
         errors=errors,
     )

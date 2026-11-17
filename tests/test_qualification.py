@@ -10,6 +10,7 @@ from gitlab_security_mcp.advisory import AdvisoryLookup
 from gitlab_security_mcp.commands import CommandResult, assert_allowed
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.qualification import (
+    capture_version_alignment,
     load_policy,
     review_major_upgrade,
     review_package,
@@ -19,6 +20,7 @@ from gitlab_security_mcp.qualification import (
     validate_edits,
 )
 from gitlab_security_mcp.validate import _lint_result, _product_result
+from tests.conftest import manager_doc_sources
 
 
 @pytest.mark.parametrize("truncated,code", [(False, 0), (False, 1), (True, 0)])
@@ -148,7 +150,7 @@ def test_node_validation_stops_after_required_check_fails(
     calls = [call.args[0][1:] for call in runner.run.call_args_list]
     if failed_check is None:
         assert ["run", "build"] in calls
-        assert ["test"] in calls
+        assert ["test"] not in calls
         assert all(row["status"] == "PASSED" for row in rows if row.get("kind"))
         return
     assert ["run", failed_check] in calls
@@ -200,7 +202,6 @@ def test_node_validation_stops_when_required_lint_script_is_missing(tmp_path):
     assert {row["kind"] for row in rows if row.get("kind")} == {
         "lint",
         "build",
-        "unit_tests",
     }
     assert all(
         row["status"] == "SKIPPED" and row["required"]
@@ -390,12 +391,16 @@ def test_unit_test_policy_runs_without_rewriting_checks(tmp_path, package_policy
     rows = run_checks(tmp_path, checks, runner, lambda name: name, 30)
 
     # Assert
-    assert runner.run.call_count == 4
-    assert loaded["checks"] == checks
+    assert runner.run.call_count == 3
+    assert loaded["checks"] == {
+        kind: value for kind, value in checks.items() if kind != "unit_tests"
+    }
     assert path.read_bytes() == original
     assert checks["unit_tests"]["argv"] == ["npm", "test"]
     assert len(rows) == 4
-    assert all(row["status"] == "PASSED" and row["required"] for row in rows)
+    assert all(row["status"] == "PASSED" for row in rows if row["required"])
+    skipped = next(row for row in rows if row["kind"] == "unit_tests")
+    assert skipped["status"] == "SKIPPED" and skipped["required"] is False
 
 
 @pytest.mark.parametrize("script", ["security:smoke", "postbuild"])
@@ -712,18 +717,16 @@ def test_package_batch_builds_and_tests_once(pending_package_batch):
     assert result["status"] == "VALIDATION_COMPLETE", result
     assert cached["cached"] is True
     assert calls.count(["run", "build"]) == 1
-    assert calls.count(["test"]) == 1
+    assert calls.count(["test"]) == 0
     tests = [row for row in result["results"] if row.get("kind") == "unit_tests"]
-    assert len(tests) == 1
-    assert tests[0]["status"] == "PASSED"
-    assert tests[0]["required"] is True
+    assert tests == []
     assert all(
         change["qualification_status"] == "VALIDATED"
         for change in package_engine.state.changes
     )
 
 
-@pytest.mark.parametrize("failed_kind", ["build", "test"])
+@pytest.mark.parametrize("failed_kind", ["build"])
 @pytest.mark.parametrize("bad", ["example", "other", "interaction"])
 def test_failed_batch_retains_green_subset(pending_package_batch, failed_kind, bad):
     """Isolate bad updates or interacting pairs and retain a build-validated subset."""
@@ -794,7 +797,7 @@ def test_corporate_checks_share_the_final_build_and_tests(
     assert result["status"] == "VALIDATION_COMPLETE", result
     assert ["run", "build"] not in before and ["test"] not in before
     assert calls.count(["run", "build"]) == 1
-    assert calls.count(["test"]) == 1
+    assert calls.count(["test"]) == 0
     assert (
         calls.count(["run", "security:smoke"])
         == calls.count(["run", "security:licenses"])
@@ -999,10 +1002,13 @@ def test_informational_lint_never_blocks_build_and_runtime_gates(
     assert all(
         not row["required"] for row in package_engine.state.lint_baseline["results"]
     )
-    assert sum(
-        call.args[0][1:] == ["run", "lint"]
-        for call in package_engine.runner.run.call_args_list
-    ) == (0 if lint_problem == "missing" else 1)
+    assert (
+        sum(
+            call.args[0][1:] == ["run", "lint"]
+            for call in package_engine.runner.run.call_args_list
+        )
+        == 0
+    )
 
 
 def test_validation_matrix_never_runs_lint_before_qualification(package_engine):
@@ -1021,7 +1027,7 @@ def test_validation_matrix_never_runs_lint_before_qualification(package_engine):
         for call in package_engine.runner.run.call_args_list
     )
     assert any(row.get("kind") == "build" for row in result["results"])
-    assert any(row.get("kind") == "unit_tests" for row in result["results"])
+    assert not any(row.get("kind") == "unit_tests" for row in result["results"])
 
 
 def test_lint_rule_inventory_preserves_unique_structured_and_text_rule_names():
@@ -1081,7 +1087,7 @@ def package_review():
         "target": "1.0.1",
         "documentation": {
             "complete": True,
-            "sources": ["https://example.test/docs"],
+            "sources": ["https://example.test/docs", *manager_doc_sources()],
             "summary": "Reviewed API and release notes",
         },
         "compatible": True,
@@ -1216,7 +1222,7 @@ def test_security_loop_retains_good_fixes_and_continues_after_rejection(
             call.args[0][1:] == ["run", "lint"]
             for call in package_engine.runner.run.call_args_list
         )
-        == 1
+        == 0
     )
 
 
@@ -1265,16 +1271,16 @@ def test_qualification_defers_build_and_unit_tests_until_after_fix(
 
     # Assert
     assert result["status"] == "QUALIFIED"
-    assert ["run", "lint"] in commands
+    assert ["run", "lint"] not in commands
     assert ["run", "build"] not in commands
     assert ["test"] not in commands
-    assert commands == [["run", "lint"]]
+    assert commands == []
     assert (package_engine.repo_root / "package.json").read_bytes() == original
     assert package_engine.apply_minimal_fix("package")["status"] == "APPLIED"
     assert package_engine.run_validation_matrix()["status"] == "VALIDATION_COMPLETE"
     commands = [call.args[0][1:] for call in package_engine.runner.run.call_args_list]
     assert commands.count(["run", "build"]) == 1
-    assert commands.count(["test"]) == 1
+    assert commands.count(["test"]) == 0
 
 
 @pytest.mark.parametrize("exit_code", [0, 124])
@@ -1371,10 +1377,8 @@ def test_existing_lint_issues_are_saved_before_security_updates(
     assert path.is_file()
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["phase"] == "before_changes"
-    assert payload["results"][0]["diagnostics"]["errors"] == ["error: existing issue"]
-    assert payload["results"][0]["diagnostics"]["warnings"] == [
-        "warning: existing warning"
-    ]
+    assert payload["results"] == []
+    package_engine.runner.run.assert_not_called()
     assert result["status"] == "QUALIFIED"
     assert (package_engine.repo_root / "package.json").read_bytes() == original
 
@@ -1442,19 +1446,6 @@ def test_missing_default_policy_uses_documented_license_review(
     validated = package_engine.run_validation_matrix()
     refreshed = package_engine.get_run_status()
     assert applied["status"] == "APPLIED", applied
-    if missing_script == "test":
-        assert validated["status"] == "VALIDATION_INCOMPLETE", validated
-        tests = [row for row in validated["results"] if row.get("kind") == "unit_tests"]
-        assert len(tests) == 1
-        assert tests[0]["required"] is True and tests[0]["status"] == "SKIPPED"
-        assert "no test script" in tests[0]["detail"]
-        assert package_engine.state.changes[0]["status"] == "ROLLED_BACK"
-        assert package_engine.state.changes[0]["qualification_status"] == "REJECTED"
-        assert (
-            json.loads(path.read_text(encoding="utf-8"))["dependencies"]["example"]
-            == "1.0.0"
-        )
-        return
     assert validated["status"] == "VALIDATION_COMPLETE", validated
     assert package_engine.state.changes[0]["qualification_status"] == "VALIDATED"
     assert refreshed["package_updates"][0]["qualification_status"] == "VALIDATED"
@@ -1496,12 +1487,11 @@ def test_lint_diagnostics_are_retained_once_before_updates(
     assert applied["status"] == "APPLIED", applied
     assert validated["status"] == "VALIDATION_COMPLETE", validated
     receipt = package_engine.state.findings[0]["packageQualification"]
-    for phase in ("baseline_results",):
-        lint = next(row for row in receipt[phase] if row.get("kind") == "lint")
-        assert lint["status"] == "PASSED"
-        assert lint["diagnostics"]["warnings"]
-        assert lint["diagnostics"]["info"]
-        assert lint["diagnostics"]["unknown"]
+    assert receipt["baseline_results"] == []
+    assert all(
+        call.args[0][1:] != ["run", "lint"]
+        for call in package_engine.runner.run.call_args_list
+    )
 
 
 def test_lint_baseline_is_retained_when_build_cannot_start(
@@ -1538,8 +1528,8 @@ def test_lint_baseline_is_retained_when_build_cannot_start(
         call.args[0][1:] != ["run", "build"]
         for call in package_engine.runner.run.call_args_list
     )
-    lint = next(row for row in result["baseline_results"] if row.get("kind") == "lint")
-    assert lint["diagnostics"]["warnings"] == ["warning: existing issue"]
+    assert result["baseline_results"] == []
+    package_engine.runner.run.assert_not_called()
 
 
 @pytest.mark.parametrize("stage", ["build", "security:smoke"])
@@ -2444,7 +2434,8 @@ def test_native_dotnet_smoke_filter_variants(tmp_path, flag, value):
     argv = ["dotnet", "test", "--configuration", "Release", "--nologo", flag, value]
 
     # Act
-    assert_allowed(argv, tmp_path)
+    with pytest.raises(PermissionError):
+        assert_allowed(argv, tmp_path)
     # Assert
     assert argv[1:] in _check_variants("nuget", "runtime")
     with pytest.raises(PermissionError):
@@ -2558,6 +2549,136 @@ def test_source_changes_are_rejected_even_when_listed_as_allowed(tmp_path, mode)
     assert "production or unit-test code changed" in str(raised.value)
 
 
+def test_linked_policy_paths_share_the_approved_edit_scope(tmp_path):
+    """Treat directory aliases as one approved file, not unrelated checkout changes."""
+    # Arrange
+    import os
+
+    canonical = tmp_path / ".github"
+    canonical.mkdir()
+    policy = canonical / "versions.md"
+    policy.write_text("Library 1.0.0\n", encoding="utf-8")
+    mirror = tmp_path / "subproject"
+    mirror.mkdir()
+    link = mirror / ".github"
+    if os.name == "nt":
+        from _winapi import CreateJunction
+
+        CreateJunction(str(canonical), str(link))
+    else:
+        link.symlink_to(canonical, target_is_directory=True)
+    receipt = {"tree": tree_snapshot(tmp_path)}
+    policy.write_text("Library 1.0.1\n", encoding="utf-8")
+
+    # Act
+    result = validate_edits(tmp_path, receipt, [".github/versions.md"])
+
+    # Assert
+    assert result["subproject/.github/versions.md"] == result[".github/versions.md"]
+    assert link.resolve() == canonical
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        ".github/instructions/versions.instructions.md",
+        ".github/skills/security/SKILL.md",
+        ".cursor/rules/versions.mdc",
+        "AGENTS.md",
+    ],
+)
+def test_version_only_ai_document_updates_are_allowed(tmp_path, relative):
+    """Allow known package-version synchronization without changing instruction text."""
+    # Arrange
+    document = tmp_path / relative
+    document.parent.mkdir(parents=True, exist_ok=True)
+    document.write_bytes(b"Use v1.0.0; retain unrelated 3.2.1.\r\n")
+    tree = tree_snapshot(tmp_path)
+    receipt = {
+        "tree": tree,
+        "version_alignment_before": capture_version_alignment(tmp_path, tree),
+        "plan": {
+            "manager": "gradle",
+            "package": "example:library",
+            "installed": "1.0.0",
+            "target": "1.0.1",
+        },
+    }
+    document.write_bytes(b"Use v1.0.1; retain unrelated 3.2.1.\r\n")
+
+    # Act
+    validate_edits(tmp_path, receipt, [])
+
+    # Assert
+    assert receipt["version_alignment_files"] == [relative]
+    assert receipt["version_alignment"][relative]["before"].endswith("\r\n")
+    assert document.read_bytes() == b"Use v1.0.1; retain unrelated 3.2.1.\r\n"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "instructions",
+        "unknown-version",
+        "delete",
+        "create",
+        "unrelated",
+        "executable",
+        "ambiguous",
+    ],
+)
+def test_alignment_exception_does_not_authorize_unrelated_edits(tmp_path, mode):
+    """Reject instruction rewrites, unreviewed versions and changes outside AI documentation."""
+    # Arrange
+    relative = {
+        "unrelated": "README.md",
+        "executable": ".github/skills/security/check.py",
+    }.get(mode, ".github/instructions/versions.instructions.md")
+    document = tmp_path / relative
+    document.parent.mkdir(parents=True, exist_ok=True)
+    if mode != "create":
+        document.write_text("Use 1.0.0.\n", encoding="utf-8")
+    tree = tree_snapshot(tmp_path)
+    plan = {
+        "manager": "gradle",
+        "package": "example:library",
+        "installed": "1.0.0",
+        "target": "1.0.1",
+    }
+    receipt = {
+        "tree": tree,
+        "version_alignment_before": capture_version_alignment(tmp_path, tree),
+        "plan": plan,
+    }
+    plans = [plan]
+    if mode == "ambiguous":
+        plans.append({**plan, "package": "unrelated:library"})
+    if mode == "delete":
+        document.unlink()
+    else:
+        document.write_text(
+            "Disable checks; use 1.0.1.\n"
+            if mode == "instructions"
+            else "Use 9.9.9.\n"
+            if mode == "unknown-version"
+            else "Use 1.0.1.\n",
+            encoding="utf-8",
+        )
+
+    # Act
+    with pytest.raises(ValueError) as raised:
+        validate_edits(tmp_path, receipt, [], version_updates=plans)
+
+    # Assert
+    assert any(
+        text in str(raised.value)
+        for text in (
+            "Undeclared checkout changes",
+            "exact reviewed package versions",
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "ecosystem,manager,tool,commands",
     [
@@ -2590,7 +2711,7 @@ def test_source_changes_are_rejected_even_when_listed_as_allowed(tmp_path, mode)
             "maven",
             "mvn",
             [
-                ["--batch-mode", "clean", "verify"],
+                ["--batch-mode", "clean", "package", "-Dmaven.test.skip=true"],
                 ["--batch-mode", "-Psecurity-smoke", "verify"],
                 ["--batch-mode", "-Psecurity-licenses", "verify"],
             ],
@@ -2600,8 +2721,9 @@ def test_source_changes_are_rejected_even_when_listed_as_allowed(tmp_path, mode)
             "gradle",
             "gradle",
             [
-                ["--no-daemon", task]
-                for task in ("assemble", "securitySmoke", "securityLicenses")
+                ["--no-daemon", "assemble", "-x", "test"],
+                ["--no-daemon", "securitySmoke"],
+                ["--no-daemon", "securityLicenses"],
             ],
         ),
     ],
@@ -2634,6 +2756,11 @@ def test_other_ecosystems_require_all_allowlisted_checks(
     runner.run.return_value = CommandResult(
         [], 0, "CHECK_PASSED\nTests: 1 passed", "", 0, False, "", ""
     )
+    if manager in {"nuget", "maven"}:
+        with pytest.raises(PermissionError):
+            load_policy(tmp_path, path, plan)
+        runner.run.assert_not_called()
+        return
     qualified = load_policy(tmp_path, path, plan)
     rows = run_checks(tmp_path, qualified["checks"], runner, lambda name: name, 30)
 

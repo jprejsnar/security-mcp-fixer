@@ -1,4 +1,4 @@
-"""Verify build-and-unit-test acceptance and transitive Java remediation."""
+"""Verify build-only acceptance and configuration-proven Java remediation."""
 
 import asyncio
 from copy import deepcopy
@@ -12,13 +12,224 @@ from mcp.shared.memory import create_client_server_memory_streams
 
 from gitlab_security_mcp import server
 from gitlab_security_mcp.advisory import AdvisoryLookup
-from gitlab_security_mcp.commands import CommandResult, assert_allowed
+from gitlab_security_mcp.commands import CommandResult, CommandRunner, assert_allowed
 from gitlab_security_mcp.engine import Engine, _ValidationRunner
 from gitlab_security_mcp.manifests import PackageHit
 from gitlab_security_mcp.qualification import run_checks
 from gitlab_security_mcp.remediate import apply_plan, plan_remediation
 from gitlab_security_mcp.validate import _product_result, run_validation
-from tests.conftest import documentation_client
+from tests.conftest import documentation_client, manager_doc_sources
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        "",
+        'configurations.configureEach { resolutionStrategy.force("example:library:1.0.1") }\n',
+    ],
+)
+@pytest.mark.parametrize("configuration", [None, "customRuntimeClasspath"])
+def test_unmatched_runtime_dependency_cannot_be_fixed_by_a_pin(
+    tmp_path, pin, configuration
+):
+    """Do not confuse a literal force or an unresolved constraint with remediation."""
+    # Arrange
+    manifest = tmp_path / "build.gradle"
+    manifest.write_text("plugins { id 'java' }\n" + pin)
+    inspected = configuration or "runtimeClasspath"
+    runner = Mock()
+    runner.run.side_effect = lambda argv, **kwargs: CommandResult(
+        argv,
+        0,
+        f"{inspected} - runtime\nNo dependencies\n"
+        "testRuntimeClasspath - test\n\\--- example:library:1.0.0 (c)\n"
+        "tooling - not resolvable (n)\n\\--- example:library:1.0.0 (n)\n",
+        "",
+        0,
+        False,
+        "",
+        "",
+    )
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(
+        outcome="resolved", affected=True, lowest_fixed_version="1.0.1"
+    )
+    engine = Engine(
+        tmp_path,
+        runner=runner,
+        gitlab=Mock(),
+        advisory=advisory,
+        which=lambda name: name,
+    )
+    finding = {
+        "id": "runtime-missing",
+        "component": "example:library",
+        "category": "dependency_scanning",
+        "installedVersion": "1.0.0",
+        "location": {"file": "build.gradle"},
+    }
+    if configuration:
+        finding["location"]["configuration"] = configuration
+
+    # Act
+    decision = engine._decide(finding)
+
+    # Assert
+    assert decision[0] == "MANUAL_REVIEW"
+    assert decision[3] is None
+    assert inspected in decision[1]
+    assert "all-configuration dependency report" in decision[1]
+    assert (
+        "does not mean the requested fixed version is unavailable or incompatible"
+        in decision[1]
+    )
+    assert "Next: inspect the scanner's artifact" in decision[1]
+    assert "No update was applied" in decision[1]
+    assert manifest.read_text() == "plugins { id 'java' }\n" + pin
+    assert runner.run.call_count == 2
+    assert runner.run.call_args_list[0].args[0][-2:] == ["--configuration", inspected]
+    assert runner.run.call_args.args[0][-1] == "dependencies"
+
+
+@pytest.mark.parametrize("filename", ["build.gradle", "build.gradle.kts"])
+def test_existing_gradle_property_and_policy_row_are_preserved(tmp_path, filename):
+    """Update an explicit property and its central row without replacing its source expression."""
+    # Arrange
+    original = (
+        'dependencies { implementation("example:library:${libraryMinVersion}") }\n'
+    )
+    (tmp_path / filename).write_text(original)
+    (tmp_path / "gradle.properties").write_text(
+        "libraryMinVersion=1.0.0\notherVersion=7.0.0\n"
+    )
+    policy = tmp_path / ".github" / "versions.md"
+    policy.parent.mkdir()
+    policy.write_text(
+        "| Pin | Value | Source |\n|---|---|---|\n| libraryMinVersion | `1.0.0` | `gradle.properties` |\n"
+    )
+    hit = PackageHit(
+        "Maven",
+        "gradle",
+        "example:library",
+        "1.0.0",
+        "${libraryMinVersion}",
+        filename,
+        None,
+        True,
+    )
+    plan, reason = plan_remediation(tmp_path, {}, hit, "1.0.1")
+    assert plan is not None, reason
+
+    # Act
+    result = apply_plan(tmp_path, plan, Mock(), lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED"
+    assert (tmp_path / filename).read_text() == original
+    assert (
+        tmp_path / "gradle.properties"
+    ).read_text() == "libraryMinVersion=1.0.1\notherVersion=7.0.0\n"
+    assert "| libraryMinVersion | `1.0.1` | `gradle.properties` |" in policy.read_text()
+    assert set(result["files"]) == {
+        filename,
+        "gradle.properties",
+        ".github/versions.md",
+    }
+
+
+def test_catalog_reference_updates_its_existing_central_policy(tmp_path):
+    """Keep the catalog reference and synchronize its explicit version-policy key."""
+    # Arrange
+    catalog = tmp_path / "gradle" / "libs.versions.toml"
+    catalog.parent.mkdir()
+    catalog.write_text(
+        '[versions]\nlibraryFloor = "1.0.0"\n[libraries]\n'
+        'library = { module = "example:library", version.ref = "libraryFloor" }\n'
+    )
+    policy = tmp_path / ".github" / "versions.md"
+    policy.parent.mkdir()
+    policy.write_text("| Pin | Value | Source |\n|---|---|---|\n")
+    hit = PackageHit(
+        "Maven",
+        "gradle",
+        "example:library",
+        "1.0.0",
+        "1.0.0",
+        "gradle/libs.versions.toml",
+        None,
+        True,
+    )
+    plan, reason = plan_remediation(tmp_path, {}, hit, "1.0.1")
+    assert plan is not None, reason
+
+    # Act
+    result = apply_plan(tmp_path, plan, Mock(), lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED"
+    assert 'libraryFloor = "1.0.1"' in catalog.read_text()
+    assert 'version.ref = "libraryFloor"' in catalog.read_text()
+    assert (
+        "| libraryFloor | `1.0.1` | `gradle/libs.versions.toml` |" in policy.read_text()
+    )
+    assert set(plan.files) == {"gradle/libs.versions.toml", ".github/versions.md"}
+
+
+@pytest.mark.parametrize(
+    "manager,ecosystem,filename",
+    [
+        ("gradle", "Maven", "build.gradle"),
+        ("pnpm", "npm", "package.json"),
+        ("nuget", "NuGet", "app.csproj"),
+    ],
+)
+def test_manager_documentation_outage_blocks_edits(
+    tmp_path, manager, ecosystem, filename
+):
+    """Require each relevant publisher page, not merely language home pages."""
+    # Arrange
+    from gitlab_security_mcp.official_docs import manager_documentation
+
+    plan = {"manager": manager, "ecosystem": ecosystem, "files": [filename]}
+    required = manager_documentation(plan)
+    docs = documentation_client({required[0]: "unavailable"})
+
+    # Act
+    result = docs.read_before_fix({"proposedFix": plan})
+
+    # Assert
+    assert not result.complete
+    assert any(
+        item.url == required[0] and item.required and not item.ok
+        for item in result.sources
+    )
+    assert set(required) <= {item.url for item in result.sources}
+
+
+@pytest.mark.parametrize(
+    "scripts",
+    [
+        {"build": "vitest run"},
+        {"build": "vite build", "prebuild": "npm test"},
+        {"build": "vite build", "postbuild": "node --test"},
+        {"build": "pnpm run compile", "compile": "jest --runInBand"},
+    ],
+)
+def test_build_scripts_cannot_sneak_in_test_execution(tmp_path, monkeypatch, scripts):
+    """Block known direct, nested and lifecycle test commands before any child starts."""
+    # Arrange
+    import json
+
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": scripts}))
+    launch = Mock()
+    monkeypatch.setattr("gitlab_security_mcp.commands.subprocess.Popen", launch)
+    runner = CommandRunner(tmp_path)
+
+    # Act
+    with pytest.raises(PermissionError, match="Tests are disabled"):
+        runner.run(["pnpm", "run", "build"], timeout=30)
+    # Assert
+    launch.assert_not_called()
 
 
 def _gradle_wrapper(root, version):
@@ -56,20 +267,17 @@ def test_masked_test_failures_cannot_be_accepted(output):
 
 
 @pytest.mark.parametrize("version", [None, "7.5.1", "7.6.4", "9.9.0", "custom"])
-def test_gradle_policy_reuses_verified_junit_execution(tmp_path, version):
-    """Share one forced unit run while honoring legacy corporate test command forms."""
+def test_gradle_policy_reuses_production_build_without_tests(tmp_path, version):
+    """Share a production build and explicitly skip legacy unit-check policies."""
     # Arrange
     (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
     if version is not None:
         _gradle_wrapper(tmp_path, version)
-    report = tmp_path / "build" / "test-results" / "test" / "TEST-App.xml"
-    report.parent.mkdir(parents=True)
 
     def execute(argv, **kwargs):
-        """Emit fresh JUnit evidence but no console test counts."""
+        """Reject scheduling a test task while permitting its explicit exclusion."""
         assert_allowed(argv, tmp_path)
-        if "test" in argv:
-            report.write_text('<testsuite tests="4" failures="0" errors="0"/>')
+        assert "test" not in argv or argv[-2:] == ["-x", "test"]
         output = 'openjdk version "25.0.1"' if argv[0] == "java" else "BUILD SUCCESSFUL"
         return CommandResult(argv, 0, output, "", 0, False, "", "")
 
@@ -95,7 +303,7 @@ def test_gradle_policy_reuses_verified_junit_execution(tmp_path, version):
         tmp_path,
         {
             "build": {
-                "argv": [tool, "--no-daemon", "assemble"],
+                "argv": [tool, "--no-daemon", "assemble", "-x", "test"],
                 "success_marker": "BUILD SUCCESSFUL",
             },
             "unit_tests": {
@@ -110,22 +318,22 @@ def test_gradle_policy_reuses_verified_junit_execution(tmp_path, version):
 
     # Assert
     assert validation["status"] == "VALIDATION_COMPLETE"
-    assert all(check["status"] == "PASSED" for check in checks)
-    assert sum("test" in call.args[0] for call in underlying.run.call_args_list) == 1
+    assert checks[0]["status"] == "PASSED"
+    assert checks[1]["status"] == "SKIPPED"
+    assert not checks[1]["required"]
     gradle_calls = [
         call.args[0]
         for call in underlying.run.call_args_list
         if call.args[0][0] == tool
     ]
-    assert len(gradle_calls) == (1 if version in {"7.6.4", "9.9.0"} else 3)
-    if version in {"7.6.4", "9.9.0"}:
-        assert gradle_calls[0][1:] == ["--no-daemon", "assemble", "test", "--rerun"]
+    assert len(gradle_calls) == 1
+    assert gradle_calls[0][1:] == ["--no-daemon", "assemble", "-x", "test"]
 
 
 @pytest.mark.parametrize("mode", ["fresh", "stale", "empty", "failed", "invalid"])
 @pytest.mark.parametrize("modern", [False, True])
-def test_gradle_tests_require_fresh_successful_reports(tmp_path, mode, modern):
-    """Reject stale, empty or failing reports despite a successful task exit."""
+def test_gradle_build_does_not_execute_or_require_tests(tmp_path, mode, modern):
+    """Do not execute tests or make production acceptance depend on test reports."""
     # Arrange
     (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
     if modern:
@@ -136,15 +344,9 @@ def test_gradle_tests_require_fresh_successful_reports(tmp_path, mode, modern):
         report.write_text('<testsuite tests="4" failures="0" errors="0"/>')
 
     def execute(argv, **kwargs):
-        """Create only the evidence this simulated test command actually produced."""
+        """Produce build results without scheduling any test task."""
         assert_allowed(argv, tmp_path)
-        if "test" in argv and mode != "stale":
-            report.write_text(
-                "broken XML"
-                if mode == "invalid"
-                else f'<testsuite tests="{0 if mode == "empty" else 4}" '
-                f'failures="{1 if mode == "failed" else 0}" errors="0"/>'
-            )
+        assert "test" not in argv or argv[-2:] == ["-x", "test"]
         output = 'openjdk version "25.0.1"' if argv[0] == "java" else "BUILD SUCCESSFUL"
         return CommandResult(argv, 0, output, "", 0, False, "", "")
 
@@ -162,10 +364,8 @@ def test_gradle_tests_require_fresh_successful_reports(tmp_path, mode, modern):
     )
 
     # Assert
-    assert result["status"] == (
-        "VALIDATION_COMPLETE" if mode == "fresh" else "VALIDATION_FAILED"
-    )
-    assert any("test" in call.args[0] for call in runner.run.call_args_list)
+    assert result["status"] == "VALIDATION_COMPLETE"
+    assert "DISABLED" in result["test_execution"]
 
 
 @pytest.mark.parametrize(
@@ -175,13 +375,13 @@ def test_gradle_tests_require_fresh_successful_reports(tmp_path, mode, modern):
             "build.gradle",
             "gradle",
             "dependencies { implementation platform('bom:app:1') }\n",
-            'resolutionStrategy.force("example:library:1.0.1")',
+            'add("implementation", "example:library")',
         ),
         (
             "build.gradle.kts",
             "gradle",
             'dependencies { implementation(platform("bom:app:1")) }\n',
-            'resolutionStrategy.force("example:library:1.0.1")',
+            'add("implementation", "example:library")',
         ),
         (
             "pom.xml",
@@ -215,7 +415,9 @@ def test_transitive_java_override_preserves_existing_bom(
         if manager == "gradle"
         else ("<artifactId>app</artifactId><version>1</version>" in path.read_text())
     )
-    assert result["files"] == [filename]
+    assert result["files"] == (
+        [filename, "gradle.properties"] if manager == "gradle" else [filename]
+    )
 
 
 def _review(package, ecosystem):
@@ -226,7 +428,7 @@ def _review(package, ecosystem):
         "target": "1.0.1",
         "documentation": {
             "complete": True,
-            "sources": ["https://example.test/docs"],
+            "sources": ["https://example.test/docs", *manager_doc_sources()],
             "summary": "Reviewed target API",
         },
         "compatible": True,
@@ -252,7 +454,7 @@ def _review(package, ecosystem):
     }
 
 
-@pytest.mark.parametrize("invalid", ["target", "license"])
+@pytest.mark.parametrize("invalid", ["target", "license", "documentation", "blocked"])
 def test_native_preparation_rejects_unreviewed_target_or_license(tmp_path, invalid):
     """Preparing automatic edits must retain exact-target and license gates."""
     # Arrange
@@ -269,7 +471,12 @@ def test_native_preparation_rejects_unreviewed_target_or_license(tmp_path, inval
     engine.state.findings = [{"id": "one", "proposedFix": plan}]
     engine.state.decisions = {"one": {"decision": "CHANGE_REQUIRED"}}
     review = _review(plan["package"], "Maven")
-    if invalid == "target":
+    if invalid == "documentation":
+        review["documentation"]["sources"] = ["https://example.test/docs"]
+    elif invalid == "blocked":
+        review = {key: review[key] for key in ("ecosystem", "package", "target")}
+        review["blocked_reason"] = "blocked: no supported update is available"
+    elif invalid == "target":
         review["target"] = "9.0.0"
     else:
         review.pop("license")
@@ -287,8 +494,75 @@ def test_native_preparation_rejects_unreviewed_target_or_license(tmp_path, inval
 
 
 @pytest.mark.parametrize(
+    "invalid",
+    [
+        "compatible",
+        "compatible_without_code_changes",
+        "known_incompatibilities",
+        "source_fixes",
+        "compatibility_limitations",
+    ],
+)
+def test_build_only_trial_cannot_hide_known_breakage_or_missing_evidence(invalid):
+    """Uncertainty permits a disclosed trial, never a known break or missing review."""
+    # Arrange
+    from gitlab_security_mcp.qualification import review_package
+
+    review = _review("example:library", "Maven")
+    review.update(
+        validation_mode="build_only",
+        compatible=None,
+        compatible_without_code_changes=None,
+        known_incompatibilities=[],
+        compatibility_limitations="Transitive runtime callers are unverified.",
+    )
+    review[invalid] = (
+        False
+        if invalid in {"compatible", "compatible_without_code_changes"}
+        else ["known caller change"]
+        if invalid in {"known_incompatibilities", "source_fixes"}
+        else ""
+    )
+
+    # Act
+    with pytest.raises(ValueError):
+        review_package(review)
+
+    # Assert
+    assert review["validation_mode"] == "build_only"
+
+
+@pytest.mark.parametrize("installed,target", [("1.0.0", "2.0.0"), (None, "1.0.1")])
+def test_build_only_trial_requires_known_nonmajor_versions(tmp_path, installed, target):
+    """Do not bypass major-upgrade review or guess an unknown upgrade size."""
+    # Arrange
+    from gitlab_security_mcp.qualification import review_major_upgrade
+
+    review = {"validation_mode": "build_only"}
+    plan = {"installed": installed, "target": target}
+
+    # Act
+    with pytest.raises(ValueError):
+        review_major_upgrade(tmp_path, plan, review)
+
+    # Assert
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
     "outcome",
-    ["success", "mcp", "build", "test", "checkout_changed", "blocked_review", "docs"],
+    [
+        "success",
+        "mcp",
+        "build",
+        "resolution",
+        "checkout_changed",
+        "blocked_review",
+        "blocked_tamper",
+        "build_only",
+        "build_only_failure",
+        "docs",
+    ],
 )
 @pytest.mark.parametrize("modern", [False, True])
 def test_native_approval_automatically_updates_selected_gradle_packages(
@@ -299,6 +573,11 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     manifest = tmp_path / "build.gradle"
     original = "plugins { id 'java' }\ndependencies { }\n"
     manifest.write_text(original)
+    properties = tmp_path / "gradle.properties"
+    properties.write_text("unrelatedPin=7.0.0\n")
+    policy = tmp_path / ".github" / "versions.md"
+    policy.parent.mkdir()
+    policy.write_text("| Pin | Value | Source |\n|---|---|---|\n")
     if modern:
         _gradle_wrapper(tmp_path, "9.9.0")
     packages = [
@@ -313,16 +592,15 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     def execute(argv, **kwargs):
         """Resolve real manifest edits and fail only the offending updated coordinate."""
         assert_allowed(argv, tmp_path)
-        text = manifest.read_text()
-        bad = "example:library:1.0.1" in text
-        failed = bad and (
-            (outcome == "build" and "assemble" in argv)
-            or (outcome == "test" and "test" in argv)
+        pins = properties.read_text()
+        bad = "securityMcp.example.library.version=1.0.1" in pins
+        failed = (
+            bad and outcome in {"build", "build_only_failure"} and "assemble" in argv
         )
         output = (
             "runtimeClasspath - runtime\n"
             + "\n".join(
-                f"\\--- {package}:{'1.0.1' if package + ':1.0.1' in text else '1.0.0'}"
+                f"\\--- {package}:{'1.0.1' if 'securityMcp.' + package.replace(':', '.') + '.version=1.0.1' in pins and not (outcome == 'resolution' and package == 'example:library') else '1.0.0'}"
                 for package in dict.fromkeys(packages)
             )
             if "dependencies" in argv
@@ -385,7 +663,7 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     reviews = {
         str(index): _review(package, "Maven") for index, package in enumerate(packages)
     }
-    if outcome == "blocked_review":
+    if outcome in {"blocked_review", "blocked_tamper"}:
         for finding_id in ("0", "1"):
             reviews[finding_id] = {
                 "ecosystem": "Maven",
@@ -393,6 +671,15 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
                 "target": "1.0.1",
                 "blocked_reason": "Compatibility could not be established for this target.",
             }
+    if outcome in {"build_only", "build_only_failure"}:
+        for finding_id in ("0", "1"):
+            reviews[finding_id].update(
+                validation_mode="build_only",
+                compatible=None,
+                compatible_without_code_changes=None,
+                known_incompatibilities=[],
+                compatibility_limitations="Transitive runtime behavior is unverified.",
+            )
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
     if outcome == "docs":
@@ -423,8 +710,8 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
             return {
                 "action": "accept",
                 "content": {
-                    "finding_0": True,
-                    "finding_1": True,
+                    "finding_0": outcome != "blocked_review",
+                    "finding_1": outcome != "blocked_review",
                     "finding_2": True,
                 },
             }
@@ -469,6 +756,14 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     asyncio.run(exercise())
 
     # Assert
+    if outcome == "blocked_tamper":
+        assert engine.state.fix_selection["status"] == "INVALID"
+        assert engine.state.fix_selection["selected_ids"] == []
+        assert not engine.state.changes
+        assert manifest.read_text() == original
+        assert not any("assemble" in call.args[0] for call in runner.run.call_args_list)
+        dialog.close.assert_awaited_once()
+        return
     execution = engine.state.fix_selection["package_execution"]
     assert (
         execution["status"]
@@ -476,24 +771,37 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
             "success": "COMPLETED",
             "mcp": "COMPLETED",
             "build": "PARTIAL_FAILURE",
-            "test": "PARTIAL_FAILURE",
+            "resolution": "PARTIAL_FAILURE",
             "checkout_changed": "BLOCKED",
-            "blocked_review": "PARTIAL_FAILURE",
+            "blocked_review": "COMPLETED",
+            "build_only": "COMPLETED",
+            "build_only_failure": "PARTIAL_FAILURE",
             "docs": "PARTIAL_FAILURE",
         }[outcome]
     ), execution
     text = manifest.read_text()
-    assert ("example:library:1.0.1" in text) == (outcome in {"success", "mcp"})
-    assert ("example:codec:1.0.1" in text) == (outcome != "checkout_changed")
-    assert "example:unchecked:1.0.1" not in text
+    pins = properties.read_text()
+    assert ("securityMcp.example.library.version=1.0.1" in pins) == (
+        outcome in {"success", "mcp", "build_only"}
+    )
+    assert ("securityMcp.example.codec.version=1.0.1" in pins) == (
+        outcome != "checkout_changed"
+    )
+    assert "example:unchecked" not in text
+    assert "unrelatedPin=7.0.0" in pins
+    if outcome in {"success", "mcp", "build_only"}:
+        assert (
+            "| securityMcp.example.library.version | `1.0.1` | `gradle.properties` |"
+            in policy.read_text()
+        )
     assert engine.state.json_report_path
     if outcome != "checkout_changed":
         assert engine.state.validation_status == "VALIDATION_COMPLETE"
-    if outcome in {"success", "mcp"}:
+    if outcome in {"success", "mcp", "build_only"}:
         calls = [call.args[0] for call in runner.run.call_args_list]
         assert sum("assemble" in argv for argv in calls) == 1
-        assert sum("test" in argv for argv in calls) == 1
-        assert sum("dependencies" in argv for argv in calls) == (2 if modern else 3)
+        assert all("test" not in argv or argv[-2:] == ["-x", "test"] for argv in calls)
+        assert sum("dependencies" in argv for argv in calls) == 2
         assert engine.state.changes[1]["reused_from"] == "0"
         assert all(change["edit_duration_ms"] >= 0 for change in engine.state.changes)
         assert all(step["duration_ms"] >= 0 for step in execution["results"])
@@ -502,11 +810,23 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
         )
         assert "Edit/reuse and lockfile refresh:" in report
         assert " ms)" in report
+        if outcome == "build_only":
+            assert "runtime/test compatibility was not verified" in report
+            assert reviews["0"]["compatible"] is None
     opened.assert_awaited_once()
     if outcome == "blocked_review":
         assert opened.call_args.args[1]["finding_0"]["title"].startswith("BLOCKED")
+        assert opened.call_args.args[1]["finding_0"]["enabled"] is False
         assert (
             "Compatibility could not be established"
+            in opened.call_args.args[1]["finding_0"]["summary"]
+        )
+    if outcome == "build_only":
+        assert opened.call_args.args[1]["finding_0"]["title"].startswith(
+            "BUILD-ONLY TRIAL"
+        )
+        assert (
+            "Transitive runtime behavior is unverified"
             in opened.call_args.args[1]["finding_0"]["summary"]
         )
     dialog.close.assert_awaited_once()
@@ -515,11 +835,11 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
 
 
 @pytest.mark.parametrize("manager", ["nuget", "gradle", "maven"])
-@pytest.mark.parametrize("failed_check", ["build", "test"])
+@pytest.mark.parametrize("failed_check", ["build"])
 def test_cross_stack_failure_reverts_only_offending_update(
     tmp_path, manager, failed_check
 ):
-    """Keep the other package when an update breaks either the build or unit tests."""
+    """Keep the other package when an update breaks the production build."""
     # Arrange
     packages = (
         ("Example", "Other")
@@ -549,17 +869,19 @@ def test_cross_stack_failure_reverts_only_offending_update(
             in text,
         }[manager]
         stage = (
-            "test"
-            if "test" in argv
-            else "build"
-            if ("build" in argv or "assemble" in argv)
+            "build"
+            if any(task in argv for task in ("build", "assemble", "package"))
             else None
         )
-        if "verify" in argv:
-            stage = failed_check
         failed = bad and stage == failed_check
         output = (
-            'openjdk version "25.0.1"'
+            "runtimeClasspath - runtime\n"
+            + "\n".join(
+                f"\\--- {package}:{'1.0.1' if package + ':1.0.1' in text else '1.0.0'}"
+                for package in packages
+            )
+            if "dependencies" in argv
+            else 'openjdk version "25.0.1"'
             if argv[0] == "java"
             else "10.0.100\nTests: 2 passed"
         )
@@ -624,15 +946,25 @@ def test_cross_stack_failure_reverts_only_offending_update(
     assert not engine.state.manual_cleanup_required
 
 
-@pytest.mark.parametrize("resolved_version", ["1.0.0", "1.0.1"])
-@pytest.mark.parametrize("manager", ["gradle", "maven"])
+@pytest.mark.parametrize("resolved_version", ["1.0.0", "1.0.1", None])
+@pytest.mark.parametrize(
+    "manager,filename,configuration",
+    [
+        ("gradle", "build.gradle", "runtimeClasspath"),
+        ("gradle", "build.gradle", "checkstyle"),
+        ("gradle", "build.gradle.kts", "checkstyle"),
+        ("gradle", "build.gradle", "testRuntimeClasspath"),
+        ("maven", "pom.xml", None),
+    ],
+)
 def test_java_override_requires_actual_resolved_fixed_version(
-    tmp_path, resolved_version, manager
+    tmp_path, resolved_version, manager, filename, configuration
 ):
-    """Do not accept a passing build/test if the override left the vulnerable dependency."""
+    """Find non-runtime dependencies and reject ineffective or disappearing overrides."""
     # Arrange
-    filename = "build.gradle" if manager == "gradle" else "pom.xml"
-    marker = "resolutionStrategy" if manager == "gradle" else "<dependencyManagement>"
+    marker = (
+        "// security-mcp:start" if manager == "gradle" else "<dependencyManagement>"
+    )
     manifest = tmp_path / filename
     manifest.write_text("dependencies { }\n" if manager == "gradle" else "<project/>")
     if manager == "maven":
@@ -651,10 +983,22 @@ def test_java_override_requires_actual_resolved_fixed_version(
         """Resolve the target only when the simulated dependency resolver honors it."""
         assert_allowed(argv, tmp_path)
         version = resolved_version if marker in manifest.read_text() else "1.0.0"
+        dependencies = f"{configuration} - selected classpath\n" + (
+            f"\\--- example:library:{version}\n" if version else "No dependencies\n"
+        )
+        if configuration not in {None, "runtimeClasspath"}:
+            dependencies = (
+                "runtimeClasspath - runtime\nNo dependencies\n"
+                + dependencies
+                + "securityAnalysis - another affected classpath\n"
+                + f"\\--- example:library:{version or '1.0.1'}\n"
+            )
+            if "--configuration" in argv:
+                dependencies = "runtimeClasspath - runtime\nNo dependencies\n"
         output = (
             f"[INFO] \\- example:library:jar:{version}:compile\n"
             if "dependency:tree" in argv
-            else f"runtimeClasspath - runtime\n\\--- example:library:{version}\n"
+            else dependencies
             if "dependencies" in argv
             else 'openjdk version "25.0.1"'
             if argv[0] == "java"
@@ -688,6 +1032,15 @@ def test_java_override_requires_actual_resolved_fixed_version(
         == "QUALIFIED"
     )
     assert engine.apply_minimal_fix("transitive")["status"] == "APPLIED"
+    if configuration not in {None, "runtimeClasspath"}:
+        assert f'configurations.named("{configuration}")' in manifest.read_text()
+        assert 'configurations.named("securityAnalysis")' in manifest.read_text()
+        assert "resolutionStrategy.force" in manifest.read_text()
+        assert "strictly(" not in manifest.read_text()
+        assert (
+            "securityMcp.example.library.version=1.0.1"
+            in (tmp_path / "gradle.properties").read_text()
+        )
 
     # Act
     result = engine.run_validation_matrix()
@@ -697,3 +1050,161 @@ def test_java_override_requires_actual_resolved_fixed_version(
         "VALIDATION_COMPLETE" if resolved_version == "1.0.1" else "FIX_REJECTED"
     ), result
     assert (marker in manifest.read_text()) == (resolved_version == "1.0.1")
+
+
+def test_non_runtime_catalog_dependency_overrides_the_owning_build(tmp_path):
+    """Keep the catalog intact when a discovered tooling dependency needs a scoped rule."""
+    # Arrange
+    catalog = tmp_path / "gradle" / "libs.versions.toml"
+    catalog.parent.mkdir()
+    original = (
+        '[versions]\nlibraryFloor = "1.0.0"\n[libraries]\n'
+        'library = { module = "example:library", version.ref = "libraryFloor" }\n'
+    )
+    catalog.write_text(original)
+    build = tmp_path / "build.gradle"
+    build.write_text("plugins { id 'java' }\n")
+    hit = PackageHit(
+        "Maven",
+        "gradle",
+        "example:library",
+        "1.0.0",
+        "1.0.0",
+        "gradle/libs.versions.toml",
+        None,
+        True,
+        configuration_versions={"checkstyle": ["1.0.0"]},
+    )
+    finding = {"dependencyResolution": {"manifest": "build.gradle"}}
+    plan, reason = plan_remediation(tmp_path, finding, hit, "1.0.1")
+    assert plan is not None, reason
+
+    # Act
+    result = apply_plan(tmp_path, plan, Mock(), lambda name: name)
+
+    # Assert
+    assert result["status"] == "APPLIED"
+    assert plan.files == ["build.gradle", "gradle.properties"]
+    assert plan.as_dict()["gradle_configurations"] == ["checkstyle"]
+    assert 'configurations.named("checkstyle")' in build.read_text()
+    assert "resolutionStrategy.force" in build.read_text()
+    assert catalog.read_text() == original
+
+
+@pytest.mark.parametrize("failure", ["none", "first", "all"])
+def test_version_alignment_follows_selective_package_rollback(tmp_path, failure):
+    """Keep AI documentation aligned to retained versions when another update fails."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+
+    updates = [("bad:library", "1.0.0", "1.0.1"), ("good:library", "2.0.0", "2.0.1")]
+    manifest = tmp_path / "build.gradle"
+    manifest.write_text(
+        "dependencies {\n"
+        + "".join(
+            f" implementation '{package}:{old}'\n" for package, old, _target in updates
+        )
+        + "}\n",
+        encoding="utf-8",
+    )
+    document = tmp_path / ".github" / "instructions" / "versions.instructions.md"
+    document.parent.mkdir(parents=True)
+    document.write_text("bad:library 1.0.0\ngood:library 2.0.0\n", encoding="utf-8")
+    runner, advisory = Mock(), Mock()
+
+    def execute(argv, **kwargs):
+        """Build the actual edits and reject only the first updated dependency."""
+        assert_allowed(argv, tmp_path)
+        text = manifest.read_text(encoding="utf-8")
+        failed = "assemble" in argv and (
+            (failure in {"first", "all"} and "bad:library:1.0.1" in text)
+            or (failure == "all" and "good:library:2.0.1" in text)
+        )
+        output = (
+            "runtimeClasspath - runtime\n"
+            + "".join(
+                f"\\--- {package}:{target if package + ':' + target in text else old}\n"
+                for package, old, target in updates
+            )
+            if "dependencies" in argv
+            else 'openjdk version "25.0.1"'
+            if argv[0] == "java"
+            else "BUILD SUCCESSFUL"
+        )
+        return CommandResult(
+            argv,
+            int(failed),
+            output,
+            "Offending update" if failed else "",
+            0,
+            False,
+            "",
+            "",
+        )
+
+    def lookup(finding, *_args):
+        """Supply the exact fixed version for each independent package."""
+        target = updates[int(finding["id"])][2]
+        return AdvisoryLookup(
+            outcome="resolved",
+            affected=True,
+            fixed_versions=[target],
+            lowest_fixed_version=target,
+        )
+
+    runner.run.side_effect = execute
+    advisory.lookup.side_effect = lookup
+    engine = Engine(
+        tmp_path,
+        runner=runner,
+        gitlab=Mock(),
+        advisory=advisory,
+        docs=documentation_client(),
+        which=lambda name: name,
+    )
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [
+        {
+            "id": str(index),
+            "component": package,
+            "category": "dependency_scanning",
+            "installedVersion": old,
+            "identifiers": ["CVE-TEST"],
+            "location": {"file": "build.gradle"},
+        }
+        for index, (package, old, _target) in enumerate(updates)
+    ]
+    for index, (package, _old, target) in enumerate(updates):
+        finding_id = str(index)
+        assert (
+            engine.verify_security_finding(finding_id)["decision"] == "CHANGE_REQUIRED"
+        )
+        review = {**_review(package, "Maven"), "target": target}
+        assert (
+            engine.qualify_package_update(finding_id, review)["status"] == "QUALIFIED"
+        )
+        assert engine.apply_minimal_fix(finding_id)["status"] == "APPLIED"
+    document.write_text("bad:library 1.0.1\ngood:library 2.0.1\n", encoding="utf-8")
+
+    # Act
+    result = engine.run_validation_matrix()
+
+    # Assert
+    assert result["status"] == (
+        "FIX_REJECTED" if failure == "all" else "VALIDATION_COMPLETE"
+    ), result
+    assert document.read_text() == (
+        f"bad:library {'1.0.1' if failure == 'none' else '1.0.0'}\n"
+        f"good:library {'2.0.0' if failure == 'all' else '2.0.1'}\n"
+    )
+    assert ("good:library:2.0.1" in manifest.read_text()) == (failure != "all")
+    assert ("bad:library:1.0.0" in manifest.read_text()) == (failure != "none")
+    assert not engine.state.manual_cleanup_required
+    if failure == "first":
+        assert result["retained_updates"] == ["1"]
+    if failure != "all":
+        payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+        assert payload["package_qualifications"]["1"]["version_alignment_files"] == [
+            ".github/instructions/versions.instructions.md"
+        ]
+        assert "Version-only AI alignment documents:" in markdown

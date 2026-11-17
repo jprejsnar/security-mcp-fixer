@@ -276,10 +276,11 @@ def test_source_receipt_cache_evicts_old_records_not_frequently_used_catalog(
 
 
 @pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("configuration", ["runtimeClasspath", "checkstyle"])
 def test_parallel_gradle_findings_share_one_dependency_inspection(
-    tmp_path, monkeypatch, exit_code
+    tmp_path, monkeypatch, exit_code, configuration
 ):
-    """Five parallel findings reuse one complete tree rather than spawning five builds."""
+    """Parallel findings share both the scoped inspection and any all-configuration fallback."""
     # Arrange
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import Mock
@@ -302,7 +303,7 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(
         "checkstyle - Tool classpath.\r\n"
         "+--- io.example:library:0.9.0\r\n"
         "runtimeClasspath - Application classpath.\r\n"
-        "+--- io.example:library:1.0.0\r\n"
+        f"+--- io.example:{'library' if configuration == 'runtimeClasspath' else 'other'}:1.0.0\r\n"
         "Deprecated Gradle features were used in this build, making it incompatible with Gradle 10.\r\n",
         "",
         0,
@@ -326,7 +327,9 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(
         {
             "id": str(index),
             "component": "io.example/library",
-            "installedVersion": "1.0.0",
+            "installedVersion": "1.0.0"
+            if configuration == "runtimeClasspath"
+            else "0.9.0",
             "category": "dependency_scanning",
             "location": {"file": "build.gradle"},
         }
@@ -343,8 +346,9 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(
         results = list(pool.map(verify, [str(index) for index in range(5)]))
 
     # Assert
-    runner.run.assert_called_once()
-    assert parse.call_count == (0 if exit_code else 1)
+    inspections = 1 if exit_code or configuration == "runtimeClasspath" else 2
+    assert runner.run.call_count == inspections
+    assert parse.call_count == (0 if exit_code else inspections)
     assert advisory.lookup.call_count == 5
     expected = "MANUAL_REVIEW" if exit_code else "NO_SAFE_FIX"
     assert all(result["decision"] == expected for result in results)
@@ -357,11 +361,16 @@ def test_parallel_gradle_findings_share_one_dependency_inspection(
         payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
         assert len(payload["validation_caveats"]) == 1
         assert "Gradle 10" in payload["final_summary_markdown"]
-        assert "checkstyle" in markdown and "runtimeClasspath" in markdown
+        assert configuration in markdown
+        assert all(
+            list(finding["dependencyResolution"]["configuration_versions"])
+            == [configuration]
+            for finding in engine.state.findings
+        )
         assert engine.state.validation_status is None
     engine.verify_security_finding("0")
-    assert runner.run.call_count == (2 if exit_code else 1)
-    assert parse.call_count == (0 if exit_code else 1)
+    assert runner.run.call_count == inspections + int(bool(exit_code))
+    assert parse.call_count == (0 if exit_code else inspections)
 
 
 def test_advisory_lookups_overlap_without_mixing_validation_sites():

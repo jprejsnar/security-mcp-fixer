@@ -74,7 +74,7 @@ Each tool description is the procedure for that step.
 11. complete_security_run, which offers the human approval checkboxes once
 If select_security_fixes returns AWAITING_HUMAN, stop and wait. The Windows
 window has no review deadline. On submission the server automatically qualifies,
-applies and build/unit-test validates only the selected package updates, saves
+applies and production-build validates only the selected package updates, saves
 reports, then offers separate false-positive approvals. No second continue request
 is needed for packages. REMEDIATION_RUNNING also means wait, never duplicate work.
 Selected source-code fixes still require the host AI to continue its scoped work.
@@ -82,11 +82,23 @@ Do not reopen approved selections or start completion, edits or validation while
 selection or server-owned package execution is pending.
 Apply all human-approved, qualified package security updates for Node, .NET/C#
 and Java, including supported transitive dependency overrides. Retain updates
-only after both production builds and executed unit tests pass, along with
-configured policy checks. If a batch fails, isolate and revert offending package
-updates while retaining passing updates. Missing tests or tools are not success;
+only after production builds, resolved-version proof and test-free configured
+policy checks pass. Never run unit/integration tests. If a batch fails, isolate
+and revert offending updates while retaining passing updates. Missing tools are not success;
 an already-failing baseline requires explicit investigation, not a green claim.
 Do not modify source, unit tests or check scripts to make a package update pass.
+For a non-major update, unknown transitive caller behavior is not a proven
+incompatibility. After reading current package/manager docs and license terms,
+use review.validation_mode="build_only", compatible=null,
+compatible_without_code_changes=null, known_incompatibilities=[] and
+compatibility_limitations describing what remains unverified. Keep all normal
+documentation, api_changes, frameworks, license and source_fixes=[] evidence.
+Disclose the trial before human approval; retain only after production builds
+and exact dependency checks pass. This does not verify runtime/test compatibility.
+Never use this mode for a known incompatibility, required source changes or a
+major upgrade. Assess the exact finding: an unrelated advisory on the same
+package may still need code changes and must remain unresolved independently.
+Blocked packages are disabled in the form, not selectable promises of an update.
 Do not open an approval form during finding verification. Only the human may
 select or submit. Do not infer approval, poll AWAITING_HUMAN, or commit, push,
 or open a merge request. Only the human form may dismiss a finding. Unknown
@@ -547,7 +559,7 @@ def run_prechecks(repo_root: str | None = None) -> dict[str, Any]:
 def pull_main_twice(repo_root: str | None = None) -> dict[str, Any]:
     """Pull main twice and prepare pnpm projects; failures stop this run.
 
-    Reused branches defer pnpm clean/install until create_security_branch.
+    Dependency preparation is deferred until an approved update requires it.
     """
     return _run("pull_main_twice", repo_root=repo_root)
 
@@ -666,9 +678,10 @@ def qualify_package_update(
     """Qualify a human-selected exact package/target; no production/test caller adaptations.
 
     review: ecosystem,package,target,documentation {complete,sources,summary},
-    compatible=true,compatible_without_code_changes=true,api_changes,
+    compatible=true,compatible_without_code_changes=true (or explicit build_only
+    per workflow),api_changes,
     frameworks [{name,version,source_url,assessment}],source_fixes=[].
-    Lint is informational; build/test after all edits.
+    Production builds/resolution after edits; never unit/integration tests.
     Without corporate policy: license {expression,sources,
     commercial_use_permitted:true,no_license_fees:true,obligations,assessment}.
     If proposed major_upgrade=true: major_upgrade {scan_id from
@@ -718,7 +731,7 @@ def generate_aaa_test(finding_id: str, repo_root: str | None = None) -> dict[str
     )
 )
 def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
-    """Validate pending updates with production builds, unit tests and policy checks.
+    """Validate pending updates with production builds, resolution and test-free policy checks.
 
     Read isolation_trials/rejected_updates; stop on incomplete recovery or cleanup.
     """
@@ -794,7 +807,7 @@ def _fix_choice_text(item: dict) -> tuple[str, str]:
                 if plan.get("major_upgrade")
                 or is_major_upgrade(item.get("current_version"), plan["target"])
                 else "Risk: Compatibility and license review still required; a version number alone does not prove safety.",
-                "Keep only if production builds, executed unit tests and configured policy checks pass. "
+                "Keep only if production builds, resolution and test-free policy checks pass; unit/integration tests are disabled. "
                 "Isolate and revert offending updates; retain passing updates. Do not adapt source or tests to force acceptance.",
             ]
         )
@@ -840,6 +853,14 @@ async def _finish_desktop_fix_selection(
             if response["action"] == "accept"
             else {}
         )
+        if any(
+            values.get(f"finding_{index}") is True
+            and prepared["reviews"].get(item["id"], {}).get("blocked_reason")
+            for index, item in enumerate(candidates)
+        ):
+            raise ValueError(
+                "A blocked update cannot be selected; obtain a new review before approval."
+            )
         ids = [
             item["id"]
             for index, item in enumerate(candidates)
@@ -935,9 +956,22 @@ async def _open_fix_selection(
             field = properties[f"finding_{index}"]
             blocked = prepared["reviews"].get(item["id"], {}).get("blocked_reason")
             if blocked:
+                field["enabled"] = False
                 field["title"] = "BLOCKED | " + field["title"]
                 field["description"] = (
                     f"No automatic update: {blocked}\n\n" + field["description"]
+                )
+            elif (
+                prepared["reviews"].get(item["id"], {}).get("validation_mode")
+                == "build_only"
+            ):
+                review = prepared["reviews"][item["id"]]
+                field["title"] = "BUILD-ONLY TRIAL | " + field["title"]
+                field["description"] = (
+                    "Compatibility is not proven. Retain only after production build and exact-version resolution pass; runtime/test compatibility remains unverified.\n"
+                    + review["compatibility_limitations"]
+                    + "\n\n"
+                    + field["description"]
                 )
             field["summary"] = field["description"]
         dialog = await desktop_approval.open_dialog(
@@ -945,7 +979,7 @@ async def _open_fix_selection(
             "Select only the package updates or scoped code fixes you authorize. All boxes start unchecked. "
             "Review current/proposed versions, file scope, risk and acceptance requirements. "
             "There is no selection deadline. Cancel or close authorizes nothing. "
-            "After submission, the server automatically applies checked package updates and runs builds/unit tests. "
+            "After submission, the server applies checked package updates and runs production builds/dependency checks, never unit/integration tests. "
             "Keep the server running; no second continue request is needed for packages. Source-code fixes still require your IDE agent.",
             properties,
             title="GitLab security: choose updates and code fixes",
@@ -974,6 +1008,14 @@ async def _open_fix_selection(
         await started.wait()
         return {
             **result,
+            "blocked_updates": [
+                {
+                    "finding_id": item["id"],
+                    "reason": prepared["reviews"][item["id"]]["blocked_reason"],
+                }
+                for item in candidates
+                if prepared["reviews"].get(item["id"], {}).get("blocked_reason")
+            ],
             "message": "The Windows selection window is open with no review timeout. "
             "This tool call is complete. Do not poll, reopen selection, start fixes or complete the run. "
             "After submission the server automatically qualifies, edits and validates selected package updates, then saves reports and offers separate false-positive approvals. "
@@ -1025,12 +1067,11 @@ async def select_security_fixes(
     repo_root: str | None = None,
     package_reviews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | InputRequiredResult:
-    """Human-only selection; cancel/empty/unavailable skips edits; then complete run.
+    """Human-only selection; cancel/empty/unavailable skips edits.
 
-    Windows package_reviews[finding_id]: qualify_package_update evidence before
-    checkboxes; reviews are not consent. Submission auto-qualifies/edits selected
-    packages, builds/tests and selectively rolls back failures.
-    Blocked: exact ecosystem/package/target + blocked_reason; never invent evidence.
+    Windows package_reviews[id]: exact qualification evidence before checkboxes.
+    Submission applies selected packages, builds without tests and isolates failures.
+    blocked_reason disables the choice; build_only trials disclose uncertainty.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     protocol = ctx.protocol_version

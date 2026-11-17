@@ -430,7 +430,7 @@ def test_selection_explains_package_versions_and_scoped_code_action(
     assert f"Current version: {current} ({source})" in details
     assert "Proposed version: 2.0.0" in details
     assert "Scope: frontend/package.json" in details
-    assert "executed unit tests" in details
+    assert "unit/integration tests are disabled" in details
     assert "Evidence for one." in details
     if installed:
         assert "Major-version change" in details

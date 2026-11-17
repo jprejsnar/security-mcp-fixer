@@ -91,6 +91,14 @@ def _close_http_clients(monkeypatch):
         client.close()
 
 
+def manager_doc_sources() -> list[str]:
+    """Provide explicit manager citations for offline reviewed-package fixtures."""
+    from gitlab_security_mcp.official_docs import MANAGER_PUBLISHERS, REQUIRED_DOCS
+
+    names = {name for publishers in MANAGER_PUBLISHERS.values() for name in publishers}
+    return [url for name, url, _marker in REQUIRED_DOCS if name in names]
+
+
 def documentation_client(pages: dict[str, str] | None = None):
     """Serve publisher markers locally so tests can authorize an edit offline."""
     import httpx
@@ -167,7 +175,7 @@ def approve_package_for_test(root: Path, plan: dict) -> dict:
         **{key: plan[key] for key in ("ecosystem", "package", "target")},
         "documentation": {
             "complete": True,
-            "sources": ["https://example.test/docs"],
+            "sources": ["https://example.test/docs", *manager_doc_sources()],
             "summary": "Fixture API review",
         },
         "compatible": True,
