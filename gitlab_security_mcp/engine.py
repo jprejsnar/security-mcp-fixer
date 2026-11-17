@@ -2717,7 +2717,10 @@ class Engine:
             self.state.gitlab_dismissals.append(record)
             records.append(record)
         self._remember()
-        self._progress(None, f"Verifying {len(approved)} approved GitLab dismissals with up to {MAX_WORKERS} workers")
+        self._progress(
+            None,
+            f"Verifying {len(approved)} approved GitLab dismissals with up to {MAX_WORKERS} workers",
+        )
 
         def dismiss(item: dict) -> dict:
             """Keep HTTP work detached from the caller-owned run state."""

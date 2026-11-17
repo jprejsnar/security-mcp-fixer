@@ -426,7 +426,10 @@ def test_transitive_java_override_preserves_existing_bom(
         assert plan.as_dict()["gradle_force"] is True
         assert "resolutionStrategy.force" in path.read_text()
         assert "strictly(" not in path.read_text()
-        assert "Runtime compatibility with the platform remains unverified" in plan.description
+        assert (
+            "Runtime compatibility with the platform remains unverified"
+            in plan.description
+        )
     assert (
         ("bom:app:1" in path.read_text())
         if manager == "gradle"
@@ -442,6 +445,8 @@ def test_transitive_java_override_preserves_existing_bom(
 def test_duplicate_gradle_override_preserves_owned_block_and_line_endings(
     tmp_path, newline, force
 ):
+    """Replay the same owned override without duplicating pins or changing newlines."""
+    # Arrange
     original = "plugins { id 'java' }\n"
     if force:
         original += 'dependencies { implementation(enforcedPlatform("bom:app:1")) }\n'
@@ -453,10 +458,12 @@ def test_duplicate_gradle_override_preserves_owned_block_and_line_endings(
     plan, reason = plan_remediation(tmp_path, {}, hit, "1.0.1")
     assert plan is not None, reason
 
+    # Act
     assert apply_plan(tmp_path, plan, Mock(), lambda name: name)["status"] == "APPLIED"
     first = path.read_bytes()
     assert apply_plan(tmp_path, plan, Mock(), lambda name: name)["status"] == "APPLIED"
 
+    # Assert
     assert path.read_bytes() == first
     assert first.count(b"// security-mcp:start") == 1
     assert b"\n" not in first.replace(newline.encode(), b"")
@@ -472,14 +479,21 @@ def test_duplicate_gradle_override_preserves_owned_block_and_line_endings(
         "description = '''\nimplementation enforcedPlatform('bom:app:1')\n'''\n",
     ],
 )
-def test_quoted_or_commented_platform_does_not_change_override_strategy(tmp_path, source):
+def test_quoted_or_commented_platform_does_not_change_override_strategy(
+    tmp_path, source
+):
     """Do not introduce a broader force because documentation mentions a platform."""
+    # Arrange
     manifest = tmp_path / "build.gradle"
     manifest.write_text(source)
-    hit = PackageHit("Maven", "gradle", "example:library", "1.0.0", None, manifest.name, None, False)
+    hit = PackageHit(
+        "Maven", "gradle", "example:library", "1.0.0", None, manifest.name, None, False
+    )
 
+    # Act
     plan, reason = plan_remediation(tmp_path, {}, hit, "1.0.1")
 
+    # Assert
     assert plan is not None, reason
     assert not plan.gradle_force
 
@@ -664,7 +678,10 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
         bad = "securityMcp.example.library.version=1.0.1" in pins
         failed = "assemble" in argv and (
             (bad and outcome in {"build", "build_only_failure"})
-            or (outcome == "codec_build" and "securityMcp.example.codec.version=1.0.1" in pins)
+            or (
+                outcome == "codec_build"
+                and "securityMcp.example.codec.version=1.0.1" in pins
+            )
         )
         output = (
             "runtimeClasspath - runtime\n"
@@ -872,7 +889,11 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
         calls = [call.args[0] for call in runner.run.call_args_list]
         assert sum("assemble" in argv for argv in calls) == 2
         assert engine.state.batch_isolation[-1]["finding_ids"] == ["0", "1"]
-        assert [change["status"] for change in engine.state.changes] == ["APPLIED", "APPLIED", "ROLLED_BACK"]
+        assert [change["status"] for change in engine.state.changes] == [
+            "APPLIED",
+            "APPLIED",
+            "ROLLED_BACK",
+        ]
     if outcome == "enforced_platform":
         assert "configurations.configureEach" in text
         assert "resolutionStrategy.force" in text

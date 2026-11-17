@@ -25,10 +25,7 @@ logger = logging.getLogger("gitlab_security_mcp")
 
 
 def utc_now_iso() -> str:
-    """Return the current UTC time as one ISO 8601 string.
-
-    Every log timestamp uses this function so the clock text has one definition.
-    """
+    """Return the current UTC time as one ISO 8601 string."""
     return datetime.now(UTC).isoformat()
 
 
@@ -224,7 +221,7 @@ def timed_http_stream(
     try:
         with client.stream(method, url, **kwargs) as response:
             yield response
-    except Exception as exc:
+    except BaseException as exc:
         error = type(exc).__name__
         raise
     finally:

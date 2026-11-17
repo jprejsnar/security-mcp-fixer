@@ -18,6 +18,7 @@ FINDING = {"identifiers": ["CVE-2021-23337"], "title": "lodash"}
 )
 def test_nvd_unaffected_reason_explains_installed_version_and_bounds(version, affected):
     """Explain the archived libexpat decision without mistaking a fix for its cause."""
+    # Arrange
     from gitlab_security_mcp.advisory import _from_nvd
 
     record = {
@@ -41,8 +42,10 @@ def test_nvd_unaffected_reason_explains_installed_version_and_bounds(version, af
         }
     }
 
+    # Act
     result = _from_nvd(record, "libexpat", version, ["nvd:CVE-fixture"], [])
 
+    # Assert
     assert result.affected is affected
     assert result.ranges == [">=2.8.2,<2.8.4"]
     if not affected:

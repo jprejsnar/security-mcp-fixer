@@ -244,14 +244,16 @@ class DesktopApproval:
     async def close(self) -> None:
         """Close the dialog pipes and reap only this server-owned process."""
         process = self.process
-        if process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-        _close_stream(process.stdin)
-        _close_stream(process.stdout)
-        _close_stream(process.stderr)
+        try:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+        finally:
+            _close_stream(process.stdin)
+            _close_stream(process.stdout)
+            _close_stream(process.stderr)
         await process.wait()
 
 

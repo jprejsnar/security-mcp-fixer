@@ -15,6 +15,7 @@ from collections import deque
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
+from time import gmtime
 from typing import Any
 from uuid import uuid4
 
@@ -44,7 +45,7 @@ from gitlab_security_mcp import __version__, desktop_approval
 from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
-from gitlab_security_mcp.util import logged_lock
+from gitlab_security_mcp.util import logged_lock, redact
 from gitlab_security_mcp.versions import is_major_upgrade
 
 logger = logging.getLogger("gitlab_security_mcp")
@@ -156,10 +157,37 @@ def _prepare_stderr() -> None:
         return
 
 
+class _StderrFormatter(logging.Formatter):
+    """Keep diagnostic context while redacting the server's environment credentials."""
+
+    converter = gmtime
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Redact the complete rendered record, including chained tracebacks."""
+        return redact(
+            super().format(record),
+            [
+                os.environ.get(name)
+                for name in (
+                    "GITLAB_TOKEN",
+                    "GITLAB_PERSONAL_ACCESS_TOKEN",
+                    "GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "NVD_API_KEY",
+                )
+            ],
+        )
+
+
 def _stderr_handler() -> logging.Handler:
     """Build one plain-text handler that writes to the current stderr."""
     handler = logging.StreamHandler(_CurrentStderr())
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    handler.setFormatter(
+        _StderrFormatter(
+            "%(asctime)sZ %(levelname)s %(name)s [%(threadName)s]: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    )
     return handler
 
 
@@ -243,8 +271,13 @@ class _ProgressConsole:
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 process.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
+            try:
                 process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Progress console could not be reaped after kill; pid=%s",
+                    process.pid,
+                )
         for pipe in (process.stdout, process.stderr):
             if pipe is not None and not pipe.closed:
                 with contextlib.suppress(OSError):
@@ -829,6 +862,28 @@ def _fix_choice_text(item: dict) -> tuple[str, str]:
 _desktop_fix_selection_tasks: dict[str, asyncio.Task] = {}
 
 
+def _desktop_task_done(
+    task: asyncio.Task,
+    *,
+    tasks: dict[str, asyncio.Task],
+    request_id: str,
+    repo_root: Path,
+) -> None:
+    """Release ownership and retrieve failures that escaped background cleanup."""
+    if tasks.get(request_id) is task:
+        tasks.pop(request_id)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "Desktop task failed repo=%s request=%s",
+            repo_root,
+            request_id,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
 async def _finish_desktop_fix_selection(
     ctx: Context,
     selected: Engine,
@@ -913,8 +968,12 @@ async def _finish_desktop_fix_selection(
             )
         )
         raise
-    except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning("Desktop fix selection failed: %s", exc)
+    except Exception as exc:
+        logger.exception(
+            "Desktop fix selection failed repo=%s request=%s",
+            selected.repo_root,
+            request_id,
+        )
         await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -1003,7 +1062,12 @@ async def _open_fix_selection(
         )
         _desktop_fix_selection_tasks[request_id] = task
         task.add_done_callback(
-            lambda _task: _desktop_fix_selection_tasks.pop(request_id, None)
+            partial(
+                _desktop_task_done,
+                tasks=_desktop_fix_selection_tasks,
+                request_id=request_id,
+                repo_root=selected.repo_root,
+            )
         )
         await started.wait()
         return {
@@ -1242,8 +1306,12 @@ async def _finish_desktop_approval(
             )
         )
         raise
-    except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning("Desktop false-positive approval failed: %s", exc)
+    except Exception as exc:
+        logger.exception(
+            "Desktop false-positive approval failed repo=%s request=%s",
+            selected.repo_root,
+            request_id,
+        )
         await asyncio.to_thread(
             selected.resolve_desktop_approval,
             request_id,
@@ -1469,7 +1537,12 @@ async def submit_false_positive_approvals(
         )
         _desktop_approval_tasks[receipt["request_id"]] = task
         task.add_done_callback(
-            lambda _task: _desktop_approval_tasks.pop(receipt["request_id"], None)
+            partial(
+                _desktop_task_done,
+                tasks=_desktop_approval_tasks,
+                request_id=receipt["request_id"],
+                repo_root=selected.repo_root,
+            )
         )
         return result
     await asyncio.to_thread(

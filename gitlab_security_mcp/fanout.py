@@ -68,7 +68,7 @@ def map_ordered(
                     pending[pool.submit(copy_context().run, function, item)] = submitted
                     submitted += 1
             return [results[index] for index in range(submitted)]
-        except Exception as exc:
+        except BaseException as exc:
             error = type(exc).__name__
             raise
         finally:

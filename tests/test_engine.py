@@ -92,7 +92,9 @@ def test_dns_loss_blocks_pulls_or_pnpm_preparation(
     assert engine.create_security_branch()["status"] == "BRANCH_CREATION_FAILED"
 
 
-def test_repository_override_recovers_unresolved_host_placeholder(repo, monkeypatch):
+def test_repository_override_recovers_unresolved_host_placeholder(
+    cloned_repo, monkeypatch
+):
     """Repository override recovers unresolved host placeholder."""
     # Arrange
     monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
@@ -100,14 +102,14 @@ def test_repository_override_recovers_unresolved_host_placeholder(repo, monkeypa
     # Act
     with pytest.raises(ValueError, match="unresolved host placeholder"):
         Engine.from_env()
-    engine = Engine.from_env(str(repo))
+    engine = Engine.from_env(str(cloned_repo))
     try:
         precheck = engine.run_prechecks()
     finally:
         engine.close()
 
     # Assert
-    assert engine.repo_root == repo.resolve()
+    assert engine.repo_root == cloned_repo.resolve()
     assert precheck["status"] == "PRECHECK_PASSED"
 
 
@@ -126,7 +128,7 @@ def test_missing_repository_has_actionable_error(tmp_path, monkeypatch):
     assert "Repository directory does not exist" in str(raised.value)
 
 
-def test_server_recovers_configuration_error(repo, monkeypatch):
+def test_server_recovers_configuration_error(cloned_repo, monkeypatch):
     """Server recovers configuration error."""
     # Arrange
     from gitlab_security_mcp import server
@@ -136,7 +138,7 @@ def test_server_recovers_configuration_error(repo, monkeypatch):
 
     # Act
     failed = server.run_prechecks()
-    recovered = server.run_prechecks(repo_root=str(repo))
+    recovered = server.run_prechecks(repo_root=str(cloned_repo))
     try:
         # Assert
         assert failed["status"] == "ERROR"
@@ -144,10 +146,13 @@ def test_server_recovers_configuration_error(repo, monkeypatch):
         assert "unresolved host placeholder" in failed["error"]
         assert "repo_root" in failed["action"]
         assert recovered["status"] == "PRECHECK_PASSED"
-        assert recovered["repo_root"] == str(repo.resolve())
-        other = server.run_prechecks(repo_root=str(repo.parent))
+        assert recovered["repo_root"] == str(cloned_repo.resolve())
+        other = server.run_prechecks(repo_root=str(cloned_repo.parent))
         assert other["status"] == "PRECHECK_FAILED"
-        assert server.get_run_status(repo_root=str(repo))["status"] == "PRECHECK_PASSED"
+        assert (
+            server.get_run_status(repo_root=str(cloned_repo))["status"]
+            == "PRECHECK_PASSED"
+        )
     finally:
         server._close_engine()
 
@@ -161,9 +166,12 @@ def test_two_repositories_run_at_the_same_time(tmp_path):
     server._close_engine()
     first = tmp_path / "one"
     second = tmp_path / "two"
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", "-b", "main", str(remote))
     for checkout in (first, second):
         checkout.mkdir()
         git(checkout, "init", "-b", "main")
+        git(checkout, "remote", "add", "origin", str(remote))
     barrier = threading.Barrier(2)
     results: dict[str, dict] = {}
 
@@ -199,6 +207,23 @@ def test_two_repositories_run_at_the_same_time(tmp_path):
         )
     finally:
         server._close_engine()
+
+
+def test_unreadable_origin_stops_prechecks_without_assuming_branch_absence(repo):
+    """Keep unknown remote state from authorizing branch preparation."""
+    # Arrange
+    from contextlib import closing
+    from unittest.mock import Mock
+
+    with closing(Engine(repo, gitlab=Mock(), advisory=Mock())) as engine:
+        # Act
+        result = engine.run_prechecks()
+
+        # Assert
+        assert result["status"] == "PRECHECK_FAILED"
+        assert "branch absence was not inferred" in result["error"]
+        assert result["no_changes_attempted"]
+        assert engine.git.current_branch() == "main"
 
 
 def test_server_logs_go_to_stderr(capsys):
@@ -2423,8 +2448,9 @@ def test_gradle_transitive_inspection_preserves_advisory_review(tmp_path, mode):
         assert first["proposed_fix"] is None
     assert "https://osv.dev" in first["security_validation_sites"]
     successful = mode in {"resolved", "logged", "configurations"}
-    assert before_change == (1 if successful else 2)
-    assert runner.run.call_count == (2 if successful else 3)
+    reusable_report = successful or mode in {"conflict", "unresolved"}
+    assert before_change == (1 if reusable_report else 2)
+    assert runner.run.call_count == (2 if reusable_report else 3)
     expected_version = "1.1.0" if successful else "1.0.0"
     assert advisory.lookup.call_args.args[1:] == (
         "Maven",
@@ -3219,6 +3245,7 @@ def test_branch_reuse_rechecks_date_after_server_crosses_midnight(
 @pytest.mark.parametrize("fixed", ["3.5.8", None])
 def test_container_package_fix_without_supported_edit_requires_review(repo, fixed):
     """Keep known container fixes out of the no-solution list without guessing edits."""
+    # Arrange
     from contextlib import closing
     from unittest.mock import Mock
 
@@ -3239,12 +3266,16 @@ def test_container_package_fix_without_supported_edit_requires_review(repo, fixe
         fixed_versions=[fixed] if fixed else [],
         summary="Fixed bound found." if fixed else "No fixed bound found.",
     )
-    with closing(Engine(repo, gitlab=FakeGitLab([finding]), advisory=advisory)) as engine:
+    with closing(
+        Engine(repo, gitlab=FakeGitLab([finding]), advisory=advisory)
+    ) as engine:
         engine.state.status = "FINDINGS_LISTED"
         engine.state.findings = [finding]
 
+        # Act
         result = engine.verify_security_finding(finding["id"])
 
+        # Assert
         assert result["decision"] == ("MANUAL_REVIEW" if fixed else "NO_SAFE_FIX")
         assert not result["eligible_for_auto_fix"]
         assert result["proposed_fix"] is None

@@ -15,6 +15,34 @@ from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
 from gitlab_security_mcp.util import timed_http_stream
 
 
+@pytest.mark.parametrize("boundary", ["fanout", "http"])
+def test_cancellation_is_propagated_and_logged_as_an_error(boundary, caplog):
+    """Never describe interrupted HTTP or worker operations as successful spans."""
+    # Arrange
+    import asyncio
+
+    def interrupt(_item):
+        """Model cancellation escaping synchronous work."""
+        raise asyncio.CancelledError
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        with pytest.raises(asyncio.CancelledError):
+            if boundary == "fanout":
+                map_ordered(interrupt, [1, 2])
+            else:
+                with httpx.Client(transport=httpx.MockTransport(interrupt)) as client:
+                    with timed_http_stream(
+                        client, "GET", "https://example.test", source="fixture"
+                    ):
+                        pytest.fail("No response should be yielded")
+    prefix = "HTTP timing " if boundary == "http" else "Concurrency "
+    record = json.loads(caplog.records[-1].message.removeprefix(prefix))
+
+    # Assert
+    assert record["error"] == "CancelledError"
+
+
 def test_main_and_branch_reports_overlap_and_keep_main_first():
     """Fetch the main report and the branch report together, then keep main first."""
     # Arrange
@@ -981,22 +1009,27 @@ def test_unexpected_doc_failure_is_logged_and_recorded(caplog):
 @pytest.mark.parametrize("count", [1, 2])
 def test_fanout_persists_completions_on_caller_before_waiting_for_earlier_items(count):
     """Deliver later completions promptly without moving persistence onto worker threads."""
+    # Arrange
     caller = threading.get_ident()
     release_first = threading.Event()
     completed = []
 
     def work(item):
+        """Let the later item release the first via its persistence callback."""
         if count > 1 and item == 0:
             assert release_first.wait(3)
         return item * 10
 
     def persist(index, result):
+        """Record a completion on the caller before replenishing workers."""
         assert threading.get_ident() == caller
         completed.append((index, result))
         release_first.set()
 
+    # Act
     result = map_ordered(work, range(count), on_result=persist)
 
+    # Assert
     assert result == [item * 10 for item in range(count)]
     assert completed == ([(0, 0)] if count == 1 else [(1, 10), (0, 0)])
 

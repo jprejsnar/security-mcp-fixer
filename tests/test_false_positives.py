@@ -184,7 +184,14 @@ def test_desktop_approval_returns_before_human_response_and_refreshes_report(
 @pytest.mark.parametrize(
     "foreground_pid,handles,cycle,area,expected_window,expected_bounds",
     [
-        (20, {"10": 111, "20": 222}, False, [-1920, 0, 1920, 1040], 999, [-1560, 140, 1200, 760]),
+        (
+            20,
+            {"10": 111, "20": 222},
+            False,
+            [-1920, 0, 1920, 1040],
+            999,
+            [-1560, 140, 1200, 760],
+        ),
         (99, {"20": 222}, False, [1920, 40, 1280, 984], 222, [1960, 152, 1200, 760]),
         (99, {"10": 111}, False, [0, 0, 800, 600], 111, [0, 0, 800, 600]),
         (99, {}, False, [-1280, -1024, 1280, 1024], 0, [-1240, -892, 1200, 760]),
@@ -195,6 +202,7 @@ def test_approval_uses_host_ancestry_and_bounds_without_opening_windows(
     foreground_pid, handles, cycle, area, expected_window, expected_bounds
 ):
     """Prefer the host monitor, ignore unrelated apps, and fit negative/small screens."""
+    # Arrange
     import subprocess
 
     script = r"""
@@ -232,6 +240,7 @@ $bounds = Get-ApprovalBounds -WorkingArea $area -RequestedSize (New-Object Syste
 @{ window = $selected.ToInt64(); bounds = @($bounds.X, $bounds.Y, $bounds.Width, $bounds.Height) } |
     ConvertTo-Json -Compress
 """
+    # Act
     result = subprocess.run(
         [str(server.desktop_approval.powershell()), "-NoProfile", "-Command", script],
         input=json.dumps(
@@ -249,6 +258,7 @@ $bounds = Get-ApprovalBounds -WorkingArea $area -RequestedSize (New-Object Syste
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
+    # Assert
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert json.loads(result.stdout) == {
@@ -630,7 +640,9 @@ def test_desktop_window_closes_on_server_shutdown_without_authorizing(
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["launch", "invalid_response"])
+@pytest.mark.parametrize(
+    "failure", ["launch", "invalid_response", "unexpected_response"]
+)
 def test_desktop_approval_failures_are_reported_without_dismissal(
     tmp_path, monkeypatch, failure
 ):
@@ -647,6 +659,8 @@ def test_desktop_approval_failures_are_reported_without_dismissal(
     opened = AsyncMock(return_value=dialog)
     if failure == "launch":
         opened.side_effect = OSError("Synthetic desktop launch failure")
+    elif failure == "unexpected_response":
+        dialog.wait.side_effect = TypeError("Synthetic unexpected response")
     monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
 
     async def exercise():
@@ -665,6 +679,63 @@ def test_desktop_approval_failures_are_reported_without_dismissal(
     )
     report = json.loads(Path(engine.state.json_report_path).read_text())
     assert report["false_positive_approval_form"]["reason"]
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_desktop_termination_failure_still_closes_pipes():
+    """Release every pipe even when terminating the owned window fails."""
+    # Arrange
+    from gitlab_security_mcp.desktop_approval import DesktopApproval
+
+    process = Mock(returncode=None, wait=AsyncMock())
+    process.terminate.side_effect = PermissionError("Synthetic termination denial")
+    streams = (process.stdin, process.stdout, process.stderr)
+    for stream in streams:
+        stream.transport.is_closing.return_value = False
+
+    # Act
+    with pytest.raises(PermissionError, match="termination denial"):
+        asyncio.run(DesktopApproval(process).close())
+
+    # Assert
+    for stream in streams:
+        stream.transport.close.assert_called_once()
+    process.wait.assert_not_awaited()
+
+
+def test_background_cleanup_failure_is_retrieved_and_logged(
+    tmp_path, monkeypatch, caplog
+):
+    """Observe cleanup failures with checkout/request context after saving the outcome."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    dialog = Mock(
+        wait=AsyncMock(return_value={"action": "cancel"}),
+        close=AsyncMock(side_effect=OSError("Synthetic pipe close failure")),
+    )
+    monkeypatch.setattr(
+        server.desktop_approval, "open_dialog", AsyncMock(return_value=dialog)
+    )
+
+    async def exercise():
+        """Complete the window owner and give its completion callback a turn."""
+        await server.submit_false_positive_approvals(_context(), str(tmp_path))
+        tasks = list(server._desktop_approval_tasks.values())
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    record = next(row for row in caplog.records if "Desktop task failed" in row.message)
+    assert record.exc_info[0] is OSError
+    assert str(tmp_path) in record.message
+    assert engine.state.false_positive_approval_form["request_id"] in record.message
+    assert engine.state.false_positive_approval_form["status"] == "CANCELLED"
+    assert not server._desktop_approval_tasks
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
@@ -1510,8 +1581,11 @@ def test_source_review_changed_while_form_open_cannot_write(tmp_path, monkeypatc
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
-def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_path, monkeypatch):
+def test_parallel_dismissals_keep_consent_durability_and_independent_proof(
+    tmp_path, monkeypatch
+):
     """Overlap distinct targets, persist each result on the caller, and never retry writes."""
+    # Arrange
     from collections import Counter
 
     from gitlab_security_mcp.fanout import MAX_WORKERS
@@ -1519,14 +1593,21 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_p
     engine = _engine(tmp_path)
     findings = [
         normalize_finding(
-            {"id": f"gid://gitlab/Vulnerability/{index + 1}", "uuid": f"finding-{index}", "state": "DETECTED"},
+            {
+                "id": f"gid://gitlab/Vulnerability/{index + 1}",
+                "uuid": f"finding-{index}",
+                "state": "DETECTED",
+            },
             None,
         )
         for index in range(MAX_WORKERS + 3)
     ]
     engine.state.findings = findings
     engine.state.decisions = {
-        finding["id"]: {"decision": "FALSE_POSITIVE", "reason": "Synthetic reviewed finding."}
+        finding["id"]: {
+            "decision": "FALSE_POSITIVE",
+            "reason": "Synthetic reviewed finding.",
+        }
         for finding in findings
     }
     approved = engine.false_positive_candidates()["candidates"][:-1]
@@ -1535,6 +1616,7 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_p
     save = engine._remember
 
     def remember():
+        """Check that completion persistence stays on the caller thread."""
         assert threading.get_ident() == caller
         save()
         saves.append([item["status"] for item in engine.state.gitlab_dismissals])
@@ -1546,13 +1628,16 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_p
     calls = Counter()
 
     def handler(request):
+        """Coordinate concurrent target checks and simulate one uncertain mutation."""
         nonlocal inflight, peak
         data = json.loads(request.content)
         vulnerability_id = data["variables"]["id"]
         index = int(vulnerability_id.rsplit("/", 1)[-1]) - 1
         query = data["query"]
-        operation = "target" if query == DISMISSAL_TARGET_QUERY else (
-            "confirm" if query == DISMISSAL_CONFIRMATION_QUERY else "mutation"
+        operation = (
+            "target"
+            if query == DISMISSAL_TARGET_QUERY
+            else ("confirm" if query == DISMISSAL_CONFIRMATION_QUERY else "mutation")
         )
         with lock:
             calls[(index, operation)] += 1
@@ -1561,12 +1646,19 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_p
         try:
             if operation == "target":
                 if index < MAX_WORKERS:
-                    saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+                    saved = json.loads(
+                        (tmp_path / ".security-mcp" / "run-state.json").read_text()
+                    )
                     assert len(saved["gitlab_dismissals"]) == len(approved)
-                    assert all(item["status"] == "PENDING" for item in saved["gitlab_dismissals"])
+                    assert all(
+                        item["status"] == "PENDING"
+                        for item in saved["gitlab_dismissals"]
+                    )
                     barrier.wait()
             if operation == "mutation" and index == 2:
-                raise httpx.ReadTimeout("Synthetic lost mutation response", request=request)
+                raise httpx.ReadTimeout(
+                    "Synthetic lost mutation response", request=request
+                )
             node = {
                 "id": vulnerability_id,
                 "uuid": f"finding-{index}",
@@ -1576,22 +1668,31 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_p
             }
             return httpx.Response(
                 200,
-                json={"data": {"vulnerabilityDismiss": {"errors": [], "vulnerability": node}}}
-                if operation == "mutation" else {"data": {"vulnerability": node}},
+                json={
+                    "data": {
+                        "vulnerabilityDismiss": {"errors": [], "vulnerability": node}
+                    }
+                }
+                if operation == "mutation"
+                else {"data": {"vulnerability": node}},
             )
         finally:
             with lock:
                 inflight -= 1
 
+    # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         with GitLabClient("fixture-token", http=http) as client:
             engine.gitlab = client
             result = engine.dismiss_false_positives(approved)
 
+    # Assert
     assert 2 <= peak <= MAX_WORKERS
     assert result["status"] == "PARTIAL_FAILURE"
     assert result["confirmed_dismissals"] == len(approved) - 1
-    assert [item["id"] for item in result["results"]] == [item["id"] for item in approved]
+    assert [item["id"] for item in result["results"]] == [
+        item["id"] for item in approved
+    ]
     assert saves[0] == ["PENDING"] * len(approved)
     assert any("DISMISSED" in snapshot and "PENDING" in snapshot for snapshot in saves)
     assert all(status != "PENDING" for status in saves[-1])
@@ -1604,6 +1705,7 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(tmp_p
 
 def test_duplicate_gitlab_target_cannot_mutate_concurrently_or_twice():
     """A second call for the same target must observe the first persisted dismissal."""
+    # Arrange
     from concurrent.futures import ThreadPoolExecutor
 
     remote = {"dismissed": False, "writes": 0}
@@ -1611,6 +1713,7 @@ def test_duplicate_gitlab_target_cannot_mutate_concurrently_or_twice():
     start = threading.Barrier(2, timeout=5)
 
     def handler(request):
+        """Read or update the simulated remote target under one lock."""
         data = json.loads(request.content)
         with lock:
             if data["query"] == DISMISS_FALSE_POSITIVE:
@@ -1625,19 +1728,31 @@ def test_duplicate_gitlab_target_cannot_mutate_concurrently_or_twice():
             }
         return httpx.Response(
             200,
-            json={"data": {"vulnerabilityDismiss": {"errors": [], "vulnerability": node}}}
-            if data["query"] == DISMISS_FALSE_POSITIVE else {"data": {"vulnerability": node}},
+            json={
+                "data": {"vulnerabilityDismiss": {"errors": [], "vulnerability": node}}
+            }
+            if data["query"] == DISMISS_FALSE_POSITIVE
+            else {"data": {"vulnerability": node}},
         )
 
+    # Act
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         with GitLabClient("fixture-token", http=http) as client:
+
             def dismiss():
+                """Start both operations together on one vulnerability."""
                 start.wait()
-                return client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed fixture.")
+                return client.dismiss_false_positive(
+                    GID, "finding-1", "group/app", "Reviewed fixture."
+                )
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                results = [future.result(timeout=5) for future in [pool.submit(dismiss), pool.submit(dismiss)]]
+                results = [
+                    future.result(timeout=5)
+                    for future in [pool.submit(dismiss), pool.submit(dismiss)]
+                ]
 
+    # Assert
     assert all(item["status"] == "DISMISSED" for item in results)
     assert remote["writes"] == 1
     assert sum(bool(item.get("already_dismissed")) for item in results) == 1
@@ -1645,6 +1760,7 @@ def test_duplicate_gitlab_target_cannot_mutate_concurrently_or_twice():
 
 def test_gitlab_close_waits_for_admitted_dismissals_and_rejects_new_ones():
     """Never close an owned HTTP pool while a target is using it."""
+    # Arrange
     from concurrent.futures import ThreadPoolExecutor
 
     entered = threading.Event()
@@ -1654,11 +1770,13 @@ def test_gitlab_close_waits_for_admitted_dismissals_and_rejects_new_ones():
     client._owns_http = True
 
     def admitted():
+        """Hold an admitted operation until the shutdown assertion finishes."""
         with client._dismissal_access(GID):
             entered.set()
             assert release.wait(5)
             http.close.assert_not_called()
 
+    # Act
     with ThreadPoolExecutor(max_workers=2) as pool:
         active = pool.submit(admitted)
         assert entered.wait(3)
@@ -1668,20 +1786,25 @@ def test_gitlab_close_waits_for_admitted_dismissals_and_rejects_new_ones():
                 assert client._idle.wait_for(lambda: client._closing, timeout=1)
             assert not closing.done()
             with pytest.raises(RuntimeError, match="closed"):
-                client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed fixture.")
+                client.dismiss_false_positive(
+                    GID, "finding-1", "group/app", "Reviewed fixture."
+                )
             http.close.assert_not_called()
         finally:
             release.set()
         active.result(timeout=3)
         closing.result(timeout=3)
 
+    # Assert
     http.close.assert_called_once()
     assert client._closed
 
 
 def test_report_distinguishes_host_changes_and_tests_from_mcp_evidence(tmp_path):
     """Do not contradict the archive's externally edited working tree or test execution."""
+    # Arrange
     engine = _engine(tmp_path)
+    # Act
     payload, markdown = render(
         engine.state,
         staged=[],
@@ -1689,6 +1812,7 @@ def test_report_distinguishes_host_changes_and_tests_from_mcp_evidence(tmp_path)
         diff_files=" M logback.xml",
     )
 
+    # Assert
     assert "No MCP-managed remediation edits were recorded." in markdown
     assert "No files were changed." not in markdown
     assert "M logback.xml" in markdown

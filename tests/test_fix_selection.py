@@ -592,7 +592,8 @@ def test_concurrent_native_selection_reserves_only_one_window(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize(
-    "interruption", ["shutdown", "new_run", "changed_target", "invalid_boolean"]
+    "interruption",
+    ["shutdown", "new_run", "changed_target", "invalid_boolean", "unexpected"],
 )
 def test_native_selection_interruptions_never_authorize_or_leak(
     tmp_path, monkeypatch, interruption
@@ -614,6 +615,8 @@ def test_native_selection_interruptions_never_authorize_or_leak(
         async def wait():
             """Wait until the stale or invalid answer is ready."""
             await answer.wait()
+            if interruption == "unexpected":
+                raise TypeError("Synthetic unexpected selection failure")
             return {
                 "action": "accept",
                 "content": {
@@ -649,6 +652,7 @@ def test_native_selection_interruptions_never_authorize_or_leak(
             "new_run": None,
             "changed_target": "INVALID",
             "invalid_boolean": "INVALID",
+            "unexpected": "INVALID",
         }[interruption]
     )
     dialog.close.assert_awaited_once()

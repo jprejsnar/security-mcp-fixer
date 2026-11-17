@@ -1163,6 +1163,7 @@ def test_progress_console_close_survives_a_child_that_ignores_kill():
 
         def __init__(self):
             """Provide streams and start unkilled."""
+            self.pid = 123456
             self.stdin = Pipe()
             self.stdout = Pipe()
             self.stderr = None
@@ -1186,6 +1187,90 @@ def test_progress_console_close_survives_a_child_that_ignores_kill():
     assert child.killed
     assert child.stdin.closed
     assert child.stdout.closed
+
+
+def test_unreaped_command_is_an_explicit_cleanup_failure(monkeypatch, caplog):
+    """Do not publish successful cleanup while the owned command is still alive."""
+    # Arrange
+    import subprocess
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import commands
+
+    process = Mock(pid=123456)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("synthetic", 10)
+    monkeypatch.setattr(commands.subprocess, "run", Mock())
+    monkeypatch.setattr(commands.os, "killpg", Mock(), raising=False)
+
+    # Act
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        commands._kill_tree(process)
+
+    # Assert
+    process.kill.assert_called_once()
+    assert "not reaped" in caplog.text
+
+
+def test_command_start_failure_has_diagnostic_context(tmp_path, monkeypatch, caplog):
+    """Log the safe tool, checkout and traceback when no result can be produced."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import commands
+
+    monkeypatch.setattr(commands, "_WindowsJob", Mock())
+    monkeypatch.setattr(
+        commands.subprocess,
+        "Popen",
+        Mock(side_effect=OSError("synthetic spawn failure")),
+    )
+    runner = CommandRunner(tmp_path)
+
+    # Act
+    with pytest.raises(OSError, match="synthetic spawn"):
+        runner.run(["git", "rev-parse", "HEAD"], timeout=1)
+
+    # Assert
+    record = next(row for row in caplog.records if "before a result" in row.message)
+    assert "tool=git" in record.message
+    assert str(tmp_path) in record.message
+    assert record.exc_info[0] is OSError
+
+
+def test_stderr_formatter_adds_context_and_redacts_tracebacks(monkeypatch):
+    """Preserve UTC/thread context without leaking credential values or encodings."""
+    # Arrange
+    import sys
+
+    from gitlab_security_mcp.server import _stderr_handler
+
+    secret = "fixture/token"
+    monkeypatch.setenv("GITLAB_TOKEN", secret)
+    try:
+        raise ValueError(f"Synthetic credential {secret}")
+    except ValueError:
+        record = logging.LogRecord(
+            "gitlab_security_mcp",
+            logging.ERROR,
+            __file__,
+            1,
+            "Synthetic URL fixture%%2Ftoken and %s",
+            (secret,),
+            sys.exc_info(),
+        )
+    record.created = 0
+
+    # Act
+    formatted = _stderr_handler().format(record)
+
+    # Assert
+    assert formatted.startswith("1970-01-01T00:00:00Z ERROR")
+    assert record.threadName in formatted
+    assert "ValueError" in formatted
+    assert secret not in formatted
+    assert "fixture%2Ftoken" not in formatted
+    assert formatted.count("[REDACTED]") == 3
 
 
 def test_utc_now_iso_is_the_shared_timestamp():

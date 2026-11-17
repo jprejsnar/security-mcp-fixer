@@ -215,10 +215,14 @@ class GitOps:
         return bool(result.stdout.strip())
 
     def branch_exists_on_origin(self, name: str) -> bool:
-        """Return whether origin has this branch. An unreachable remote counts as no."""
+        """Return whether origin has this branch; an unreadable remote is an error."""
         result = self._git(["ls-remote", "--heads", "origin", name], check=False)
-        if result.exit_code != 0:
-            return False
+        if result.exit_code != 0 or result.truncated:
+            raise RuntimeError(
+                "Could not verify the security branch on origin: git ls-remote failed "
+                "or its output was truncated. Check network/VPN and Git access; "
+                "branch absence was not inferred."
+            )
         return bool(result.stdout.strip())
 
     def staged_names(self) -> list[str]:

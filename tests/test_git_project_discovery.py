@@ -14,6 +14,26 @@ from gitlab_security_mcp.gitlab_client import FetchResult, GitLabClient
 from tests.conftest import commit_all, git
 
 
+@pytest.mark.parametrize("exit_code,truncated", [(128, False), (0, True)])
+def test_remote_branch_query_failure_is_not_reported_as_absence(
+    tmp_path, exit_code, truncated
+):
+    """Stop branch selection on failed or incomplete remote evidence."""
+    # Arrange
+    from gitlab_security_mcp.git_ops import GitOps
+
+    runner = Mock()
+    runner.run.return_value = Mock(exit_code=exit_code, truncated=truncated, stdout="")
+    operations = GitOps(tmp_path, runner)
+
+    # Act
+    with pytest.raises(RuntimeError, match="absence was not inferred") as failure:
+        operations.branch_exists_on_origin("security-fixes-fixture")
+
+    # Assert
+    assert "network/VPN" in str(failure.value)
+
+
 @pytest.mark.parametrize(
     ("remote", "api", "expected"),
     [

@@ -766,6 +766,14 @@ class CommandRunner:
         except subprocess.TimeoutExpired:
             timed_out = True
             exit_code = -1
+        except BaseException:
+            logging.getLogger("gitlab_security_mcp").exception(
+                "Command execution failed before a result: tool=%s cwd=%s pid=%s",
+                tool_name(argv[0]),
+                workdir,
+                process.pid if process is not None else None,
+            )
+            raise
         finally:
             try:
                 try:
@@ -1297,18 +1305,32 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
                     check=False,
                 )
             except (OSError, subprocess.TimeoutExpired):
-                pass
+                logging.getLogger("gitlab_security_mcp").warning(
+                    "Command tree termination failed; attempting direct kill pid=%s",
+                    process.pid,
+                    exc_info=True,
+                )
         else:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
+            except ProcessLookupError:
                 pass
+            except OSError:
+                logging.getLogger("gitlab_security_mcp").exception(
+                    "Could not terminate command process group pid=%s", process.pid
+                )
+                raise
         if process.poll() is None:
             process.kill()
     try:
         process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger("gitlab_security_mcp").error(
+            "Command process was not reaped after termination pid=%s", process.pid
+        )
+        raise RuntimeError(
+            f"Command process {process.pid} was not reaped after termination; cleanup is incomplete"
+        ) from exc
 
 
 def resolve_tool(name: str, which) -> str | None:
