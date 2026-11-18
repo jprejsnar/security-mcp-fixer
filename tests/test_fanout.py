@@ -842,6 +842,8 @@ def test_advisory_identifiers_are_requested_together_in_order(repeated):
     # Arrange
     state = {"inflight": 0, "max": 0, "requests": 0}
     lock = threading.Lock()
+    # Both distinct reads must be in flight together; a sleep only made overlap likely.
+    together = threading.Barrier(2, timeout=5)
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Serve one OSV record per identifier and count overlapping calls."""
@@ -850,7 +852,7 @@ def test_advisory_identifiers_are_requested_together_in_order(repeated):
             state["inflight"] += 1
             state["max"] = max(state["max"], state["inflight"])
         try:
-            time.sleep(0.05)
+            together.wait()
             ident = request.url.path.rsplit("/", 1)[-1]
             return httpx.Response(
                 200,
