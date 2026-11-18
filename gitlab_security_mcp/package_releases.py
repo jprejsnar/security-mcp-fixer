@@ -6,11 +6,11 @@ import json
 import re
 from pathlib import Path
 from urllib.parse import quote, urlsplit
-from xml.etree import ElementTree
+from xml.etree.ElementTree import ParseError
 
 import httpx
 
-from gitlab_security_mcp.util import timed_http_stream
+from gitlab_security_mcp.util import parse_xml, timed_http_stream
 from gitlab_security_mcp.versions import parse_version
 
 MAX_RELEASE_BYTES = 20 * 1024 * 1024
@@ -85,8 +85,8 @@ def release_catalog(
                     raise ValueError("Package release catalog exceeds the size limit")
     if ecosystem == "Maven":
         try:
-            metadata = ElementTree.fromstring(content)
-        except ElementTree.ParseError as exc:
+            metadata = parse_xml(content)
+        except ParseError as exc:
             raise ValueError(f"Invalid Maven release metadata: {exc}") from exc
         if (
             metadata.findtext("groupId") != group

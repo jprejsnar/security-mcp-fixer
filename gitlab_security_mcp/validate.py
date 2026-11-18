@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 from subprocess import SubprocessError
-from xml.etree import ElementTree
+from xml.etree.ElementTree import ParseError
 
 from gitlab_security_mcp.commands import (
     CommandResult,
@@ -24,7 +24,7 @@ from gitlab_security_mcp.manifests import (
     iter_files,
     java_build_roots,
 )
-from gitlab_security_mcp.util import log_unexpected, read_bounded
+from gitlab_security_mcp.util import log_unexpected, parse_xml, read_bounded
 
 
 def run_validation(
@@ -797,8 +797,8 @@ def _executed_gradle_tests(
             contents = read_bounded(path, 10 * 1024 * 1024)
             if contents is None:
                 raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
-            report = ElementTree.fromstring(contents)
-        except ElementTree.ParseError as exc:
+            report = parse_xml(contents)
+        except ParseError as exc:
             raise ValueError(f"Invalid JUnit report {path}: {exc}") from exc
         for suite in report.iter("testsuite"):
             tests = int(suite.get("tests", "0"))

@@ -11,6 +11,8 @@ import shutil
 import sys
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -326,6 +328,57 @@ def redact(text: str, secrets: list[str | None]) -> str:
         if encoded != secret:
             redacted = redacted.replace(encoded, "[REDACTED]")
     return redacted
+
+
+def parse_xml(source: str | bytes | bytearray) -> ET.Element:
+    """Parse XML without expanding entity declarations.
+
+    The standard parser expands internal entities, so a short document can
+    become a very large tree. Maven files, release catalogs, and JUnit reports
+    use this parser. A document type that declares no entities is still read.
+    """
+    data = source.encode("utf-8") if isinstance(source, str) else bytes(source)
+    parser = expat.ParserCreate(None, "}")
+    builder = ET.TreeBuilder()
+    names: dict[str, str] = {}
+
+    def fixname(key: str) -> str:
+        """Return the ElementTree form of one Expat name."""
+        name = names.get(key)
+        if name is None:
+            name = "{" + key if "}" in key else key
+            names[key] = name
+        return name
+
+    def start(tag: str, attributes: list[str]) -> None:
+        """Record one opening tag and its attributes."""
+        fields = {
+            fixname(attributes[index]): attributes[index + 1]
+            for index in range(0, len(attributes), 2)
+        }
+        builder.start(fixname(tag), fields)
+
+    def reject_entity(*_args: object) -> None:
+        """Stop parsing when the document declares an entity."""
+        raise expat.ExpatError("XML entity declarations are not allowed")
+
+    def reject_external(*_args: object) -> None:
+        """Stop parsing when the document requests an external entity."""
+        raise expat.ExpatError("External XML entities are not allowed")
+
+    parser.ordered_attributes = 1
+    parser.buffer_text = 1
+    parser.StartElementHandler = start
+    parser.EndElementHandler = lambda tag: builder.end(fixname(tag))
+    parser.CharacterDataHandler = builder.data
+    parser.EntityDeclHandler = reject_entity
+    parser.UnparsedEntityDeclHandler = reject_entity
+    parser.ExternalEntityRefHandler = reject_external
+    try:
+        parser.Parse(data, True)
+    except expat.ExpatError as exc:
+        raise ET.ParseError(str(exc)) from exc
+    return builder.close()
 
 
 def read_bounded(path: Path, limit: int) -> bytes | None:

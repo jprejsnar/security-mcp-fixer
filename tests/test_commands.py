@@ -1274,6 +1274,56 @@ def test_stderr_formatter_adds_context_and_redacts_tracebacks(monkeypatch):
     assert formatted.count("[REDACTED]") == 3
 
 
+def test_parse_xml_rejects_entity_expansion():
+    """Keep a declared entity from expanding into the parsed document."""
+    # Arrange
+    from xml.etree.ElementTree import ParseError
+
+    from gitlab_security_mcp.util import parse_xml
+
+    document = """<?xml version="1.0"?>
+<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;">]>
+<r>&lol2;</r>
+"""
+
+    # Act
+    with pytest.raises(ParseError, match="entity declarations") as raised:
+        parse_xml(document)
+
+    # Assert
+    assert "lol" not in str(raised.value)
+
+
+def test_parse_xml_keeps_elementtree_names_without_entities():
+    """Read a namespaced document and a document type that declares no entities."""
+    # Arrange
+    import xml.etree.ElementTree as ET
+
+    from gitlab_security_mcp.util import parse_xml
+
+    namespaced = (
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        "<dependencies><dependency><artifactId>commons-text</artifactId>"
+        "</dependency></dependencies></project>"
+    )
+    typed = (
+        '<?xml version="1.0"?><!DOCTYPE project>'
+        "<project><artifactId>ok</artifactId></project>"
+    )
+
+    # Act
+    parsed = parse_xml(namespaced)
+    standard = ET.fromstring(namespaced)
+    declared = parse_xml(typed)
+
+    # Assert
+    assert parsed.tag == standard.tag
+    assert parsed.find(".//{http://maven.apache.org/POM/4.0.0}artifactId").text == (
+        "commons-text"
+    )
+    assert declared.find("artifactId").text == "ok"
+
+
 def test_utc_now_iso_is_the_shared_timestamp():
     """Produce one UTC ISO 8601 string for every log timestamp."""
     # Arrange

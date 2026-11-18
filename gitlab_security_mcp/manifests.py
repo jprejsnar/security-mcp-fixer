@@ -6,15 +6,20 @@ import json
 import os
 import re
 import tomllib
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
+from xml.etree.ElementTree import ParseError
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
-from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
+from gitlab_security_mcp.util import (
+    atomic_write_text,
+    json_object,
+    parse_xml,
+    resolve_inside,
+)
 from gitlab_security_mcp.versions import bump_npm_spec, parse_version, range_allows
 
 SKIP_DIRS = {
@@ -236,8 +241,8 @@ def java_build_roots(
     for path in poms:
         members[path] = set()
         try:
-            project = ET.parse(path).getroot()
-        except ET.ParseError as exc:
+            project = parse_xml(path.read_bytes())
+        except ParseError as exc:
             raise ValueError(f"Could not parse {path}") from exc
         for modules in project:
             if _local(modules.tag) != "modules":
@@ -520,8 +525,8 @@ def _local(tag: str) -> str:
 def _pom_dependencies(path: Path) -> list[dict[str, str]]:
     """Read Maven dependency fields; reject malformed XML as unreadable."""
     try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
+        root = parse_xml(path.read_bytes())
+    except ParseError as exc:
         raise ValueError(f"Could not parse {path}") from exc
     found: list[dict[str, str]] = []
     for node in root.iter():
@@ -538,8 +543,8 @@ def _pom_dependencies(path: Path) -> list[dict[str, str]]:
 def _pom_properties(path: Path) -> dict[str, str]:
     """Read local Maven properties used to resolve dependency versions."""
     try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
+        root = parse_xml(path.read_bytes())
+    except ParseError as exc:
         raise ValueError(f"Could not parse {path}") from exc
     props: dict[str, str] = {}
     for node in root.iter():
@@ -1242,7 +1247,7 @@ def add_java_override(
             ),
             1,
         )
-    ET.fromstring(updated)
+    parse_xml(updated)
     _write(path, updated)
 
 
