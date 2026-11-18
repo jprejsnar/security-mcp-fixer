@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gitlab-security-mcp"
-version = "1.0.36"
+version = "1.0.37"
 description = "Local-only MCP server that verifies GitLab security findings and applies minimal fixes."
 readme = "README.md"
 requires-python = ">=3.11"

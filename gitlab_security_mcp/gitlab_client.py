@@ -16,7 +16,12 @@ from urllib.parse import quote, unquote, urlparse
 import httpx
 
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import redact, timed_http_stream, utc_now_iso
+from gitlab_security_mcp.util import (
+    log_unexpected,
+    redact,
+    timed_http_stream,
+    utc_now_iso,
+)
 from gitlab_security_mcp.versions import parse_fixed_versions
 
 FINDINGS_QUERY = """
@@ -306,6 +311,7 @@ class GitLabClient:
             TypeError,
             AttributeError,
         ) as exc:
+            log_unexpected(exc, "GitLab vulnerability report retrieval")
             return FetchResult(ok=False, error=self._clean(str(exc)))
         if len(kept) > self.max_findings:
             kept = kept[: self.max_findings]

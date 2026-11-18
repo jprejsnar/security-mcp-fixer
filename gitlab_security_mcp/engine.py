@@ -86,6 +86,7 @@ from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import (
     atomic_write_text,
     log_task,
+    log_unexpected,
     logged_lock,
     read_bounded,
     resolve_inside,
@@ -446,6 +447,7 @@ class Engine:
         try:
             self.git.ensure_work_tree()
         except Exception as exc:
+            log_unexpected(exc, "Git work-tree verification")
             self.state.status = "PRECHECK_FAILED"
             self.state.stop_stage = "precheck"
             return {
@@ -607,6 +609,7 @@ class Engine:
                         },
                     )
             except Exception as exc:
+                log_unexpected(exc, f"pull {number} of main")
                 return self._stop(
                     "PULL_FAILED",
                     f"pull_{number}",
@@ -767,6 +770,7 @@ class Engine:
                         },
                     )
         except Exception as exc:
+            log_unexpected(exc, f"security branch preparation {name}")
             return self._stop(
                 "BRANCH_CREATION_FAILED",
                 "branch",
@@ -863,6 +867,7 @@ class Engine:
                 finding, source_review
             )
         except (OSError, ValueError, TypeError, AttributeError) as exc:
+            log_unexpected(exc, f"finding verification {finding_id}")
             reason = f"Finding evidence could not be read safely: {exc}"
             decision, evidence, proposed = "MANUAL_REVIEW", [reason], None
             prompt = self._prompt(finding, None, reason)
@@ -1325,6 +1330,7 @@ class Engine:
                 review_major_upgrade(self.repo_root, plan, review)
                 self._package_policy(plan, review)
             except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                log_unexpected(exc, f"package review preparation {item['id']}")
                 required.append(
                     {
                         "finding_id": item["id"],
@@ -1587,6 +1593,7 @@ class Engine:
                 "baseline_results": baseline["results"],
             }
         except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            log_unexpected(exc, f"package qualification {finding_id}")
             finding["packageQualification"] = {
                 "status": "BLOCKED",
                 "reason": str(exc),
@@ -1729,6 +1736,7 @@ class Engine:
                 AttributeError,
                 RuntimeError,
             ) as exc:
+                log_unexpected(exc, f"applying qualified fix {finding_id}")
                 return {
                     "status": "QUALIFICATION_REQUIRED",
                     "finding_id": finding_id,
@@ -1992,6 +2000,7 @@ class Engine:
         try:
             return self._isolate_package_batch(pending, outcome)
         except (OSError, ValueError, RuntimeError, TypeError) as exc:
+            log_unexpected(exc, "failed package batch isolation")
             self.state.manual_cleanup_required = True
             self.state.status = self.state.validation_status = "VALIDATION_FAILED"
             self.state.stop_stage = "batch_isolation"
@@ -2485,6 +2494,7 @@ class Engine:
                 AttributeError,
                 RuntimeError,
             ) as exc:
+                log_unexpected(exc, "package batch validation")
                 change["detail"] = str(exc)
                 outcome["status"] = "VALIDATION_FAILED"
                 outcome["results"].append(
@@ -3058,7 +3068,8 @@ class Engine:
                 AttributeError,
                 RuntimeError,
                 KeyError,
-            ):
+            ) as exc:
+                log_unexpected(exc, "package validation freshness check")
                 valid = False
             if not valid:
                 change["qualification_status"] = receipt["status"] = (

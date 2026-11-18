@@ -28,7 +28,7 @@ from gitlab_security_mcp.manifests import (
     update_pom_version,
 )
 from gitlab_security_mcp.official_docs import manager_documentation
-from gitlab_security_mcp.util import json_object, resolve_inside
+from gitlab_security_mcp.util import json_object, log_unexpected, resolve_inside
 from gitlab_security_mcp.versions import parse_version
 
 MAX_AUTO_SCORE = 3
@@ -460,6 +460,7 @@ def apply_plan(
         if plan.manager == "nuget":
             return _apply_nuget(root, plan, runner, which, edited, commands)
     except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as exc:
+        log_unexpected(exc, f"applying {plan.strategy} plan for {plan.package}")
         return _failed("FIX_FAILED", plan, str(exc), edited, commands)
     return _failed("FIX_FAILED", plan, "No applicator matched this plan.")
 
@@ -485,9 +486,7 @@ def _apply_node(root, plan, runner, which, edited, commands) -> dict:
             )
         edited.append(manifest)
         if any(
-            path.endswith("lock.json")
-            or path.endswith("lock.yaml")
-            or Path(path).name == "yarn.lock"
+            path.endswith(("lock.json", "lock.yaml")) or Path(path).name == "yarn.lock"
             for path in plan.files
         ):
             return _refresh_node_lock(

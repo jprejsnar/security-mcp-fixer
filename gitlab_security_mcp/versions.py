@@ -157,7 +157,7 @@ def bump_npm_spec(old_spec: str, fixed: str) -> str | None:
         ("workspace:", "file:", "link:", "catalog:", "npm:", "git", "http")
     ):
         return None
-    if text.startswith("^") or text.startswith("~"):
+    if text.startswith(("^", "~")):
         return f"{text[0]}{fixed}"
     if text[:1].isdigit():
         return fixed

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from gitlab_security_mcp.manifests import _read_json, iter_files
-from gitlab_security_mcp.util import atomic_write_text
+from gitlab_security_mcp.util import atomic_write_text, log_unexpected
 
 DEPENDENCY_STRATEGIES = {
     "lockfile_only",
@@ -28,6 +28,7 @@ def generate_aaa_test(root: Path, finding: dict, change: dict | None) -> dict:
     try:
         return _generate_aaa_test(root, finding, change)
     except (OSError, ValueError, TypeError, AttributeError) as exc:
+        log_unexpected(exc, f"AAA test generation {finding.get('id')}")
         return {
             "status": "NOT_GENERATED",
             "finding_id": finding.get("id"),

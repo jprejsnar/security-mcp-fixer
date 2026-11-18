@@ -7,7 +7,7 @@ from pathlib import Path
 
 from gitlab_security_mcp.config_findings import config_kind
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_pages
-from gitlab_security_mcp.util import read_bounded, resolve_inside
+from gitlab_security_mcp.util import log_unexpected, read_bounded, resolve_inside
 
 _MIN_AUDIT_SENTENCE = 24
 _MAX_APPROVAL_REASON = 400
@@ -252,6 +252,7 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
                 "workflow": {**workflow, "status": review["decision"]},
             }
     except (OSError, ValueError, TypeError) as exc:
+        log_unexpected(exc, f"source review validation {finding.get('id')}")
         reason = f"Source evidence/review could not be accepted: {exc}. {reason}"
     return {
         "decision": "SOURCE_REVIEW_REQUIRED",

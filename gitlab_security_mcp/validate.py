@@ -24,7 +24,7 @@ from gitlab_security_mcp.manifests import (
     iter_files,
     java_build_roots,
 )
-from gitlab_security_mcp.util import read_bounded
+from gitlab_security_mcp.util import log_unexpected, read_bounded
 
 
 def run_validation(
@@ -51,6 +51,7 @@ def run_validation(
             lint_only=lint_only,
         )
     except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+        log_unexpected(exc, "validation matrix")
         return {
             "status": "VALIDATION_COMPLETE" if lint_only else "VALIDATION_FAILED",
             "detected": {},

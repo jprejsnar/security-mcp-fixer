@@ -303,7 +303,7 @@ def _gradle_ok(args: list[str]) -> bool:
 
 def _java_node_ok(args: list[str]) -> bool:
     """Permit runtime version probes, not arbitrary source execution."""
-    return args == ["-version"] or args == ["--version"]
+    return args in (["-version"], ["--version"])
 
 
 def _nginx_ok(args: list[str], repo_root: Path) -> bool:

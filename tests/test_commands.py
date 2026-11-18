@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 from datetime import date
+from unittest.mock import Mock
 
 import pytest
 
@@ -1289,3 +1290,34 @@ def test_utc_now_iso_is_the_shared_timestamp():
     parsed = datetime.fromisoformat(text)
     assert before <= parsed <= datetime.now(UTC)
     assert parsed.utcoffset() == before.utcoffset()
+
+
+@pytest.mark.parametrize(
+    "error,logged",
+    [
+        (KeyError("missing"), True),
+        (AttributeError("absent"), True),
+        (OSError("disk"), False),
+        (ValueError("bad value"), False),
+    ],
+)
+def test_converted_programming_errors_keep_a_traceback(error, logged, caplog):
+    """Log tracebacks for defect-type errors but not expected recorded failures."""
+    # Arrange
+    from gitlab_security_mcp.advisory import AdvisoryClient
+
+    client = AdvisoryClient(http=Mock())
+    client._get_json = Mock(side_effect=error)
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        ident, payload, message = client._osv_record("CVE-2026-0001")
+
+    # Assert
+    assert (ident, payload) == ("CVE-2026-0001", None)
+    assert message.startswith("osv:CVE-2026-0001:")
+    records = [row for row in caplog.records if "Converted" in row.message]
+    assert bool(records) is logged
+    if logged:
+        assert "OSV advisory read CVE-2026-0001" in records[0].message
+        assert records[0].exc_info[1] is error

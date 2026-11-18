@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from subprocess import SubprocessError
 from time import perf_counter, process_time
 from urllib.parse import quote
 
@@ -135,6 +136,27 @@ def _log_performance(name: str, before: dict) -> None:
         logger.info("Task performance %s", json.dumps(record, ensure_ascii=True))
     except Exception:
         logger.warning("Could not write task performance log", exc_info=True)
+
+
+def log_unexpected(exc: BaseException, context: str) -> None:
+    """Keep a traceback when a handler converts a programming error into a result.
+
+    Expected I/O, validation, command and HTTP failures are already recorded in
+    the returned result, so they are not logged again. Types such as TypeError,
+    AttributeError or KeyError usually indicate a defect; their message alone
+    lacks the file and line needed to diagnose it. Malformed external data can
+    raise the same types, so the record is a warning rather than an error.
+    """
+    if isinstance(exc, (OSError, ValueError, RuntimeError, SubprocessError)):
+        return
+    if isinstance(exc, httpx.HTTPError):
+        return
+    logger.warning(
+        "Converted %s into a failed result during %s; traceback follows",
+        type(exc).__name__,
+        context,
+        exc_info=exc,
+    )
 
 
 def log_concurrency(kind: str, name: str, **fields: object) -> None:

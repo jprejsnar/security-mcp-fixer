@@ -538,7 +538,7 @@ def _check_variants(manager: str, kind: str) -> list[list[str]]:
     category = "SecurityRuntimeSmoke" if kind == "runtime" else "LicenseCompliance"
     prefix = ["test", "--configuration", "Release", "--nologo"]
     return [
-        prefix + [flag, value]
+        [*prefix, flag, value]
         for flag, value in (
             ("--filter", f"Category={category}"),
             ("--filter", f"TestCategory={category}"),

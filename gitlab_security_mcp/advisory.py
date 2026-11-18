@@ -20,7 +20,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import redact, timed_http_stream
+from gitlab_security_mcp.util import log_unexpected, redact, timed_http_stream
 from gitlab_security_mcp.versions import (
     collect_fixed_versions,
     describe_ranges,
@@ -240,6 +240,7 @@ class AdvisoryClient:
                 AttributeError,
                 RuntimeError,
             ) as exc:
+                log_unexpected(exc, "advisory lookup")
                 result = AdvisoryLookup(
                     outcome="lookup_failed",
                     summary="Online advisory data could not be read safely.",
@@ -402,6 +403,7 @@ class AdvisoryClient:
         try:
             payload = self._get_json(OSV_VULN.format(ident=ident))
         except Exception as exc:
+            log_unexpected(exc, f"OSV advisory read {ident}")
             return ident, None, self._clean(f"osv:{ident}: {exc}")
         return ident, payload if isinstance(payload, dict) else None, None
 
@@ -413,6 +415,7 @@ class AdvisoryClient:
         try:
             payload = self._get_json(GITHUB_ADVISORIES, params=params, headers=headers)
         except Exception as exc:
+            log_unexpected(exc, f"GitHub advisory read {ident}")
             return ident, None, self._clean(f"github:{ident}: {exc}")
         return ident, payload, None
 
@@ -448,6 +451,7 @@ class AdvisoryClient:
                         _NVD_ATTEMPTS,
                     )
         except Exception as exc:
+            log_unexpected(exc, f"NVD advisory read {cve}")
             errors.append(self._clean(f"nvd:{cve}: {exc}"))
             return None
         vulnerabilities = (payload or {}).get("vulnerabilities") or []

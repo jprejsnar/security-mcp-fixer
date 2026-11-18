@@ -28,7 +28,9 @@ def _quote(path):
 def _windows_powershell():
     """Return the Windows PowerShell 5.1 executable shipped with Windows."""
     root = os.environ.get("SystemRoot", r"C:\Windows")
-    executable = Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    executable = (
+        Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
     if not executable.is_file():
         pytest.skip("Windows PowerShell 5.1 is not installed")
     return str(executable)
