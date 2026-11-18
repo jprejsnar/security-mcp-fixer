@@ -771,6 +771,27 @@ def run_validation_matrix(repo_root: str | None = None) -> dict[str, Any]:
     return _run("run_validation_matrix", repo_root=repo_root)
 
 
+def _checkbox_model(name: str, candidates: list[dict], text) -> type[BaseModel]:
+    """Build one unchecked box per finding. ``text`` returns its title and description."""
+    fields = {}
+    for index, item in enumerate(candidates):
+        title, description = text(item)
+        fields[f"finding_{index}"] = (
+            bool,
+            Field(default=False, strict=True, title=title, description=description),
+        )
+    return create_model(name, **fields)
+
+
+def _checked(candidates: list[dict], values: dict) -> list[dict]:
+    """Return the findings whose boxes were explicitly checked."""
+    return [
+        item
+        for index, item in enumerate(candidates)
+        if values.get(f"finding_{index}") is True
+    ]
+
+
 def _form_supported(ctx: Context) -> bool:
     """Return whether this host can display an MCP checkbox form."""
     capabilities = ctx.session.client_capabilities
@@ -908,19 +929,15 @@ async def _finish_desktop_fix_selection(
             if response["action"] == "accept"
             else {}
         )
+        chosen = _checked(candidates, values)
         if any(
-            values.get(f"finding_{index}") is True
-            and prepared["reviews"].get(item["id"], {}).get("blocked_reason")
-            for index, item in enumerate(candidates)
+            prepared["reviews"].get(item["id"], {}).get("blocked_reason")
+            for item in chosen
         ):
             raise ValueError(
                 "A blocked update cannot be selected; obtain a new review before approval."
             )
-        ids = [
-            item["id"]
-            for index, item in enumerate(candidates)
-            if values.get(f"finding_{index}") is True
-        ]
+        ids = [item["id"] for item in chosen]
         result = await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -1163,21 +1180,7 @@ async def select_security_fixes(
             if not candidates
             else "The host does not advertise human form support; no code edits are authorized.",
         )
-    schema = create_model(
-        "SecurityFixSelection",
-        **{
-            f"finding_{index}": (
-                bool,
-                Field(
-                    default=False,
-                    strict=True,
-                    title=_fix_choice_text(item)[0],
-                    description=_fix_choice_text(item)[1],
-                ),
-            )
-            for index, item in enumerate(candidates)
-        },
-    )
+    schema = _checkbox_model("SecurityFixSelection", candidates, _fix_choice_text)
     if native:
         prepared = await asyncio.to_thread(
             selected.prepare_package_updates, candidates, package_reviews or {}
@@ -1224,11 +1227,7 @@ async def select_security_fixes(
         if response.action == "accept" and response.data is not None
         else {}
     )
-    ids = [
-        item["id"]
-        for index, item in enumerate(candidates)
-        if chosen.get(f"finding_{index}") is True
-    ]
+    ids = [item["id"] for item in _checked(candidates, chosen)]
     return await asyncio.to_thread(
         selected.record_fix_selection,
         candidates,
@@ -1281,11 +1280,7 @@ async def _finish_desktop_approval(
         approved = None
         if response["action"] == "accept":
             values = schema.model_validate(response.get("content")).model_dump()
-            approved = [
-                item
-                for index, item in enumerate(candidates)
-                if values.get(f"finding_{index}") is True
-            ]
+            approved = _checked(candidates, values)
         result = await asyncio.to_thread(
             selected.resolve_desktop_approval, request_id, approved
         )
@@ -1459,23 +1454,15 @@ async def submit_false_positive_approvals(
                 "source_review_queue": queue,
             },
         )
-    schema = create_model(
+    schema = _checkbox_model(
         "FalsePositiveApprovals",
-        **{
-            f"finding_{index}": (
-                bool,
-                Field(
-                    default=False,
-                    strict=True,
-                    title=f"{item['id']}: {item['title']}",
-                    description=(
-                        f"Why this is a false positive: {item['description']}\n\n"
-                        f"Dismiss as FALSE_POSITIVE with comment:\n{item['reason']}"
-                    ),
-                ),
-            )
-            for index, item in enumerate(candidates)
-        },
+        candidates,
+        lambda item: (
+            f"{item['id']}: {item['title']}",
+            "Why this is a false positive: "
+            f"{item['description']}\n\n"
+            f"Dismiss as FALSE_POSITIVE with comment:\n{item['reason']}",
+        ),
     )
     if desktop_approval.available():
         receipt.update(request_id=uuid4().hex, presentation="WINDOWS_DIALOG")
@@ -1609,12 +1596,7 @@ async def submit_false_positive_approvals(
                 "message": "No GitLab changes were made.",
             },
         )
-    approvals = response.data.model_dump()
-    approved = [
-        item
-        for index, item in enumerate(candidates)
-        if approvals.get(f"finding_{index}") is True
-    ]
+    approved = _checked(candidates, response.data.model_dump())
     result = await asyncio.to_thread(selected.dismiss_false_positives, approved)
     result["source_review_queue"] = queue
     result["excluded"] = snapshot["excluded"]

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from gitlab_security_mcp.config_findings import config_kind
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_pages
-from gitlab_security_mcp.util import resolve_inside
+from gitlab_security_mcp.util import read_bounded, resolve_inside
 
 _MIN_AUDIT_SENTENCE = 24
 _MAX_APPROVAL_REASON = 400
@@ -53,9 +53,8 @@ def _read_source(root: Path, relative: str) -> bytes:
     path = resolve_inside(root, relative)
     if path is None or not path.is_file():
         raise ValueError(f"{relative} is not an existing file inside the checkout")
-    with path.open("rb") as stream:
-        contents = stream.read(MAX_SOURCE_BYTES + 1)
-    if len(contents) > MAX_SOURCE_BYTES:
+    contents = read_bounded(path, MAX_SOURCE_BYTES)
+    if contents is None:
         raise ValueError(f"{relative} exceeds the source-review size limit")
     return contents
 

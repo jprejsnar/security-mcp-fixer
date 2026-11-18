@@ -87,6 +87,7 @@ from gitlab_security_mcp.util import (
     atomic_write_text,
     log_task,
     logged_lock,
+    read_bounded,
     resolve_inside,
     utc_now_iso,
 )
@@ -3132,9 +3133,8 @@ class Engine:
                             raise ValueError(
                                 "Truncated Maven dependency output has no complete local log"
                             )
-                        with log.open("rb") as stream:
-                            raw = stream.read(8 * 1024 * 1024 + 1)
-                        if len(raw) > 8 * 1024 * 1024:
+                        raw = read_bounded(log, 8 * 1024 * 1024)
+                        if raw is None:
                             raise ValueError(
                                 "Maven dependency log exceeds the 8 MiB inspection limit"
                             )
@@ -3258,9 +3258,8 @@ class Engine:
                         detail="Gradle dependency output is truncated and has no complete local log.",
                     )
                 else:
-                    with log.open("rb") as stream:
-                        raw = stream.read(8 * 1024 * 1024 + 1)
-                    if len(raw) > 8 * 1024 * 1024:
+                    raw = read_bounded(log, 8 * 1024 * 1024)
+                    if raw is None:
                         row.update(
                             status="FAILED",
                             detail="Gradle dependency log exceeds the 8 MiB inspection limit.",

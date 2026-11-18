@@ -306,6 +306,19 @@ def redact(text: str, secrets: list[str | None]) -> str:
     return redacted
 
 
+def read_bounded(path: Path, limit: int) -> bytes | None:
+    """Read a file that must fit in ``limit`` bytes, or return None when it does not.
+
+    The extra byte distinguishes a file at the limit from a file past it.
+    The caller keeps its own error text. The file is closed before that check.
+    """
+    with path.open("rb") as stream:
+        contents = stream.read(limit + 1)
+    if len(contents) > limit:
+        return None
+    return contents
+
+
 def resolve_inside(root: Path, raw: str | Path) -> Path | None:
     """Resolve ``raw`` and return it only when it stays inside ``root``.
 

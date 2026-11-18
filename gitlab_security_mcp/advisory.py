@@ -633,6 +633,15 @@ def _matching_affected(records: list[dict], package: str | None) -> list[dict]:
     return []
 
 
+def _affected_vote(votes: list[bool | None]) -> bool | None:
+    """Collapse range votes: any affected result wins, then a unanimous clear."""
+    if any(vote is True for vote in votes):
+        return True
+    if votes and all(vote is False for vote in votes):
+        return False
+    return None
+
+
 def _references(records: list[dict]) -> list[str]:
     """Keep at most five unique advisory reference URLs for reporting."""
     urls: list[str] = []
@@ -663,15 +672,9 @@ def _from_osv(
             errors=errors,
             references=_references(records),
         )
-    affected_votes = (
+    affected = _affected_vote(
         [osv_version_affected(version, entry) for entry in entries] if version else []
     )
-    if any(vote is True for vote in affected_votes):
-        affected: bool | None = True
-    elif affected_votes and all(vote is False for vote in affected_votes):
-        affected = False
-    else:
-        affected = None
     fixed = collect_fixed_versions(entries)
     ranges = describe_ranges(entries)
     # The smallest fixed version can sit inside another affected range, so
@@ -752,13 +755,11 @@ def _from_github(
             ranges.append(vulnerable)
         if patched and parse_version(patched) and patched not in fixed:
             fixed.append(patched)
-    affected = None
-    if version and ranges:
-        votes = [_github_range_contains(version, item) for item in ranges]
-        if any(vote is True for vote in votes):
-            affected = True
-        elif votes and all(vote is False for vote in votes):
-            affected = False
+    affected = (
+        _affected_vote([_github_range_contains(version, item) for item in ranges])
+        if version and ranges
+        else None
+    )
     floor = first_unaffected(
         version,
         fixed,

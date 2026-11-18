@@ -1579,7 +1579,7 @@ def update_dockerfile_tag(
     not left half on the vulnerable tag. Digest pins are left alone.
     Return the repo-relative paths that changed.
     """
-    name, current = _image_name_tag(image)
+    name, current = image_name_tag(image)
     if not name or not current:
         return []
     if files is None:
@@ -1601,7 +1601,7 @@ def update_dockerfile_tag(
     return changed
 
 
-def _image_name_tag(image: str) -> tuple[str | None, str | None]:
+def image_name_tag(image: str) -> tuple[str | None, str | None]:
     """Split an image tag and reject digest-pinned or untagged references."""
     if "@" in image:
         return None, None

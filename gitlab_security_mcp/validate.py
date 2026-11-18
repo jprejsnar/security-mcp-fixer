@@ -24,6 +24,7 @@ from gitlab_security_mcp.manifests import (
     iter_files,
     java_build_roots,
 )
+from gitlab_security_mcp.util import read_bounded
 
 
 def run_validation(
@@ -273,6 +274,23 @@ def _java_major(text: str, expected: int) -> bool:
     return int(match.group("major")) >= expected
 
 
+def _prepare_node(
+    runner, tool: str, install: list[str], audit: list[str], timeout: int, root: Path
+) -> list[dict]:
+    """Run one locked install, then one informational audit."""
+    return [
+        _run(runner, [tool, *install], timeout, required=True, cwd=root),
+        _run(
+            runner,
+            [tool, *audit],
+            timeout,
+            required=False,
+            informational=True,
+            cwd=root,
+        ),
+    ]
+
+
 def _node(
     root: Path,
     stack: StackInfo,
@@ -309,87 +327,24 @@ def _node(
         )
         row.update(kind="lint", cwd=str(root), required=False, baseline_only=True)
         return [row]
-    rows = []
     if manager == "npm":
-        rows.append(
-            _run(
-                runner,
-                [tool, "ci", "--ignore-scripts"],
-                timeout,
-                required=True,
-                cwd=root,
-            )
-        )
-        rows.append(
-            _run(
-                runner,
-                [tool, "audit", "--json"],
-                timeout,
-                required=False,
-                informational=True,
-                cwd=root,
-            )
-        )
+        install, audit = ["ci", "--ignore-scripts"], ["audit", "--json"]
     elif manager == "pnpm":
-        rows.append(
-            _run(
-                runner,
-                [tool, "install", "--frozen-lockfile", "--ignore-scripts"],
-                timeout,
-                required=True,
-                cwd=root,
-            )
-        )
-        rows.append(
-            _run(
-                runner,
-                [tool, "audit", "--json"],
-                timeout,
-                required=False,
-                informational=True,
-                cwd=root,
-            )
+        install, audit = (
+            ["install", "--frozen-lockfile", "--ignore-scripts"],
+            ["audit", "--json"],
         )
     elif is_modern_yarn(root):
-        rows.append(
-            _run(
-                runner,
-                [tool, "install", "--immutable", "--mode=skip-build"],
-                timeout,
-                required=True,
-                cwd=root,
-            )
-        )
-        rows.append(
-            _run(
-                runner,
-                [tool, "npm", "audit", "--json"],
-                timeout,
-                required=False,
-                informational=True,
-                cwd=root,
-            )
+        install, audit = (
+            ["install", "--immutable", "--mode=skip-build"],
+            ["npm", "audit", "--json"],
         )
     else:
-        rows.append(
-            _run(
-                runner,
-                [tool, "install", "--frozen-lockfile", "--ignore-scripts"],
-                timeout,
-                required=True,
-                cwd=root,
-            )
+        install, audit = (
+            ["install", "--frozen-lockfile", "--ignore-scripts"],
+            ["audit", "--json"],
         )
-        rows.append(
-            _run(
-                runner,
-                [tool, "audit", "--json"],
-                timeout,
-                required=False,
-                informational=True,
-                cwd=root,
-            )
-        )
+    rows = _prepare_node(runner, tool, install, audit, timeout, root)
     if rows[0]["status"] == "FAILED":
         rows.append(
             _row(
@@ -838,9 +793,8 @@ def _executed_gradle_tests(
         if stamp[1] > 10 * 1024 * 1024:
             raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
         try:
-            with path.open("rb") as stream:
-                contents = stream.read(10 * 1024 * 1024 + 1)
-            if len(contents) > 10 * 1024 * 1024:
+            contents = read_bounded(path, 10 * 1024 * 1024)
+            if contents is None:
                 raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
             report = ElementTree.fromstring(contents)
         except ElementTree.ParseError as exc:

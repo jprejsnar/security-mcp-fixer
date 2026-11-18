@@ -18,6 +18,7 @@ from gitlab_security_mcp.manifests import (
     dockerfile_images,
     gradle_uses_enforced_platform,
     gradle_version_files,
+    image_name_tag,
     is_modern_yarn,
     spec_already_allows,
     update_csproj_version,
@@ -356,14 +357,14 @@ def _image_plan(
     image = (finding.get("location") or {}).get("image")
     component = finding.get("component") or ""
     if image:
-        name, _tag = _split_image(image)
+        name, _tag = image_name_tag(image)
     else:
         name = None
     if name and component and not _same_image(component, name, image):
         return None
     if not name:
         for candidate in dockerfile_images(root, files):
-            candidate_name, _tag = _split_image(candidate)
+            candidate_name, _tag = image_name_tag(candidate)
             if candidate_name and _same_image(component, candidate_name, candidate):
                 name = candidate_name
                 image = candidate
@@ -383,16 +384,6 @@ def _image_plan(
         description=f"Move the {name} base image tag to {fixed}.",
         oracle=oracle,
     )
-
-
-def _split_image(image: str) -> tuple[str | None, str | None]:
-    """Separate image repository and tag; reject digest-pinned references."""
-    if "@" in image:
-        return None, None
-    if ":" not in image:
-        return image, None
-    name, tag = image.rsplit(":", 1)
-    return name, tag
 
 
 def _same_image(component: str, name: str, image: str | None) -> bool:

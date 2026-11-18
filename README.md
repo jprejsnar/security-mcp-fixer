@@ -487,10 +487,10 @@ flowchart TB
   reviewer["Human reviewer"] --> host["MCP host and AI agent"]
   host <-->|"MCP requests and results over stdio"| server["Local Python MCP process"]
   host -->|"Read exact-version package docs and compatibility guides"| publisher["Official publisher documentation"]
-  host -->|"Read complete source and trace callers, inputs and controls"| checkout["One or more application checkouts"]
+  host -->|"Open the GitLab file and line, then trace callers and inputs"| checkout["One or more application checkouts"]
   host -->|"Submit per-finding review with full-byte hashes"| server
-  server -->|"Unchecked approval form through host elicitation"| reviewer
-  reviewer -->|"Explicit checkbox selections only"| approval["Human-approved false-positive dismissal"]
+  server -->|"Windows checkbox windows, or a host form when Windows is unavailable"| reviewer
+  reviewer -->|"Checked boxes only"| approval["Human-approved false-positive dismissal"]
   approval -->|"Fixed GitLab mutation and exact assessment reason"| gitlab
   gitlab -->|"Independent state and dismissal-reason read-back"| server
 
@@ -500,14 +500,14 @@ flowchart TB
     github["GitHub Advisory identifiers, requested together"]
     nvd["NVD fallback with shared pacing and bounded retries"]
     publisherPages["Required publisher and directive documentation"]
-    securityPages["Informational CVE, CWE, NSA and NIST references"]
+    securityPages["Named CVE records and CWE definitions"]
   end
 
   server -->|"Tracked main and active findings, pages in cursor order"| gitlab
   server -->|"Try OSV, then GitHub, then NVD"| osv
   server -->|"Same source order; earliest GitHub id still wins"| github
   server -->|"Only when OSV and GitHub have no record"| nvd
-  server -->|"Before every edit: bounded batches, at most 8 workers each"| publisherPages
+  server -->|"Cited language, manifest, or config pages; at most 8 workers"| publisherPages
   server -->|"Record consulted sites even when records are missing"| securityPages
   server -->|"Live text bars via MCP progress notifications"| host
   server -->|"Inspect and apply supported local edits"| checkout
@@ -540,6 +540,8 @@ permission to claim a finding is safe and not a veto on a concrete GitLab fix. P
 bodies are hashed in full and then discarded. The recorded SHA-256 covers every
 response byte. Phrase checks use the first 1 MB. Up to four CVE records, their
 NVD detail pages, and four CWE definitions are added when the finding names them.
+NSA catalog homes are not requested. A named CVE or CWE page that fails to load
+blocks a false-positive conclusion; it does not block a concrete code edit.
 
 ### Internal components
 
@@ -554,6 +556,7 @@ runs one allowlisted command at a time.
 ```mermaid
 flowchart TB
   launcher["Root server.py: source launcher"] --> tools["Package server.py: fifteen MCP tools and error boundary"]
+  tools --> desktop["desktop_approval.py: Windows fix-selection and false-positive windows"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Severity positions, Windows console, notifications and bounded transcript"]
   progress --> progressCleanup["Bounded drain; cancel and await sender; reject late callbacks"]
@@ -591,7 +594,7 @@ flowchart TB
   remediation --> configFindings
   remediation --> manifests
   engine --> aaa["aaa.py: supported base-image regression tests"]
-  engine --> validation["validate.py: lint-only capture before edits, full checks after the complete batch"]
+  engine --> validation["validate.py: informational lint before edits; production builds after the batch"]
   validation --> manifests
   engine --> gitOps["git_ops.py: main, branch and diff operations"]
 
@@ -601,7 +604,7 @@ flowchart TB
   validation --> runner
   runner --> processes["Owned command trees, stdout/stderr readers and full logs"]
   processes --> processCleanup["Timeout, cancellation or exit: reap descendants and close handles"]
-  runner -->|"Production build and unit-test progress"| progress
+  runner -->|"Production-build progress; unit and integration tests stay off"| progress
   officialDocs -->|"Completed document request counts"| progress
 
   engine --> state["state.py: active RunState and inspection snapshot"]
@@ -651,16 +654,21 @@ flowchart TD
   retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
   moreFindings -->|"No"| fixSelection["select_security_fixes: unchecked eligible choices; blocked rows disabled; build-only trials disclosed"]
   fixSelection --> selectionMode{"Windows native selection?"}
-  selectionMode -->|"Yes"| selectionWait["No review deadline: submit choices; reviewed packages execute automatically"]
+  selectionMode -->|"Yes"| selectionWait["No review deadline. Submit the checked choices."]
   selectionMode -->|"No: host-controlled form"| approvedFixes{"Human selected any issues?"}
-  selectionWait --> approvedFixes
+  selectionWait --> windowsKind{"What was checked?"}
+  windowsKind -->|"Package updates"| serverBatch["Server qualifies, edits, and production-build validates those packages"]
+  serverBatch --> reports
+  windowsKind -->|"Source-code fixes"| sourceContinue["Host continues only those source fixes"]
+  sourceContinue --> editKind
+  windowsKind -->|"Nothing"| reports
   approvedFixes -->|"No: skip code, continue independent false positives"| reports
   approvedFixes -->|"Yes: selected issues only"| editKind
   moreFindings -->|"Yes"| verify["verify_security_finding: source workflow or local package/advisory evidence"]
   verify --> decisionGate{"Decision?"}
-  decisionGate -->|"SOURCE_REVIEW_REQUIRED"| sourceReview["Host AI reads complete source and relevant callers/configuration"]
+  decisionGate -->|"SOURCE_REVIEW_REQUIRED"| sourceReview["Host opens the GitLab file and line and reads that code"]
   sourceReview --> sourceGate{"Sufficient evidence available?"}
-  sourceGate -->|"Yes: submit hash-bound source_review"| verify
+  sourceGate -->|"Yes: plain 2-sentence reason plus hash-bound trace"| verify
   sourceGate -->|"No: explicit blocker"| unresolved
   decisionGate -->|"CONFIRMED_VULNERABILITY without a supported plan"| sourceDefect["Retain confirmed source issue for later human fix selection"]
   sourceDefect --> unresolved
@@ -695,8 +703,8 @@ flowchart TD
   validationGate -->|"Yes"| reports["complete_security_run: reuse current assessments"]
   validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
   rollbackGate -->|"Retain green subset or report blocked recovery"| reports
-  reports --> eligible{"Eligible false positives and host form support?"}
-  eligible -->|"Yes"| form["Human receives initially unchecked checkbox form"]
+  reports --> eligible{"Eligible false positives?"}
+  eligible -->|"Yes"| form["Unchecked checkboxes: Windows window, or a host form"]
   form --> selected{"Human submitted checked selections?"}
   selected -->|"Yes"| dismiss["Validate identity and fresh source; dismiss only selected findings with exact reasons"]
   selected -->|"No: decline, cancel or unchecked"| finalReport["Generate final report with actual approval and validation outcomes"]
@@ -853,13 +861,14 @@ A finding is auto-fixed only when all of these are true:
 
 An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before qualification. Failed lookups are informational when GitLab provides a concrete newer fix. Production builds, dependency checks and test-free policy checks determine acceptance; failures isolate offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
 
-CVE, CWE, NSA and NIST security-reference pages are best-effort information,
-not an authorization gate for version or supported code/configuration fixes.
+Named CVE record pages and CWE definitions are read when GitLab names those
+identifiers. NSA catalog homes are not requested. A failed named record blocks
+a false-positive conclusion and does not block a supported code or version edit.
 Unavailable records, 404/503 responses and missing fix descriptions are recorded
-without blocking edits. Publisher directive pages and configured policy checks
-remain separate requirements. Validation evidence lists the actual consulted
-site URLs; it does not claim CVE, CWE, NSA or another provider was queried merely
-because its identifier was present.
+without blocking edits. Publisher pages for the cited language, manifest, or
+config, and configured policy checks, remain separate requirements. Validation
+evidence lists the actual consulted site URLs. It does not claim a provider was
+queried merely because its name appeared.
 
 Unknown reachability is not treated as a false positive. Secret detection and DAST findings are reported for you to handle. They are not rewritten. SAST findings are not patched by guessing at source changes.
 
@@ -945,8 +954,9 @@ state or refresh a newer run's report.
 
 On other platforms, hosts supporting **MCP form elicitation** display an in-chat
 form; those requests remain subject to the host's own deadlines. Both presentations
-display one initially unchecked boolean/checkbox per eligible assessment, including finding ID,
-location and exact reason. Select the findings you approve and submit the form.
+show one initially unchecked checkbox per eligible assessment. The Windows reason
+column is the plain explanation, without the file path or line number. The issue
+title identifies the finding. Select the findings you approve and submit the form.
 Submission immediately dismisses only selected findings in GitLab with
 `dismissalReason: FALSE_POSITIVE` and the displayed reason as `comment`, using
 [`vulnerabilityDismiss`](https://docs.gitlab.com/api/graphql/reference/mutations/#vulnerabilitydismiss).
@@ -1239,7 +1249,11 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   `anyio>=4.16.0,<5`, `pytest>=9.2.0` and `ruff>=0.17.5,<1`.
   Isolated wheel builds use `setuptools>=84.2.1` through the declared PEP 517
   backend. Pydantic and AnyIO are explicit dependencies because production and
-  test code import them directly, respectively.
+  test code import them directly, respectively. These lines are minimums.
+  Installing the requirements file again does not replace a version that
+  already meets its floor. Use
+  [Refresh installed dependency versions](#refresh-installed-dependency-versions)
+  to move an existing environment forward.
 - A GitLab token with `read_api` and access to the project's vulnerability report.
   Optional false-positive dismissal requires `api` write scope and a GitLab role
   permitted to dismiss the finding; a read-only token does not enable writes.
@@ -1412,7 +1426,7 @@ sequenceDiagram
     else Fresh exact plan
       MCP->>Docs: Read the required publisher pages together
       MCP-->>Host: Live completed-document text bar
-      Note over Docs,MCP: CVE, CWE, NSA and NIST reads are informational
+      Note over Docs,MCP: Named CVE and CWE pages are read; a failed record blocks a false positive, not the edit
       alt A required page cannot be read
         MCP-->>Host: DOCS_REQUIRED and no file change
       else Current pages were read
@@ -2179,6 +2193,46 @@ from the MCP source clone, not the application repository:
 Use `.venv/bin/python` on macOS/Linux. Do not run these source commands against
 an unrelated environment or install the application into the MCP environment.
 
+### Refresh installed dependency versions
+
+`requirements.txt` and `requirements-dev.txt` record the oldest accepted
+release, not the copy currently installed. `pip install -r` leaves a package
+in place when it already satisfies that floor. Upper bounds such as
+`mcp[cli]<3` and `ruamel.yaml<0.20` still block a new major line.
+
+Stop the MCP connection first. From the MCP source clone, upgrade that
+environment and list anything still behind:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip list --outdated
+.\.venv\Scripts\python.exe -m pip check
+```
+
+```bash
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install --upgrade -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pip list --outdated
+.venv/bin/python -m pip check
+```
+
+An empty outdated list means every installed package is the newest release
+pip can select. `pip check` must report no broken requirements. Run the unit
+suite before trusting a development environment, then start the MCP connection
+again. Restarting loads the upgraded libraries; an open server keeps the old
+process.
+
+After a newer release is confirmed, raise the matching floor in
+`pyproject.toml`, `requirements.txt`, and `requirements-dev.txt`. The next
+fresh install then cannot return to the older release. A new major version
+also requires raising its upper bound before pip will install it.
+
+A wheel deployment upgrades libraries only inside the environment that runs
+`gitlab-security-mcp`. Use that environment's Python for the same
+`--upgrade` install. Upgrading the source clone does not change a wheel
+installation.
+
 ### VS Code and Copilot upgrade steps
 
 1. In the intended Copilot session, open **Chat: Open Customizations > MCP Servers**.
@@ -2564,54 +2618,20 @@ a command-line replacement for the agent request above.
 3. Use clean `main` or today's allowed security branch in `REPO_ROOT`; finish
    any in-progress Git operation. Prior errors block same-day reuse.
 4. Start/reload `gitlab-security` and enable its tools.
-5. Ask the host agent to follow the workflow below.
+5. Ask the host agent to follow the [workflow](#workflow).
 6. Review the returned unresolved table, validation/isolation evidence, local reports, and `git diff`.
 7. Commit and push manually only after reviewing the evidence and changes.
 
 Example agent request:
 
 ```text
-Use the gitlab-security MCP tools in order for one checkout. Pass the same
-absolute repo_root on every call when more than one checkout is active. Run
-prechecks and pull main twice. Do not run eager pnpm clean/install, test discovery
-or pre-edit informational lint.
-Then create the security branch, list findings, and
-verify each finding. For package updates, review the exact target docs and call
-qualify_package_update with compatibility and documented license evidence,
-obeying any configured corporate policy. Let the server read the required
-publisher pages before every edit. Treat DOCS_REQUIRED as no change. Cited
-nginx and GitLab CI lines may change only when the current page still documents
-that one-line edit. Never invent approvals or force incompatible framework
-versions. Never change production code, unit tests or check scripts to support
-any package version. Read current manager-specific official documentation and
-cite it in the compatibility review. Apply reviewed updates first, then run
-production builds, necessary dependency resolution and test-free policy checks
-once for the complete batch. Never execute unit/integration suites, including
-during rollback diagnosis. Do not silently waive conflicting corporate checks.
-Do not run a pre-fix build/test suite. Keep live MCP progress
-bars visible; never insert sleeps, polling waits or elapsed-time percentages.
-Accept only with passing builds, dependency proof and required test-free policy checks.
-Only a failed final batch permits diagnostic build/resolution reruns. The server
-splits failed groups, replays reviewed subsets with guarded dependency restores,
-and retains a passing combination. Reject incompatible updates and interactions.
-Require green final builds and dependency checks, even when every update is
-rejected and the original baseline is restored. Never claim a broken baseline
-is recovered. Do not retry rejected targets blindly or adapt source/tests.
-Finish with complete_security_run to save the local report and automatically
-offer the human checkbox form once. Do not wait for an additional readiness message.
-Do not open the submit form during verification. Display final_summary_markdown verbatim at the
-end of your final response: the six-column security issues table. Inspect
-isolation_trials, retained_updates and rejected_updates after recovery.
-If validation returns FIX_REJECTED with continue_with_next_finding true,
-all candidates were rejected and the baseline proved green. Otherwise
-stop on run-level failures, incomplete validation or unsafe rollback. Retain finding-level
-manual-review and no-safe-fix reasons; continue only with eligible findings.
-Do not commit, push, or claim pending edits are resolved. Dismiss false positives
-only through submit_false_positive_approvals after the human checks and submits
-the form. Completion invokes that gate automatically; only explicitly reopen it on human request.
-Do not open that form during verification, and do not make
-a separate review/report call in this standard workflow.
+run gitlab-security on this repo
 ```
+
+That request uses the workflow above. Pass the same absolute `repo_root` when
+more than one checkout is open. The server instructions already require human
+selection before edits, one approval offer at `complete_security_run`, and no
+commit, push, or invented approval.
 
 ### Reports and local artifacts
 
@@ -2673,9 +2693,12 @@ not package-advisory findings. `verify_security_finding` returns
 the cited path, full-byte SHA256, line, and a short window in
 `ai_source_review.cited_source`, with `status: "HOST_REVIEW_REQUIRED"`.
 The file body is not returned.
-The calling host AI must read that source and trace configuration,
-callers, mutation paths and possible untrusted inputs. Neither a test filename,
-missing source nor missing CVE proves safety.
+The calling host AI opens the file and line GitLab already reported, reads that
+code in the checkout, and traces configuration, callers, and inputs. The
+false-positive `reason` is what a non-developer reads: at most 2 sentences and
+400 characters, with no path or line number. The trace stays in the other
+`source_review` fields. Neither a test filename, missing source, nor missing
+CVE proves safety.
 
 For a proven false positive, call `verify_security_finding` again with
 `source_review` containing `decision: "FALSE_POSITIVE"`, `reason`, `input_origin`,
@@ -2958,11 +2981,11 @@ for deployment and restart differences.
 | `Ctrl+Shift+P` does not open MCP settings | It opens the Command Palette only. In VS Code use **Chat: Open Customizations > MCP Servers** or **MCP: List Servers** when available; in Cursor use Customize/MCP settings. Verify the IDE features and organization policy. |
 | `APPROVAL_UNAVAILABLE` | The host did not advertise form support or could not open the form. No new findings are dismissed by that call. Use a form-capable host or the GitLab UI; do not generate AI approval values or repeatedly reopen a declined form. |
 | No eligible false-positive assessments | Inspect `SOURCE_REVIEW_REQUIRED`, `ASSESSMENT_REQUIRED` or `ALREADY_DISMISSED` and the excluded-finding blockers. The host AI must finish source review and submit valid current evidence first; a scanner flag alone is insufficient. Do not relist or rescan merely to open approvals. |
-| `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI must read the supplied complete source, trace inputs/callers/configuration and submit `source_review` within the same request. This is not a request for the user to analyze code. Deprecated sampling is intentionally disabled. |
+| `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI opens the file and line GitLab already reported, reads that code in the checkout, and submits `source_review`. The visible reason is at most 2 everyday sentences and 400 characters. This is not a request for the user to analyze code. The file body is not returned. Deprecated sampling is intentionally disabled. |
 | Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval`, `gitlab_dismissal_counts` and saved `gitlab_dismissals` verification. Only an independent read of persisted `DISMISSED` / `FALSE_POSITIVE` establishes confirmation; mutation acknowledgements alone remain unverified. Check the Vulnerability report's Dismissed/False positive filters and tracked ref, not historical scanner artifacts. Inspect unknown outcomes; never automatically retry writes. |
 | NVD returns 429/503 or times out | Review recorded errors and pacing/retry progress. Bounded retries honor shared cooldowns and `Retry-After`; long cooldowns fail explicitly. Do not bypass rate limits or treat an outage as proof of safety. |
 | Approval window opens on an unexpected monitor | Search server stderr for `Approval window pid=... reported diagnostics`. It names why the MCP host window could not be identified; the dialog then uses the active monitor. |
 | `Desktop task failed` or `Approval window pid=... returned unreadable output` | The background approval owner or native dialog failed. The saved form/selection status records the failure and nothing was authorized. Use the logged traceback, process ID and exit code, then reopen the form. |
 | Windows command containment cannot be established | The command fails explicitly before its suspended child resumes; owned resources are cleaned up. Inspect the error and host/job/security-policy restrictions with your administrator rather than disabling containment or launching an uncontained fallback. |
 | Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |
-| `SOURCE_REVIEW_REQUIRED` | Read `source_workflow`, trace the cited source and input origins, and supply source-bound review evidence or reproduce/fix/validate the source defect. Missing advisories are not a SAST disposition. |
+| `SOURCE_REVIEW_REQUIRED` | Open the file and line in `source_workflow`, read that code, and supply the hash-bound review or reproduce, fix, and validate the source defect. The visible false-positive reason is at most 2 everyday sentences. Missing advisories are not a SAST disposition. |

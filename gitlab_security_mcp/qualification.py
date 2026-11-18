@@ -18,7 +18,12 @@ from urllib.parse import urlparse
 from gitlab_security_mcp.commands import assert_allowed, resolve_tool, tool_name
 from gitlab_security_mcp.manifests import iter_files, java_project_root
 from gitlab_security_mcp.official_docs import manager_documentation
-from gitlab_security_mcp.util import atomic_write_text, json_object, resolve_inside
+from gitlab_security_mcp.util import (
+    atomic_write_text,
+    json_object,
+    read_bounded,
+    resolve_inside,
+)
 from gitlab_security_mcp.validate import (
     _run_result,
     java_wrapper,
@@ -238,9 +243,8 @@ def _read_bounded(path: Path, limit: int) -> bytes:
     Bound the actual read rather than trusting a preceding stat result.
     Read and decoding errors propagate to the qualification boundary.
     """
-    with path.open("rb") as stream:
-        contents = stream.read(limit + 1)
-    if len(contents) > limit:
+    contents = read_bounded(path, limit)
+    if contents is None:
         raise ValueError(f"{path.name} exceeds the qualification size limit")
     return contents
 
