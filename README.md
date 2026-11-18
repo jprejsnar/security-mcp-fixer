@@ -1243,7 +1243,21 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
 
 ### Prerequisites
 
-- Python 3.11 or newer and Git on Windows, macOS, or Linux.
+- Python 3.11 or newer, including `pip` and `venv`, and Git on Windows,
+  macOS, or Linux. VS Code and Cursor start the `gitlab-security-mcp` Python
+  program; Git is required before that program can check or update a checkout.
+  The Windows helper
+  [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) stops before
+  it creates or changes an environment when `py -3` is missing, older than
+  3.11, or has no `venv` and `pip`, and when `git` is missing. It does not
+  install them for you. On Windows, install them with the
+  [winget commands](#install-windows-prerequisites-with-winget).
+- PowerShell 7 (`pwsh`) before a Windows install that uses the same helper.
+  The helper stops in the same way when `pwsh` is missing or older than 7.
+  Windows PowerShell 5.1 can launch the script only when PowerShell 7 is
+  already on `PATH`. Use the same
+  [winget commands](#install-windows-prerequisites-with-winget). macOS and
+  Linux wheel installs do not use this script and do not require PowerShell.
 - Runtime floors: `mcp[cli]>=2.3.0,<3`, `httpx>=0.28.1`, `packaging>=26.3`,
   `pydantic>=2.14.3,<3`, and `ruamel.yaml>=0.19.1,<0.20`. Development floors are
   `anyio>=4.16.0,<5`, `pytest>=9.2.0` and `ruff>=0.17.5,<1`.
@@ -1812,10 +1826,30 @@ Activation is optional when commands use the virtual environment's executable.
 Use absolute paths in the MCP configuration so the host's working directory and
 global Python installation cannot select the wrong server.
 
+### Install Windows prerequisites with winget
+
+Run these three commands once in Windows PowerShell or PowerShell 7 before the
+Windows helper. PowerShell 7 provides `pwsh`. Python 3.14 satisfies the 3.11
+minimum and includes the `py` launcher, `venv`, and `pip`. Git for Windows
+provides `git`.
+
+```powershell
+winget install --id Microsoft.PowerShell -e
+winget install --id Python.Python.3.14 -e
+winget install --id Git.Git -e
+```
+
+Close that window and open a new one so the new commands are on `PATH`. The
+helper does not install these programs.
+
 ### Installing a built wheel
 
 **Windows upgrades:** close **all instances of VS Code and Cursor**, including
-Agents/background windows, before installing. Use a standalone PowerShell window.
+Agents/background windows, before installing. Install PowerShell 7, Python
+3.11 or newer, and Git with the
+[winget commands](#install-windows-prerequisites-with-winget), then use a
+standalone PowerShell window. The helper checks all three before it creates
+or changes the environment.
 A running `gitlab-security-mcp.exe` is locked by Windows (`WinError 32`); the
 executable cannot intercept an external pip install to shut itself down.
 
@@ -1826,9 +1860,9 @@ wheel and run it instead of the raw pip command:
 & "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.36-py3-none-any.whl"
 ```
 
-The helper defaults to `$HOME\Tools\gitlab-security-mcp`, creates the environment
-if needed, and checks for a locked launcher **before** pip can alter the
-installation. A lock produces the explicit close-all-windows message; the helper
+The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
+7, Python 3.11, pip, and Git, then checks for a locked launcher **before** pip
+can alter the installation. It creates the environment if needed. A lock produces the explicit close-all-windows message; the helper
 never kills applications or server processes. It reinstalls the package to repair
 an interrupted upgrade and checks dependencies. Use `-InstallDirectory` for a
 different environment, or `-WhatIf` for a preflight-only preview.
@@ -2165,8 +2199,11 @@ and restarting does not undo edits or confirmed GitLab dismissals.
 | Installed `gitlab-security-mcp` entry point | Obtain the new trusted wheel; stop all connections using that environment; install the wheel into that exact environment; check version/dependencies; start the connection again. Updating the source clone alone has no effect. |
 | Virtualenv Python plus the absolute source `server.py` | Obtain reviewed source changes in that clone; install changed runtime requirements into its configured virtualenv if needed; stop/start the connection. Source-only changes need no wheel build or reinstall. |
 
-For Windows wheel deployments, close all VS Code/Cursor windows, including
-Agents/background windows, and use **standalone PowerShell**:
+For Windows wheel deployments, install PowerShell 7, Python 3.11 or newer,
+and Git with the
+[winget commands](#install-windows-prerequisites-with-winget). Close all
+VS Code/Cursor windows, including Agents/background windows, and use
+**standalone PowerShell**:
 
 ```powershell
 & "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.36-py3-none-any.whl"
