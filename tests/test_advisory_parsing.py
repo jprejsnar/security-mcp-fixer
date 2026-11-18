@@ -13,6 +13,195 @@ from gitlab_security_mcp.versions import (
 FINDING = {"identifiers": ["CVE-2021-23337"], "title": "lodash"}
 
 
+@pytest.mark.parametrize("independent_bounds", [True, False])
+def test_withdrawn_osv_record_cannot_supply_an_active_range_or_fix(independent_bounds):
+    """Continue to independent evidence instead of trusting a withdrawn OSV advisory."""
+    # Arrange
+    finding = {"identifiers": ["CVE-2021-23337", "GHSA-35jh-r3h4-6jhm"]}
+
+    def handler(request):
+        """Serve the logged withdrawn-record shape and independent NVD bounds."""
+        if request.url.path.endswith("GHSA-35jh-r3h4-6jhm"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "GHSA-35jh-r3h4-6jhm",
+                    "withdrawn": "2026-11-18T15:38:56Z",
+                    "affected": [
+                        {
+                            "package": {"name": "lodash", "ecosystem": "npm"},
+                            "ranges": [
+                                {
+                                    "type": "SEMVER",
+                                    "events": [
+                                        {"introduced": "0"},
+                                        {"fixed": "99.0.0"},
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+        if request.url.host == "api.github.com":
+            return httpx.Response(200, json=[])
+        if independent_bounds and request.url.host == "services.nvd.nist.gov":
+            return httpx.Response(
+                200,
+                json={
+                    "vulnerabilities": [
+                        {
+                            "cve": {
+                                "configurations": [
+                                    {
+                                        "nodes": [
+                                            {
+                                                "cpeMatch": [
+                                                    {
+                                                        "criteria": "cpe:2.3:a:lodash:lodash:*:*:*:*:*:*:*:*",
+                                                        "vulnerable": True,
+                                                        "versionEndExcluding": "4.17.21",
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            result = client.lookup(finding, "npm", "lodash", "4.17.20")
+
+    # Assert
+    assert result.lowest_fixed_version == ("4.17.21" if independent_bounds else None)
+    assert result.affected is (True if independent_bounds else None)
+    assert any("withdrawn" in error.lower() for error in result.errors)
+    if not independent_bounds:
+        assert result.outcome == "lookup_failed"
+
+
+@pytest.mark.parametrize(
+    "versions,default,current,expected",
+    [
+        (
+            [
+                {
+                    "version": "0",
+                    "lessThanOrEqual": "4.4.1",
+                    "status": "affected",
+                    "versionType": "semver",
+                }
+            ],
+            "unaffected",
+            "4.4.1",
+            True,
+        ),
+        (
+            [
+                {
+                    "version": "0",
+                    "lessThanOrEqual": "4.4.1",
+                    "status": "affected",
+                    "versionType": "semver",
+                }
+            ],
+            "unaffected",
+            "4.4.2",
+            False,
+        ),
+        (
+            [
+                {"version": "4.4.0", "status": "affected"},
+                {"version": "4.4.1", "status": "affected"},
+            ],
+            None,
+            "4.4.1",
+            True,
+        ),
+        ([{"version": "4.4.0", "status": "affected"}], None, "4.4.1", None),
+        (
+            [
+                {
+                    "version": "5.0.0",
+                    "lessThanOrEqual": "4.4.1",
+                    "status": "affected",
+                    "versionType": "semver",
+                }
+            ],
+            "unaffected",
+            "4.4.1",
+            None,
+        ),
+        (
+            [
+                {
+                    "version": "0",
+                    "lessThanOrEqual": "4.4.1",
+                    "status": "affected",
+                    "versionType": "git",
+                }
+            ],
+            "unaffected",
+            "4.4.1",
+            None,
+        ),
+    ],
+)
+def test_cna_structured_versions_fill_missing_nvd_bounds(
+    versions, default, current, expected
+):
+    """Use exact CNA package/version evidence without inferring safe versions from omissions."""
+    # Arrange
+    ident = "CVE-2026-93690"
+    entry = {
+        "product": "uri-js",
+        "packageURL": "pkg:npm/uri-js",
+        "versions": versions,
+    }
+    if default is not None:
+        entry["defaultStatus"] = default
+
+    def handler(request):
+        """Return incomplete NVD data and a package-bound published CNA record."""
+        if request.url.host == "services.nvd.nist.gov":
+            return httpx.Response(
+                200, json={"vulnerabilities": [{"cve": {"id": ident}}]}
+            )
+        if request.url.host == "cveawg.mitre.org":
+            return httpx.Response(
+                200,
+                json={
+                    "cveMetadata": {"cveId": ident, "state": "PUBLISHED"},
+                    "containers": {"cna": {"affected": [entry]}},
+                },
+            )
+        if request.url.host == "api.github.com":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            result = client.lookup({"identifiers": [ident]}, "npm", "uri-js", current)
+
+    # Assert
+    assert result.affected is expected
+    assert f"cve:{ident}" in result.sources
+    assert result.lowest_fixed_version is None
+    if expected is True:
+        assert result.outcome == "no_fix_published"
+        assert "CNA" in result.summary
+    elif expected is None:
+        assert result.outcome == "lookup_failed"
+
+
 @pytest.mark.parametrize(
     "version, affected", [("2.7.5-r0", False), ("2.8.3-r0", True), ("2.8.4-r0", False)]
 )

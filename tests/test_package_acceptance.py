@@ -18,7 +18,11 @@ from gitlab_security_mcp.manifests import PackageHit
 from gitlab_security_mcp.qualification import run_checks
 from gitlab_security_mcp.remediate import apply_plan, plan_remediation
 from gitlab_security_mcp.validate import _product_result, run_validation
-from tests.conftest import documentation_client, manager_doc_sources
+from tests.conftest import (
+    documentation_client,
+    manager_doc_sources,
+    select_release_for_test,
+)
 
 
 @pytest.mark.parametrize(
@@ -746,6 +750,7 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
             engine.verify_security_finding(finding["id"])["decision"]
             == "CHANGE_REQUIRED"
         )
+        select_release_for_test(engine, finding["id"])
     reviews = {
         str(index): _review(package, "Maven") for index, package in enumerate(packages)
     }
@@ -1030,6 +1035,7 @@ def test_cross_stack_failure_reverts_only_offending_update(
         assert (
             engine.verify_security_finding(finding_id)["decision"] == "CHANGE_REQUIRED"
         )
+        select_release_for_test(engine, finding_id)
         qualified = engine.qualify_package_update(
             finding_id, _review(package, "NuGet" if manager == "nuget" else "Maven")
         )
@@ -1126,6 +1132,7 @@ def test_java_override_requires_actual_resolved_fixed_version(
     engine.state.status = "FINDINGS_LISTED"
     engine.state.findings = [deepcopy(finding)]
     assert engine.verify_security_finding("transitive")["decision"] == "CHANGE_REQUIRED"
+    select_release_for_test(engine, "transitive")
     assert (
         engine.qualify_package_update(
             "transitive", _review("example:library", "Maven")
@@ -1280,6 +1287,7 @@ def test_version_alignment_follows_selective_package_rollback(tmp_path, failure)
         assert (
             engine.verify_security_finding(finding_id)["decision"] == "CHANGE_REQUIRED"
         )
+        select_release_for_test(engine, finding_id)
         review = {**_review(package, "Maven"), "target": target}
         assert (
             engine.qualify_package_update(finding_id, review)["status"] == "QUALIFIED"

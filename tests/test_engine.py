@@ -2256,8 +2256,9 @@ def test_advisory_verified_dependency_fix_across_stacks(
 
     # Act
     verified = engine.verify_security_finding("cross-stack")
-    from tests.conftest import approve_package_for_test
+    from tests.conftest import approve_package_for_test, select_release_for_test
 
+    select_release_for_test(engine, "cross-stack")
     review = approve_package_for_test(tmp_path, verified["proposed_fix"])
     engine.package_policy_path = (
         tmp_path / ".security-mcp" / "package-update-policy.json"
@@ -2907,8 +2908,9 @@ def test_full_local_run_reports_every_required_section(cloned_repo):
     verified = {
         item["id"]: engine.verify_security_finding(item["id"]) for item in findings
     }
-    from tests.conftest import approve_package_for_test
+    from tests.conftest import approve_package_for_test, select_release_for_test
 
+    select_release_for_test(engine, "fix")
     review = approve_package_for_test(cloned_repo, verified["fix"]["proposed_fix"])
     engine.package_policy_path = (
         cloned_repo / ".security-mcp" / "package-update-policy.json"
@@ -3644,6 +3646,7 @@ def test_tools_are_registered():
         "create_security_branch",
         "list_security_findings",
         "verify_security_finding",
+        "select_package_version",
         "select_security_fixes",
         "qualify_package_update",
         "apply_minimal_fix",

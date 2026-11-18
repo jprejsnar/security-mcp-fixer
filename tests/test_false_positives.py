@@ -1219,8 +1219,10 @@ def test_typed_numeric_cwe_is_checked_and_retained_in_false_positive_audit(tmp_p
 
     # Assert
     assert result["decision"] == "FALSE_POSITIVE"
-    assert "https://cwe.mitre.org/data/definitions/601.html" in result["reason"]
-    assert "GitLab did not cite a CVE or CWE" not in result["reason"]
+    assert result["reason"] == review["reason"]
+    audit = engine.state.findings[0]["falsePositiveAudit"]
+    assert "https://cwe.mitre.org/data/definitions/601.html" in audit
+    assert "GitLab did not cite a CVE or CWE" not in audit
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
@@ -1586,10 +1588,18 @@ def test_non_regex_source_review_records_conclusion_and_retracts_stale_evidence(
     # Assert
     assert result["decision"] == decision
     assert payload["source_reviews"]["finding-1"] == review
+    if decision == "FALSE_POSITIVE":
+        audit = payload["false_positive_audits"]["finding-1"]
+        assert review["finding_analysis"] in audit
+        assert review["reviewed_files"][0]["sha256"] in audit
+        assert candidates[0]["reason"] == audit
+    else:
+        assert payload["false_positive_audits"] == {}
     assert bool(candidates) is (decision == "FALSE_POSITIVE")
     assert bool(payload["unresolved_issues"]) is (decision != "FALSE_POSITIVE")
     assert status["source_review_queue"]["finding_count"] == 1
     assert "sourceReview" not in engine.state.findings[0]
+    assert "falsePositiveAudit" not in engine.state.findings[0]
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 

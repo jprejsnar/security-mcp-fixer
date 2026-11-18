@@ -31,6 +31,7 @@ from gitlab_security_mcp.advisory import (
     AdvisoryClient,
     AdvisoryLookup,
 )
+from gitlab_security_mcp.alpine_packages import AlpinePackages, ApkPins
 from gitlab_security_mcp.commands import (
     CommandRunner,
     progress_sink,
@@ -56,6 +57,7 @@ from gitlab_security_mcp.official_docs import (
     OfficialDocs,
     cited_security_pages_ok,
 )
+from gitlab_security_mcp.package_releases import release_catalog, reviewed_selection
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
     backup_dependency_files,
@@ -205,6 +207,7 @@ class Engine:
         gitlab: GitLabClient | None = None,
         advisory: AdvisoryClient | None = None,
         docs: OfficialDocs | None = None,
+        alpine: AlpinePackages | None = None,
         runner: CommandRunner | None = None,
         which: Callable[[str], str | None] | None = None,
         today: date | None = None,
@@ -237,6 +240,8 @@ class Engine:
         self._owns_gitlab = gitlab is None
         self._owns_advisory = advisory is None
         self._owns_docs = docs is None
+        self._owns_alpine = alpine is None
+        self._alpine = alpine
         self.gitlab = (
             gitlab
             if gitlab is not None
@@ -299,6 +304,19 @@ class Engine:
                 self.docs = OfficialDocs(http_log_path=self.http_log_path)
             return self.docs
 
+    def _alpine_packages(self) -> AlpinePackages:
+        """Return the injected Alpine index reader or open one on first use."""
+        with self._lock:
+            if self._alpine is None:
+                self._alpine = AlpinePackages(http_log_path=self.http_log_path)
+            return self._alpine
+
+    def _apk_versions(
+        self, image: str | None, pinned: dict[str, str], names: list[str]
+    ) -> ApkPins:
+        """Look up current Alpine versions for a Dockerfile apk pinning plan."""
+        return self._alpine_packages().latest(image, pinned, names)
+
     @contextmanager
     def _tool_access(
         self, finding_id: str | None = None, *, verification: bool = False
@@ -349,8 +367,12 @@ class Engine:
                     if self._owns_advisory:
                         self.advisory.close()
                 finally:
-                    if self._owns_docs and self.docs is not None:
-                        self.docs.close()
+                    try:
+                        if self._owns_docs and self.docs is not None:
+                            self.docs.close()
+                    finally:
+                        if self._owns_alpine and self._alpine is not None:
+                            self._alpine.close()
 
     @classmethod
     def from_env(cls, repo_root: str | None = None) -> Engine:
@@ -860,6 +882,7 @@ class Engine:
                 }
             finding = deepcopy(current)
         finding.pop("sourceWorkflow", None)
+        finding.pop("falsePositiveAudit", None)
         finding.pop("dependencyResolution", None)
         try:
             self._progress(finding_id, "Assessing scanner category and local evidence")
@@ -1072,6 +1095,19 @@ class Engine:
                     "manager",
                 )
             }
+        elif plan.get("strategy") == "config_line":
+            identity["config_edit"] = {
+                key: deepcopy(plan.get(key))
+                for key in (
+                    "strategy",
+                    "files",
+                    "target",
+                    "line",
+                    "expected_line",
+                    "replacement_line",
+                    "line_edits",
+                )
+            }
         return identity
 
     @_serialized
@@ -1177,7 +1213,10 @@ class Engine:
         if (
             status == "APPROVED"
             and presentation == "WINDOWS_DIALOG"
-            and any("package_update" in identity for identity in approved.values())
+            and any(
+                "package_update" in identity or "config_edit" in identity
+                for identity in approved.values()
+            )
         ):
             self.state.fix_selection["package_execution"] = {"status": "QUEUED"}
         self._fix_selection_snapshot = (
@@ -1195,6 +1234,7 @@ class Engine:
             "created": status == "REQUESTED",
             "request_id": self.state.fix_selection["request_id"],
             "selected_ids": selected_ids,
+            "server_execution_queued": "package_execution" in self.state.fix_selection,
             "skipped_ids": [
                 item["id"] for item in candidates if item["id"] not in approved
             ],
@@ -1302,6 +1342,7 @@ class Engine:
         if current.get("candidates") != candidates:
             return {"status": "SELECTION_CHANGED", "next_tool": "get_run_status"}
         prepared = {}
+        warnings = {}
         required = []
         for item in candidates:
             plan = (self._finding(item["id"]) or {}).get("proposedFix") or {}
@@ -1328,7 +1369,9 @@ class Engine:
                     continue
                 review_package(review)
                 review_major_upgrade(self.repo_root, plan, review)
-                self._package_policy(plan, review)
+                policy = self._package_policy(plan, review)
+                self._require_package_version(plan)
+                warnings[item["id"]] = policy.get("warnings", [])
             except (OSError, ValueError, TypeError, RuntimeError) as exc:
                 log_unexpected(exc, f"package review preparation {item['id']}")
                 required.append(
@@ -1354,6 +1397,7 @@ class Engine:
                 for item in candidates
             )
         if required:
+            self._remember()
             return {
                 "status": "PACKAGE_REVIEW_REQUIRED",
                 "required_reviews": required,
@@ -1368,7 +1412,8 @@ class Engine:
         return {
             "status": "READY",
             "reviews": prepared,
-            "tree": tree_snapshot(self.repo_root) if prepared else {},
+            "warnings": warnings,
+            "tree": tree_snapshot(self.repo_root),
         }
 
     def execute_selected_package_updates(
@@ -1378,7 +1423,14 @@ class Engine:
         expected_tree: dict,
         cancelled: threading.Event,
     ) -> dict:
-        """Qualify, edit and validate the live human-selected batch without another AI turn."""
+        """Qualify, edit and validate the live human-selected batch without another AI turn.
+
+        Reviewed package updates are qualified, applied and validated together.
+        Approved documented configuration line edits (Dockerfile, nginx, GitLab
+        CI) are then applied one at a time, each followed by validation, because
+        only one pending non-package fix is allowed. Other selected fixes remain
+        host-led, so the run is finished automatically only when none remain.
+        """
         with self._lock:
             selection = self.state.fix_selection
             if (
@@ -1390,13 +1442,27 @@ class Engine:
             if execution.get("status") != "QUEUED":
                 return {"status": "ALREADY_EXECUTED"}
             selected_ids = selection["selected_ids"]
+            approved = selection.get("approved_findings") or {}
             package_ids = [
                 finding_id for finding_id in selected_ids if finding_id in reviews
             ]
-            source_ids = [
-                finding_id for finding_id in selected_ids if finding_id not in reviews
+            config_ids = [
+                finding_id
+                for finding_id in selected_ids
+                if finding_id not in reviews
+                and "config_edit" in (approved.get(finding_id) or {})
             ]
-            execution.update(status="RUNNING", results=[], source_ids=source_ids)
+            source_ids = [
+                finding_id
+                for finding_id in selected_ids
+                if finding_id not in reviews and finding_id not in config_ids
+            ]
+            execution.update(
+                status="RUNNING",
+                results=[],
+                config_ids=config_ids,
+                source_ids=source_ids,
+            )
             selection["package_execution"] = execution
             self._remember()
 
@@ -1475,6 +1541,16 @@ class Engine:
                 failed |= validation["status"] != "VALIDATION_COMPLETE" or bool(
                     validation.get("rejected_updates")
                 )
+            for finding_id in config_ids:
+                if self.state.manual_cleanup_required:
+                    failed = True
+                    break
+                applied = step("apply_minimal_fix", finding_id)
+                if applied["status"] != "APPLIED":
+                    failed = True
+                    continue
+                validation = step("run_validation_matrix")
+                failed |= validation["status"] != "VALIDATION_COMPLETE"
             if cancelled.is_set():
                 raise InterruptedError(
                     "Server shutdown interrupted the approved package batch."
@@ -1490,7 +1566,9 @@ class Engine:
             if self.state.fix_selection.get("request_id") != request_id:
                 return {"status": "STALE_SELECTION"}
             if status in {"INTERRUPTED", "BLOCKED"} and any(
-                change.get("validation_pending") for change in self._package_changes()
+                change.get("validation_pending")
+                for change in self.state.changes
+                if change.get("status") == "APPLIED"
             ):
                 self.state.manual_cleanup_required = True
             execution.update(
@@ -1505,6 +1583,153 @@ class Engine:
                 "finish_run": not source_ids
                 and status not in {"INTERRUPTED", "BLOCKED"},
             }
+
+    @_serialized
+    def select_package_version(
+        self, finding_id: str, review: dict | None = None
+    ) -> dict:
+        """Select the latest supported stable release before human fix approval."""
+        finding = self._finding(finding_id)
+        plan = (finding or {}).get("proposedFix") or {}
+        if (
+            self.state.status not in AFTER_BRANCH
+            or finding is None
+            or finding.get("remediationDecision") != "CHANGE_REQUIRED"
+            or plan.get("ecosystem") not in PACKAGE_ECOSYSTEMS
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Verify a package finding before release selection",
+            }
+        if self._package_changes():
+            return {
+                "status": "ERROR",
+                "reason": "Select package releases before applying any package updates",
+            }
+        if self.state.fix_selection.get("status") in {"REQUESTED", "AWAITING_HUMAN"}:
+            return {
+                "status": "ERROR",
+                "reason": "Close the pending approval form before changing package targets",
+            }
+        try:
+            catalog = release_catalog(
+                plan["ecosystem"], plan["package"], log_path=self.http_log_path
+            )
+            self._record_validation_sites(finding, [catalog["source"]])
+            if review is None:
+                return {
+                    "status": "RELEASE_REVIEW_REQUIRED",
+                    "finding_id": finding_id,
+                    "catalog": catalog,
+                    "advisory_floor": plan.get("advisory_floor", plan["target"]),
+                    "requirements": (
+                        "Review publisher support, actual project runtime compatibility, and target-version "
+                        "fees. Supply target=<exact reviewed eligible version>,"
+                        "supported=true,runtime_compatible=true,sources,assessment and "
+                        "excluded_releases [{version,reason: unsupported|runtime_incompatible|paid,"
+                        "sources,assessment}]. Never exclude a release merely because it is a major upgrade. "
+                        "Every paid release must be flagged for user investigation."
+                    ),
+                }
+            selection = reviewed_selection(
+                catalog, plan.get("advisory_floor", plan["target"]), review
+            )
+            selection["status"] = "PENDING"
+            finding["packageVersionSelection"] = deepcopy(selection)
+            for paid in selection["paid_releases"]:
+                warning = (
+                    f"PAID VERSION: {plan['package']} {paid['version']}; "
+                    f"blocked from automatic upgrade; investigate licensing: {paid['assessment']}"
+                )
+                if warning not in finding.setdefault("evidence", []):
+                    finding["evidence"].append(warning)
+            if "target" not in review or review["target"] != selection["target"]:
+                raise ValueError(
+                    f"The latest eligible target is {selection['target']!r}, but the release review "
+                    "does not identify that exact target. Review the current catalog and resubmit; "
+                    "a newly published release cannot inherit an older target's support or fee review."
+                )
+            if selection["target"] is None:
+                selection["status"] = "BLOCKED"
+                finding["packageVersionSelection"] = deepcopy(selection)
+                finding.pop("packageQualification", None)
+                plan.pop("release_selection", None)
+                self._remember()
+                return {
+                    "status": "NO_SAFE_FIX",
+                    "reason": "No supported, runtime-compatible stable release at or above the fix floor remains.",
+                    "selection": selection,
+                }
+            target = selection["target"]
+            target_advisory = self.advisory.lookup(
+                finding, plan["ecosystem"], plan["package"], target
+            )
+            self._record_validation_sites(finding, target_advisory.validation_sites)
+            if target_advisory.affected is not False:
+                raise ValueError(
+                    f"Latest eligible target {target} is affected or could not be verified against public advisories; manual investigation required"
+                )
+            decision, reason, evidence, proposed, prompt = self._decide(
+                finding, package_target=target
+            )
+            if decision != "CHANGE_REQUIRED" or proposed is None:
+                raise ValueError(f"Latest eligible release cannot be planned: {reason}")
+            selection["status"] = "SELECTED"
+            finding["packageVersionSelection"] = deepcopy(selection)
+            proposed["release_selection"] = selection
+            finding["proposedFix"] = proposed
+            finding.pop("packageQualification", None)
+            evidence.extend(
+                item
+                for item in finding.get("evidence", [])
+                if item.startswith("PAID VERSION:")
+            )
+            evidence.append(
+                f"Latest supported runtime-compatible stable target: {target}; {catalog['source']}."
+            )
+            finding["evidence"] = evidence
+            finding["assessment"] = {
+                "decision": decision,
+                "reason": reason,
+                "evidence": evidence,
+            }
+            if finding_id in self.state.decisions:
+                self.state.decisions[finding_id] = deepcopy(finding["assessment"])
+            self._remember()
+            return {
+                "status": "VERSION_SELECTED",
+                "finding_id": finding_id,
+                "proposed_fix": deepcopy(proposed),
+                "paid_releases": selection["paid_releases"],
+                "next_tool": "select_security_fixes",
+                "message": "Review this exact target and obtain fresh human approval; previous target qualification is invalid.",
+            }
+        except (httpx.HTTPError, OSError, ValueError, TypeError) as exc:
+            log_unexpected(exc, f"package release selection {finding_id}")
+            finding.pop("packageQualification", None)
+            plan.pop("release_selection", None)
+            if finding.get("packageVersionSelection"):
+                finding["packageVersionSelection"]["status"] = "BLOCKED"
+            self._remember()
+            return {
+                "status": "RELEASE_REVIEW_REQUIRED",
+                "finding_id": finding_id,
+                "reason": str(exc),
+                "eligible_for_auto_fix": False,
+            }
+
+    @staticmethod
+    def _require_package_version(plan: dict) -> None:
+        """Keep advisory-floor candidates out of the automatic editing path."""
+        selection = plan.get("release_selection") or {}
+        if (
+            selection.get("target") != plan.get("target")
+            or selection.get("status") != "SELECTED"
+        ):
+            raise ValueError(
+                "Call select_package_version before approval: the advisory fix is only a minimum, "
+                "not proof of the latest supported runtime-compatible stable release"
+            )
 
     @_serialized
     def qualify_package_update(self, finding_id: str, review: dict) -> dict:
@@ -1559,6 +1784,7 @@ class Engine:
             review_package(review)
             major_review = review_major_upgrade(self.repo_root, plan, review)
             policy = self._package_policy(plan, review)
+            self._require_package_version(plan)
             tree = tree_snapshot(self.repo_root)
             alignment_before = capture_version_alignment(self.repo_root, tree)
             scripts = package_script_hashes(self.repo_root, tree)
@@ -1597,6 +1823,7 @@ class Engine:
             finding["packageQualification"] = {
                 "status": "BLOCKED",
                 "reason": str(exc),
+                "plan": deepcopy(plan),
                 "baseline_results": baseline["results"],
             }
             if plan.get("major_upgrade") and isinstance(review, dict):
@@ -1619,6 +1846,7 @@ class Engine:
             "eligible_for_auto_fix": True,
             "approval": policy["approval"],
             "policy_mode": policy["policy_mode"],
+            "warnings": policy.get("warnings", []),
             "validation_mode": review.get("validation_mode", "reviewed"),
             "compatibility_limitations": review.get("compatibility_limitations"),
             "baseline_results": receipt["baseline_results"],
@@ -1718,6 +1946,7 @@ class Engine:
                         "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
                     )
                 policy = self._package_policy(proposed, receipt["review"])
+                self._require_package_version(proposed)
                 if receipt["policy_sha256"] != policy["policy_sha256"] or receipt[
                     "tree"
                 ] != tree_snapshot(self.repo_root):
@@ -1810,6 +2039,7 @@ class Engine:
             line=proposed.get("line"),
             expected_line=proposed.get("expected_line"),
             replacement_line=proposed.get("replacement_line"),
+            line_edits=tuple(proposed.get("line_edits") or ()),
             doc_pages=tuple(proposed.get("doc_pages") or ()),
             gradle_configurations=tuple(proposed.get("gradle_configurations") or ()),
             gradle_force=bool(proposed.get("gradle_force", False)),
@@ -2665,7 +2895,7 @@ class Engine:
                         "title": finding.get("title"),
                         "location": finding.get("location") or {},
                         "description": description,
-                        "reason": reason,
+                        "reason": finding.get("falsePositiveAudit") or reason,
                         "assessment": deepcopy(assessment),
                         "source_review": deepcopy(finding.get("sourceReview")),
                         **(
@@ -3024,6 +3254,28 @@ class Engine:
     def _package_policy(self, plan: dict, review: dict) -> dict:
         """Enforce configured/existing policy, otherwise require license review."""
         review_manager_guidance(plan, review)
+        license_review = review.get("license")
+        if isinstance(license_review, dict) and (
+            license_review.get("no_license_fees") is False
+            or license_review.get("commercial_use_permitted") is False
+        ):
+            for finding in self.state.findings:
+                proposed = finding.get("proposedFix") or {}
+                if all(
+                    proposed.get(key) == plan.get(key)
+                    for key in ("ecosystem", "package", "target")
+                ):
+                    finding["licenseInvestigation"] = {
+                        "package": plan.get("package"),
+                        "target": plan.get("target"),
+                        "sources": license_review.get("sources", []),
+                        "assessment": license_review.get("assessment"),
+                        "reason": "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; user investigation required.",
+                    }
+            raise ValueError(
+                "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; flag this target "
+                "for user investigation even when an older version or corporate approval is free."
+            )
         if self._package_policy_required or self.package_policy_path.exists():
             return load_policy(self.repo_root, self.package_policy_path, plan)
         return reviewed_license_policy(self.repo_root, plan, review)
@@ -3420,7 +3672,11 @@ class Engine:
             return None
 
     def _decide(
-        self, finding: dict, source_review: dict | None = None
+        self,
+        finding: dict,
+        source_review: dict | None = None,
+        *,
+        package_target: str | None = None,
     ) -> tuple[str, str, list[str], dict | None, str | None]:
         """Combine local evidence and advisories without guessing safe edits.
 
@@ -3510,7 +3766,7 @@ class Engine:
                 )
                 if assessment["decision"] == "FALSE_POSITIVE":
                     try:
-                        assessment["reason"] = audit_false_positive_comment(
+                        finding["falsePositiveAudit"] = audit_false_positive_comment(
                             finding,
                             source_review,
                             assessment["workflow"]["documentation"],
@@ -3935,7 +4191,7 @@ class Engine:
             )
 
         image_only = category == "container_scanning" and hit is None
-        fixed = looked_up.lowest_fixed_version
+        fixed = package_target or looked_up.lowest_fixed_version
         self._progress(
             finding.get("id"), f"Planning minimal dependency change to {fixed}"
         )
@@ -4016,6 +4272,14 @@ class Engine:
                     "Major-version candidate: review target APIs and actual callers before deciding compatibility. No source/test adjustments are permitted for an automatic major update."
                 )
         proposed = plan.as_dict()
+        if plan.ecosystem in PACKAGE_ECOSYSTEMS:
+            proposed["version_policy"] = "latest-supported-stable"
+            proposed["advisory_floor"] = looked_up.lowest_fixed_version
+            evidence.append(
+                "Advisory-floor candidate only. Call select_package_version before human approval "
+                "to select the latest supported stable release compatible with the project's runtime, "
+                "including major upgrades. Paid releases require investigation; unknown fees require a warning."
+            )
         if major_upgrade and plan.ecosystem in PACKAGE_ECOSYSTEMS:
             proposed["major_upgrade"] = True
             proposed["caller_scan"] = scan_package_callers(self.repo_root, proposed)
@@ -4029,8 +4293,15 @@ class Engine:
         A matching directive is only proposed after the current publisher
         pages still document it. Other cited lines stay on manual review.
         """
-        assessment = assess_config(self.repo_root, finding)
+        assessment = assess_config(
+            self.repo_root, finding, apk_versions=self._apk_versions
+        )
         evidence.append(assessment.reason)
+        if assessment.sources:
+            self._record_validation_sites(finding, list(assessment.sources))
+            evidence.extend(
+                f"Read official Alpine package data {url}" for url in assessment.sources
+            )
         if assessment.decision == "missing":
             return (
                 "MANUAL_REVIEW",

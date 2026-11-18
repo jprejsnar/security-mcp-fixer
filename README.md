@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.37.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.40.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -36,6 +36,43 @@ requirements. An unknown current version is explicitly marked, never invented.
 Source choices show file/line and the proposed scoped action instead of raw
 dictionaries. Approval binds the displayed package versions and file scope;
 changed findings or proposed targets require fresh consent.
+
+Release 1.0.40 takes the Alpine release for apk pins from the Docker image itself.
+The `study-config-service` run on 1.0.39 left the KICS busybox finding on manual
+review: one brief `ConnectError` from `dl-cdn.alpinelinux.org` (the three index
+downloads failed within 120 ms) aborted the plan, which had to read every
+supported branch to infer the release from other pins. The server now reads the
+stage image's linux/amd64 metadata from its public registry
+(`mcr.microsoft.com/dotnet/sdk:10.0-alpine` reports `alpine-minirootfs-3.24.4`),
+so the pin is the latest version compatible with that image —
+`busybox=1.37.0-r31` from Alpine v3.24 — even when GitLab supplies no version and
+no other package is pinned. That needs one package index instead of up to six.
+Existing pins remain the fallback for private registries. Transient connection
+errors, timeouts, 429 and 5xx responses are retried four times with backoff, and
+the underlying error text is logged.
+
+Release 1.0.39 fixes approved configuration fixes stalling after the Windows
+selection window. In `study-config-service`, the KICS busybox pin was approved
+(`fix_selection.status = APPROVED`) but nothing was edited: the window starts
+server-owned execution only for package updates, while the host AI had already
+been told to stop. Approved Dockerfile, nginx and GitLab CI line fixes are now
+applied by the server after submission, one at a time, each with a fresh read of
+the required documentation, the source-review hash check, an exact-line match and
+a validation run. The run then saves reports and offers false-positive approvals
+when no other host-led source fixes remain. Approval now binds the exact displayed
+edit (file, lines, replacement and target version), so a re-planned edit cannot
+be applied under earlier consent. Host-form (non-Windows) selections are unchanged.
+
+Release 1.0.38 automatically pins KICS **Unpinned Package Version in Apk Add**
+findings in Dockerfiles to the current Alpine package version, even when no
+version is named in the finding or the file. In `study-config-service`, the
+`mig-build` stage's existing pins (`git=2.54.1-r0`, `icu-libs`/`icu-data-full=78.1-r0`)
+are published only by Alpine v3.24, so `busybox` is planned as
+`busybox=1.37.0-r31`. Previously every Dockerfile KICS line stayed manual review.
+The plan reads the KICS rule, Docker's version-pinning guidance and Alpine's
+release page, plus the Dockerfile reference, before assessment and again before
+the write. Configuration plans can now edit several lines of one instruction,
+all or nothing. See [Safety boundaries](#safety-boundaries) for the evidence rules.
 
 Release 1.0.37 keeps tracebacks for programming-error types that a handler
 turns into a result. Previously, advisory reads (OSV, GitHub, NVD), report
@@ -382,7 +419,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 
 ## Changes delivered on November 13, 2026
 
-This summary covers changes through 1.0.37. Earlier wheels do not contain
+This summary covers changes through 1.0.40. Earlier wheels do not contain
 all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
@@ -397,7 +434,7 @@ all of these changes; updating source files does not update an installed wheel.
 | Resolved-on-main branch findings | Other tracked branches are checked for GitLab-confirmed main resolution at this run's pulled main commit. Eligible entries require human checkbox approval and fresh remote main/ref/resolution checks; an absent finding alone is not proof. |
 | VPN and dependency preparation | Corporate DNS is checked before work and pulls. No eager pnpm clean/install runs; dependency preparation occurs only when an approved update/build needs it. |
 | Progress visibility | Separate critical/high/medium/low/info positions, such as `Processing 5 of 21 criticals`, appear in console/notification/transcript channels. Owned Windows log consoles close after completion/failure and reopen for later work; unrelated prompts remain untouched. |
-| Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Missing NVD version bounds require review, not a no-fix verdict. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
+| Advisory robustness | Plural GitLab fix-version lists retain all explicit alternatives. Incomplete NVD data falls back to authoritative, package-matched CVE CNA version data; missing bounds still require review. Withdrawn OSV records do not supply active bounds or prove a false positive. Ordered OSV/GitHub fallback, shared NVD pacing and bounded retries respect `Retry-After`; identical advisory requests share a bounded cache. GitLab Maven `group/artifact` names match local `group:artifact` coordinates. |
 | Dependency edits | Qualified plans may refresh lockfiles, update manifests or add supported transitive constraints/overrides. Current manager documentation, compatibility/license review, passing production builds and resolution checks remain mandatory. Tests are not executed. Failed updates are isolated; passing updates remain. |
 | Bounded fan-out | Up to eight independent finding verifications overlap within a checkout; the same finding remains serialized and snapshots commit under the engine lock. Independent documentation/advisory batches and human-approved GitLab dismissals use at most eight workers, bounded submissions, isolated request contexts and input-ordered results. Dismissal intents are saved before dispatch, each completion is saved on the caller thread, the same vulnerability is never written concurrently, and mutations are never retried. Checkout edits, validation/rollback and dismissals wait for active verifications. |
 | Resource cleanup | Pools join workers; responses and owned clients close; cancellation/startup failures clean up owned command trees, pipes, logs and Windows job handles. Approval-window pipes close even if terminating the window fails. A command child that cannot be reaped is reported as a cleanup failure rather than a normal result. Background approval tasks persist unexpected failures and their completion callbacks log any exception escaping cleanup. Hung progress delivery has a one-second completion drain limit; late callbacks cannot reuse a finished request. |
@@ -546,7 +583,15 @@ source. Responses larger than 2 MB are rejected while they are read.
 
 The host still supplies the exact-version package, API, and license review used
 by qualification. Separately, the server reads the required publisher pages
-before it writes any package, image, or configuration edit. A failed or
+before it writes any package, image, or configuration edit. Every Dockerfile and
+nginx edit reads its live pages when the plan is assessed and again immediately
+before the write; cached receipts are never reused for a write. Dockerfile edits
+read the [Dockerfile reference](https://docs.docker.com/reference/dockerfile/);
+apk pins also read the [KICS rule](https://docs.kics.io/latest/queries/dockerfile-queries/d3499f6d-1651-41bb-a9a7-de925fea487b/),
+Docker's [version-pinning guidance](https://docs.docker.com/build/building/best-practices/)
+and Alpine's [release branches](https://alpinelinux.org/releases/). nginx edits read
+the [nginx documentation](https://nginx.org/en/docs/) and the module page for the
+directive. A failed or
 incomplete required publisher read returns `DOCS_REQUIRED` and does not change
 the file. Missing or failed security-reference reads are informational, not
 permission to claim a finding is safe and not a veto on a concrete GitLab fix. Page
@@ -583,7 +628,8 @@ flowchart TB
     fanout["fanout.py: bounded submissions, at most 8 workers, copied request context"]
     manifests["manifests.py: discovery, parsing and local package evidence"]
     versions["versions.py: affected ranges and version comparison"]
-    configFindings["config_findings.py: cited nginx and GitLab CI lines"]
+    configFindings["config_findings.py: cited nginx, GitLab CI and Dockerfile apk lines"]
+    alpinePackages["alpine_packages.py: image Alpine release, releases.json and APKINDEX current versions"]
     sourceFindings["source_findings.py: source workflows, hash-bound review and stale-evidence checks"]
     sourceEvidence["ai_source_review.py: bounded complete cited source for host AI"]
   end
@@ -597,6 +643,8 @@ flowchart TB
   advisoryClient --> versions
   engine --> versions
   engine --> configFindings
+  configFindings --> alpinePackages
+  alpinePackages --> fanout
   engine --> sourceFindings
   tools --> sourceEvidence
   sourceEvidence --> hostReview["Calling host AI traces source; no MCP sampling"]
@@ -672,7 +720,9 @@ flowchart TD
   selectionWait --> windowsKind{"What was checked?"}
   windowsKind -->|"Package updates"| serverBatch["Server qualifies, edits, and production-build validates those packages"]
   serverBatch --> reports
-  windowsKind -->|"Source-code fixes"| sourceContinue["Host continues only those source fixes"]
+  windowsKind -->|"Dockerfile, nginx or GitLab CI line fixes"| serverConfig["Server applies each documented edit after a fresh docs read, then validates it"]
+  serverConfig --> reports
+  windowsKind -->|"Other source-code fixes"| sourceContinue["Host continues only those source fixes"]
   sourceContinue --> editKind
   windowsKind -->|"Nothing"| reports
   approvedFixes -->|"No: skip code, continue independent false positives"| reports
@@ -740,6 +790,7 @@ checkout is active.
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
 | `select_security_fixes(repo_root=None, package_reviews=None)` | Open unchecked human issue-selection boxes after read-only assessment. On Windows, supply exact-target documentation/compatibility/license reviews keyed by finding ID; no AI selection arguments. Human submission automatically qualifies, edits and validates selected package updates, then saves reports and offers independent false-positive approval. Source fixes remain host-led. |
+| `select_package_version(finding_id, review=None, repo_root=None)` | Read the public npm/NuGet/Maven stable-release catalog, then submit documented publisher-support/runtime exclusions to select the latest eligible version before human fix approval. Paid exclusions are reported for investigation. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require human issue selection, exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
 | `apply_minimal_fix(finding_id, repo_root=None)` | For human-selected issues only, read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
 | `generate_aaa_test(finding_id, repo_root=None)` | For human-selected issues only, generate supported base-image tests when a suitable oracle and framework exist; not generic package API tests. |
@@ -870,9 +921,10 @@ A finding is auto-fixed only when all of these are true:
 - An online advisory publishes a fixed version newer than what is installed, or GitLab explicitly recommends a newer fix for the matching local dependency. Missing data, missing records and failed public lookups do not veto GitLab's recommendation. Positive evidence that the proposed target remains affected is distinct from missing data.
 - The edit is a lockfile refresh, a manifest version bump, a package override, an unpinned `FROM` tag bump, or one cited nginx or GitLab CI line that the current publisher page still documents.
 - Major package updates are candidates, not automatic skips. They require documented API/caller compatibility without source/test changes and passing post-update checks. Major image-tag changes still require manual review.
+- Node.js, .NET 10/NuGet, and Java/Maven/Gradle fixes must select the latest supported stable release compatible with the project's existing runtime, including major upgrades. An advisory's first fixed version is only a minimum, not the final upgrade target. Known paid/restricted targets are blocked; unverified licensing is allowed with an explicit warning unless corporate policy is stricter.
 - Every package update requires no production/unit-test API adaptations and passing post-update production builds, dependency checks and applicable test-free corporate checks. Unit/integration tests are disabled and test compatibility is not verified. Same-major does not prove compatibility.
 
-An advisory that names the identifier but not the package found in the repo does not by itself block a GitLab-recommended dependency update. The finding's package and installed version must match locally, and available target advisory evidence is recorded before qualification. Failed lookups are informational when GitLab provides a concrete newer fix. Production builds, dependency checks and test-free policy checks determine acceptance; failures isolate offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
+An advisory that names the identifier but not the package found in the repo does not by itself block establishing a GitLab-recommended fix floor. The finding's package and installed version must match locally. Failed lookups can still establish that preliminary floor when GitLab provides a concrete newer fix; they do not prove the final latest target safe. Release selection requires public advisory evidence that its exact target is unaffected. Production builds, dependency checks and test-free policy checks determine acceptance; failures isolate offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
 
 Named CVE record pages and CWE definitions are read when GitLab names those
 identifiers. NSA catalog homes are not requested. A failed named record blocks
@@ -887,7 +939,15 @@ Unknown reachability is not treated as a false positive. Secret detection and DA
 
 A cited nginx or GitLab CI line can change only after a source-bound AI review confirms the finding, the current line still matches the plan, and the live publisher page still contains the documented phrase. Supported line edits are `server_tokens on` to `off`, `autoindex on` to `off`, removal of `TLSv1` and `TLSv1.1` from `ssl_protocols` when `TLSv1.2` or `TLSv1.3` remains, and these GitLab CI variables when set to `true`, `1`, or `yes`: `SAST_DISABLED`, `DEPENDENCY_SCANNING_DISABLED`, `CONTAINER_SCANNING_DISABLED`, `SECRET_DETECTION_DISABLED`, and `DAST_DISABLED`. The replacement is `"false"`. `CODE_QUALITY_DISABLED` is left unchanged. Comments and unmatched lines stay on manual review. Missing configuration files and paths outside the checkout remain unresolved; neither establishes a false positive.
 
-Container-scanning Dockerfile findings stay on the image-tag path. Other Dockerfile lines, including `USER root`, are not rewritten unless a later rule names one documented one-line edit. The current Docker reference does not authorize an automatic `ADD` to `COPY` change.
+Container-scanning Dockerfile findings stay on the image-tag path. Other Dockerfile lines, including `USER root`, are not rewritten unless a rule names one documented edit. The current Docker reference does not authorize an automatic `ADD` to `COPY` change.
+
+KICS **Unpinned Package Version in Apk Add** (query `d3499f6d-1651-41bb-a9a7-de925fea487b`) receives a minimum-version requirement automatically, even when no version is named anywhere. Every bare package in the cited shell-form `RUN` gets `"name>=<current version>"` (for example, `"busybox>=1.37.0-r31"`), including packages on continuation lines and after `&&`. Quotes prevent the shell from treating `>` as output redirection. Option values such as `--virtual .build-deps`, existing `name=version` pins, `name~version` constraints, quoted `name>=version` requirements and comment lines are left as written. Minimum-version requirements are not used as exact-version evidence to infer the Alpine branch. The version comes only from Alpine's official data:
+
+1. `https://alpinelinux.org/releases.json` lists the branches that have not reached end of life.
+2. The Alpine branch is, in order: (a) named by an explicit `alpine:3.x` or `*-alpine3.x` stage tag; (b) **read from the stage image itself**, so the pin is the latest version compatible with that image even when GitLab names no version — the server anonymously reads the public registry's linux/amd64 manifest and config, takes the `alpine-minirootfs-3.x` entry from the image history, or else the base layer's `/etc/apk/repositories`; (c) otherwise the **only** supported branch whose `APKINDEX.tar.gz` (main, then community, x86_64) publishes every exact version the same stage already pins. `ARG` defaults are resolved, and a `FROM <stage>` chain inherits its parent stage's pins and root image. `latest`, unversioned `-alpine` tags and unresolved `ARG` images never select a branch by tag. Image metadata is read only from public registries (`docker.io`, `mcr.microsoft.com`, `ghcr.io`, `quay.io`, `public.ecr.aws`, `gcr.io`, `registry.k8s.io`) over HTTPS with an anonymous pull token when challenged; private or unresolved registries are never contacted and fall back to (c). Every blob must match its SHA-256 digest. Alpine and registry reads retry connection errors, timeouts, HTTP 429 and 5xx up to four attempts (1, 2 and 4 second backoff) and log the underlying error text.
+3. Each bare package receives the version that branch publishes now as its minimum; newer versions are allowed.
+
+No evidence, several matching branches, a package missing from the branch, unreadable data, quotes other than simple quoted minimum-version requirements, command substitution, heredocs, exec-form `RUN`, a non-default `# escape`, variable package lists, unknown `apk` options or local `.apk` files keep manual review with the precise reason. Build-time `--build-arg` overrides of the pins are not visible to this evidence. Minimum-version requirements allow newer revisions when Alpine mirrors drop superseded ones.
 
 ## Safety boundaries
 
@@ -955,6 +1015,8 @@ Resizing the window reflows both columns; long lists scroll vertically. There is
 no duplicate lower description pane. Only checking an issue and submitting grants
 approval. The full audit comment, including evidence and documentation references,
 remains in the saved reports and is the unchanged GitLab submission text.
+JSON reports keep these comments in `false_positive_audits`; human-facing
+assessment reasons retain the concise reviewed explanation instead of the full audit.
 Advisory-only findings use their existing assessed
 reason; resolved-on-main descriptions explicitly preserve their branch scope
 and never claim the older branch is safe.
@@ -1143,6 +1205,8 @@ GitLab solution lists such as `Upgrade to versions 7.30.2, 8.12.4 or above.`
 retain every explicit fixed version. The smallest version newer than the local
 dependency is checked as a candidate; plural wording does not discard the fix,
 and unrelated version numbers elsewhere in the prose are not treated as fixes.
+For npm, NuGet and Maven/Gradle, this establishes only an advisory floor.
+`select_package_version` must select the final latest supported stable target.
 
 GitLab Maven package names in either `group:artifact` or `group/artifact`
 format are matched to canonical Maven/Gradle coordinates, including version
@@ -1214,7 +1278,11 @@ before the call returns. A single request stays
 on the caller thread. One page or identifier failure is recorded without
 dropping the other results from that batch. GitLab pagination stays sequential
 because each page needs the previous cursor. OSV, GitHub, and NVD stay in that
-order. Required Git pulls, edits, validation/rollback, and human-approved GitLab
+order, followed by authoritative CVE CNA data when NVD cannot establish package
+version bounds. Exact affected versions establish affected status; omissions
+establish safety only with an explicit unaffected default and fully supported
+version data. No fixed version is inferred from advisory prose.
+Required Git pulls, edits, validation/rollback, and human-approved GitLab
 mutations stay serialized; parallelizing those steps could corrupt evidence or
 the checkout. Host AI instructions permit bounded fan-out of independent
 read-only evidence work and reuse of complete-file reads, never verdicts.
@@ -1310,6 +1378,52 @@ support does not mean every toolchain or Python runtime has been certified.
 
 ### Package Update Qualification
 
+Before human fix selection, call `select_package_version(finding_id)` to read
+the public npm registry, NuGet flat-container index, or Maven Central metadata.
+These reads send only the package coordinate, never source code or credentials;
+private-only packages, unreadable catalogs, and missing stable releases require
+manual investigation rather than falling back to the advisory minimum.
+Deprecated npm releases and prereleases are excluded from the catalog.
+Uncomparable release formats require manual investigation rather than silently
+selecting an older release.
+Publication alone does not establish support or runtime compatibility.
+
+Read publisher support, runtime requirements and target-version licensing, then
+call the same tool with this review:
+
+```json
+{
+  "target": "10.0.5",
+  "supported": true,
+  "runtime_compatible": true,
+  "sources": ["https://publisher.example/support"],
+  "assessment": "Documented support for this project's actual runtime",
+  "excluded_releases": [
+    {
+      "version": "11.0.0",
+      "reason": "runtime_incompatible",
+      "sources": ["https://publisher.example/runtime-requirements"],
+      "assessment": "Requires .NET 11; this project targets .NET 10"
+    }
+  ]
+}
+```
+
+The server chooses the newest remaining stable release at or above the advisory
+floor, checks that public advisories mark it unaffected, and replans the edit.
+Newer releases may be excluded only for documented `unsupported`,
+`runtime_incompatible`, or `paid` reasons, never simply because they cross a major
+version. The review must identify the exact eligible `target` (or `null` when
+all eligible releases are excluded); a newer release published after the initial
+catalog read requires a fresh review rather than inheriting an older target's
+support or fee assessment. Review actual .NET target frameworks, Node engine/peer requirements,
+and Java runtime/platform constraints without upgrading the runtime to force a
+match. Every known paid release is flagged in the response and local reports
+for user investigation; a free installed version must never silently become paid.
+When no eligible release remains, no automatic upgrade is authorized.
+Replanning invalidates qualification; obtain human approval for the new target.
+API/caller compatibility remains a separate qualification requirement.
+
 Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifiers:
 
 1. The AI fully reads the target version's official documentation, release notes,
@@ -1324,7 +1438,12 @@ Every Node, NuGet, Maven, and Gradle package update has four mandatory qualifier
 3. Without a configured/existing policy, provide `review.license` with the
   exact-target license expression, official HTTPS sources, commercial-use and
   no-license-fee assessments, and distribution obligations. This is documented
-  terms review, not corporate approval. Unknown/unlicensed terms block editing.
+  terms review, not corporate approval. Known paid or restricted terms block editing
+  and require user investigation. Unlicensed terms still block editing. For
+  unverified terms, explicitly use `null` for `commercial_use_permitted` and/or
+  `no_license_fees`, cite the attempted official review, and explain the uncertainty.
+  Such upgrades may proceed with persistent `UNVERIFIED LICENSE` warnings in the
+  approval window, qualification response and reports; unknown is never recorded as free.
   When a corporate policy is configured or present, independent exact-version
   approval and all its checks remain required; the AI must not invent approvals.
 4. Apply reviewed updates first, then run production builds, necessary dependency
@@ -1794,7 +1913,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.37-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.40-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1810,7 +1929,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.37-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.40-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -1870,7 +1989,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.37-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.40-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
@@ -1886,7 +2005,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.37-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.40-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -1907,7 +2026,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.37-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.40-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -1916,7 +2035,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.37-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.40-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -2219,7 +2338,7 @@ VS Code/Cursor windows, including Agents/background windows, and use
 **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.37-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.40-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2293,7 +2412,7 @@ installation.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.37**
+3. Apply the deployment-specific update and verify installed version **1.0.40**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2302,7 +2421,7 @@ installation.
    `review_false_positives` among the fifteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.37`
+   edits before requesting a new run. Its `server_version` must be `1.0.40`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -2363,7 +2482,8 @@ GitLab permissions or clear the host's internal conversation errors.
    not hand that task to the user. Before edits, review the package current/proposed
    versions or scoped code actions and check only the fixes you permit. On Windows,
    the separate window has no review deadline: submit and the reviewed package
-   updates execute automatically. Only selected source fixes need Agent continuation.
+   updates and documented Dockerfile, nginx or GitLab CI line fixes execute
+   automatically. Only other selected source fixes need Agent continuation.
    Keep the server running until builds/tests and reports finish.
    At completion, select only the false positives
    you want dismissed in the automatically offered checkbox form. The report
@@ -2797,18 +2917,20 @@ summary, not a misleading package-advisory failure.
 | Override or direct pin | A transitive npm, pnpm, Yarn, or NuGet package | 3 |
 | Image tag | An unpinned `FROM image:tag` whose name matches the finding. Digest-pinned references stay unchanged. | 3 |
 | Cited configuration line | The current line is `server_tokens on`, `autoindex on`, obsolete TLS in `ssl_protocols`, or a documented GitLab security-disable variable set to true | 2 |
+| Dockerfile apk minimum version | KICS unpinned `apk add` packages in the cited `RUN`, requiring at least the current version of the evidenced Alpine branch | 2 |
 
 The server applies plans scoring at most 3. It does not perform arbitrary source
 rewrites or production/unit-test adaptations for any package version increment.
-A configuration edit changes only the cited line and keeps its line ending.
+A configuration edit changes only the planned lines of the cited instruction and
+keeps their line endings. Every planned line must still match before any is written.
 Unsupported edits and breaking upgrades remain for manual review.
 
 Lockfile refreshes use the package manager already selected by the repo (`npm`, `pnpm`, or `yarn`) and pass `--ignore-scripts` on that refresh. Validation then runs the project's own install and test commands.
 
 ### Node and pnpm security version updates
 
-When a concrete security target is available and the local package matches, the
-server chooses the smallest supported qualified plan. It does **not** always
+After selecting the latest supported runtime-compatible stable target, the
+server chooses the smallest supported qualified edit for that target. It does **not** always
 edit both a manifest and a workspace file:
 
 | Situation | File or field that may change |

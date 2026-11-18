@@ -20,7 +20,7 @@ from gitlab_security_mcp.qualification import (
     validate_edits,
 )
 from gitlab_security_mcp.validate import _lint_result, _product_result
-from tests.conftest import manager_doc_sources
+from tests.conftest import manager_doc_sources, select_release_for_test
 
 
 @pytest.mark.parametrize("truncated,code", [(False, 0), (False, 1), (True, 0)])
@@ -501,6 +501,7 @@ def package_engine(tmp_path, package_policy):
     engine.state.status = "FINDINGS_LISTED"
     engine.state.findings = [finding]
     engine.verify_security_finding("package")
+    select_release_for_test(engine, "package")
     return engine
 
 
@@ -562,6 +563,7 @@ def pending_package_batch(package_engine, package_review, request):
     # Act
     for finding_id, package in packages:
         package_engine.verify_security_finding(finding_id)
+        select_release_for_test(package_engine, finding_id)
         review = {
             **deepcopy(package_review),
             "package": package,
@@ -588,6 +590,7 @@ def duplicate_package_update(package_engine, package_review):
         package_engine.state.findings.append(extra)
     for finding in package_engine.state.findings:
         package_engine.verify_security_finding(finding["id"])
+        select_release_for_test(package_engine, finding["id"])
     assert (
         package_engine.qualify_package_update("package", package_review)["status"]
         == "QUALIFIED"
@@ -933,6 +936,7 @@ def test_missing_security_metadata_defers_to_product_validation(
 
     # Act
     verified = package_engine.verify_security_finding("package")
+    select_release_for_test(package_engine, "package")
     qualified = package_engine.qualify_package_update("package", package_review)
     applied = package_engine.apply_minimal_fix("package")
     validated = package_engine.run_validation_matrix()
@@ -1168,6 +1172,7 @@ def test_security_loop_retains_good_fixes_and_continues_after_rejection(
             lowest_fixed_version=target,
         )
         package_engine.verify_security_finding(finding_id)
+        select_release_for_test(package_engine, finding_id)
         review = {**deepcopy(package_review), "target": target}
         assert (
             package_engine.qualify_package_update(finding_id, review)["status"]
@@ -1783,6 +1788,7 @@ def major_package_update(tmp_path, package_engine, package_policy, package_revie
     policy["approvals"][0]["target"] = "2.0.0"
     path.write_text(json.dumps(policy), encoding="utf-8")
     verified = package_engine.verify_security_finding("package")
+    select_release_for_test(package_engine, "package")
     package_review["target"] = "2.0.0"
     package_review["major_upgrade"] = {
         "scan_id": verified["proposed_fix"]["caller_scan"]["scan_id"],
@@ -1992,6 +1998,7 @@ def test_nested_transitive_pnpm_major_update_preserves_callers(
         }
     ]
     verified = engine.verify_security_finding(package)
+    select_release_for_test(engine, package)
     package_review.update(package=package, target=target)
     package_review["license"] = {
         "expression": "MIT",

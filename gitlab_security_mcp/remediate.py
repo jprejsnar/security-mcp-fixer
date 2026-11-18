@@ -65,6 +65,7 @@ class Plan:
     line: int | None = None
     expected_line: str | None = None
     replacement_line: str | None = None
+    line_edits: tuple[dict, ...] = ()
     doc_pages: tuple[dict, ...] = ()
     gradle_configurations: tuple[str, ...] = ()
     gradle_force: bool = False
@@ -85,6 +86,7 @@ class Plan:
             "line": self.line,
             "expected_line": self.expected_line,
             "replacement_line": self.replacement_line,
+            "line_edits": [dict(edit) for edit in self.line_edits],
             "doc_pages": [
                 {
                     "name": page["name"],
@@ -100,9 +102,10 @@ class Plan:
                 "package": self.package,
                 "target": self.target,
                 "requirements": [
+                    "Select the latest supported stable release compatible with the actual project runtime, including major upgrades; the advisory fix is only a minimum.",
                     "Review complete official package documentation and API changes.",
                     "Do not adapt production/unit-test APIs or check scripts; reject known incompatibilities.",
-                    "Review target-version license terms; obey configured corporate policy when present.",
+                    "Block paid/restricted target versions and flag them for user investigation. Warn explicitly about unverified licensing; obey stricter configured corporate policy when present.",
                     "Require production builds, exact resolved-dependency proof and test-free configured policy checks. Never run unit/integration tests. Revert offending updates while retaining passing updates.",
                 ],
                 "manager_documentation": manager_documentation(

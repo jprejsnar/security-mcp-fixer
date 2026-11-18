@@ -554,25 +554,43 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
     if not isinstance(license_review, dict):
         raise ValueError(
             "No corporate policy is configured. Provide review.license with expression, "
-            "official sources, commercial_use_permitted=true, no_license_fees=true, "
+            "official sources, commercial_use_permitted and no_license_fees (true or "
+            "explicit null when unverified), "
             "obligations, and assessment. No corporate approval file is required."
         )
     for key in ("expression", "obligations", "assessment"):
         _text(license_review.get(key), f"License {key}")
     if license_review["expression"].strip().upper() in {
         "UNLICENSED",
+    }:
+        raise ValueError("Unlicensed terms cannot qualify a package update")
+    _sources(license_review.get("sources"), "Official target-version license terms")
+    warnings = []
+    for field in ("commercial_use_permitted", "no_license_fees"):
+        if field not in license_review or (
+            license_review[field] is not None
+            and not isinstance(license_review[field], bool)
+        ):
+            raise ValueError(
+                f"License {field} must be true or explicitly null when unverified"
+            )
+        if license_review[field] is False:
+            raise ValueError(
+                "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; user investigation required. "
+                "Reviewed license terms must permit commercial use without license fees."
+            )
+        if license_review[field] is None:
+            warnings.append(
+                f"UNVERIFIED LICENSE: {plan.get('package')} {plan.get('target')}: "
+                f"{field} is unknown; investigate target-version terms before distribution."
+            )
+    if license_review["expression"].strip().upper() in {
         "UNKNOWN",
         "NOASSERTION",
         "NONE",
     }:
-        raise ValueError("Unknown or unlicensed terms cannot qualify a package update")
-    _sources(license_review.get("sources"), "Official target-version license terms")
-    if (
-        license_review.get("commercial_use_permitted") is not True
-        or license_review.get("no_license_fees") is not True
-    ):
-        raise ValueError(
-            "Reviewed license terms must permit commercial use without license fees"
+        warnings.append(
+            f"UNVERIFIED LICENSE: {plan.get('package')} {plan.get('target')}: license expression is unknown."
         )
     if plan.get("manager") in {"npm", "pnpm", "yarn"}:
         entry = next(
@@ -611,6 +629,7 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
         "approval": None,
         "policy_mode": "documentation_review",
         "license_review": license_review,
+        "warnings": warnings,
         "checks": {},
         "policy_sha256": hashlib.sha256(
             json.dumps(fingerprint, sort_keys=True).encode()

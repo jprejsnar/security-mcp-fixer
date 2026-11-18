@@ -193,6 +193,26 @@ def approve_package_for_test(root: Path, plan: dict) -> dict:
     }
 
 
+def select_release_for_test(engine, finding_id: str) -> None:
+    """Provide explicit offline release evidence to tests of later workflow phases."""
+    from gitlab_security_mcp.package_releases import reviewed_selection
+
+    plan = engine._finding(finding_id)["proposedFix"]
+    plan["release_selection"] = reviewed_selection(
+        {"source": "https://example.test/releases", "versions": [plan["target"]]},
+        plan.get("advisory_floor", plan["target"]),
+        {
+            "target": plan["target"],
+            "supported": True,
+            "runtime_compatible": True,
+            "sources": ["https://example.test/support"],
+            "assessment": "Fixture release supports the fixture runtime",
+            "excluded_releases": [],
+        },
+    )
+    plan["release_selection"]["status"] = "SELECTED"
+
+
 def commit_all(repo: Path, message: str = "init") -> None:
     """Stage and commit fixture files using a local test-only identity."""
     subprocess.run(

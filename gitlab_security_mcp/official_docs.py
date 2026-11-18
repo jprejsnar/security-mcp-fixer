@@ -107,6 +107,8 @@ REQUIRED_DOCS = (
 ALLOWED_HOSTS = frozenset(
     {
         "docs.docker.com",
+        "docs.kics.io",
+        "alpinelinux.org",
         "nginx.org",
         "docs.gitlab.com",
         "docs.oracle.com",

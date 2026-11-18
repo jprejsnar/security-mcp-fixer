@@ -425,6 +425,7 @@ def render(
                     "approval",
                     "policy_mode",
                     "license_review",
+                    "warnings",
                     "policy_sha256",
                     "baseline_results",
                     "post_results",
@@ -435,6 +436,16 @@ def render(
             }
             for finding in state.findings
             if (qualification := finding.get("packageQualification"))
+        },
+        "package_version_selections": {
+            finding.get("id"): finding["packageVersionSelection"]
+            for finding in state.findings
+            if finding.get("packageVersionSelection")
+        },
+        "license_investigations": {
+            finding.get("id"): finding["licenseInvestigation"]
+            for finding in state.findings
+            if finding.get("licenseInvestigation")
         },
         "false_positives": false_positive_bullets,
         "false_positive_details": state.false_positives,
@@ -456,6 +467,11 @@ def render(
             finding.get("id"): finding["sourceReview"]
             for finding in state.findings
             if finding.get("sourceReview")
+        },
+        "false_positive_audits": {
+            finding.get("id"): finding["falsePositiveAudit"]
+            for finding in state.findings
+            if finding.get("falsePositiveAudit")
         },
         "finding_assessments": assessments,
         "finding_assessments_table": assessments_table,
@@ -628,6 +644,22 @@ def render(
             for key in ("command", "stdout_log_path", "stderr_log_path"):
                 if inspection.get(key):
                     lines.append(f"  {key}: {inspection[key]}")
+    lines.extend(["", "## Package Release and Licensing Investigation"])
+    for finding_id, investigation in payload["license_investigations"].items():
+        lines.append(
+            f"- {finding_id}: {investigation['package']} {investigation['target']}; "
+            f"{investigation['reason']} {investigation.get('assessment') or ''} "
+            f"Sources: {', '.join(investigation['sources'])}."
+        )
+    for finding_id, selection in payload["package_version_selections"].items():
+        lines.append(
+            f"- {finding_id}: selected {selection.get('target') or 'no eligible release'}; {selection['source']}."
+        )
+        for paid in selection.get("paid_releases", []):
+            lines.append(
+                f"  PAID VERSION {paid['version']}: blocked; user investigation required. "
+                f"{paid['assessment']} Sources: {', '.join(paid['sources'])}."
+            )
     lines.extend(["", "## Package Update Qualifications"])
     if payload["package_qualifications"]:
         for finding_id, qualification in payload["package_qualifications"].items():
@@ -645,6 +677,8 @@ def render(
             lines.append(
                 f"  Obligations: {approval.get('obligations') or license_review.get('obligations') or 'not recorded'}."
             )
+            for warning in qualification.get("warnings") or []:
+                lines.append(f"  WARNING: {warning}")
             documentation = (qualification.get("review") or {}).get(
                 "documentation"
             ) or {}

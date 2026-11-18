@@ -16,7 +16,7 @@ _NGINX_SSL = "https://nginx.org/en/docs/http/ngx_http_ssl_module.html"
 _GITLAB_SCANS = "https://docs.gitlab.com/user/application_security/policies/scan_execution_policies/"
 
 
-def _ready(tmp_path, finding, docs, name, text):
+def _ready(tmp_path, finding, docs, name, text, **engine_options):
     """Place one configuration file and a listed finding into an engine."""
     path = tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -27,6 +27,7 @@ def _ready(tmp_path, finding, docs, name, text):
         advisory=object(),
         docs=docs,
         which=lambda _name: None,
+        **engine_options,
     )
     engine.state.status = "FINDINGS_LISTED"
     engine.state.findings = [finding]
@@ -582,3 +583,398 @@ def test_documentation_client_rejects_other_hosts_and_closes_owned_clients():
     assert injected.is_closed is False
     assert owned._closed is True
     injected.close()
+
+
+_KICS_APK = (
+    "https://docs.kics.io/latest/queries/dockerfile-queries/"
+    "d3499f6d-1651-41bb-a9a7-de925fea487b/"
+)
+_APK_DOCS = {
+    _KICS_APK: "Unpinned Package Version in Apk Add",
+    "https://docs.docker.com/build/building/best-practices/": "This is known as version pinning.",
+    "https://alpinelinux.org/releases/": "Alpine release branches",
+}
+_STUDY_CONFIG = (
+    "# syntax=docker/dockerfile:1\n"
+    "ARG ICU_VERSION=78.1-r0\n"
+    "ARG GIT_VERSION=2.54.1-r0\n"
+    "FROM registry.example/aspnet:10.0-alpine-icu AS base\n"
+    "RUN apk add --no-cache wget=1.25.0-r3\n"
+    "FROM mcr.microsoft.com/dotnet/sdk:10.0-alpine AS mig-build\n"
+    "ARG GIT_VERSION\n"
+    "# Pin add only.\n"
+    "RUN apk add --no-cache \\\n"
+    "    busybox \\\n"
+    "    git=${GIT_VERSION}\n"
+    "ENV PATH=/root/.dotnet/tools\n"
+)
+
+
+def _apk_finding(line, **extra):
+    """Build the KICS unpinned apk finding that GitLab reports for a Dockerfile."""
+    return _finding(
+        "backend/Dockerfile",
+        line,
+        title="Unpinned Package Version in Apk Add",
+        identifiers=["d3499f6d-1651-41bb-a9a7-de925fea487b"],
+        **extra,
+    )
+
+
+def _resolver(calls, versions=None, error=None):
+    """Record each Alpine lookup request and return fixed current versions."""
+    from gitlab_security_mcp.alpine_packages import AlpineLookupError, ApkPins
+
+    def resolve(image, pinned, names):
+        """Answer like AlpinePackages.latest without network access."""
+        calls.append((image, dict(pinned), list(names)))
+        if error:
+            raise AlpineLookupError(error)
+        found = {name: (versions or {}).get(name, "1.0.0-r1") for name in names}
+        return ApkPins(
+            "v3.24",
+            "fixture branch evidence",
+            found,
+            {name: "main" for name in names},
+            ("https://alpinelinux.org/releases.json",),
+        )
+
+    return resolve
+
+
+def test_kics_unpinned_apk_is_pinned_to_the_current_alpine_version(tmp_path):
+    """Pin only the bare package after reading the KICS, Docker and Alpine pages."""
+    # Arrange
+    from tests.test_alpine_packages import alpine_client
+
+    alpine = alpine_client()
+    engine = _ready(
+        tmp_path,
+        _apk_finding(9),
+        documentation_client(_APK_DOCS),
+        "backend/Dockerfile",
+        _STUDY_CONFIG,
+        alpine=alpine,
+    )
+
+    # Act
+    decision = engine.verify_security_finding("config", source_review=_review(engine))
+    applied = engine.apply_minimal_fix("config")
+    updated = (tmp_path / "backend/Dockerfile").read_text(encoding="utf-8")
+    engine.close()
+
+    # Assert
+    assert decision["decision"] == "CHANGE_REQUIRED", decision["reason"]
+    assert decision["proposed_fix"]["line_edits"] == [
+        {
+            "line": 10,
+            "expected": "    busybox \\",
+            "replacement": '    "busybox>=1.37.0-r31" \\',
+        }
+    ]
+    assert "Alpine v3.24" in decision["reason"]
+    assert decision["proposed_fix"]["target"] == "busybox>=1.37.0-r31"
+    assert decision["proposed_fix"]["oracle"] == "busybox>=1.37.0-r31"
+    assert "git=2.54.1-r0" in decision["reason"]
+    assert "wget" not in decision["reason"]
+    assert {"https://docs.kics.io", "https://alpinelinux.org"} <= set(
+        decision["security_validation_sites"]
+    )
+    assert "https://dl-cdn.alpinelinux.org" in decision["security_validation_sites"]
+    assert applied["status"] == "APPLIED"
+    assert updated == _STUDY_CONFIG.replace(
+        "    busybox \\", '    "busybox>=1.37.0-r31" \\'
+    )
+    assert not alpine.http.is_closed
+    alpine.close()
+    alpine.http.close()
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_apk_options_chains_and_existing_constraints_are_respected(tmp_path, quote):
+    """Pin every bare package across lines without touching option values or pins."""
+    # Arrange
+    from gitlab_security_mcp.config_findings import apply_config_line, assess_config
+
+    text = (
+        "ARG CURL_VERSION=8.0.0-r0\r\n"
+        "FROM alpine:3.24 AS tools\r\n"
+        "ARG CURL_VERSION\r\n"
+        "RUN --mount=type=cache,target=/var/cache/apk apk update && \\\r\n"
+        "    apk add --no-cache --virtual .build-deps \\\r\n"
+        "    # compilers\r\n"
+        "    gcc musl-dev \\\r\n"
+        f"    curl=${{CURL_VERSION}} tzdata~2026 {quote}busybox>=1.37.0-r31{quote} && \\\r\n"
+        "    rm -rf /tmp/build\r\n"
+    )
+    (tmp_path / "Dockerfile").write_bytes(text.encode())
+    calls = []
+    finding = {**_apk_finding(4), "location": {"file": "Dockerfile", "startLine": 7}}
+
+    # Act
+    assessment = assess_config(
+        tmp_path,
+        finding,
+        apk_versions=_resolver(calls, {"gcc": "15.2.0-r2", "musl-dev": "1.2.6-r0"}),
+    )
+    apply_config_line(tmp_path, assessment.plan)
+
+    # Assert
+    assert calls == [("alpine:3.24", {"curl": "8.0.0-r0"}, ["gcc", "musl-dev"])]
+    assert [edit["line"] for edit in assessment.plan.line_edits] == [7]
+    assert (tmp_path / "Dockerfile").read_bytes() == text.replace(
+        "    gcc musl-dev \\", '    "gcc>=15.2.0-r2" "musl-dev>=1.2.6-r0" \\'
+    ).encode()
+
+
+def test_stage_chain_supplies_root_image_and_inherited_pins(tmp_path):
+    """Resolve FROM <stage> to its root image and carry that stage's exact pins."""
+    # Arrange
+    from gitlab_security_mcp.config_findings import assess_config
+
+    (tmp_path / "Dockerfile").write_text(
+        "FROM mcr.microsoft.com/dotnet/sdk:10.0-alpine AS base\n"
+        "RUN apk add git=2.54.1-r0\n"
+        "FROM base AS next\n"
+        "RUN apk add busybox ca-certificates\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    # Act
+    assessment = assess_config(
+        tmp_path,
+        {**_apk_finding(4), "location": {"file": "Dockerfile", "startLine": 4}},
+        apk_versions=_resolver(calls),
+    )
+
+    # Assert
+    assert assessment.decision == "plan"
+    assert calls == [
+        (
+            "mcr.microsoft.com/dotnet/sdk:10.0-alpine",
+            {"git": "2.54.1-r0"},
+            ["busybox", "ca-certificates"],
+        )
+    ]
+    assert assessment.plan.line_edits[0]["replacement"] == (
+        'RUN apk add "busybox>=1.0.0-r1" "ca-certificates>=1.0.0-r1"'
+    )
+
+
+@pytest.mark.parametrize(
+    "run,reason",
+    [
+        ('RUN apk add "busybox"', "quotes"),
+        ("RUN apk add $PACKAGES", "not a plain package"),
+        ('RUN ["apk", "add", "busybox"]', "Exec-form"),
+        ("RUN apk add ./local.apk", "not a plain package"),
+        ("RUN apk add busybox.apk", "not a plain package"),
+        ("RUN apk add busybox;echo done", "combines commands"),
+        ("RUN apk add --foo busybox", "not recognized"),
+        ("RUN <<EOF\napk add busybox\nEOF", "heredoc"),
+        ("RUN apk add busybox=1.37.0-r31", "already pinned"),
+        ('RUN apk add "busybox>=1.37.0-r31"', "already pinned"),
+        ("RUN apk add 'busybox>=1.37.0-r31'", "already pinned"),
+        ('RUN apk add "busybox>=1.37.0-r31$(id)"', "quotes"),
+        ("RUN apk add busybox>=1.37.0-r31", "combines commands"),
+        ("COPY busybox /bin/", "not part of a RUN"),
+    ],
+)
+def test_ambiguous_apk_instructions_are_never_rewritten(tmp_path, run, reason):
+    """Keep manual review whenever the packages cannot be identified exactly."""
+    # Arrange
+    from gitlab_security_mcp.config_findings import assess_config
+
+    (tmp_path / "Dockerfile").write_text(f"FROM alpine:3.24\n{run}\n")
+    calls = []
+
+    # Act
+    assessment = assess_config(
+        tmp_path,
+        {**_apk_finding(2), "location": {"file": "Dockerfile", "startLine": 2}},
+        apk_versions=_resolver(calls),
+    )
+
+    # Assert
+    assert assessment.decision == "manual"
+    assert reason in assessment.reason
+    assert calls == []
+
+
+@pytest.mark.parametrize("variant", ["escape", "other_rule", "lookup_error"])
+def test_apk_pinning_requires_the_kics_rule_and_exact_alpine_evidence(
+    tmp_path, variant
+):
+    """Ignore other Dockerfile rules, odd escapes and unproven Alpine branches."""
+    # Arrange
+    from gitlab_security_mcp.config_findings import assess_config
+
+    prefix = "# escape=`\n" if variant == "escape" else ""
+    (tmp_path / "Dockerfile").write_text(
+        prefix + "FROM alpine:3.24\nRUN apk add busybox\n"
+    )
+    line = 3 if variant == "escape" else 2
+    finding = {
+        **_apk_finding(line),
+        "location": {"file": "Dockerfile", "startLine": line},
+    }
+    if variant == "other_rule":
+        finding.update(
+            title="Healthcheck Instruction Missing", identifiers=["b03a748a"]
+        )
+    calls = []
+
+    # Act
+    assessment = assess_config(
+        tmp_path,
+        finding,
+        apk_versions=_resolver(
+            calls,
+            error="Supported Alpine branches publishing x: none."
+            if variant == "lookup_error"
+            else None,
+        ),
+    )
+
+    # Assert
+    assert assessment.decision == "manual"
+    assert (tmp_path / "Dockerfile").read_text().endswith("RUN apk add busybox\n")
+    if variant == "lookup_error":
+        assert "Supported Alpine branches" in assessment.reason
+        assert "left unchanged" in assessment.reason
+    else:
+        assert calls == []
+
+
+def test_multi_line_config_plan_is_all_or_nothing(tmp_path):
+    """A stale second line blocks the whole edit instead of half-applying it."""
+    # Arrange
+    from gitlab_security_mcp.config_findings import apply_config_line, assess_config
+
+    path = tmp_path / "Dockerfile"
+    path.write_text("FROM alpine:3.24\nRUN apk add \\\n    busybox \\\n    tini\n")
+    assessment = assess_config(
+        tmp_path,
+        {**_apk_finding(2), "location": {"file": "Dockerfile", "startLine": 2}},
+        apk_versions=_resolver([]),
+    )
+    changed = "FROM alpine:3.24\nRUN apk add \\\n    busybox \\\n    tini-static\n"
+    path.write_text(changed)
+
+    # Act
+    with pytest.raises(ValueError, match="no longer matches"):
+        apply_config_line(tmp_path, assessment.plan)
+
+    # Assert
+    assert len(assessment.plan.line_edits) == 2
+    assert path.read_text() == changed
+
+
+def test_windows_approval_applies_and_validates_config_fix_without_another_turn(
+    tmp_path, monkeypatch
+):
+    """An approved Dockerfile line fix runs to completion after the window closes."""
+    # Arrange
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from gitlab_security_mcp import server
+    from tests.test_alpine_packages import alpine_client
+
+    alpine = alpine_client()
+    engine = _ready(
+        tmp_path,
+        _apk_finding(9),
+        documentation_client(_APK_DOCS),
+        "backend/Dockerfile",
+        _STUDY_CONFIG,
+        alpine=alpine,
+    )
+    engine.git = Mock()
+    engine.git.staged_names.return_value = []
+    engine.git.diff_summary.return_value = {"stat": "", "files": ""}
+    assert (
+        engine.verify_security_finding("config", source_review=_review(engine))[
+            "decision"
+        ]
+        == "CHANGE_REQUIRED"
+    )
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    dialog = Mock(
+        wait=AsyncMock(
+            return_value={"action": "accept", "content": {"finding_0": True}}
+        ),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        server.desktop_approval, "open_dialog", AsyncMock(return_value=dialog)
+    )
+    ctx = Mock()
+    ctx.session.client_capabilities = None
+
+    async def exercise():
+        """Open the window, let the human approve, and await the server-owned work."""
+        opened = await server.select_security_fixes(ctx, str(tmp_path))
+        await asyncio.gather(*server._desktop_fix_selection_tasks.values())
+        return opened
+
+    # Act
+    opened = asyncio.run(exercise())
+    updated = (tmp_path / "backend/Dockerfile").read_text(encoding="utf-8")
+    execution = engine.state.fix_selection["package_execution"]
+    engine.close()
+
+    # Assert
+    assert opened["status"] == "AWAITING_HUMAN"
+    assert "Dockerfile, nginx or GitLab CI line fixes" in opened["message"]
+    assert updated == _STUDY_CONFIG.replace(
+        "    busybox \\", '    "busybox>=1.37.0-r31" \\'
+    )
+    assert execution["status"] == "COMPLETED", execution
+    assert execution["config_ids"] == ["config"]
+    assert execution["source_ids"] == []
+    assert [row["stage"] for row in execution["results"]] == [
+        "apply_minimal_fix",
+        "run_validation_matrix",
+    ]
+    assert engine.state.changes[0]["status"] == "APPLIED"
+    assert engine.state.status == "REPORT_GENERATED"
+    assert not server._desktop_fix_selection_tasks
+    alpine.close()
+    alpine.http.close()
+
+
+def test_config_approval_is_bound_to_the_displayed_edit(tmp_path):
+    """A re-planned version after approval cannot be applied under the old consent."""
+    # Arrange
+    from tests.test_alpine_packages import alpine_client
+
+    alpine = alpine_client()
+    engine = _ready(
+        tmp_path,
+        _apk_finding(9),
+        documentation_client(_APK_DOCS),
+        "backend/Dockerfile",
+        _STUDY_CONFIG,
+        alpine=alpine,
+    )
+    engine.verify_security_finding("config", source_review=_review(engine))
+    candidates = engine.fix_selection_candidates()["candidates"]
+    engine.record_fix_selection(candidates, ["config"], "APPROVED")
+    engine.state.findings[0]["proposedFix"]["line_edits"][0]["replacement"] = (
+        '    "busybox>=9.9.9-r0" \\'
+    )
+
+    # Act
+    result = engine.run_approved_fix("apply_minimal_fix", "config")
+    engine.close()
+
+    # Assert
+    assert result["status"] == "FIX_APPROVAL_REQUIRED"
+    assert (tmp_path / "backend/Dockerfile").read_text(
+        encoding="utf-8"
+    ) == _STUDY_CONFIG
+    alpine.close()
+    alpine.http.close()

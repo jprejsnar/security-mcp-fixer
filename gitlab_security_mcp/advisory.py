@@ -1,4 +1,4 @@
-"""Online advisory lookups. OSV first, then GitHub Advisory, then NVD."""
+"""Online advisories: OSV, GitHub, NVD, then authoritative CVE CNA bounds."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic, sleep
+from urllib.parse import unquote
 
 import httpx
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -38,6 +39,7 @@ OSV_VULN = "https://api.osv.dev/v1/vulns/{ident}"
 OSV_QUERY = "https://api.osv.dev/v1/query"
 GITHUB_ADVISORIES = "https://api.github.com/advisories"
 NVD_CVE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CVE_RECORD = "https://cveawg.mitre.org/api/cve/{ident}"
 MAX_CACHE_ENTRIES = 256
 _MAX_ADVISORY_BYTES = 2_000_000
 _NVD_LOCK = threading.Lock()
@@ -211,9 +213,10 @@ class AdvisoryClient:
     ) -> AdvisoryLookup:
         """Match online advisory evidence to a package and installed version.
 
-        Prefer OSV, then GitHub Advisory Database, then NVD. Identifiers within
-        one source are requested together; the next source is used only when
-        the earlier source has no record. Return an AdvisoryLookup with
+        Prefer OSV, then GitHub Advisory Database, then NVD, with authoritative
+        CVE CNA bounds when NVD is incomplete or unavailable. Ignore withdrawn
+        records without treating withdrawal as proof of safety. Identifiers within
+        one source are requested together. Return an AdvisoryLookup with
         affected status, candidate fixes, and sources.
         Failed requests, malformed responses, and calls after close return
         lookup_failed rather than claiming the version is safe. The engine may
@@ -336,13 +339,27 @@ class AdvisoryClient:
         cve = next(
             (item for item in identifiers if item.upper().startswith("CVE-")), None
         )
+        nvd_fallback = None
         if cve:
             nvd_record = self._nvd(cve, errors, sources)
             if nvd_record is not None:
                 nvd_result = _from_nvd(nvd_record, package, version, sources, errors)
-                if nvd_result.outcome != PACKAGE_MISMATCH:
+                if nvd_result.outcome == "lookup_failed":
+                    nvd_fallback = nvd_result
+                elif nvd_result.outcome != PACKAGE_MISMATCH:
                     return nvd_result
-                mismatch = nvd_result
+                else:
+                    mismatch = nvd_result
+            cna_record = self._cve(cve, errors, sources)
+            if cna_record is not None:
+                cna_result = _from_cve(
+                    cna_record, ecosystem, package, version, sources, errors
+                )
+                if cna_result.outcome != PACKAGE_MISMATCH:
+                    return cna_result
+                mismatch = cna_result
+        if nvd_fallback is not None:
+            return nvd_fallback
         if mismatch is not None:
             return mismatch
 
@@ -355,7 +372,7 @@ class AdvisoryClient:
             )
         return AdvisoryLookup(
             outcome="not_found",
-            summary="No matching record in OSV, the GitHub Advisory Database, or NVD.",
+            summary="No matching record in OSV, the GitHub Advisory Database, NVD, or CVE CNA data.",
             sources=sources,
             errors=errors,
         )
@@ -402,10 +419,34 @@ class AdvisoryClient:
         """Fetch one OSV record without aborting the other identifier reads."""
         try:
             payload = self._get_json(OSV_VULN.format(ident=ident))
+            if isinstance(payload, dict) and payload.get("withdrawn"):
+                return (
+                    ident,
+                    None,
+                    f"osv:{ident}: advisory withdrawn at {payload['withdrawn']}; "
+                    "ignored as active evidence. Withdrawal alone does not establish a false positive.",
+                )
         except Exception as exc:
             log_unexpected(exc, f"OSV advisory read {ident}")
             return ident, None, self._clean(f"osv:{ident}: {exc}")
         return ident, payload if isinstance(payload, dict) else None, None
+
+    def _cve(self, ident: str, errors: list[str], sources: list[str]) -> dict | None:
+        """Read a CVE's authoritative CNA data when NVD cannot supply bounds."""
+        try:
+            payload = self._get_json(CVE_RECORD.format(ident=ident))
+            if payload is None:
+                return None
+            if (
+                not isinstance(payload, dict)
+                or (payload.get("cveMetadata") or {}).get("cveId") != ident
+            ):
+                raise ValueError(f"CVE CNA response does not identify {ident}")
+            sources.append(f"cve:{ident}")
+            return payload
+        except (httpx.HTTPError, ValueError) as exc:
+            errors.append(self._clean(f"cve:{ident}: {exc}"))
+            return None
 
     def _github_one(
         self, item: tuple[str, dict], headers: dict[str, str]
@@ -839,6 +880,147 @@ def _product_key(package: str) -> str:
     """Reduce a package name to the form NVD uses for products."""
     last = re.split(r"[/:]", package.lower())[-1]
     return last.replace("-", "_").replace(".", "_")
+
+
+def _cna_matches(entry: dict, ecosystem: str | None, package: str) -> bool:
+    """Prefer a CNA package URL; otherwise require an exact product name."""
+    purl = entry.get("packageURL")
+    if purl:
+        kind = {"npm": "npm", "NuGet": "nuget", "Maven": "maven", "PyPI": "pypi"}.get(
+            ECOSYSTEMS.get((ecosystem or "").lower())
+        )
+        coordinate = package.replace(":", "/") if kind == "maven" else package
+        expected = f"pkg:{kind}/{coordinate}".lower()
+        actual = unquote(str(purl)).split("?", 1)[0].split("#", 1)[0].lower()
+        return actual == expected or actual.startswith(expected + "@")
+    return str(entry.get("product") or "").casefold() == package.casefold()
+
+
+def _cna_ranges(entry: dict) -> tuple[dict, bool]:
+    """Translate supported structured CNA versions, retaining incomplete-evidence status."""
+    converted: dict = {"versions": [], "ranges": []}
+    rows = entry.get("versions") or []
+    complete = bool(rows) and entry.get("defaultStatus") == "unaffected"
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or row.get("status") != "affected"
+            or row.get("changes")
+            or row.get("versionType") not in {None, "semver"}
+        ):
+            complete = False
+            continue
+        start = row.get("version")
+        upper = row.get("lessThan") or row.get("lessThanOrEqual")
+        if start == "*":
+            start = "0"
+        lower_version = parse_version(start) if isinstance(start, str) else None
+        if lower_version is None:
+            complete = False
+            continue
+        if upper is None:
+            if row.get("version") == "*":
+                converted["ranges"].append(
+                    {"type": "SEMVER", "events": [{"introduced": "0"}]}
+                )
+            else:
+                converted["versions"].append(start)
+            continue
+        upper_version = parse_version(upper) if isinstance(upper, str) else None
+        if (
+            row.get("versionType") != "semver"
+            or upper_version is None
+            or upper_version < lower_version
+            or (upper_version == lower_version and row.get("lessThan"))
+            or (row.get("lessThan") and row.get("lessThanOrEqual"))
+        ):
+            complete = False
+            continue
+        end = "fixed" if row.get("lessThan") else "last_affected"
+        converted["ranges"].append(
+            {
+                "type": "SEMVER",
+                "events": [{"introduced": start}, {end: upper}],
+            }
+        )
+    return converted, complete
+
+
+def _from_cve(
+    record: dict,
+    ecosystem: str | None,
+    package: str | None,
+    version: str | None,
+    sources: list[str],
+    errors: list[str],
+) -> AdvisoryLookup:
+    """Evaluate published, package-matched CNA bounds without mining prose or inventing fixes."""
+    if (record.get("cveMetadata") or {}).get("state") != "PUBLISHED":
+        return AdvisoryLookup(
+            outcome="lookup_failed",
+            sources=sources,
+            errors=errors,
+            summary="The CVE CNA record is not published; independent review is required, not automatic dismissal.",
+        )
+    cna = (record.get("containers") or {}).get("cna") or {}
+    entries = [
+        entry
+        for entry in cna.get("affected") or []
+        if isinstance(entry, dict)
+        and package
+        and _cna_matches(entry, ecosystem, package)
+    ]
+    if not entries:
+        return AdvisoryLookup(
+            outcome=PACKAGE_MISMATCH,
+            sources=sources,
+            errors=errors,
+            summary=f"The CVE CNA record does not identify package {package}.",
+        )
+    mappings = [_cna_ranges(entry) for entry in entries]
+
+    def affected_at(candidate: str | None) -> bool | None:
+        """Do not treat an omitted version as safe unless the CNA explicitly permits it."""
+        votes = []
+        for converted, complete in mappings:
+            vote = osv_version_affected(candidate, converted)
+            votes.append(None if vote is False and not complete else vote)
+        return _affected_vote(votes)
+
+    affected = affected_at(version)
+    converted_entries = [converted for converted, _complete in mappings]
+    fixed = collect_fixed_versions(converted_entries)
+    floor = first_unaffected(
+        version, fixed, lambda candidate: affected_at(candidate) is not False
+    )
+    if affected is False:
+        outcome, summary = (
+            "resolved",
+            f"Installed {package} {version} is outside the explicit CVE CNA affected versions.",
+        )
+    elif affected is True:
+        outcome = "resolved" if floor else "no_fix_published"
+        summary = f"CVE CNA lists {package} {version} as affected; " + (
+            f"fixed version bound: {floor}."
+            if floor
+            else "no verified fixed-version bound is published in this record."
+        )
+    else:
+        outcome, summary = (
+            "lookup_failed",
+            "The CVE CNA record names this package but its structured versions do not establish the installed version's status.",
+        )
+    return AdvisoryLookup(
+        outcome=outcome,
+        affected=affected,
+        fixed_versions=fixed,
+        lowest_fixed_version=floor,
+        ranges=describe_ranges(converted_entries),
+        summary=summary,
+        sources=sources,
+        errors=errors,
+        references=_references([cna]),
+    )
 
 
 def _from_nvd(

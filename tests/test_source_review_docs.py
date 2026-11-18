@@ -171,13 +171,14 @@ def test_false_positive_comment_records_source_and_missing_cve_cwe(tmp_path):
 
     # Assert
     assert result["decision"] == "FALSE_POSITIVE"
-    assert review["reason"] in result["reason"]
-    assert "widget.py:1" in result["reason"]
-    assert "Input origin:" in result["reason"]
-    assert "Code analysis:" in result["reason"]
-    assert "Reachability:" in result["reason"]
-    assert "no issue-specific CVE or CWE record page was available" in result["reason"]
-    assert "python: available at https://docs.python.org/3/" in result["reason"]
+    assert result["reason"] == review["reason"]
+    audit = engine.state.findings[0]["falsePositiveAudit"]
+    assert "widget.py:1" in audit
+    assert "Input origin:" in audit
+    assert "Code analysis:" in audit
+    assert "Reachability:" in audit
+    assert "no issue-specific CVE or CWE record page was available" in audit
+    assert "python: available at https://docs.python.org/3/" in audit
 
 
 def test_false_positive_comment_records_available_cve_and_cwe_pages(tmp_path):
@@ -200,15 +201,17 @@ def test_false_positive_comment_records_available_cve_and_cwe_pages(tmp_path):
 
     # Assert
     assert result["decision"] == "FALSE_POSITIVE"
+    assert result["reason"] == review["reason"]
+    audit = engine.state.findings[0]["falsePositiveAudit"]
     assert (
         "cve:CVE-2024-12345: available at https://www.cve.org/CVERecord?id=CVE-2024-12345"
-        in result["reason"]
+        in audit
     )
     assert (
         "nist:CVE-2024-12345: available at https://nvd.nist.gov/vuln/detail/CVE-2024-12345"
-        in result["reason"]
+        in audit
     )
-    assert f"cwe:CWE-79: available at {cwe_url}" in result["reason"]
+    assert f"cwe:CWE-79: available at {cwe_url}" in audit
 
 
 def test_false_positive_without_the_named_cve_is_not_accepted(tmp_path):

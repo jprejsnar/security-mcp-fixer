@@ -63,11 +63,35 @@ Each tool description is the procedure for that step.
 5. verify_security_finding for every finding. Open the file and line GitLab
    already reported and read that code. A false-positive reason is at most
    2 everyday sentences about why the warning does not apply.
-6. select_security_fixes before any remediation edit. For Windows package
+6. For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
+   select_package_version to read the public stable-release catalog, then again
+   with documented support/runtime exclusions. Choose the latest supported stable
+   release compatible with the actual project runtime, including major upgrades.
+   The advisory's minimum fix is not the final target. Never skip a newer release
+   merely to minimize the version bump. Flag all paid releases for user
+   investigation; never automatically upgrade to paid terms. Unverified licensing
+   is allowed only with an explicit warning; configured corporate policy may be stricter.
+   Then select_security_fixes before any remediation edit. For Windows package
    checkboxes, first collect the exact-target documentation/API/framework/license
    evidence described by qualify_package_update. Supply package_reviews keyed by
    finding ID. PACKAGE_REVIEW_REQUIRED means finish that read-only AI review and
    repeat selection with the evidence; do not invent evidence or approval.
+   Release review schema: target:<exact reviewed eligible version or null if none>,
+   supported:true,runtime_compatible:true,sources:[official
+   HTTPS URLs],assessment,excluded_releases:[{version,reason:unsupported|
+   runtime_incompatible|paid,sources:[official HTTPS URLs],assessment}].
+   Qualification review schema: ecosystem,package,target,documentation
+   {complete:true,sources,summary},compatible:true,
+   compatible_without_code_changes:true,api_changes,frameworks
+   [{name,version,source_url,assessment}],source_fixes:[].
+   Without corporate policy, license:{expression,sources,
+   commercial_use_permitted:true,no_license_fees:true,obligations,assessment}.
+   Explicit null permits unknown license permissions/fees with warnings; false blocks.
+   For proposed major_upgrade=true also provide major_upgrade:
+   {scan_id:proposed_fix.caller_scan.scan_id,compatible_without_code_changes:true,
+   caller_breakages_found:false,migration_sources:[official HTTPS URLs],
+   api_comparison,caller_assessment,dependency_assessment,
+   reviewed_files:[{path,sha256,assessment}]}.
 7. qualify_package_update for each selected package update
 8. apply_minimal_fix for each selected eligible fix, with no build between edits
 9. generate_aaa_test only for a supported base-image change
@@ -75,10 +99,11 @@ Each tool description is the procedure for that step.
 11. complete_security_run, which offers the human approval checkboxes once
 If select_security_fixes returns AWAITING_HUMAN, stop and wait. The Windows
 window has no review deadline. On submission the server automatically qualifies,
-applies and production-build validates only the selected package updates, saves
-reports, then offers separate false-positive approvals. No second continue request
-is needed for packages. REMEDIATION_RUNNING also means wait, never duplicate work.
-Selected source-code fixes still require the host AI to continue its scoped work.
+applies and production-build validates the selected package updates and selected
+documented Dockerfile, nginx or GitLab CI line fixes, saves reports, then offers
+separate false-positive approvals. No second continue request is needed for these.
+REMEDIATION_RUNNING also means wait, never duplicate work.
+Other selected source-code fixes still require the host AI to continue its scoped work.
 Do not reopen approved selections or start completion, edits or validation while
 selection or server-owned package execution is pending.
 Apply all human-approved, qualified package security updates for Node, .NET/C#
@@ -570,6 +595,21 @@ def _run(
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Select latest supported package version",
+        read_only_hint=False,
+        destructive_hint=False,
+        open_world_hint=True,
+    )
+)
+def select_package_version(
+    finding_id: str, review: dict[str, Any] | None = None, repo_root: str | None = None
+) -> dict[str, Any]:
+    """Read releases; submit workflow-schema review to select the latest eligible target before approval."""
+    return _run("select_package_version", finding_id, review, repo_root=repo_root)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Run prechecks", read_only_hint=True, open_world_hint=True
     )
 )
@@ -708,21 +748,7 @@ async def verify_security_finding(
 def qualify_package_update(
     finding_id: str, review: dict[str, Any], repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Qualify a human-selected exact package/target; no production/test caller adaptations.
-
-    review: ecosystem,package,target,documentation {complete,sources,summary},
-    compatible=true,compatible_without_code_changes=true (or explicit build_only
-    per workflow),api_changes,
-    frameworks [{name,version,source_url,assessment}],source_fixes=[].
-    Production builds/resolution after edits; never unit/integration tests.
-    Without corporate policy: license {expression,sources,
-    commercial_use_permitted:true,no_license_fees:true,obligations,assessment}.
-    If proposed major_upgrade=true: major_upgrade {scan_id from
-    proposed_fix.caller_scan,compatible_without_code_changes:true,
-    caller_breakages_found:false,migration_sources:[official HTTPS URLs],
-    api_comparison,caller_assessment,dependency_assessment,
-    reviewed_files:[{path,sha256,assessment}]}.
-    """
+    """Qualify the selected latest target using the workflow schema. Paid terms block; unknown fees warn."""
     return _run("qualify_package_update", finding_id, review, repo_root=repo_root)
 
 
@@ -915,7 +941,7 @@ async def _finish_desktop_fix_selection(
     started: asyncio.Event,
     prepared: dict,
 ) -> None:
-    """Execute reviewed package choices after physical approval, outside the host deadline."""
+    """Execute reviewed package and configuration choices after physical approval."""
     closed = False
     work = None
     cancelled = threading.Event()
@@ -952,9 +978,7 @@ async def _finish_desktop_fix_selection(
             result["status"],
             len(result.get("selected_ids", [])),
         )
-        if result["status"] == "APPROVED" and any(
-            finding_id in prepared["reviews"] for finding_id in ids
-        ):
+        if result["status"] == "APPROVED" and result.get("server_execution_queued"):
             work = asyncio.get_running_loop().run_in_executor(
                 None,
                 partial(
@@ -1030,6 +1054,11 @@ async def _open_fix_selection(
         properties = schema.model_json_schema()["properties"]
         for index, item in enumerate(candidates):
             field = properties[f"finding_{index}"]
+            warnings = prepared.get("warnings", {}).get(item["id"], [])
+            if warnings:
+                field["description"] = (
+                    "\n".join(warnings) + "\n\n" + field["description"]
+                )
             blocked = prepared["reviews"].get(item["id"], {}).get("blocked_reason")
             if blocked:
                 field["enabled"] = False
@@ -1055,8 +1084,9 @@ async def _open_fix_selection(
             "Select only the package updates or scoped code fixes you authorize. All boxes start unchecked. "
             "Review current/proposed versions, file scope, risk and acceptance requirements. "
             "There is no selection deadline. Cancel or close authorizes nothing. "
-            "After submission, the server applies checked package updates and runs production builds/dependency checks, never unit/integration tests. "
-            "Keep the server running; no second continue request is needed for packages. Source-code fixes still require your IDE agent.",
+            "After submission, the server applies checked package updates and documented Dockerfile, nginx or GitLab CI line fixes, "
+            "then runs production builds/dependency checks, never unit/integration tests. "
+            "Keep the server running; no second continue request is needed for these. Other source-code fixes still require your IDE agent.",
             properties,
             title="GitLab security: choose updates and code fixes",
             detail_header="Proposed change and decision details",
@@ -1099,8 +1129,9 @@ async def _open_fix_selection(
             ],
             "message": "The Windows selection window is open with no review timeout. "
             "This tool call is complete. Do not poll, reopen selection, start fixes or complete the run. "
-            "After submission the server automatically qualifies, edits and validates selected package updates, then saves reports and offers separate false-positive approvals. "
-            "Keep the server running. Only selected source-code fixes require the IDE agent to continue.",
+            "After submission the server automatically qualifies, edits and validates selected package updates, applies and validates "
+            "selected documented Dockerfile, nginx or GitLab CI line fixes, then saves reports and offers separate false-positive approvals. "
+            "Keep the server running. Only other selected source-code fixes require the IDE agent to continue.",
         }
     except asyncio.CancelledError:
         if task is not None:
@@ -1150,9 +1181,8 @@ async def select_security_fixes(
 ) -> dict[str, Any] | InputRequiredResult:
     """Human-only selection; cancel/empty/unavailable skips edits.
 
-    Windows package_reviews[id]: exact qualification evidence before checkboxes.
-    Submission applies selected packages, builds without tests and isolates failures.
-    blocked_reason disables the choice; build_only trials disclose uncertainty.
+    Windows package_reviews[id]: workflow qualification evidence before checkboxes.
+    blocked_reason disables choices; build_only discloses uncertainty.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
     protocol = ctx.protocol_version
@@ -1665,7 +1695,7 @@ async def complete_security_run(
     if selection.get("presentation") == "WINDOWS_DIALOG" and selection.get(
         "status"
     ) in {"REQUESTED", "AWAITING_HUMAN"}:
-        message = "Wait for the human's open fix-selection window. Approved, reviewed packages continue automatically; selected source fixes remain host-led. Do not poll or reopen."
+        message = "Wait for the human's open fix-selection window. Approved, reviewed packages and documented configuration line fixes continue automatically; other selected source fixes remain host-led. Do not poll or reopen."
         return CallToolResult(
             content=[TextContent(text=message)],
             structuredContent={

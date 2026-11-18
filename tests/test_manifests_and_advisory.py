@@ -65,6 +65,7 @@ def test_advisory_sites_include_attempts_but_not_unused_providers(mode):
         else [
             "https://api.github.com",
             "https://api.osv.dev",
+            "https://cveawg.mitre.org",
             "https://services.nvd.nist.gov",
         ]
     )
@@ -398,7 +399,8 @@ def test_package_plans_require_version_specific_qualifiers(ecosystem):
     assert qualifiers["status"] == "REQUIRED"
     assert qualifiers["package"] == "example"
     assert qualifiers["target"] == "1.0.1"
-    assert len(qualifiers["requirements"]) == 4
+    assert any("latest supported stable" in item for item in qualifiers["requirements"])
+    assert any("Block paid" in item for item in qualifiers["requirements"])
 
 
 @pytest.mark.parametrize(
