@@ -7,9 +7,29 @@ from gitlab_security_mcp.versions import (
     lowest_fixed,
     osv_version_affected,
     parse_fixed_versions,
+    parse_version,
     range_allows,
     range_contains,
 )
+
+
+@pytest.mark.parametrize("suffix", [".Final", "-final", ".RELEASE", ".GA"])
+def test_maven_stable_qualifiers_are_comparable(suffix):
+    """Compare Maven final releases without dropping their affected-version bounds."""
+    # Arrange
+    installed = f"4.2.19{suffix}"
+    fixed = f"4.2.20{suffix}"
+    events = [{"introduced": "0"}, {"fixed": fixed}]
+
+    # Act
+    affected = range_contains(installed, events)
+    unaffected = range_contains(fixed, events)
+
+    # Assert
+    assert parse_version(fixed) == parse_version("4.2.20")
+    assert affected is True
+    assert unaffected is False
+    assert lowest_fixed(installed, [fixed]) == fixed
 
 
 @pytest.mark.parametrize(

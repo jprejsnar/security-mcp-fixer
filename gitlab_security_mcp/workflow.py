@@ -1,0 +1,103 @@
+"""Ordered, inspection-only receipts for the seven human-controlled jobs."""
+
+from __future__ import annotations
+
+import logging
+from copy import deepcopy
+from typing import TYPE_CHECKING
+
+from gitlab_security_mcp.progress import publish
+
+if TYPE_CHECKING:
+    from gitlab_security_mcp.engine import Engine
+
+logger = logging.getLogger("gitlab_security_mcp")
+
+JOB_LABELS = (
+    "Pre-checks",
+    "Download GitLab security findings",
+    "Select and apply package updates",
+    "Review and upload false positives",
+    "Select and fix GitLab source findings",
+    "Optional deep-dive software audit and selected fixes",
+    "Display unresolved remediation report",
+)
+
+
+def start(engine: Engine) -> None:
+    """Create one sequential run; disk receipts are never loaded as permission."""
+    with engine._lock:
+        engine.state.workflow = {
+            "current": 1,
+            "jobs": [
+                {
+                    "number": index,
+                    "label": label,
+                    "status": "RUNNING" if index == 1 else "PENDING",
+                }
+                for index, label in enumerate(JOB_LABELS, 1)
+            ],
+            "code_results": {},
+        }
+        engine._remember()
+        activity(engine, "Checking checkout, branch and prerequisites.")
+
+
+def activity(engine: Engine, message: str, *, status: str = "RUNNING") -> None:
+    """Expose the current job and actual completed-job count, not a time estimate."""
+    workflow = engine.state.workflow
+    if not workflow:
+        return
+    number = workflow["current"]
+    if workflow.get("final_report") and workflow["jobs"][-1]["status"] == "FINISHED":
+        status = "FINISHED"
+        message = workflow["final_result"]["message"]
+    finished = sum(
+        job["status"] in {"FINISHED", "SKIPPED", "FAILED"} for job in workflow["jobs"]
+    )
+    try:
+        publish(
+            engine.repo_root,
+            "workflow",
+            f"Job {number}/7: {JOB_LABELS[number - 1]}",
+            message,
+            status=status,
+            completed=finished,
+            total=7,
+            unit="jobs finished",
+            jobs=deepcopy(workflow["jobs"]),
+            final_report=workflow.get("final_report", False),
+        )
+    except (OSError, ValueError):
+        logger.warning("Could not publish workflow progress", exc_info=True)
+
+
+def advance(engine: Engine, *, status: str = "FINISHED", message: str = "") -> None:
+    """Finish exactly one job and activate its immediate successor."""
+    with engine._lock:
+        workflow = engine.state.workflow
+        job = workflow["jobs"][workflow["current"] - 1]
+        job.update(status=status, message=message)
+        if workflow["current"] < 7:
+            workflow["current"] += 1
+            workflow["jobs"][workflow["current"] - 1]["status"] = "RUNNING"
+        engine._remember()
+        activity(engine, message or "Starting next job.")
+
+
+def require(engine: Engine, *numbers: int) -> dict | None:
+    """Reject out-of-order work without creating edit or dismissal permission."""
+    workflow = engine.state.workflow
+    if not workflow or workflow["current"] in numbers:
+        return None
+    current = workflow["current"]
+    logger.warning(
+        "Out-of-order workflow call: current job %s, expected %s", current, numbers
+    )
+    return {
+        "status": "JOB_ORDER_REQUIRED",
+        "current_job": current,
+        "job": JOB_LABELS[current - 1],
+        "message": "Finish the current job before starting another. Call complete_security_run to continue.",
+        "next_tool": "complete_security_run",
+    }

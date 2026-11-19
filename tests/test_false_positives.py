@@ -39,6 +39,14 @@ from tests.conftest import documentation_client
 GID = "gid://gitlab/Vulnerability/123"
 
 
+@pytest.fixture(autouse=True)
+def isolate_closing_audit(monkeypatch):
+    """Keep these approval tests independent of the separately tested closing choice."""
+    offered = AsyncMock(return_value={"status": "CHOICE_REQUIRED"})
+    monkeypatch.setattr(server, "_offer_software_audit", offered)
+    return offered
+
+
 def _verification():
     """Model the client's independent read-back proof, not a mutation ACK."""
     return {
@@ -734,6 +742,30 @@ def test_desktop_dialog_diagnostics_reach_server_logs(stdout, caplog):
         assert "pid=4321" in str(failure.value)
         assert f"{len(stdout)} bytes, exit 0" in str(failure.value)
         assert failure.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("choice", ["generate_report", "done", "unknown"])
+def test_owned_native_choice_accepts_only_displayed_buttons(choice):
+    """Validate detached Yes/No answers without inferring an unknown choice as approval."""
+    # Arrange
+    from gitlab_security_mcp.desktop_approval import DesktopApproval
+
+    process = Mock(pid=4321, returncode=0)
+    process.communicate = AsyncMock(
+        return_value=(json.dumps({"choice": choice}).encode("utf-8"), b"")
+    )
+    dialog = DesktopApproval(process, frozenset({"generate_report", "done"}))
+
+    # Act
+    if choice == "unknown":
+        with pytest.raises(ValueError, match="invalid choice"):
+            asyncio.run(dialog.wait())
+        response = None
+    else:
+        response = asyncio.run(dialog.wait())
+
+    # Assert
+    assert response is None if choice == "unknown" else response == {"choice": choice}
 
 
 def test_background_cleanup_failure_is_retrieved_and_logged(

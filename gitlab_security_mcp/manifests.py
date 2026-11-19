@@ -96,7 +96,13 @@ def _rel(root: Path, path: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
-def iter_files(root: Path) -> tuple[list[Path], bool]:
+def iter_files(
+    root: Path,
+    *,
+    excluded_dirs: set[str] | None = None,
+    excluded_paths: set[Path] | None = None,
+    unbounded: bool = False,
+) -> tuple[list[Path], bool]:
     """Walk the repo, pruning dependency and build directories in place.
 
     ``os.walk`` is used so ``node_modules`` is not descended into. A recursive
@@ -109,16 +115,32 @@ def iter_files(root: Path) -> tuple[list[Path], bool]:
         """Propagate filesystem errors into the caller's evidence boundary."""
         raise error
 
+    omitted_paths = {path.resolve() for path in excluded_paths or ()}
+
+    def omitted(path: Path) -> bool:
+        """Prune exact project output paths without hiding same-named siblings."""
+        return bool(omitted_paths) and any(
+            path.resolve().is_relative_to(parent) for parent in omitted_paths
+        )
+
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root, onerror=fail_walk):
-        dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in SKIP_DIRS
+            and name.lower() not in (excluded_dirs or set())
+            and not omitted(Path(dirpath) / name)
+        ]
         for filename in filenames:
             path = Path(dirpath) / filename
+            if omitted(path):
+                continue
             # A symlink can sit inside the tree and point outside it.
             if path.is_symlink() and resolve_inside(root, path) is None:
                 continue
             found.append(path)
-            if len(found) > MAX_FILES:
+            if not unbounded and len(found) > MAX_FILES:
                 return found, True
     return found, False
 

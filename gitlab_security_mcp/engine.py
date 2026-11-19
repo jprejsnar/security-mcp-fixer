@@ -997,13 +997,17 @@ class Engine:
             }
         if self.state.status not in AFTER_BRANCH:
             return {"status": "ERROR", "reason": "Verify findings in this run first"}
-        if self.state.changes:
+        job = self.state.workflow.get("current")
+        if self.state.changes and job != 5:
             return {
                 "status": "SELECTION_LOCKED",
                 "reason": "Edits already exist. Validate this authorized batch before starting a fresh clean run.",
             }
         candidates = []
         for finding in self.state.findings:
+            package = "package_update" in self._fix_identity(finding)
+            if (job == 3 and not package) or (job == 5 and package):
+                continue
             assessment = self.state.decisions.get(finding["id"]) or {}
             if assessment.get("decision") not in {
                 "CHANGE_REQUIRED",
@@ -1285,6 +1289,13 @@ class Engine:
             }
         approved = selection.get("approved_findings") or {}
         if operation == "run_validation_matrix":
+            if self.state.workflow.get("current") == 5:
+                approved = {
+                    **self.state.workflow.get("package_selection", {}).get(
+                        "approved_findings", {}
+                    ),
+                    **approved,
+                }
             if (
                 not approved
                 and not self.state.changes
@@ -1345,8 +1356,21 @@ class Engine:
         warnings = {}
         required = []
         for item in candidates:
-            plan = (self._finding(item["id"]) or {}).get("proposedFix") or {}
+            finding = self._finding(item["id"]) or {}
+            plan = finding.get("proposedFix") or {}
             if plan.get("ecosystem") not in PACKAGE_ECOSYSTEMS:
+                continue
+            selection = finding.get("packageVersionSelection") or {}
+            if selection.get("status") == "BLOCKED" and selection.get("target") is None:
+                prepared[item["id"]] = {
+                    **{
+                        key: plan.get(key) for key in ("ecosystem", "package", "target")
+                    },
+                    "blocked_reason": (
+                        "No supported, runtime-compatible release remains. "
+                        + selection["review"]["assessment"]
+                    ),
+                }
                 continue
             review = reviews.get(item["id"])
             try:
@@ -1383,19 +1407,6 @@ class Engine:
                 )
             else:
                 prepared[item["id"]] = deepcopy(review)
-        if candidates and all(
-            prepared.get(item["id"], {}).get("blocked_reason") for item in candidates
-        ):
-            required.extend(
-                {
-                    "finding_id": item["id"],
-                    "plan": deepcopy(
-                        (self._finding(item["id"]) or {}).get("proposedFix")
-                    ),
-                    "reason": prepared[item["id"]]["blocked_reason"],
-                }
-                for item in candidates
-            )
         if required:
             self._remember()
             return {
@@ -1413,6 +1424,11 @@ class Engine:
             "status": "READY",
             "reviews": prepared,
             "warnings": warnings,
+            "all_blocked": bool(candidates)
+            and all(
+                prepared.get(item["id"], {}).get("blocked_reason")
+                for item in candidates
+            ),
             "tree": tree_snapshot(self.repo_root),
         }
 
@@ -1659,6 +1675,13 @@ class Engine:
                     "status": "NO_SAFE_FIX",
                     "reason": "No supported, runtime-compatible stable release at or above the fix floor remains.",
                     "selection": selection,
+                    "next_tool": "select_security_fixes",
+                    "message": (
+                        "Keep this finding unresolved; do not retry the same release review. "
+                        "Continue reviewing the remaining findings, then call select_security_fixes. "
+                        "Blocked packages do not prevent completion: complete_security_run saves "
+                        "the unresolved findings and offers the human the software-audit choice."
+                    ),
                 }
             target = selection["target"]
             target_advisory = self.advisory.lookup(
@@ -3076,6 +3099,15 @@ class Engine:
         return {"status": "OK"}
 
     @_serialized
+    def begin_software_audit(self) -> dict:
+        """Reserve the one automatic audit offer without authorizing any action."""
+        if self.state.software_audit:
+            return {**deepcopy(self.state.software_audit), "created": False}
+        self.state.software_audit = {"status": "REQUESTED", "choice": None}
+        self._remember()
+        return {**deepcopy(self.state.software_audit), "created": True}
+
+    @_serialized
     def record_software_audit(self, details: dict) -> dict:
         """Remember the human's closing audit choice. It authorizes no Git write."""
         self.state.software_audit = deepcopy(details)
@@ -3181,6 +3213,8 @@ class Engine:
                 self.state.false_positive_approval_form
             ),
             "fix_selection": deepcopy(self.state.fix_selection),
+            "software_audit": deepcopy(self.state.software_audit),
+            "workflow": deepcopy(self.state.workflow),
             "report_path": self.state.report_path,
             "lint_issues_path": str(
                 self.repo_root / ".security-mcp" / "lint-issues.json"

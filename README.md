@@ -15,19 +15,73 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.41.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.48.** In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
 ```
 
-This is one chat request, not a terminal command. The host AI analyzes findings
-and source, applies eligible fixes, validates the batch, and calls
-`complete_security_run` to list eligible false positives and write the final
-report, then automatically offer native approval checkboxes. No extra
-"ready to submit" message is required. Cancel to continue reviewing and
-explicitly request `submit_false_positive_approvals` to reopen the form later.
-Only explicitly selected findings are dismissed in GitLab.
+This is one chat request, not a terminal command. The workflow runs these
+**seven separate jobs, one at a time**:
+
+1. **Pre-checks**, including safe main/branch preparation.
+2. **Download security findings from GitLab.**
+3. **Package updates:** unchecked GUI choices for frontend/backend packages,
+   followed by only the approved updates and their validation.
+4. **False positives:** evidence-backed explanations, then separate unchecked
+   GUI approvals. Upload only approved dismissals with their displayed reasons;
+   verify GitLab's persisted result independently.
+5. **GitLab source fixes:** a new unchecked source/config-only GUI. The host AI
+   fixes only selected findings and records successful or unsuccessful outcomes.
+6. **Optional deep-dive audit:** ask **Yes / No** first. Yes generates the
+   coverage-checked report before showing unchecked audit-fix choices.
+7. **Final unresolved report:** write and display
+   `.security-mcp/reports/unresolved-remediation.md`, with package current/target
+   versions and blockers, plus unsuccessful code attempts and their reasons.
+
+Canceling a selection authorizes nothing and continues to the next job.
+Declining the audit still generates the final report. Jobs cannot be started
+out of order. An interrupted or unavailable approval never implies consent.
+
+**In-editor progress requires both release files:** install the Python wheel,
+then install `gitlab-security-progress-1.0.48.vsix` in **each** editor using
+**Extensions: Install from VSIX**. The wheel alone cannot force an editor status
+bar or persistent notification. See [the progress extension](editor-progress/README.md).
+
+Release 1.0.48 adds a persistent editor tab with a real graphical progress bar,
+counts, percentage, current activity and seven-job checklist. **Show Task
+Progress** and the status-bar click reveal that view; **Show Progress Log**
+opens diagnostic text separately. The graphical view opens automatically for
+an active run even if native notifications are muted. Waiting states use a
+clock rather than claiming the host AI is actively working.
+
+An unfinished review does not open audit-fix checkboxes. Progress responses
+explicitly return `continue_review`, the remaining file count, next paths and
+remaining phases. The host must continue after delegated reviews, save the
+complete report, and call `report_ready=True`; a partial chat summary is not a
+report. Resume a paused audit in its existing agent conversation. Restarting
+the MCP discards its in-memory review receipts and is not a resume operation.
+
+Release 1.0.47 fixes audit-stage visibility and host timeouts. Native audit
+consent and audit-fix checklists are owned background dialogs, so the opening
+tool returns before the human decides. Repeated/cancelled host waits do not
+reopen or discard the live window; collect its saved handoff with
+`choose_software_audit_action(repo_root=...)`.
+
+During report generation the status bar prioritizes **Software audit** and
+its actual reviewed-file count. A separate five-second heartbeat survives
+returned tool calls. It reports server liveness and time since the last AI
+update, not fictional AI activity or time-based percentages. **Waiting for AI**,
+**Waiting for you**, and **No recent updates** are distinct. A canceled consent
+request is recorded as interrupted, never left claiming that a scan is running.
+
+Release 1.0.46 replaces the earlier automatic audit with explicit human consent.
+Per-file hash/assessment receipts and all five audit review phases are
+required; partial reviews cannot silently finish. A genuinely complete audit
+may still find zero or one defect. Package and source permissions are separate.
+The companion extension displays the current **Job N/7**, real finished-job
+counts, current finding/activity, and the full job checklist. Unknown command
+durations remain indeterminate; job progress is not elapsed-time estimation.
 
 Release 1.0.23 makes the earlier **fix selection** precise: each package option
 shows its name, current version and evidence source, exact proposed version,
@@ -36,6 +90,23 @@ requirements. An unknown current version is explicitly marked, never invented.
 Source choices show file/line and the proposed scoped action instead of raw
 dictionaries. Approval binds the displayed package versions and file scope;
 changed findings or proposed targets require fresh consent.
+
+Release 1.0.44 fixes scan-then-select when the audit report does not yet exist.
+The host AI receives an explicit scan/progress/report-ready continuation before
+unchecked audit findings are shown. Background Windows approvals and package
+workers retain a separate progress console with current activity, elapsed time,
+and completed execution-step counts in both Cursor and VS Code. Unknown totals
+remain indeterminate; an ended tool request is not a completed audit.
+
+Release 1.0.43 automatically offers the software-audit choice at completion and
+after Windows false-positive approvals close. Documented no-safe-release outcomes
+continue to reporting instead of repeating package review. Gradle and advisory
+comparisons now recognize Maven's stable Final/RELEASE/GA suffixes.
+
+Release 1.0.42 adds clickable file-and-line links to software audit reports and
+requires reachable-path evidence, ordered review, calibrated severity, and
+separate unfinished-work and rejected-lead sections in the audit prompt.
+Only findings from sections 2 and 3 are selectable for fixes.
 
 Release 1.0.41 ignores withdrawn advisories, fills missing NVD version bounds
 from package-matched CVE CNA records, keeps concise false-positive reasons
@@ -801,7 +872,7 @@ checkout is active.
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
-| `select_security_fixes(repo_root=None, package_reviews=None)` | Open unchecked human issue-selection boxes after read-only assessment. On Windows, supply exact-target documentation/compatibility/license reviews keyed by finding ID; no AI selection arguments. Human submission automatically qualifies, edits and validates selected package updates, then saves reports and offers independent false-positive approval. Source fixes remain host-led. |
+| `select_security_fixes(repo_root=None, package_reviews=None)` | Job 3 shows package-only unchecked GUI choices; job 5 shows a fresh source/config-only GUI after false-positive review. On Windows, supply exact-target package reviews before selection. No AI selection arguments. Only checked findings authorize edits; source fixes remain host-led. |
 | `select_package_version(finding_id, review=None, repo_root=None)` | Read the public npm/NuGet/Maven stable-release catalog, then submit documented publisher-support/runtime exclusions to select the latest eligible version before human fix approval. Paid exclusions are reported for investigation. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require human issue selection, exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
 | `apply_minimal_fix(finding_id, repo_root=None)` | For human-selected issues only, read the required publisher pages, then apply the supported plan. Package edits also require fresh qualification and validation of prior package edits. `DOCS_REQUIRED` writes nothing. |
@@ -809,10 +880,111 @@ checkout is active.
 | `run_validation_matrix(repo_root=None)` | Validate the human-authorized batch once; skip remediation checks when code fixes were declined. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
 | `review_false_positives(repo_root=None)` | List eligible assessments for verification. Returns immediately and dismisses nothing. |
 | `submit_false_positive_approvals(repo_root=None)` | Open human approval checkboxes, automatically invoked by completion or explicitly requested to reopen. Only selected findings are dismissed; no AI approval argument is accepted. |
-| `complete_security_run(repo_root=None)` | Save reports, automatically offer human approval checkboxes once, then refresh reports with actual outcomes. Does not rescan or rerun verification. |
-| `generate_local_report(repo_root=None)` | Legacy finishing name: save Markdown/JSON reports, offer the same human-only false-positive approvals as `complete_security_run`, and refresh actual outcomes. It is not a report-only bypass. |
-| `choose_software_audit_action(repo_root=None, choice=None, selected_ids=None)` | After approval is no longer waiting, ask the human to generate a home-directory software audit report, check the findings to fix, or stop. Fix mode shows one unchecked checkbox per selectable finding and fixes only the checked items. The server does not edit, commit, or push. |
-| `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
+| `complete_security_run(repo_root=None, code_results=None, progress=None)` | Advance the seven sequential jobs. Report each selected host code outcome as `{id,status:"fixed" or "failed",reason,validation}`; a fixed outcome requires actual validation evidence. Send `{id,message}` in `progress` while fixing a selected item. Ask audit consent after source work; finish with displayed unresolved Markdown, including failed audit fixes. Host outcomes are attestations, not independent MCP validation. |
+| `generate_local_report(repo_root=None)` | Legacy alias for `complete_security_run`; follows the same ordered job gates. It is not a report-only or approval-order bypass. |
+| `choose_software_audit_action(repo_root=None, choice=None, selected_ids=None, report_ready=False, progress=None)` | Await owned work and collect the next sequential job handoff. In job 6 obtain Yes/No consent, then submit file/phase coverage and write the reserved audit report. `report_ready=True` checks coverage before opening unchecked findings. Cancel/empty selection proceeds to the final report. |
+| `get_run_status(repo_root=None)` | Return phase, counts, package-validation status, and the saved software-audit result. During owned background work, return a nonblocking activity snapshot and finished execution steps instead of waiting behind a build's engine lock. Completed steps do not imply successful validation. |
+
+Software audit reports use clickable filename-and-line links (`#L12`) for VS Code
+and Cursor. The host resolves links from the saved report's home-directory
+location to the audited checkout, including URL-encoding paths with spaces.
+Open the Markdown preview and click a filename, or Ctrl+click the link in the
+Markdown source. Links refer to local files; regenerate the report if the
+checkout or report moves.
+
+After `AWAITING_HUMAN` or `REMEDIATION_RUNNING`, the host calls
+`choose_software_audit_action(repo_root=...)` once, without a choice, to await
+the owned background work. This keeps an AI request attached to the eventual
+audit handoff; native background windows alone cannot start a new AI turn.
+Do not poll or duplicate the server's edits. Human windows have no server
+review deadline; the editor can still interrupt an active tool request.
+If interrupted, call the handoff tool again to collect the saved result.
+
+`GENERATE_AUDIT_REPORT` is an instruction for the **host AI**, not a claim that
+the server scanned code. At consent the server creates an explicitly INCOMPLETE
+Markdown progress draft at the reserved home-directory `output_path`; file
+existence alone never proves that the audit is complete. Progress is persisted
+without overwriting host-written findings. The host replaces the draft with the
+actual report incrementally and completes coverage before `report_ready=True`.
+The AI scans the returned `repo_root`, periodically
+calls the same tool with
+`progress={"message": "Reviewing controller/caller", "files": [{"path": "src/Controller.java", "sha256": "<current full-file hash>", "assessment": "<behavior traced>"}], "completed_phases": ["entry_points"]}`,
+and writes the exact `output_path`. Inventory paths are in `coverage.files`.
+Complete every first-party inventory file and all five phases: `entry_points`,
+`data_access`, `errors_logs`, `resource_lifetime`, and `ui_siblings`.
+Generated source is not code-reviewed, even as supporting evidence. The inventory
+excludes known generated directories and filenames, plus files with explicit
+generator markers in their leading comments (checked within the first 8 KiB).
+Before reviewing implementations, the host must inspect every project's build
+and generator configuration, including nested projects and copied outputs.
+Custom generated files/folders are registered through
+`progress.generated_exclusions=[{"path":"backend/custom-client","evidence":{"path":"backend/build.gradle","sha256":"<current configuration hash>","assessment":"<generator and resolved output declaration>"}}]`.
+The server prunes these concrete paths before opening their source, keeps
+same-named handwritten sibling folders, and excludes them from coverage and
+review receipts. Exclusions are host attestations backed by current configuration
+hashes; stale evidence, paths outside the checkout, and exclusions hiding the
+checkout or their evidence are rejected. Refresh the declaration if its
+configuration changes. Unresolved generator boundaries block completion rather
+than authorizing review of possibly generated code.
+Review handwritten callers, generator inputs/templates and handwritten tests
+instead. Vendored, build, coverage and lockfile inputs are also excluded as
+primary review targets. The audit inventory does not inherit dependency discovery's
+5,000-file ceiling. Actual coverage receipts determine file counts.
+To prevent a host from ending a partial audit with "say continue", install the
+editor hooks once using `Install-GitLabSecurityMcp.ps1 -WheelPath <wheel>
+-EnableAuditContinuation`, or run the installed Python with
+`-m gitlab_security_mcp.audit_host --install`. This is opt-in because it enables
+automatic additional AI turns and can consume credits. Existing hooks are
+preserved. Cursor's `afterMCPExecution`/`stop` hooks and the VS Code **Copilot
+harness** `PostToolUse`/`Stop` hooks bind continuation to the session that actually
+used the live audit tool. Saved run state alone cannot start continuation or
+approve a scan/fix. A new user prompt, cancellation, error, human selection, or
+completed report is not overridden. No-progress attempts stop with an explicit
+diagnostic instead of looping. Cursor's script-level cap is replaced by a
+progress-bounded guard; Copilot's native eight-block safeguard remains in force.
+Enterprise-disabled hooks, unsupported editor harnesses, tool permission
+requests, host context/credit limits, and native safety caps cannot be bypassed.
+The legacy VS Code Local hook response is available with `--host vscode-local`;
+configure it in that harness's supported hook locations rather than assuming
+that Copilot user-hook discovery applies to Local.
+It must then call `choose_software_audit_action(repo_root=..., report_ready=True)`.
+`AUDIT_INCOMPLETE` means continue the review, not show fix checkboxes. File hashes
+are rechecked; changed files need fresh receipts. These are host-attested review
+records, not an independent proof of semantic correctness. No finding quota applies.
+Only after coverage acceptance does the developer see native unchecked findings
+or the host form. Cancel/empty selection keeps the report without approving
+fixes and continues to the final unresolved report. The server never substitutes an older
+report for the reserved output.
+An empty section 7 must say `No selectable findings.`; a missing or malformed
+section is not treated as a successful empty audit.
+
+The audit prompt requires reachable-path evidence, a caller or template,
+triggering input, and a sufficient surgical fix before reporting confirmed
+findings. It records reviewed entry points and authorization rules, keeps
+Conditional items in the security section, and separates Unfinished work and
+Investigated and rejected leads from findings. Only findings from sections 2
+and 3 appear in section 7's fix-selection checkboxes.
+
+Always finish with `complete_security_run`, even if every package is blocked or
+no fix was approved. `NO_SAFE_FIX` is a per-package outcome, not the end of the
+run. A documented release review that excludes every target is carried into
+selection automatically; when all updates are blocked, selection skips edits,
+saves the blockers, and proceeds to false-positive review instead of asking for
+the same review again. Source selection follows false-positive review; audit
+consent follows source outcomes. Repeated completion does not repeat completed jobs.
+
+Follow each completion response's `status` and `next_tool`. Only after the human
+accepts auditing does `GENERATE_AUDIT_REPORT` provide `audit_prompt` and
+`output_path`. If a form cannot be displayed, ask the human before passing
+`choice="generate_report"` (Yes) or `"done"` (No); never infer consent.
+`get_run_status` retains the workflow checklist and audit result
+after a native approval callback. A server restart is not a request to resume
+saved run state.
+
+Gradle's resolved Maven versions retain stable suffixes such as `.Final`,
+`.RELEASE`, and `.GA` in reports and edits; comparisons recognize those suffixes
+as final releases. Unrecognized qualifiers and missing advisory bounds still
+require investigation, not an automatic false-positive dismissal.
 
 ### Human selection and surgical fixes
 
@@ -981,16 +1153,16 @@ API. Local dated security-branch creation remains intentional.
 
 ### Approving false positives in Finding Assessments
 
-After verification and validation, the host calls
-`complete_security_run(repo_root=...)`. This finishing tool lists eligible
-false positives, saves the report, and automatically invokes
+After package verification, selected updates and validation, the host calls
+`complete_security_run(repo_root=...)`. Job 4 finishes remaining source
+assessments, lists eligible false positives, and automatically invokes
 `submit_false_positive_approvals` once. It does not wait for another readiness
 message. Review the initially unchecked findings and their exact reasons in
-the native form. The report already exists if you need more time: cancel,
-continue reviewing, then explicitly request `submit_false_positive_approvals`
-to reopen it. Hosts may time out unanswered forms; neither cancellation nor a
-timeout authorizes a remote write. After the response the report is refreshed
-with actual outcomes. Decline/cancel or an unsupported/failed host form writes
+the native form. Source-fix selection has not yet started. Cancel/empty
+submission changes nothing remotely and proceeds to job 5; do not reopen
+job 4 during a later job. Hosts may time out unanswered forms; neither cancellation nor a
+timeout authorizes a remote write. Final reports include actual outcomes.
+Decline/cancel or an unsupported/failed host form writes
 nothing remotely. Do not separately call the review or report tool in the
 standard workflow, and do not reopen a declined form automatically.
 Standalone review/report tools remain available for explicit follow-up requests.
@@ -1926,7 +2098,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.41-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.48-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -1942,7 +2114,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.41-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.48-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -2002,7 +2174,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.41-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.48-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
@@ -2018,7 +2190,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.41-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.48-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -2039,7 +2211,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.41-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.48-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -2048,7 +2220,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.41-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.48-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -2351,7 +2523,7 @@ VS Code/Cursor windows, including Agents/background windows, and use
 **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.41-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.48-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2425,7 +2597,7 @@ installation.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.41**
+3. Apply the deployment-specific update and verify installed version **1.0.48**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2434,7 +2606,7 @@ installation.
    `review_false_positives` among the sixteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.41`
+   edits before requesting a new run. Its `server_version` must be `1.0.48`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -2493,15 +2665,15 @@ GitLab permissions or clear the host's internal conversation errors.
 6. Follow tool progress and approval prompts. The calling AI must finish
    `HOST_REVIEW_REQUIRED` source analysis and submit hash-bound assessments,
    not hand that task to the user. Before edits, review the package current/proposed
-   versions or scoped code actions and check only the fixes you permit. On Windows,
-   the separate window has no review deadline: submit and the reviewed package
-   updates and documented Dockerfile, nginx or GitLab CI line fixes execute
-   automatically. Only other selected source fixes need Agent continuation.
-   Keep the server running until builds/tests and reports finish.
-   At completion, select only the false positives
-   you want dismissed in the automatically offered checkbox form. The report
-   is saved before the form opens. Cancel if you need more time, then explicitly
-   request `submit_false_positive_approvals` to reopen it.
+   versions and check only package updates you permit in job 3. After package
+   validation, job 4 offers separate false-positive dismissal checkboxes.
+   Job 5 then offers a NEW source/config-only fix selection. On Windows,
+   selected reviewed packages and supported configuration fixes execute
+   automatically in their respective jobs; other code fixes need Agent continuation.
+   Keep the server running until validation and reports finish.
+   Job 6 asks Yes/No before auditing; Yes writes the deep report before audit
+   fix checkboxes. Job 7 displays packages/code left unresolved and the reasons.
+   Human windows have no server review deadline. Cancel approves nothing.
    Do not authorize the AI to answer it.
 7. Review the final Finding Assessments, actual dismissal outcomes, unresolved
    findings, production-build/dependency evidence and local diff. Commit/push manually if accepted.
@@ -2588,6 +2760,29 @@ than relying only on a short natural-language success message.
 
 ### Live progress and HTTP timings
 
+For progress **inside** Cursor or VS Code, install the companion
+`gitlab-security-progress-1.0.48.vsix` using **Extensions: Install from VSIX**
+in both editors, and open the audited checkout as a workspace folder.
+It watches inspection-only `.security-mcp/progress.json` files and displays a
+status-bar spinner, progress notification, and **GitLab Security Progress**
+output channel. Click the status item or run **GitLab Security: Show Task
+Progress** for details. It sends nothing over the network and authorizes no
+edits. Install the wheel separately and restart its MCP connection.
+
+Each active tool and background owner has a separate receipt. Silent server
+work refreshes every five seconds; a returned request cannot complete its worker.
+The persistent workflow bar shows **Job N/7**, the actual finished-job fraction,
+and the current item/activity. Its tooltip/output includes all seven jobs and
+their states. This job fraction is not a prediction of runtime or fix success.
+After job seven the extension opens the final Markdown preview once in a
+trusted workspace; untrusted workspaces do not auto-open it. The host also
+receives the saved path and Markdown for display.
+Unknown totals stay indeterminate; audit percentages count actual file receipts,
+not fixed findings or elapsed time. Human/AI waiting states and stale updates
+are labelled. The extension cannot observe AI reasoning between progress calls.
+The existing external Windows console remains an optional fallback, not a
+substitute for installing the in-editor extension.
+
 The server emits progress immediately to stderr, never protocol stdout. Each
 item log identifies the checkout, finding ID, package, and current step. Steps
 include local evidence, public advisories, target planning, compatibility/license
@@ -2638,8 +2833,15 @@ a separate **GitLab Security Progress** console automatically. Progress bars
 and stage messages appear there during the tool call, even when the editor
 hides server stderr or does not request MCP progress. The console uses an
 isolated text-only child process; human messages never enter protocol stdout.
-It opens lazily for run work and closes when completion/reporting finishes,
-a run fails, or the server exits. Active concurrent tool calls drain before
+It opens lazily for run work and remains open across owned background callbacks
+and pending audit handoffs. Background tasks show the checkout, current step,
+waiting/running/failure state, elapsed time and number of finished execution
+steps every five seconds, even when a command is silent. The overall total
+stays unknown unless actual file counts were supplied; elapsed time is never
+converted into a completion percentage. These indicators work independently
+of editor notification support in Cursor and VS Code.
+The console closes after pending work/reporting ends, a terminal failure, or
+server shutdown. Active concurrent tool calls and background owners drain before
 the owned console is reaped. A later run opens a new console; unrelated command
 prompts are never closed. Read-only status requests do not create a window.
 Set `PROGRESS_CONSOLE=off` in the MCP server's
@@ -2650,7 +2852,11 @@ Restart the MCP server after changing code or this setting.
 Completed tools drain queued MCP progress for at most one second. If a host
 stops acknowledging notifications, the server logs the timeout, cancels and
 awaits its sender task, and retains the bounded transcript in the result.
-Late progress from a worker whose request has ended is ignored. This is separate
+Late callbacks cannot reuse a finished request's MCP progress token. Owned
+background work has its own publisher, console lifetime and heartbeat; executor
+threads explicitly inherit that publisher. `get_run_status.background_tasks`
+exposes current-process task receipts, not resumable authorizations. Audit
+progress and continuation are also saved in the run snapshot. This is separate
 from the product-command timeout and does not change validation success.
 
 Every tool call that emits progress also returns its most recent 64 messages
@@ -2770,10 +2976,10 @@ successful pulls are not undone if DNS subsequently fails.
 run gitlab-security on this repo
 ```
 
-That single request includes the candidate list and final report: after analysis,
-fixes and validation, `complete_security_run` saves the report and automatically
-offers native approval checkboxes once. Cancel to continue reviewing, then
-explicitly request `submit_false_positive_approvals` to reopen the form later.
+That single request follows the seven jobs above: package selection/execution,
+false-positive approval, source selection/execution, optional audit consent and
+report/fix selection, then the displayed unresolved report. Separate forms are
+never treated as interchangeable approval.
 Hosts may time out unanswered forms, so do not leave a form open during a long review.
 No findings are dismissed without your selected checkboxes.
 

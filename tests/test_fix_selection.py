@@ -1,6 +1,7 @@
 """Verify human-only issue selection before MCP remediation operations."""
 
 import asyncio
+import json
 import threading
 from copy import deepcopy
 from types import SimpleNamespace
@@ -9,10 +10,307 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from mcp.types import ClientCapabilities
 
-from gitlab_security_mcp import server
+from gitlab_security_mcp import server, workflow
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.report import render
 from gitlab_security_mcp.state import RunState
+
+
+def _ordered_engine(tmp_path, monkeypatch, job=3):
+    """Provide one ordered run with separate package and source candidates."""
+    engine = _engine(tmp_path)
+    engine.state.findings.append(
+        {
+            "id": "source",
+            "title": "Reachable source issue",
+            "severity": "high",
+            "category": "sast",
+            "location": {"file": "src/App.java", "startLine": 12},
+        }
+    )
+    engine.state.decisions["source"] = {
+        "decision": "CONFIRMED_VULNERABILITY",
+        "reason": "A reachable caller triggers this issue.",
+    }
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: False)
+    workflow.start(engine)
+    while engine.state.workflow["current"] < job:
+        workflow.advance(engine)
+    return engine
+
+
+def test_ordered_jobs_reject_early_dismissal_source_and_audit(tmp_path, monkeypatch):
+    """Prevent remote approval and audit work before the package job completes."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    ctx = _context()
+
+    async def exercise():
+        """Attempt two out-of-order jobs."""
+        dismissal = await server.submit_false_positive_approvals(ctx, str(tmp_path))
+        audit = await server.choose_software_audit_action(
+            ctx, str(tmp_path), choice="generate_report"
+        )
+        return dismissal, audit
+
+    # Act
+    dismissal, audit = asyncio.run(exercise())
+    # Assert
+    assert dismissal["status"] == audit["status"] == "JOB_ORDER_REQUIRED"
+    assert [item["id"] for item in engine.fix_selection_candidates()["candidates"]] == [
+        "one",
+        "two",
+    ]
+    assert not engine.state.software_audit
+    ctx.elicit.assert_not_called()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_package_job_cannot_finish_before_selected_update_attempt(
+    tmp_path, monkeypatch
+):
+    """Do not silently skip an approved package before any execution attempt."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    candidates = engine.fix_selection_candidates()["candidates"]
+    engine.record_fix_selection(candidates, ["one"], "APPROVED")
+    # Act
+    result = asyncio.run(server.complete_security_run(_context(), str(tmp_path)))
+    # Assert
+    assert result.structured_content["status"] == "PACKAGE_FIXES_REQUIRED"
+    assert engine.state.workflow["current"] == 3
+
+
+def test_precheck_branch_and_download_tools_start_jobs_in_order(tmp_path, monkeypatch):
+    """Verify real MCP entry points initialize and advance the sequential run."""
+    # Arrange
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(
+        engine, "run_prechecks", Mock(return_value={"status": "PRECHECK_PASSED"})
+    )
+    monkeypatch.setattr(
+        engine, "pull_main_twice", Mock(return_value={"status": "PULLED"})
+    )
+    monkeypatch.setattr(
+        engine,
+        "create_security_branch",
+        Mock(return_value={"status": "BRANCH_CREATED"}),
+    )
+    monkeypatch.setattr(
+        engine,
+        "list_security_findings",
+        Mock(return_value={"status": "OK", "findings": engine.state.findings}),
+    )
+
+    # Act
+    server.run_prechecks(str(tmp_path))
+    denied = server.list_security_findings(repo_root=str(tmp_path))
+    server.pull_main_twice(str(tmp_path))
+    assert engine.state.workflow["current"] == 1
+    server.create_security_branch(str(tmp_path))
+    assert engine.state.workflow["current"] == 2
+    server.list_security_findings(repo_root=str(tmp_path))
+
+    # Assert
+    assert denied["status"] == "JOB_ORDER_REQUIRED"
+    assert engine.state.workflow["current"] == 3
+    assert [item["status"] for item in engine.state.workflow["jobs"]] == [
+        "FINISHED",
+        "FINISHED",
+        "RUNNING",
+        "PENDING",
+        "PENDING",
+        "PENDING",
+        "PENDING",
+    ]
+    engine.list_security_findings.assert_called_once()
+
+
+def test_source_validation_keeps_prior_package_permission_without_allowing_more_package_edits(
+    tmp_path, monkeypatch
+):
+    """Validate both approved batches, but never let source consent authorize new package edits."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    engine.record_fix_selection(
+        engine.fix_selection_candidates()["candidates"], ["one"], "APPROVED"
+    )
+    engine.state.workflow["package_selection"] = deepcopy(engine.state.fix_selection)
+    engine.state.fix_selection = {}
+    workflow.advance(engine)
+    workflow.advance(engine)
+    engine.record_fix_selection(
+        engine.fix_selection_candidates()["candidates"], ["source"], "APPROVED"
+    )
+    engine.state.changes = [{"finding_id": "one"}, {"finding_id": "source"}]
+    validation = Mock(return_value={"status": "VALIDATION_COMPLETE"})
+    edits = Mock()
+    monkeypatch.setattr(engine, "run_validation_matrix", validation)
+    monkeypatch.setattr(engine, "apply_minimal_fix", edits)
+
+    # Act
+    checked = engine.run_approved_fix("run_validation_matrix")
+    denied = engine.run_approved_fix("apply_minimal_fix", "one")
+
+    # Assert
+    assert checked["status"] == "VALIDATION_COMPLETE"
+    assert denied["status"] == "FIX_APPROVAL_REQUIRED"
+    validation.assert_called_once()
+    edits.assert_not_called()
+
+
+def test_package_completion_then_false_positives_then_new_source_form(
+    tmp_path, monkeypatch
+):
+    """Separate source consent from package consent even after package edits exist."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    candidates = engine.fix_selection_candidates()["candidates"]
+    engine.record_fix_selection(
+        candidates, [], "SKIPPED", "Developer skipped package updates."
+    )
+    engine.state.changes = [
+        {"finding_id": "unrelated-previous-config", "status": "APPLIED"}
+    ]
+    calls = []
+
+    async def dismiss(ctx, root):
+        """Model the independent human false-positive window."""
+        assert engine.state.workflow["current"] == 4
+        calls.append("false positives")
+        engine.state.false_positive_approval_form = {"status": "CANCELLED"}
+        return {"status": "CANCELLED"}
+
+    monkeypatch.setattr(server, "submit_false_positive_approvals", dismiss)
+
+    async def elicit(message, schema):
+        """Approve only the source-only checklist after remote review."""
+        assert engine.state.workflow["current"] == 5
+        assert "SOURCE/CONFIG" in message
+        assert len(schema.model_fields) == 1
+        assert "Reachable source issue" in schema.model_fields["finding_0"].title
+        assert schema.model_fields["finding_0"].default is False
+        calls.append("source checkboxes")
+        return SimpleNamespace(action="accept", data=schema(finding_0=True))
+
+    ctx = _context()
+    ctx.elicit.side_effect = elicit
+
+    async def exercise():
+        """Advance past package work and obtain a fresh source selection."""
+        completion = await server.complete_security_run(ctx, str(tmp_path))
+        assert completion.structured_content["status"] == "SOURCE_SELECTION_REQUIRED"
+        selected = await server.select_security_fixes(ctx, str(tmp_path))
+        pending = await server.complete_security_run(ctx, str(tmp_path))
+        return selected, pending
+
+    # Act
+    selected, pending = asyncio.run(exercise())
+    # Assert
+    assert selected["selected_ids"] == ["source"]
+    assert pending.structured_content["status"] == "SOURCE_FIXES_REQUIRED"
+    assert engine.state.workflow["current"] == 5
+    assert engine.state.workflow["package_selection"]["selected_ids"] == []
+    assert calls == ["false positives", "source checkboxes"]
+
+
+def test_failed_source_outcome_and_declined_audit_still_display_final_report(
+    tmp_path, monkeypatch
+):
+    """Record failed source attempts and finish reporting even when audit is declined."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch, job=5)
+    candidates = engine.fix_selection_candidates()["candidates"]
+    engine.record_fix_selection(candidates, ["source"], "APPROVED")
+    consent = AsyncMock(
+        return_value=SimpleNamespace(
+            action="accept", data=server.SoftwareAuditConsent(run_audit=False)
+        )
+    )
+    ctx = _context()
+    ctx.elicit = consent
+    # This fixture normally isolates audit UI; here exercise the real consent path.
+    monkeypatch.setattr(server, "_offer_software_audit", _REAL_AUDIT_OFFER)
+
+    async def exercise():
+        """Reject an unchecked outcome, then report a real selected-fix blocker."""
+        invalid = await server.complete_security_run(
+            ctx,
+            str(tmp_path),
+            code_results=[
+                {"id": "unselected", "status": "failed", "reason": "Not approved."}
+            ],
+        )
+        assert invalid.is_error
+        assert engine.state.workflow["current"] == 5
+        return await server.complete_security_run(
+            ctx,
+            str(tmp_path),
+            code_results=[
+                {
+                    "id": "source",
+                    "status": "failed",
+                    "reason": "Required API contract is unavailable.",
+                    "validation": "Not run; cannot safely implement.",
+                }
+            ],
+        )
+
+    # Act
+    result = asyncio.run(exercise()).structured_content
+    # Assert
+    assert result["status"] == "WORKFLOW_COMPLETE"
+    assert "Required API contract is unavailable." in result["final_summary_markdown"]
+    assert "2.0.0" in result["final_summary_markdown"]
+    assert not engine.state.software_audit.get("output_path")
+    assert engine.state.workflow["jobs"][5]["status"] == "SKIPPED"
+    assert engine.state.workflow["jobs"][6]["status"] == "FINISHED"
+    consent.assert_awaited_once()
+    report = tmp_path / ".security-mcp" / "reports" / "unresolved-remediation.md"
+    assert report.read_text(encoding="utf-8") == result["final_summary_markdown"]
+    workflow.activity(engine, "Late worker cleanup")
+    receipt = json.loads(
+        (tmp_path / ".security-mcp" / "progress.json").read_text(encoding="utf-8")
+    )
+    task = next(item for item in receipt["tasks"] if item["id"] == "workflow")
+    assert task["status"] == "FINISHED"
+    assert (task["completed"], task["total"], task["unit"]) == (7, 7, "jobs finished")
+
+
+def test_source_fixed_outcome_requires_actual_validation(tmp_path, monkeypatch):
+    """Reject a success attestation without its validation command and result."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch, job=5)
+    engine.record_fix_selection(
+        engine.fix_selection_candidates()["candidates"], ["source"], "APPROVED"
+    )
+    # Act
+    result = asyncio.run(
+        server.complete_security_run(
+            _context(),
+            str(tmp_path),
+            code_results=[
+                {"id": "source", "status": "fixed", "reason": "Changed caller."}
+            ],
+        )
+    )
+    # Assert
+    assert result.is_error
+    assert "validation" in result.structured_content["reason"]
+    assert engine.state.workflow["current"] == 5
+
+
+_REAL_AUDIT_OFFER = server._offer_software_audit
+
+
+@pytest.fixture(autouse=True)
+def isolate_closing_audit(monkeypatch):
+    """Keep selection tests from opening the separately tested audit dialog."""
+    offered = AsyncMock(return_value={"status": "CHOICE_REQUIRED"})
+    monkeypatch.setattr(server, "_offer_software_audit", offered)
+    return offered
 
 
 def _engine(tmp_path):
@@ -68,6 +366,11 @@ def _context(action="accept", values=None, supported=True, before_response=None)
 def _native_lifecycle(monkeypatch, engine):
     """Isolate dialog lifecycle tests from the separately tested package executor."""
     monkeypatch.setattr(server.desktop_approval, "available", lambda: True)
+    monkeypatch.setattr(
+        server,
+        "review_false_positives",
+        AsyncMock(return_value={"status": "NO_CANDIDATES"}),
+    )
     monkeypatch.setattr(
         engine,
         "prepare_package_updates",
@@ -764,6 +1067,10 @@ def test_native_shutdown_waits_for_its_owned_package_worker(tmp_path, monkeypatc
 
     def execute(request_id, reviews, tree, cancelled):
         """Retain ownership until the current bounded operation finishes."""
+        from gitlab_security_mcp.commands import progress_sink
+
+        assert callable(progress_sink.get())
+        progress_sink.get()("Worker is building the selected package.")
         running.set()
         assert cancelled.wait(5)
         stopping.set()

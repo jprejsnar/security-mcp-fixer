@@ -150,6 +150,11 @@ def _unresolved_issues(state: RunState) -> list[dict]:
             continue
         seen.add(finding_id)
         assessment = state.decisions.get(finding_id) or finding.get("assessment") or {}
+        host_result = (
+            state.workflow.get("code_results", {}).get(f"gitlab:{finding_id}") or {}
+        )
+        if host_result.get("status") == "fixed":
+            continue
         decision = assessment.get("decision") or finding.get("remediationDecision")
         outcome = outcomes.get(finding_id) or {}
         qualification = finding.get("packageQualification") or {}
@@ -187,11 +192,15 @@ def _unresolved_issues(state: RunState) -> list[dict]:
         ):
             continue
         detail = reasons.get(finding_id) or {}
+        selection = (
+            state.workflow.get("package_selection", {})
+            if "ecosystem" in (finding.get("proposedFix") or {})
+            else state.fix_selection
+        ) or state.fix_selection
         unselected = (
-            state.fix_selection.get("status")
-            in {"APPROVED", "SKIPPED", "UNAVAILABLE", "INVALID"}
-            and finding_id in state.fix_selection.get("candidate_ids", [])
-            and finding_id not in state.fix_selection.get("selected_ids", [])
+            selection.get("status") in {"APPROVED", "SKIPPED", "UNAVAILABLE", "INVALID"}
+            and finding_id in selection.get("candidate_ids", [])
+            and finding_id not in selection.get("selected_ids", [])
         )
         unresolved.append(
             {
@@ -206,11 +215,12 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 ),
                 "location": finding.get("location") or {},
                 "decision": outcome.get("status") if failed else decision,
-                "reason": (outcome.get("detail") if failed or pending else None)
+                "reason": host_result.get("reason")
+                or (outcome.get("detail") if failed or pending else None)
                 or (
                     "No remediation edit was authorized for this finding. "
                     + (
-                        state.fix_selection.get("reason")
+                        selection.get("reason")
                         or "The human did not select this issue."
                     )
                     if unselected
@@ -233,6 +243,116 @@ def _unresolved_issues(state: RunState) -> list[dict]:
             }
         )
     return unresolved
+
+
+def write_unresolved_report(root: Path, state: RunState) -> dict:
+    """Write the final job's package blockers and explicit unsuccessful code outcomes."""
+    unresolved = _unresolved_issues(state)
+    findings = {item["id"]: item for item in state.findings}
+    reviews = state.workflow.get("package_reviews") or {}
+    lines = [
+        "# Unresolved remediation",
+        "",
+        "Local results only. Nothing was committed or pushed. Host code-fix outcomes are attestations, not independent MCP validation or GitLab resolution.",
+        "",
+        "## Package versions not updated",
+        "| Finding / package | Current | Proposed target | Why not updated |",
+        "|---|---|---|---|",
+    ]
+    package_ids = set()
+    for item in unresolved:
+        finding = findings[item["id"]]
+        plan = finding.get("proposedFix") or {}
+        if not (
+            plan.get("ecosystem")
+            or finding.get("category") in {"dependency_scanning", "container_scanning"}
+        ):
+            continue
+        package_ids.add(item["id"])
+        version_review = finding.get("packageVersionSelection") or {}
+        reason = reviews.get(item["id"], {}).get("blocked_reason")
+        if not reason and version_review.get("status") == "BLOCKED":
+            reason = (version_review.get("review") or {}).get("assessment")
+        cells = (
+            f"{item['id']}: {plan.get('package') or finding.get('component') or finding.get('title')}",
+            plan.get("installed")
+            or finding.get("installedVersion")
+            or item["installed_version"]
+            or "Not established",
+            plan.get("target") or "No verified eligible target",
+            reason or item["reason"],
+        )
+        lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")
+    if not package_ids:
+        lines.append(
+            "| None recorded | - | - | No unresolved package updates recorded; this is not a guarantee of no vulnerabilities. |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Code fixes attempted but not completed",
+            "| Origin / finding | Outcome | Why it could not be fixed | Validation |",
+            "|---|---|---|---|",
+        ]
+    )
+    results = state.workflow.get("code_results") or {}
+    failed = [item for item in results.values() if item["status"] == "failed"]
+    for item in failed:
+        lines.append(
+            "| "
+            + " | ".join(
+                _table_cell(cell)
+                for cell in (
+                    f"{item['origin']}: {item['id']}",
+                    "Failed",
+                    item["reason"],
+                    item.get("validation") or "Not reached; see blocker",
+                )
+            )
+            + " |"
+        )
+    if not failed:
+        lines.append("| None reported | - | No failed code attempts recorded | - |")
+    lines.extend(
+        [
+            "",
+            "## Other unresolved or unattempted code findings",
+            "| Finding | Reason |",
+            "|---|---|",
+        ]
+    )
+    failed_ids = {item["id"] for item in failed if item["origin"] == "gitlab"}
+    for item in unresolved:
+        if item["id"] not in package_ids | failed_ids:
+            lines.append(
+                f"| {_table_cell(item['id'])} | {_table_cell(item['reason'])} |"
+            )
+    selected_audit = {
+        item["id"] for item in state.software_audit.get("selected_items", [])
+    }
+    for item in state.software_audit.get("items", []):
+        if item["id"] not in selected_audit:
+            lines.append(
+                f"| Audit {_table_cell(item['id'])} | Not selected; no edit authorized. |"
+            )
+    lines.extend(["", "## Workflow jobs"])
+    for job in state.workflow.get("jobs", []):
+        status = "FINISHED" if job["number"] == 7 else job["status"]
+        lines.append(f"- {job['number']}. {job['label']}: {status}")
+    if state.workflow.get("blocked"):
+        lines.extend(["", f"Run blocker: {_table_cell(state.workflow['blocked'])}"])
+    if state.report_path:
+        lines.extend(["", f"[Full security report]({Path(state.report_path).name})"])
+    path = root / ".security-mcp" / "reports" / "unresolved-remediation.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    markdown = "\n".join(lines) + "\n"
+    atomic_write_text(path, markdown)
+    return {
+        "status": "WORKFLOW_COMPLETE",
+        "report_path": str(path),
+        "final_summary_markdown": markdown,
+        "message": f"Display this Markdown report to the developer: {path}. Package blockers and unsuccessful code attempts remain unresolved.",
+    }
 
 
 def render(

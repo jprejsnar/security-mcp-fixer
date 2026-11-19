@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -14,9 +15,9 @@ import threading
 from collections import deque
 from copy import deepcopy
 from datetime import UTC, datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
-from time import gmtime
+from time import gmtime, monotonic
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -42,20 +43,28 @@ from mcp.types import (
 )
 from pydantic import BaseModel, Field, create_model
 
-from gitlab_security_mcp import __version__, desktop_approval
+from gitlab_security_mcp import __version__, desktop_approval, workflow
 from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
+from gitlab_security_mcp.progress import publish as publish_editor_progress
+from gitlab_security_mcp.report import write_unresolved_report
 from gitlab_security_mcp.software_audit import (
+    REVIEW_PHASES,
+    audit_coverage_gaps,
+    audit_has_no_findings,
+    audit_inventory,
     audit_items,
+    audit_report_is_draft,
     audit_report_path,
     choice_labels,
-    latest_audit_report,
     normalize_choice,
+    persist_audit_draft,
     project_file_name,
+    record_audit_coverage,
     render_audit_prompt,
 )
-from gitlab_security_mcp.util import logged_lock, redact
+from gitlab_security_mcp.util import environment_secrets, logged_lock, redact
 from gitlab_security_mcp.versions import is_major_upgrade
 
 logger = logging.getLogger("gitlab_security_mcp")
@@ -64,16 +73,34 @@ INSTRUCTIONS = """
 Local-only GitLab security remediation. One checkout per run. Pass the same
 absolute repo_root when more than one checkout is active. ${workspaceFolder}
 is not a path. Do not construct a separate Engine or resume from saved JSON.
-A request to run gitlab-security on this repo uses this order and stops on a blocker.
+A request to run gitlab-security on this repo uses seven sequential jobs:
+1. Pre-checks: run_prechecks, pull_main_twice, create_security_branch.
+2. Download: list_security_findings.
+3. Package updates: assess package findings, select_package_version, then
+   select_security_fixes shows only frontend/backend package updates. Execute
+   only human selections and validate before complete_security_run.
+4. False positives: finish source/finding verification, then offer separate
+   unchecked dismissal boxes with the evidence-backed reasons uploaded to GitLab.
+5. GitLab source fixes: a NEW unchecked select_security_fixes form shows only
+   source/config findings. Fix only selected IDs, then complete_security_run with
+   code_results=[{id,status:fixed|failed,reason,validation}]. Failed attempts need
+   the real blocker; fixed outcomes need actual validation evidence.
+6. Ask the human YES/NO before a deep-dive software audit. No means skip the
+   audit, not the final report. Yes generates the complete coverage-checked report,
+   THEN opens unchecked audit-fix boxes. Complete selected audit fixes with the
+   same code_results schema. Send current item/stage via progress.message.
+7. Generate and display the final unresolved-remediation Markdown, including
+   package current/target versions and blockers, plus unsuccessful code attempts.
+Use complete_security_run to advance one job at a time; it returns the next
+handoff. Never combine package and source selections or overlap jobs.
+A precheck, branch,
+or execution blocker stops edits, not reporting. A package with no safe release
+stays unresolved; continue other findings, save reports, and offer the audit.
 Each tool description is the procedure for that step.
-1. run_prechecks
-2. pull_main_twice
-3. create_security_branch
-4. list_security_findings
-5. verify_security_finding for every finding. Open the file and line GitLab
+Use verify_security_finding for every finding. Open the file and line GitLab
    already reported and read that code. A false-positive reason is at most
    2 everyday sentences about why the warning does not apply.
-6. For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
+For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    select_package_version to read the public stable-release catalog, then again
    with documented support/runtime exclusions. Choose the latest supported stable
    release compatible with the actual project runtime, including major upgrades.
@@ -102,29 +129,52 @@ Each tool description is the procedure for that step.
    caller_breakages_found:false,migration_sources:[official HTTPS URLs],
    api_comparison,caller_assessment,dependency_assessment,
    reviewed_files:[{path,sha256,assessment}]}.
-7. qualify_package_update for each selected package update
-8. apply_minimal_fix for each selected eligible fix, with no build between edits
-9. generate_aaa_test only for a supported base-image change
-10. run_validation_matrix once for the batch
-11. complete_security_run, which offers the human approval checkboxes once
-12. choose_software_audit_action once the approval window is no longer waiting.
-   The human chooses one action: write the software audit report to the home
-   directory, check which report findings to fix, or stop. Fix mode starts
+Call qualify_package_update for each selected package update, apply_minimal_fix
+for each selected eligible fix with no build between package edits, and
+run_validation_matrix once for that package batch. generate_aaa_test applies
+only to a selected supported base-image change in the source/config job.
+Call complete_security_run after each approved batch, even when every finding
+    is blocked or no fix is selected. Follow the seven jobs above; source
+    selection follows false-positive review. Audit generation needs human consent.
+If the human accepts the audit, generate the complete report BEFORE its fixes.
+   Never reuse a previous run's report or skip unreviewed application areas.
+   Follow the inventory and submit per-file hash/assessment receipts and completed
+   review phases via progress. AUDIT_INCOMPLETE means continue the read-only review.
+   After report_ready=True, show unchecked findings from the completed report.
+   Fix mode starts
    with every checkbox unchecked and fixes only the checked items. Do not
    choose for the human. Do not commit, push, or open a merge request.
-If select_security_fixes returns AWAITING_HUMAN, stop and wait. The Windows
-window has no review deadline. On submission the server automatically qualifies,
-applies and production-build validates the selected package updates and selected
-documented Dockerfile, nginx or GitLab CI line fixes, saves reports, then offers
-separate false-positive approvals. No second continue request is needed for these.
-REMEDIATION_RUNNING also means wait, never duplicate work.
-Other selected source-code fixes still require the host AI to continue its scoped work.
+   GENERATE_AUDIT_REPORT and AUDIT_IN_PROGRESS require the host AI to scan
+   repo_root now; the server cannot run that AI scan itself. Report progress
+   with choose_software_audit_action(progress={message:...,
+   files:[{path:<inventory-relative>,sha256:<current full-file hash>,assessment:...}],
+   completed_phases:[entry_points|data_access|errors_logs|resource_lifetime|ui_siblings]})
+   after each small batch. Complete every inventory file and all five phases;
+   record non-applicable phases honestly. Counts are derived from receipts.
+   After writing the exact output_path,
+   call choose_software_audit_action(report_ready=True) to open the fix checklist
+   when requested. Finish selected fixes with complete_security_run(code_results=...).
+   Do not stop at a generation request or skip that continuation.
+If select_security_fixes returns AWAITING_HUMAN or REMEDIATION_RUNNING, do not
+edit or poll. Call choose_software_audit_action with repo_root only: it waits for
+the owned background work and returns its audit handoff to this active AI turn.
+Follow that result; otherwise a background choice cannot start a host AI scan.
+The Windows windows have no review deadline. In job 3 the server qualifies,
+applies and production-build validates selected package updates, then offers
+separate false-positive approvals. In job 5 it can apply selected documented
+Dockerfile, nginx or GitLab CI line fixes. Other source fixes are host-led.
+Never duplicate server-owned work while that handoff call waits.
+SOURCE_FIXES_REQUIRED returns only human-selected GitLab source findings.
+The host AI must implement those scoped code fixes, validate and call
+complete_security_run with outcomes before offering the general audit. Never treat a completed
+package batch as completion of selected source work.
 Do not reopen approved selections or start completion, edits or validation while
 selection or server-owned package execution is pending.
 Apply all human-approved, qualified package security updates for Node, .NET/C#
 and Java, including supported transitive dependency overrides. Retain updates
 only after production builds, resolved-version proof and test-free configured
-policy checks pass. Never run unit/integration tests. If a batch fails, isolate
+policy checks pass. Never run unit/integration tests for package-only remediation.
+If a batch fails, isolate
 and revert offending updates while retaining passing updates. Missing tools are not success;
 an already-failing baseline requires explicit investigation, not a green claim.
 Do not modify source, unit tests or check scripts to make a package update pass.
@@ -206,16 +256,7 @@ class _StderrFormatter(logging.Formatter):
         """Redact the complete rendered record, including chained tracebacks."""
         return redact(
             super().format(record),
-            [
-                os.environ.get(name)
-                for name in (
-                    "GITLAB_TOKEN",
-                    "GITLAB_PERSONAL_ACCESS_TOKEN",
-                    "GITHUB_TOKEN",
-                    "GH_TOKEN",
-                    "NVD_API_KEY",
-                )
-            ],
+            environment_secrets(),
         )
 
 
@@ -358,6 +399,7 @@ _progress_console_attempted = False
 _progress_console_enabled = False
 _progress_calls = 0
 _progress_close_pending = False
+_audit_progress_roots: set[Path] = set()
 
 
 def _console_for_progress() -> _ProgressConsole | None:
@@ -380,7 +422,7 @@ def _finish_progress_call(terminal: bool) -> _ProgressConsole | None:
     with _progress_console_lock:
         _progress_calls -= 1
         _progress_close_pending |= terminal
-        if _progress_calls or not _progress_close_pending:
+        if _progress_calls or _audit_progress_roots or not _progress_close_pending:
             return None
         console = _progress_console
         _progress_console = None
@@ -388,6 +430,330 @@ def _finish_progress_call(terminal: bool) -> _ProgressConsole | None:
         _progress_console_enabled = False
         _progress_close_pending = False
         return console
+
+
+_background_status: dict[tuple[Path, str], dict[str, Any]] = {}
+_background_status_lock = threading.Lock()
+_BACKGROUND_HEARTBEAT_SECONDS = 5
+_AUDIT_PENDING = {
+    "AWAITING_HUMAN",
+    "CONSENT_REQUIRED",
+    "REQUESTED",
+    "CHOICE_REQUIRED",
+    "CHOICE_UNAVAILABLE",
+    "GENERATE_AUDIT_REPORT",
+    "AUDIT_IN_PROGRESS",
+    "SELECTION_REQUIRED",
+    "ITEMS_REQUIRED",
+    "AUDIT_INCOMPLETE",
+}
+
+
+def _editor_progress(
+    root: Path, task_id: str, label: str, message: str, **details
+) -> None:
+    """Make editor-delivery failures explicit without cancelling approved remediation."""
+    try:
+        publish_editor_progress(root, task_id, label, message, **details)
+    except (OSError, ValueError):
+        logger.warning("Could not publish editor progress for %s", root, exc_info=True)
+
+
+_audit_activity_tasks: dict[Path, tuple[object, asyncio.Task]] = {}
+_desktop_audit_tasks: dict[str, asyncio.Task] = {}
+
+
+def _publish_audit_activity(selected: Engine) -> bool:
+    """Distinguish a responsive server from unobserved host-AI work."""
+    audit = selected.state.software_audit
+    status = audit.get("status")
+    if status in {
+        "AWAITING_HUMAN",
+        "REQUESTED",
+        "CONSENT_REQUIRED",
+        "SELECTION_REQUIRED",
+        "CHOICE_REQUIRED",
+    }:
+        message = (
+            audit.get("message")
+            or "Waiting for software-audit consent; no scan has started."
+        )
+        activity_status = "WAITING_FOR_HUMAN"
+        reviewed = total = None
+        label = "Software audit: approval"
+    elif status in {
+        "GENERATE_AUDIT_REPORT",
+        "AUDIT_IN_PROGRESS",
+        "AUDIT_INCOMPLETE",
+        "FIX_FROM_AUDIT_REPORT",
+    }:
+        progress = audit.get("fix_progress") or audit.get("progress") or {}
+        coverage = audit.get("coverage") or {}
+        reviewed, total = (
+            len(coverage.get("reviews", {})),
+            len(coverage.get("files", [])),
+        )
+        stage = (
+            "Selected audit fixes"
+            if status == "FIX_FROM_AUDIT_REPORT"
+            else f"Software audit: {reviewed}/{total} files reviewed"
+        )
+        message = f"{stage}. {progress.get('message') or 'Approved; waiting for the host AI to report its work.'}"
+        updated = progress.get("updated_at") or audit.get("requested_at")
+        if updated:
+            age = max(
+                0,
+                int(
+                    (
+                        datetime.now(UTC) - datetime.fromisoformat(updated)
+                    ).total_seconds()
+                ),
+            )
+            message += f" Last AI update {age}s ago; MCP server responsive."
+        activity_status = "WAITING_FOR_AI"
+        label = (
+            "Software audit: selected fixes"
+            if status == "FIX_FROM_AUDIT_REPORT"
+            else "Software audit: reviewing"
+        )
+        if status == "FIX_FROM_AUDIT_REPORT":
+            reviewed = total = None
+    else:
+        return False
+    _editor_progress(
+        selected.repo_root,
+        "software-audit",
+        label,
+        message,
+        status=activity_status,
+        completed=reviewed,
+        total=total,
+    )
+    workflow.activity(selected, message, status=activity_status)
+    return True
+
+
+def _keep_audit_visible(selected: Engine) -> None:
+    """Own a heartbeat after a tool returns, without inventing AI file progress."""
+    previous = _audit_activity_tasks.get(selected.repo_root)
+    active = _publish_audit_activity(selected)
+    if previous and (not active or previous[0] is not selected.state):
+        previous[1].cancel()
+    if not active or (
+        previous and previous[0] is selected.state and not previous[1].done()
+    ):
+        return
+    state = selected.state
+
+    async def pulse() -> None:
+        """Report server liveness and time since the last actual host update."""
+        while True:
+            await asyncio.sleep(_BACKGROUND_HEARTBEAT_SECONDS)
+            if selected.state is not state or not _publish_audit_activity(selected):
+                return
+
+    task = asyncio.create_task(pulse())
+    _audit_activity_tasks[selected.repo_root] = (state, task)
+
+
+def _with_audit_activity(function):
+    """Maintain the audit owner independently of short-lived host requests."""
+
+    @wraps(function)
+    async def call(ctx, repo_root=None, *args, **kwargs):
+        """Publish the saved audit phase even if the request is interrupted."""
+        selected = await asyncio.to_thread(_engine_for, repo_root)
+        try:
+            return await function(ctx, repo_root, *args, **kwargs)
+        finally:
+            _keep_audit_visible(selected)
+
+    return call
+
+
+def _with_background_progress(label: str):
+    """Keep owned worker progress alive independently of an ended MCP request."""
+
+    def decorate(function):
+        """Bind one native callback to its own console lifetime and status."""
+
+        @wraps(function)
+        async def run(ctx, selected: Engine, request_id: str, *args, **kwargs):
+            """Publish current activity and a truthful heartbeat until callback cleanup."""
+            global _progress_calls, _progress_console_enabled
+            key = (selected.repo_root, request_id)
+            owner_state = selected.state
+            owner_job = owner_state.workflow.get("current")
+            started = monotonic()
+            with _background_status_lock:
+                # Completed receipts are diagnostic only, never reusable authorization.
+                for old in list(_background_status):
+                    if old[0] == selected.repo_root and _background_status[old][
+                        "status"
+                    ] not in {"RUNNING", "WAITING_FOR_HUMAN", "WAITING_FOR_AI"}:
+                        del _background_status[old]
+                _background_status[key] = {
+                    "task": label,
+                    "request_id": request_id,
+                    "status": "WAITING_FOR_HUMAN",
+                    "current_step": "Waiting for the unchecked selection window.",
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            with _progress_console_lock:
+                _progress_calls += 1
+                if progress_sink.get() is not None:
+                    _progress_console_enabled = True
+            ended = threading.Event()
+
+            def publish(text: str) -> None:
+                """Never reuse the original request's progress token from a worker."""
+                if ended.is_set():
+                    return
+                text = " ".join(str(text).split())[:2000]
+                status = next(
+                    (
+                        state
+                        for state in ("WAITING_FOR_HUMAN", "WAITING_FOR_AI")
+                        if text.startswith(state)
+                    ),
+                    "RUNNING",
+                )
+                with _background_status_lock:
+                    _background_status[key].update(
+                        status=status,
+                        current_step=text,
+                        updated_at=datetime.now(UTC).isoformat(),
+                    )
+                logger.info(
+                    "Background repo=%s task=%s: %s", selected.repo_root, label, text
+                )
+                _editor_progress(
+                    selected.repo_root, request_id, label, text, status=status
+                )
+                if (
+                    selected.state is owner_state
+                    and owner_state.workflow.get("current") == owner_job
+                ):
+                    if not _publish_audit_activity(selected):
+                        workflow.activity(selected, text, status=status)
+                console = _console_for_progress()
+                if console is not None:
+                    console.write(f"{selected.repo_root} | {label} | {text}")
+
+            async def heartbeat() -> None:
+                """Show elapsed activity, not an invented overall completion percentage."""
+                while True:
+                    await asyncio.sleep(_BACKGROUND_HEARTBEAT_SECONDS)
+                    with _background_status_lock:
+                        _background_status[key].update(
+                            heartbeat_at=datetime.now(UTC).isoformat(),
+                            elapsed_seconds=round(monotonic() - started, 1),
+                        )
+                        snapshot = dict(_background_status[key])
+                    execution = (
+                        selected.state.fix_selection.get("package_execution") or {}
+                    )
+                    steps = len(execution.get("results") or [])
+                    text = f"{selected.repo_root} | {label} | {snapshot['status']} | {int(monotonic() - started)}s elapsed | {steps} execution steps finished; overall total unknown | {snapshot['current_step']}"
+                    logger.info("%s", text)
+                    _editor_progress(
+                        selected.repo_root,
+                        request_id,
+                        label,
+                        text,
+                        status=snapshot["status"],
+                    )
+                    if (
+                        selected.state is owner_state
+                        and owner_state.workflow.get("current") == owner_job
+                    ):
+                        workflow.activity(
+                            selected,
+                            snapshot["current_step"],
+                            status=snapshot["status"],
+                        )
+                    console = _console_for_progress()
+                    if console is not None:
+                        console.write(text)
+
+            token = progress_sink.set(publish)
+            ticker = asyncio.create_task(heartbeat())
+            outcome = "FINISHED"
+            try:
+                publish(
+                    "WAITING_FOR_HUMAN | Selection window is open; no response deadline."
+                )
+                return await function(ctx, selected, request_id, *args, **kwargs)
+            except asyncio.CancelledError:
+                outcome = "CANCELLED"
+                raise
+            except Exception:
+                outcome = "FAILED"
+                raise
+            finally:
+                ticker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ticker
+                execution = selected.state.fix_selection.get("package_execution") or {}
+                selection = selected.state.fix_selection
+                approval = selected.state.false_positive_approval_form
+                detail = (
+                    selected.state.software_audit.get("status")
+                    if label == "Software audit approval"
+                    else (
+                        execution.get("status") or selection.get("status")
+                        if selection.get("request_id") == request_id
+                        else approval.get("status")
+                    )
+                )
+                if outcome == "FINISHED" and detail in {
+                    "INVALID",
+                    "UNAVAILABLE",
+                    "APPROVAL_INVALID",
+                    "APPROVAL_INTERRUPTED",
+                    "PARTIAL_FAILURE",
+                    "BLOCKED",
+                    "INTERRUPTED",
+                }:
+                    outcome = detail
+                publish(
+                    f"{outcome} | callback outcome: {detail or 'see run status'}; this is not an overall run-success claim."
+                )
+                ended.set()
+                with _background_status_lock:
+                    _background_status[key].update(
+                        status=outcome,
+                        outcome=detail,
+                        elapsed_seconds=round(monotonic() - started, 1),
+                    )
+                progress_sink.reset(token)
+                _editor_progress(
+                    selected.repo_root,
+                    request_id,
+                    label,
+                    f"{outcome}: {detail}",
+                    status=outcome,
+                )
+                console = _finish_progress_call(
+                    selected.state.software_audit.get("status") not in _AUDIT_PENDING
+                )
+                if console is not None:
+                    await asyncio.to_thread(console.close)
+
+        return run
+
+    return decorate
+
+
+def _background_for(selected: Engine) -> list[dict[str, Any]]:
+    """Read worker activity without waiting behind a long-running engine mutation."""
+    with _background_status_lock:
+        return [
+            dict(value)
+            for (root, _), value in _background_status.items()
+            if root == selected.repo_root
+        ]
 
 
 def _compact_tool_text(result: CallToolResult) -> None:
@@ -422,13 +788,42 @@ async def _progress_middleware(
             "complete_security_run",
             "generate_local_report",
             "submit_false_positive_approvals",
-            "choose_software_audit_action",
         }:
             _progress_console_enabled = True
     loop = asyncio.get_running_loop()
     messages: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
     transcript: deque[str] = deque(maxlen=64)
     finished = threading.Event()
+    editor_task = uuid4().hex
+    latest = "Starting " + str(name or "MCP task")
+
+    def editor_update(text: str, status: str = "RUNNING") -> None:
+        """Resolve registered checkouts without constructing an engine for UI output."""
+        arguments = (getattr(context, "params", None) or {}).get("arguments") or {}
+        root = arguments.get("repo_root")
+        with _registry_lock:
+            selected = (
+                _engines.get(Path(root).expanduser().resolve())
+                if root
+                else next(iter(_engines.values()))
+                if len(_engines) == 1
+                else None
+            )
+        if selected is not None and name != "get_run_status":
+            _editor_progress(
+                selected.repo_root, editor_task, str(name), text, status=status
+            )
+            if status == "RUNNING":
+                if not _publish_audit_activity(selected):
+                    workflow.activity(selected, text)
+        elif root and name == "run_prechecks":
+            _editor_progress(
+                Path(root).expanduser().resolve(),
+                editor_task,
+                "Job 1/7: Pre-checks",
+                text,
+                status=status,
+            )
 
     def enqueue(text: str) -> None:
         """Keep the most recent updates if a client consumes notifications slowly."""
@@ -442,9 +837,12 @@ async def _progress_middleware(
 
     def publish(text: str) -> None:
         """Schedule updates from either command reader thread onto the MCP loop."""
+        nonlocal latest
         if finished.is_set():
             return
         text = str(text)[:2000]
+        latest = text
+        editor_update(text)
         console = _console_for_progress()
         if console is not None:
             console.write(text)
@@ -468,7 +866,16 @@ async def _progress_middleware(
 
     token = progress_sink.set(publish)
     sender = asyncio.create_task(deliver())
+
+    async def pulse() -> None:
+        """Keep silent tool calls visible without elapsed-time completion estimates."""
+        while True:
+            await asyncio.sleep(_BACKGROUND_HEARTBEAT_SECONDS)
+            editor_update(latest)
+
+    ticker = asyncio.create_task(pulse())
     terminal = True
+    tool_outcome = "FAILED"
     try:
         result = await call_next(context)
         if (
@@ -483,6 +890,12 @@ async def _progress_middleware(
             result.structured_content if isinstance(result, CallToolResult) else result
         )
         status = payload.get("status", "") if isinstance(payload, dict) else ""
+        tool_outcome = (
+            "FAILED"
+            if status == "ERROR"
+            or (isinstance(result, CallToolResult) and result.is_error)
+            else "FINISHED"
+        )
         terminal = (isinstance(result, CallToolResult) and result.is_error) or (
             isinstance(status, str)
             and (
@@ -490,7 +903,29 @@ async def _progress_middleware(
                 or status.endswith(("_FAILED", "_INCOMPLETE"))
             )
         )
+        if isinstance(payload, dict):
+            audit = payload.get("software_audit") or {}
+            review = payload.get("false_positive_review") or {}
+            if (
+                audit.get("status") in _AUDIT_PENDING
+                or review.get("status") == "AWAITING_HUMAN"
+            ):
+                terminal = False
+            if name == "choose_software_audit_action" and status in {
+                "DONE",
+                "NONE_SELECTED",
+                "NO_FINDINGS",
+                "AUDIT_REPORT_GENERATED",
+            }:
+                terminal = True
+    except asyncio.CancelledError:
+        tool_outcome = "CANCELLED"
+        raise
     finally:
+        ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
+        editor_update(latest, tool_outcome)
         progress_sink.reset(token)
         try:
             async with asyncio.timeout(1):
@@ -538,6 +973,8 @@ def _close_engine() -> None:
     with logged_lock(_registry_lock, "registry"):
         engines = list(_engines.values())
         _engines.clear()
+    with _progress_console_lock:
+        _audit_progress_roots.clear()
     failures: list[Exception] = []
     for item in engines:
         try:
@@ -588,6 +1025,32 @@ def _run(
     selected: Engine | None = None
     try:
         selected = _engine_for(repo_root)
+        if tool_name == "get_run_status":
+            return _live_run_status(selected)
+        stages = {
+            "pull_main_twice": (1,),
+            "create_security_branch": (1,),
+            "list_security_findings": (2,),
+            "verify_security_finding": (3, 4),
+            "select_package_version": (3,),
+            "qualify_package_update": (3,),
+            "apply_minimal_fix": (3, 5),
+            "generate_aaa_test": (5,),
+            "run_validation_matrix": (3, 5),
+        }
+        blocked = (
+            workflow.require(selected, *stages[tool_name])
+            if tool_name in stages
+            else None
+        )
+        if blocked:
+            return blocked
+        if (
+            tool_name == "run_prechecks"
+            and selected.state.workflow
+            and selected.state.workflow["current"] not in {1, 7}
+        ):
+            return workflow.require(selected, 1, 7)
         if tool_name in {
             "qualify_package_update",
             "apply_minimal_fix",
@@ -595,7 +1058,35 @@ def _run(
             "run_validation_matrix",
         }:
             return selected.run_approved_fix(tool_name, *args, **kwargs)
-        return getattr(selected, tool_name)(*args, **kwargs)
+        result = getattr(selected, tool_name)(*args, **kwargs)
+        if tool_name == "run_prechecks" and result["status"] != "REMEDIATION_RUNNING":
+            workflow.start(selected)
+            if result["status"] != "PRECHECK_PASSED":
+                selected.state.workflow["blocked"] = (
+                    result.get("reason") or result.get("error") or result["status"]
+                )
+                selected._remember()
+                workflow.activity(
+                    selected, selected.state.workflow["blocked"], status="FAILED"
+                )
+        elif selected.state.workflow:
+            if (
+                tool_name == "create_security_branch"
+                and result["status"] == "BRANCH_CREATED"
+            ):
+                workflow.advance(selected)
+            elif tool_name == "list_security_findings" and result["status"] == "OK":
+                workflow.advance(selected)
+            elif tool_name in {
+                "pull_main_twice",
+                "create_security_branch",
+                "list_security_findings",
+            } and (result["status"] == "ERROR" or result["status"].endswith("_FAILED")):
+                selected.state.workflow["blocked"] = (
+                    result.get("reason") or result.get("error") or result["status"]
+                )
+                selected._remember()
+        return result
     except Exception as exc:
         logger.exception("%s failed", tool_name)
         return {
@@ -677,10 +1168,7 @@ def create_security_branch(repo_root: str | None = None) -> dict[str, Any]:
 def list_security_findings(
     project_id: str | None = None, repo_root: str | None = None
 ) -> dict[str, Any]:
-    """Phase 3. Read GitLab findings on main; infer project from origin unless overridden.
-
-    A finding resolved on the default branch is not proof that this older branch is safe.
-    """
+    """Job 2: download GitLab findings; infer project from origin. Verify branch-resolution claims locally."""
     return _run("list_security_findings", project_id, repo_root=repo_root)
 
 
@@ -694,12 +1182,7 @@ async def verify_security_finding(
     repo_root: str | None = None,
     source_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assess a finding read-only; follow its source or reproduction workflow.
-
-    GitLab already names the file and line. Open that code, read it, and trace
-    callers and inputs. source_review.reason is the non-developer explanation:
-    at most 2 sentences and 400 characters. HOST_REVIEW_REQUIRED is unfinished.
-    """
+    """Assess read-only. Read the cited code, callers and inputs. source_review.reason: <=2 everyday sentences, <=400 chars. HOST_REVIEW_REQUIRED is unfinished."""
     result = await asyncio.to_thread(
         _run,
         "verify_security_finding",
@@ -947,6 +1430,7 @@ def _desktop_task_done(
         )
 
 
+@_with_background_progress("Security fix selection and execution")
 async def _finish_desktop_fix_selection(
     ctx: Context,
     selected: Engine,
@@ -994,10 +1478,11 @@ async def _finish_desktop_fix_selection(
             result["status"],
             len(result.get("selected_ids", [])),
         )
+        if result["status"] == "SKIPPED":
+            await complete_security_run(ctx, str(selected.repo_root))
         if result["status"] == "APPROVED" and result.get("server_execution_queued"):
-            work = asyncio.get_running_loop().run_in_executor(
-                None,
-                partial(
+            work = asyncio.create_task(
+                asyncio.to_thread(
                     selected.execute_selected_package_updates,
                     request_id,
                     prepared["reviews"],
@@ -1097,14 +1582,27 @@ async def _open_fix_selection(
             field["summary"] = field["description"]
         dialog = await desktop_approval.open_dialog(
             f"Repository: {selected.repo_root}\r\n"
-            "Select only the package updates or scoped code fixes you authorize. All boxes start unchecked. "
+            + (
+                "Job 3/7 - PACKAGE UPDATES ONLY (frontend and backend). Source fixes have a separate later selection.\r\n"
+                if selected.state.workflow.get("current") == 3
+                else "Job 5/7 - SOURCE/CONFIG FIXES ONLY. Package selection and false-positive review are finished.\r\n"
+                if selected.state.workflow.get("current") == 5
+                else ""
+            )
+            + "Select only the package updates or scoped code fixes you authorize. All boxes start unchecked. "
             "Review current/proposed versions, file scope, risk and acceptance requirements. "
             "There is no selection deadline. Cancel or close authorizes nothing. "
             "After submission, the server applies checked package updates and documented Dockerfile, nginx or GitLab CI line fixes, "
-            "then runs production builds/dependency checks, never unit/integration tests. "
+            "            then runs production builds/dependency checks, never unit/integration tests. "
             "Keep the server running; no second continue request is needed for these. Other source-code fixes still require your IDE agent.",
             properties,
-            title="GitLab security: choose updates and code fixes",
+            title=(
+                "GitLab security: choose package updates"
+                if selected.state.workflow.get("current") == 3
+                else "GitLab security: choose source fixes"
+                if selected.state.workflow.get("current") == 5
+                else "GitLab security: choose updates and code fixes"
+            ),
             detail_header="Proposed change and decision details",
             submit_label="Approve checked fixes",
         )
@@ -1195,12 +1693,32 @@ async def select_security_fixes(
     repo_root: str | None = None,
     package_reviews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | InputRequiredResult:
-    """Human-only selection; cancel/empty/unavailable skips edits.
-
-    Windows package_reviews[id]: workflow qualification evidence before checkboxes.
-    blocked_reason disables choices; build_only discloses uncertainty.
-    """
+    """Unchecked human GUI: job 3 packages, job 5 source. package_reviews[id] uses workflow evidence; blocked_reason disables unsafe updates."""
     selected = await asyncio.to_thread(_engine_for, repo_root)
+    blocked = workflow.require(selected, 3, 5)
+    if blocked:
+        return blocked
+    job = selected.state.workflow.get("current")
+    if job == 3:
+        missing = [
+            item["id"]
+            for item in selected.state.findings
+            if item.get("category")
+            not in {
+                "sast",
+                "secret_detection",
+                "dast",
+                "coverage_fuzzing",
+                "api_fuzzing",
+            }
+            and item["id"] not in selected.state.decisions
+        ]
+        if missing:
+            return {
+                "status": "FINDING_REVIEW_REQUIRED",
+                "finding_ids": missing,
+                "next_tool": "verify_security_finding",
+            }
     protocol = ctx.protocol_version
     if (
         isinstance(protocol, str)
@@ -1233,6 +1751,26 @@ async def select_security_fixes(
         )
         if prepared["status"] != "READY":
             return prepared
+        if job == 3:
+            selected.state.workflow["package_reviews"] = deepcopy(prepared["reviews"])
+            selected._remember()
+        if prepared.get("all_blocked"):
+            result = await asyncio.to_thread(
+                selected.record_fix_selection,
+                candidates,
+                [],
+                "SKIPPED",
+                "Every proposed update is blocked by its documented review; no edits are authorized.",
+            )
+            completion = await complete_security_run(ctx, str(selected.repo_root))
+            return {
+                **result,
+                "blocked_updates": [
+                    {"finding_id": key, "reason": review["blocked_reason"]}
+                    for key, review in prepared["reviews"].items()
+                ],
+                "completion": completion.structured_content,
+            }
         return await _open_fix_selection(ctx, selected, candidates, schema, prepared)
     pending = (
         snapshot
@@ -1246,7 +1784,14 @@ async def select_security_fixes(
     try:
         response = await _fix_form_response(
             ctx,
-            f"Choose which security issues may be fixed in {selected.repo_root}. "
+            (
+                "Job 3/7: Select frontend/backend PACKAGE UPDATES only. Source choices come after false-positive review. "
+                if job == 3
+                else "Job 5/7: Select GitLab SOURCE/CONFIG fixes only. Package updates and false-positive review are finished. "
+                if job == 5
+                else ""
+            )
+            + f"Choose which security issues may be fixed in {selected.repo_root}. "
             "All boxes start unchecked. Select only the issues you authorize. "
             "An annotation must actually enforce security, not hide a warning. "
             "Only precise, evidence-backed fixes are allowed. Dependency updates may incidentally "
@@ -1313,7 +1858,9 @@ async def _interrupt_desktop_startup(selected: Engine, receipt: dict) -> None:
     )
 
 
+@_with_background_progress("False-positive approval")
 async def _finish_desktop_approval(
+    ctx: Context,
     selected: Engine,
     request_id: str,
     candidates: list[dict],
@@ -1362,6 +1909,14 @@ async def _finish_desktop_approval(
         )
     finally:
         await dialog.close()
+    if selected.state.workflow:
+        if selected.state.false_positive_approval_form.get("request_id") == request_id:
+            await complete_security_run(ctx, str(selected.repo_root))
+    elif (
+        selected.state.false_positive_approval_form.get("request_id") == request_id
+        and _software_audit_blocked(selected) is None
+    ):
+        await _offer_software_audit(ctx, selected)
 
 
 @mcp.tool(
@@ -1466,6 +2021,9 @@ async def submit_false_positive_approvals(
     Completion calls once; reopen only on explicit human request after cancellation.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
+    blocked = workflow.require(selected, 4)
+    if blocked:
+        return blocked
     previous = selected.state.false_positive_approval_form
     if previous.get("request_id") in _desktop_approval_tasks:
         return {
@@ -1565,7 +2123,7 @@ async def submit_false_positive_approvals(
             return result
         task = asyncio.create_task(
             _finish_desktop_approval(
-                selected, receipt["request_id"], candidates, schema, dialog
+                ctx, selected, receipt["request_id"], candidates, schema, dialog
             )
         )
         _desktop_approval_tasks[receipt["request_id"]] = task
@@ -1668,7 +2226,7 @@ def _generate_local_report(repo_root: str | None = None) -> CallToolResult:
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Generate local report and offer false-positive approvals",
+        title="Continue security workflow (legacy name)",
         read_only_hint=False,
         destructive_hint=True,
         open_world_hint=True,
@@ -1677,22 +2235,336 @@ def _generate_local_report(repo_root: str | None = None) -> CallToolResult:
 async def generate_local_report(
     ctx: Context, repo_root: str | None = None
 ) -> CallToolResult:
-    """Legacy alias for complete_security_run, including human dismissal approvals."""
+    """Alias for complete_security_run; follow the current ordered job."""
     return await complete_security_run(ctx, repo_root)
 
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Complete security run: report and human approval checkboxes",
+        title="Advance ordered security jobs",
         read_only_hint=False,
         destructive_hint=True,
         open_world_hint=True,
     )
 )
+@_with_audit_activity
 async def complete_security_run(
+    ctx: Context,
+    repo_root: str | None = None,
+    code_results: list[dict[str, Any]] | None = None,
+    progress: dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Advance jobs; code_results use workflow outcome schema; progress={id,message}."""
+    selected = await asyncio.to_thread(_engine_for, repo_root)
+    if not selected.state.workflow:
+        return await _complete_legacy(ctx, repo_root)
+    lock = _workflow_locks.setdefault(selected.repo_root, asyncio.Lock())
+    async with lock:
+        result = await _continue_workflow(ctx, selected, code_results, progress)
+    return CallToolResult(
+        content=[
+            TextContent(
+                text=result.get("final_summary_markdown")
+                or result.get("message")
+                or result.get("reason")
+                or result["status"]
+            )
+        ],
+        structuredContent=result,
+        isError=result["status"] == "ERROR",
+    )
+
+
+_workflow_locks: dict[Path, asyncio.Lock] = {}
+
+
+class CodeFixResult(BaseModel):
+    """An explicit host attestation, not independent proof of a successful code fix."""
+
+    id: str = Field(min_length=1, strict=True)
+    status: Literal["fixed", "failed"]
+    reason: str = Field(min_length=1, strict=True)
+    validation: str = Field(default="", strict=True)
+
+
+def _record_code_results(selected: Engine, results: list[dict] | None) -> dict | None:
+    """Require a result for each approved host-led fix before leaving its job."""
+    state = selected.state
+    audit = state.workflow["current"] == 6
+    ids = (
+        [item["id"] for item in state.software_audit.get("selected_items", [])]
+        if audit
+        else _workflow_source_ids(state.fix_selection)
+    )
+    prefix = "audit" if audit else "gitlab"
+    stored = state.workflow["code_results"]
+    if not audit:
+        execution = state.fix_selection.get("package_execution") or {}
+        for finding_id in execution.get("config_ids", []):
+            change = next(
+                (
+                    item
+                    for item in reversed(state.changes)
+                    if item.get("finding_id") == finding_id
+                    and item.get("status") != "TEST_ADDED"
+                ),
+                {},
+            )
+            fixed = (
+                change.get("status") == "APPLIED"
+                and not change.get("validation_pending")
+                and state.validation_status == "VALIDATION_COMPLETE"
+            )
+            stored[f"gitlab:{finding_id}"] = {
+                "id": finding_id,
+                "origin": "gitlab",
+                "status": "fixed" if fixed else "failed",
+                "reason": change.get("detail")
+                or execution.get("reason")
+                or (
+                    "Applied and validated configuration fix."
+                    if fixed
+                    else "Configuration fix did not pass the recorded execution/validation checks."
+                ),
+                "validation": str(state.validation_status or "Not completed"),
+                "evidence": "MCP execution/validation receipts",
+            }
+    try:
+        parsed = [CodeFixResult.model_validate(item) for item in results or []]
+        if len({item.id for item in parsed}) != len(parsed):
+            raise ValueError("Duplicate code-fix outcome IDs.")
+        for item in parsed:
+            if item.id not in ids or not item.reason.strip():
+                raise ValueError(
+                    f"{item.id} is not a selected fix or lacks its outcome reason."
+                )
+            if item.status == "fixed" and not item.validation.strip():
+                raise ValueError(
+                    f"{item.id} needs the actual validation command/result before reporting fixed."
+                )
+    except ValueError as exc:
+        logger.warning("Code outcome rejected: %s", exc)
+        return {"status": "ERROR", "reason": str(exc)}
+    for item in parsed:
+        stored[f"{prefix}:{item.id}"] = {
+            **item.model_dump(),
+            "origin": prefix,
+            "evidence": "Host-reported; not independently verified by MCP",
+        }
+    selected._remember()
+    missing = [item for item in ids if f"{prefix}:{item}" not in stored]
+    if missing:
+        workflow.activity(
+            selected,
+            f"Waiting for code-fix outcomes: {', '.join(missing)}",
+            status="WAITING_FOR_AI",
+        )
+        return {
+            "status": "CODE_FIX_RESULTS_REQUIRED",
+            "selected_ids": missing,
+            "message": "Fix only selected items, then call complete_security_run(code_results=[{id,status:fixed|failed,reason,validation}]). Report real failures, not success-shaped fallbacks. Send progress={id,message} while working.",
+        }
+    return None
+
+
+async def _continue_workflow(
+    ctx: Context,
+    selected: Engine,
+    code_results: list[dict] | None,
+    progress: dict | None,
+) -> dict:
+    """Run only the next job, returning host work instead of overlapping jobs."""
+    state = selected.state
+    job = state.workflow["current"]
+    if progress is not None:
+        if (
+            code_results is not None
+            or job not in {5, 6}
+            or not isinstance(progress.get("message"), str)
+            or not progress["message"].strip()
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Code progress needs a message in job 5 or 6; do not combine it with outcomes.",
+            }
+        ids = (
+            [item["id"] for item in state.software_audit.get("selected_items", [])]
+            if job == 6
+            else state.fix_selection.get("selected_ids", [])
+        )
+        if progress.get("id") not in ids:
+            return {
+                "status": "ERROR",
+                "reason": "Progress must identify a human-selected code finding.",
+            }
+        workflow.activity(
+            selected,
+            f"{progress['id']}: {progress['message']}",
+            status="WAITING_FOR_AI",
+        )
+        if job == 6:
+            state.software_audit["fix_progress"] = {
+                "message": f"{progress['id']}: {progress['message']}",
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            selected._remember()
+        return {"status": "CODE_FIX_IN_PROGRESS", "current_job": job}
+    if code_results is not None and job not in {5, 6}:
+        return {
+            "status": "ERROR",
+            "reason": "Code outcomes require the selected source or audit-fix job.",
+        }
+    blocked = _software_audit_blocked(selected)
+    if blocked:
+        return blocked
+    if state.manual_cleanup_required:
+        state.workflow["blocked"] = (
+            "Manual checkout cleanup is required after remediation. Further edits and audit fixes were stopped; inspect the full security report."
+        )
+    if state.workflow.get("blocked"):
+        first = state.workflow["current"]
+        while state.workflow["current"] < 7:
+            workflow.advance(
+                selected,
+                status="FAILED" if state.workflow["current"] == first else "SKIPPED",
+                message=state.workflow["blocked"],
+            )
+        job = 7
+    if job in {1, 2}:
+        return {
+            "status": "JOB_ORDER_REQUIRED",
+            "current_job": job,
+            "message": "Finish pre-checks/branch preparation, then download GitLab findings.",
+        }
+    if job == 3:
+        selection = state.fix_selection
+        if not selection or selection.get("status") in {"REQUESTED", "AWAITING_HUMAN"}:
+            return {
+                "status": "PACKAGE_SELECTION_REQUIRED",
+                "next_tool": "select_security_fixes",
+            }
+        pending = [
+            item["finding_id"]
+            for item in state.changes
+            if item.get("validation_pending")
+        ]
+        if pending and not state.manual_cleanup_required:
+            return {
+                "status": "VALIDATION_REQUIRED",
+                "finding_ids": pending,
+                "next_tool": "run_validation_matrix",
+            }
+        attempted = {item.get("finding_id") for item in state.changes}
+        missing = [
+            item
+            for item in selection.get("selected_ids", [])
+            if item not in attempted
+            and not (selected._finding(item) or {}).get("packageQualification")
+            and not any(row["id"] == item for row in state.no_solution)
+        ]
+        if missing:
+            return {
+                "status": "PACKAGE_FIXES_REQUIRED",
+                "selected_ids": missing,
+                "next_tool": "qualify_package_update",
+                "message": "Apply the approved package updates and validate, or record their actual blockers before advancing.",
+            }
+        state.workflow["package_selection"] = deepcopy(selection)
+        state.fix_selection = {}
+        selected._fix_selection_snapshot = None
+        workflow.advance(
+            selected,
+            message="Package job finished; unresolved updates remain in the final report.",
+        )
+        job = 4
+    if job == 4:
+        missing = [
+            item["id"]
+            for item in state.findings
+            if item["id"] not in state.decisions
+            or state.decisions[item["id"]].get("decision") == "SOURCE_REVIEW_REQUIRED"
+        ]
+        if missing:
+            workflow.activity(
+                selected,
+                f"Review finding {missing[0]} for a real vulnerability or false-positive evidence.",
+                status="WAITING_FOR_AI",
+            )
+            return {
+                "status": "FINDING_REVIEW_REQUIRED",
+                "finding_ids": missing,
+                "next_tool": "verify_security_finding",
+                "message": "Read the GitLab-cited code and callers; submit evidence, then complete_security_run. Unknown reachability is not a false positive.",
+            }
+        if not state.false_positive_approval_form:
+            review = await submit_false_positive_approvals(ctx, str(selected.repo_root))
+            if review["status"] == "AWAITING_HUMAN":
+                return review
+            state.workflow["false_positive_result"] = deepcopy(review)
+        workflow.advance(
+            selected,
+            message="False-positive review finished; only human-checked findings were submitted.",
+        )
+        job = 5
+    if job == 5:
+        if not state.fix_selection:
+            return {
+                "status": "SOURCE_SELECTION_REQUIRED",
+                "next_tool": "select_security_fixes",
+                "message": "Call select_security_fixes now to display a NEW unchecked source-only human form. Package choices are not source permission.",
+            }
+        missing = _record_code_results(selected, code_results)
+        if missing:
+            if missing["status"] == "ERROR":
+                return missing
+            handoff = _selected_source_handoff(selected)
+            return {**missing, **(handoff or {})}
+        workflow.advance(
+            selected,
+            message="Selected GitLab source work finished; asking whether to run the audit.",
+        )
+        job = 6
+    if job == 6:
+        audit = state.software_audit
+        if not audit or audit.get("status") in {
+            "REQUESTED",
+            "CONSENT_REQUIRED",
+            "CONSENT_UNAVAILABLE",
+        }:
+            return await _offer_software_audit(ctx, selected)
+        if audit.get("status") == "FIX_FROM_AUDIT_REPORT":
+            missing = _record_code_results(selected, code_results)
+            if missing:
+                return missing
+        elif audit.get("status") not in {"DONE", "NONE_SELECTED", "NO_FINDINGS"}:
+            return deepcopy(audit)
+        workflow.advance(
+            selected,
+            status="SKIPPED" if not audit.get("output_path") else "FINISHED",
+            message="Software audit job finished.",
+        )
+    if state.workflow["current"] == 7:
+        if state.workflow.get("final_report"):
+            return deepcopy(state.workflow["final_result"])
+        await asyncio.to_thread(selected.generate_local_report)
+        result = await asyncio.to_thread(
+            write_unresolved_report, selected.repo_root, state
+        )
+        state.workflow["final_report"] = True
+        state.workflow["final_result"] = result
+        workflow.advance(
+            selected,
+            message="Final unresolved report is ready; opening Markdown preview.",
+        )
+        workflow.activity(selected, result["message"], status="FINISHED")
+        return result
+    raise RuntimeError("Unexpected workflow job")
+
+
+async def _complete_legacy(
     ctx: Context, repo_root: str | None = None
 ) -> CallToolResult:
-    """Save reports and automatically offer native human approval checkboxes once.
+    """Save GitLab reports, then request the full audit before Select fixes / Exit.
 
     Call after assessments and approved fixes/validation; never poll AWAITING_HUMAN.
     """
@@ -1708,9 +2580,7 @@ async def complete_security_run(
             content=[TextContent(text=message)],
             structuredContent={"status": "REMEDIATION_RUNNING", "message": message},
         )
-    if selection.get("presentation") == "WINDOWS_DIALOG" and selection.get(
-        "status"
-    ) in {"REQUESTED", "AWAITING_HUMAN"}:
+    if selection.get("status") in {"REQUESTED", "AWAITING_HUMAN"}:
         message = "Wait for the human's open fix-selection window. Approved, reviewed packages and documented configuration line fixes continue automatically; other selected source fixes remain host-led. Do not poll or reopen."
         return CallToolResult(
             content=[TextContent(text=message)],
@@ -1719,6 +2589,14 @@ async def complete_security_run(
                 "fix_selection": selection,
                 "message": message,
             },
+        )
+    if _selected_source_ids(selection):
+        _editor_progress(
+            selected.repo_root,
+            "gitlab-source-fixes",
+            "Selected GitLab source fixes",
+            "The host requested final reporting after its scoped code work; see the report for validation and unresolved issues.",
+            status="HOST_REPORTED_COMPLETE",
         )
     review = await review_false_positives(ctx, repo_root=selected_root)
     report = await asyncio.to_thread(_generate_local_report, repo_root=selected_root)
@@ -1749,19 +2627,20 @@ async def complete_security_run(
     for key in ("message", "reason"):
         if review.get(key):
             note += f"\n{review[key]}"
+    audit = None
     if review["status"] == "AWAITING_HUMAN":
-        note += "\nAfter the approval window closes, call choose_software_audit_action once."
-    else:
-        note += (
-            "\nCall choose_software_audit_action once. The human chooses whether to "
-            "generate a home-directory software audit report, fix only confirmed issues "
-            "from that report, or stop. Do not commit or push."
-        )
+        note += "\nThe software-audit choice is offered automatically after this window closes."
+    elif not report.is_error:
+        audit = await _offer_software_audit(ctx, selected)
+        note += f"\nSoftware audit: {audit['status']}."
+        if audit.get("message"):
+            note += f"\n{audit['message']}"
     return CallToolResult(
         content=[TextContent(text=note), *report.content],
         structuredContent={
             **report.structured_content,
             "false_positive_review": review,
+            "software_audit": audit,
             "software_audit_next_tool": "choose_software_audit_action",
         },
         isError=report.is_error
@@ -1769,16 +2648,368 @@ async def complete_security_run(
     )
 
 
+class AuditReviewedFile(BaseModel):
+    """Bind a host review assessment to a named file and its actual content."""
+
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    assessment: str = Field(min_length=1)
+
+
+class AuditGeneratedExclusion(BaseModel):
+    """Bind a generated output path to the project's current generator evidence."""
+
+    path: str = Field(min_length=1)
+    evidence: AuditReviewedFile
+
+
+class SoftwareAuditProgress(BaseModel):
+    """Validate host file counts without coercing booleans or negative counts."""
+
+    message: str = Field(min_length=1, strict=True)
+    reviewed_files: int | None = Field(default=None, ge=0, strict=True)
+    total_files: int | None = Field(default=None, ge=0, strict=True)
+    files: list[AuditReviewedFile] = Field(default_factory=list)
+    generated_exclusions: list[AuditGeneratedExclusion] = Field(default_factory=list)
+    completed_phases: list[str] = Field(default_factory=list)
+
+
 class SoftwareAuditChoice(BaseModel):
     """One closing action chosen by the human."""
 
-    action: Literal["generate_report", "fix_from_report", "done"] = Field(
+    action: Literal["fix_from_report", "done"] = Field(
         description=(
-            "generate_report writes the audit markdown to the home directory. "
-            "fix_from_report applies only confirmed issues from that report. "
+            "fix_from_report selects issues from the completed report. "
             "done stops without code changes."
         )
     )
+
+
+class SoftwareAuditConsent(BaseModel):
+    """Ask before performing the optional read-only deep dive."""
+
+    run_audit: bool = Field(
+        default=False,
+        strict=True,
+        description="Run the deep-dive software audit? No skips to the final unresolved report.",
+    )
+
+
+@_with_background_progress("Software audit approval")
+async def _finish_audit_approval(
+    ctx: Context,
+    selected: Engine,
+    request_id: str,
+    stage: str,
+    dialog: desktop_approval.DesktopApproval,
+    prepared: dict,
+    schema: type[BaseModel] | None,
+) -> None:
+    """Keep human approval alive when the initiating host request ends or times out."""
+    state = selected.state
+    try:
+        response = await dialog.wait()
+        if (
+            selected.state is not state
+            or state.software_audit.get("request_id") != request_id
+        ):
+            raise ValueError(
+                "This audit approval belongs to a replaced run or request."
+            )
+        if stage == "CONSENT":
+            await asyncio.to_thread(
+                _software_audit_result, selected, response["choice"]
+            )
+            if response["choice"] == "done":
+                await complete_security_run(ctx, str(selected.repo_root))
+        else:
+            if schema is None:
+                raise ValueError("The audit-fix approval schema is missing.")
+            values = (
+                schema.model_validate(response.get("content")).model_dump()
+                if response["action"] == "accept"
+                else {}
+            )
+            checked = [item["id"] for item in _checked(prepared["items"], values)]
+            result = await asyncio.to_thread(
+                _software_audit_fix,
+                selected,
+                checked,
+                expected_report_hash=prepared["report_hash"],
+            )
+            await _finish_empty_audit(ctx, selected, result)
+    except asyncio.CancelledError:
+        if (
+            selected.state is state
+            and state.software_audit.get("request_id") == request_id
+        ):
+            _record_audit_result(
+                selected,
+                {
+                    "status": "CONSENT_UNAVAILABLE"
+                    if stage == "CONSENT"
+                    else "SELECTION_REQUIRED",
+                    "message": "The server interrupted the audit approval. No new permission was recorded.",
+                },
+            )
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.exception("Software-audit approval failed")
+        if (
+            selected.state is state
+            and state.software_audit.get("request_id") == request_id
+        ):
+            _record_audit_result(
+                selected,
+                {
+                    "status": "CONSENT_UNAVAILABLE"
+                    if stage == "CONSENT"
+                    else "SELECTION_REQUIRED",
+                    "reason": str(exc),
+                    "message": "No new audit permission was recorded; review the error and retry approval.",
+                },
+            )
+    finally:
+        await dialog.close()
+        _keep_audit_visible(selected)
+
+
+async def _open_audit_approval(
+    ctx: Context,
+    selected: Engine,
+    stage: str,
+    prepared: dict | None = None,
+) -> dict:
+    """Reserve and show one owned native window, returning before the human decides."""
+    if stage not in {"CONSENT", "FIX_SELECTION"} or (
+        stage == "FIX_SELECTION" and prepared is None
+    ):
+        raise ValueError(
+            "Audit approval needs a known stage and the prepared findings."
+        )
+    state = selected.state
+    request_id = uuid4().hex
+    pending = {
+        "status": "AWAITING_HUMAN",
+        "request_id": request_id,
+        "approval_stage": stage,
+        "message": "The audit approval window is open with no selection deadline. No AI scan or fix starts without human approval. Call choose_software_audit_action once with repo_root only to collect its handoff; do not reopen the window.",
+    }
+    _record_audit_result(selected, pending)
+    dialog = None
+    try:
+        schema = None
+        if stage == "CONSENT":
+            dialog = await desktop_approval.open_choice(
+                "Run software audit?",
+                "Run a deep-dive software audit now? Yes generates the complete report before unchecked fix choices. No skips to the final unresolved report.",
+                [
+                    {"id": "generate_report", "label": "Yes - run software audit"},
+                    {"id": "done", "label": "No - final report"},
+                ],
+            )
+        else:
+            if prepared is None:
+                raise ValueError("Audit findings are required for fix selection.")
+            schema = _checkbox_model(
+                "SoftwareAuditFixes",
+                prepared["items"],
+                lambda item: (
+                    f"{item['id']}: {item['problem']}",
+                    f"{item['severity']} at {item['location']}",
+                ),
+            )
+            properties = schema.model_json_schema()["properties"]
+            for value in properties.values():
+                value["summary"] = value["description"]
+            dialog = await desktop_approval.open_dialog(
+                "Check only the audit items to fix. Every box starts unchecked. Cancel fixes nothing.",
+                properties,
+                title="Software audit fixes",
+                detail_header="Finding",
+                submit_label="Fix checked items",
+            )
+        if (
+            selected.state is not state
+            or state.software_audit.get("request_id") != request_id
+        ):
+            raise ValueError("The audit approval belongs to a replaced run.")
+        task = asyncio.create_task(
+            _finish_audit_approval(
+                ctx, selected, request_id, stage, dialog, prepared or {}, schema
+            )
+        )
+        _desktop_audit_tasks[request_id] = task
+        task.add_done_callback(
+            partial(
+                _desktop_task_done,
+                tasks=_desktop_audit_tasks,
+                request_id=request_id,
+                repo_root=selected.repo_root,
+            )
+        )
+        return pending
+    except BaseException:
+        if dialog is not None:
+            await dialog.close()
+        if (
+            selected.state is state
+            and state.software_audit.get("request_id") == request_id
+        ):
+            _record_audit_result(
+                selected,
+                {
+                    "status": "CONSENT_UNAVAILABLE"
+                    if stage == "CONSENT"
+                    else "SELECTION_REQUIRED",
+                    "message": "Audit approval startup was interrupted. No new scan or fix was authorized.",
+                },
+            )
+        raise
+
+
+async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any]:
+    """Request a fresh post-remediation report before offering audit fixes."""
+    if selected.state.workflow:
+        blocked = workflow.require(selected, 6)
+        if blocked:
+            return blocked
+        previous = selected.state.software_audit
+        if previous.get("status") not in {
+            None,
+            "REQUESTED",
+            "CONSENT_REQUIRED",
+            "CONSENT_UNAVAILABLE",
+        }:
+            return deepcopy(previous)
+        state = selected.state
+        workflow.activity(
+            selected,
+            "Run a deep-dive software audit? Waiting for Yes or No.",
+            status="WAITING_FOR_HUMAN",
+        )
+        try:
+            if desktop_approval.available():
+                return await _open_audit_approval(ctx, selected, "CONSENT")
+            elif _form_supported(ctx):
+                _record_audit_result(
+                    selected,
+                    {
+                        "status": "REQUESTED",
+                        "message": "Waiting for human audit consent. No scan has started.",
+                    },
+                )
+                response = await ctx.elicit(
+                    "Run the deep-dive software audit? No or Cancel skips to the final unresolved report.",
+                    SoftwareAuditConsent,
+                )
+                answer = (
+                    "generate_report"
+                    if response.action == "accept"
+                    and response.data is not None
+                    and response.data.run_audit
+                    else "done"
+                )
+            else:
+                return _record_audit_result(
+                    selected,
+                    {
+                        "status": "CONSENT_REQUIRED",
+                        "message": "Ask the human whether to run the software audit. Call choose_software_audit_action(choice='generate_report' for Yes or 'done' for No). Do not choose for the human.",
+                    },
+                )
+            if selected.state is not state:
+                return {
+                    "status": "ERROR",
+                    "reason": "Audit consent belongs to a replaced run.",
+                }
+            result = await asyncio.to_thread(_software_audit_result, selected, answer)
+            if answer == "done":
+                return await _continue_workflow(ctx, selected, None, None)
+            return result
+        except asyncio.CancelledError:
+            if selected.state is state:
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        _record_audit_result,
+                        selected,
+                        {
+                            "status": "CONSENT_UNAVAILABLE",
+                            "message": "The host interrupted audit consent. No scan was authorized or started; request consent again.",
+                        },
+                    )
+                )
+                workflow.activity(
+                    selected,
+                    "Audit consent was interrupted; no audit is running.",
+                    status="INTERRUPTED",
+                )
+            raise
+        except (OSError, RuntimeError, ValueError, MCPError) as exc:
+            logger.warning("Audit consent unavailable: %s", exc)
+            return _record_audit_result(
+                selected,
+                {
+                    "status": "CONSENT_UNAVAILABLE",
+                    "reason": str(exc),
+                    "message": "No audit started. Ask the human for audit consent before retrying.",
+                },
+            )
+    pending = await asyncio.to_thread(selected.begin_software_audit)
+    if not pending.pop("created"):
+        return pending
+    return await asyncio.to_thread(_software_audit_result, selected, "generate_report")
+
+
+async def _offer_audit_choices(ctx: Context, selected: Engine) -> dict[str, Any]:
+    """Offer only select-fixes or exit after the current report passed coverage checks."""
+    state = selected.state
+    try:
+        choice = await _ask_software_audit_choice(ctx)
+        if selected.state is not state:
+            logger.warning("Ignoring a software-audit response from a previous run")
+            return {
+                "status": "CHOICE_UNAVAILABLE",
+                "reason": "The software-audit choice belonged to a previous run. No action was authorized for the current run.",
+            }
+        if choice is not None:
+            return await choose_software_audit_action(
+                ctx, str(selected.repo_root), choice=choice
+            )
+        result = {
+            "status": "CHOICE_REQUIRED",
+            "choices": choice_labels(),
+            "message": (
+                "The report is complete. Ask select fixes or exit, then call "
+                "choose_software_audit_action with that choice. Do not choose for the human."
+            ),
+        }
+    except asyncio.CancelledError:
+        if selected.state is state:
+            await asyncio.shield(
+                asyncio.to_thread(
+                    _record_audit_result,
+                    selected,
+                    {
+                        "status": "CHOICE_UNAVAILABLE",
+                        "choices": choice_labels(),
+                        "reason": "The host interrupted the software-audit choice. No audit action was authorized.",
+                    },
+                )
+            )
+        raise
+    except (OSError, RuntimeError, ValueError, MCPError) as exc:
+        logger.warning("Software-audit choice was not collected: %s", exc)
+        result = {
+            "status": "CHOICE_UNAVAILABLE",
+            "choices": choice_labels(),
+            "reason": str(exc),
+            "message": (
+                "No code was changed. Ask the human using these choices, then call "
+                "choose_software_audit_action with the human's choice."
+            ),
+        }
+    return await asyncio.to_thread(_record_audit_result, selected, result)
 
 
 def _audit_revision(engine: Engine) -> str:
@@ -1796,6 +3027,8 @@ def _audit_project_name(engine: Engine) -> str:
 
 def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
     """Return a wait result while a human window or package batch is still open."""
+    if engine.state.software_audit.get("status") == "AWAITING_HUMAN":
+        return deepcopy(engine.state.software_audit)
     selection = engine.state.fix_selection or {}
     if (selection.get("package_execution") or {}).get("status") in {
         "QUEUED",
@@ -1805,9 +3038,9 @@ def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
             "status": "REMEDIATION_RUNNING",
             "message": "Wait until the approved package batch finishes. Do not start the software audit yet.",
         }
-    if selection.get("presentation") == "WINDOWS_DIALOG" and selection.get(
-        "status"
-    ) in {"REQUESTED", "AWAITING_HUMAN"}:
+    if (
+        engine.state.workflow or selection.get("presentation") == "WINDOWS_DIALOG"
+    ) and selection.get("status") in {"REQUESTED", "AWAITING_HUMAN"}:
         return {
             "status": "AWAITING_HUMAN",
             "message": "Wait for the open fix-selection window before choosing a software audit action.",
@@ -1824,23 +3057,79 @@ def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
     return None
 
 
-def _software_audit_result(engine: Engine, choice: str) -> dict[str, Any]:
-    """Describe the one human-selected closing action. This writes no repository file."""
+def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, Any]:
+    """Make unfinished review an executable continuation, not a final-answer cue."""
+    remaining = [
+        path
+        for path in coverage.get("files", [])
+        if path not in coverage.get("reviews", {})
+    ]
+    return {
+        **result,
+        "continue_review": True,
+        "generated_exclusions": coverage.get("generated_exclusions", []),
+        "remaining_file_count": len(remaining),
+        "next_files": remaining[:20],
+        "remaining_phases": sorted(
+            REVIEW_PHASES - set(coverage.get("completed_phases", []))
+        )
+        if coverage.get("files")
+        else [],
+        "next_action": (
+            "Continue the read-only audit now, including after delegated reviews finish. "
+            "A progress receipt is not a completed job: do not end the turn with a "
+            "partial findings summary or ask the developer to type continue. "
+            "Persist actual findings incrementally to output_path, replacing the "
+            "server's explicitly incomplete progress draft. "
+            "Read the next unreviewed non-generated files and submit "
+            "their real progress.files receipts. Finish every remaining file and "
+            "phase, write output_path, then call choose_software_audit_action with "
+            "the same repo_root and report_ready=True. That call opens the unchecked "
+            "fix-selection GUI. Wait for its human selection before any code changes."
+        ),
+    }
+
+
+def _software_audit_result(
+    engine: Engine, choice: str, *, select_after_report: bool = False
+) -> dict[str, Any]:
+    """Prepare the automatic read-only audit or retain the human's exit choice."""
     when = datetime.now(UTC)
     project_name = _audit_project_name(engine)
-    if choice == "generate_report":
+    if choice == "generate_report" or select_after_report:
         destination = audit_report_path(project_name, when)
+        coverage = audit_inventory(engine.repo_root)
         result = {
             "status": "GENERATE_AUDIT_REPORT",
             "choice": choice,
+            "select_after_report": select_after_report,
+            "repo_root": str(engine.repo_root),
             "output_path": str(destination),
             "audit_prompt": render_audit_prompt(when, _audit_revision(engine)),
+            "coverage": coverage,
+            "requested_at": datetime.now(UTC).isoformat(),
             "message": (
                 "Write the software audit markdown to output_path and nowhere else. "
                 "Follow audit_prompt exactly, including its selectable-findings section. "
+                "Resolve source links from the directory containing output_path to files "
+                "under repo_root, with #L<line> fragments for VS Code and Cursor. "
                 "One checkbox is shown later for each of those lines. "
                 "Do not change application code, tests, dependencies, CI, or GitLab. "
-                "Do not commit or push."
+                "Do not commit or push. "
+                "The host AI must scan repo_root now; this server does not run an AI scan. "
+                "The home-directory progress draft already exists. Replace it with "
+                "actual report content incrementally, not only after the final file. "
+                "Do not ask the developer to type continue for this approved audit. "
+                "After each small batch call choose_software_audit_action with the same "
+                "repo_root and per-file progress receipts. Counts describe reviewed files, "
+                "not successful fixes. Inventory paths are in coverage.files. "
+                "Submit progress.files=[{path,sha256,assessment}] for every file and "
+                "progress.completed_phases for all five review phases. Partial scans "
+                "cannot be accepted as complete. Never inflate the finding count. "
+                "After saving the exact output_path, call "
+                "choose_software_audit_action(repo_root=..., report_ready=True). "
+                "Do not end the workflow before that call; it opens unchecked findings "
+                "only after coverage passes. Report selected fix outcomes with complete_security_run to finish the final unresolved report."
             ),
         }
     else:
@@ -1853,16 +3142,40 @@ def _software_audit_result(engine: Engine, choice: str) -> dict[str, Any]:
 
 
 def _audit_fix_from_report(
-    report: Path, selected_ids: list[str] | None
+    report: Path,
+    selected_ids: list[str] | None,
+    expected_report_hash: str | None = None,
 ) -> dict[str, Any]:
     """Return the human-checked audit items, or ask for that selection first."""
     try:
-        items = audit_items(report.read_text(encoding="utf-8"))
-    except OSError as exc:
+        text = report.read_text(encoding="utf-8")
+        if audit_report_is_draft(text):
+            return {
+                "status": "ITEMS_REQUIRED",
+                "choice": "fix_from_report",
+                "report_path": str(report),
+                "message": "Replace the incomplete progress draft with the complete audit findings report before report_ready. No fixes are authorized by a draft.",
+            }
+        report_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if expected_report_hash is not None and report_hash != expected_report_hash:
+            return {
+                "status": "ERROR",
+                "reason": "The audit report changed while the selection window was open. No fixes were authorized; review the new report first.",
+            }
+        items = audit_items(text)
+    except (OSError, UnicodeError) as exc:
         return {
             "status": "ERROR",
             "choice": "fix_from_report",
             "reason": f"The software audit report could not be read: {exc}",
+        }
+    if not items and audit_has_no_findings(text):
+        return {
+            "status": "NO_FINDINGS",
+            "choice": "fix_from_report",
+            "report_path": str(report),
+            "selected_items": [],
+            "message": "The report explicitly lists no selectable findings. No fixes were authorized.",
         }
     if not items:
         return {
@@ -1881,6 +3194,7 @@ def _audit_fix_from_report(
             "choice": "fix_from_report",
             "report_path": str(report),
             "items": items,
+            "report_hash": report_hash,
             "message": (
                 "Show one unchecked checkbox per item. Call choose_software_audit_action "
                 "again with choice fix_from_report and selected_ids set to the checked ids only. "
@@ -1924,51 +3238,145 @@ def _audit_fix_from_report(
 
 
 def _software_audit_fix(
-    engine: Engine, selected_ids: list[str] | None
+    engine: Engine,
+    selected_ids: list[str] | None,
+    *,
+    expected_report_hash: str | None = None,
 ) -> dict[str, Any]:
     """Resolve a fix choice to checked report items. This writes no repository file."""
-    existing = latest_audit_report(_audit_project_name(engine))
+    pending = engine.state.software_audit
+    destination = pending.get("output_path")
+    existing = Path(destination) if destination else None
     if existing is None:
-        result = {
-            "status": "REPORT_REQUIRED",
-            "choice": "fix_from_report",
-            "message": (
-                "No software audit report for this project is in the home directory. "
-                "Generate that report first. Do not invent findings and do not change code."
-            ),
-        }
-    else:
-        result = _audit_fix_from_report(existing, selected_ids)
+        return _software_audit_result(
+            engine, "fix_from_report", select_after_report=True
+        )
+    if not pending.get("report_complete"):
+        return deepcopy(pending)
+    result = _audit_fix_from_report(existing, selected_ids, expected_report_hash)
+    if destination:
+        result.update(
+            output_path=destination,
+            select_after_report=pending.get("select_after_report", False),
+        )
     return _record_audit_result(engine, result)
 
 
 def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, Any]:
     """Store the closing choice and return the same result."""
+    previous = engine.state.software_audit
+    details = dict(result)
+    if result["status"] != "GENERATE_AUDIT_REPORT" and previous.get("output_path"):
+        details = {
+            **{
+                key: previous[key]
+                for key in (
+                    "output_path",
+                    "coverage",
+                    "report_complete",
+                    "items",
+                    "requested_at",
+                )
+                if key in previous
+            },
+            **details,
+        }
+    if details.get("output_path") and result["status"] in {
+        "GENERATE_AUDIT_REPORT",
+        "AUDIT_IN_PROGRESS",
+        "AUDIT_INCOMPLETE",
+    }:
+        persist_audit_draft(
+            Path(details["output_path"]),
+            engine.repo_root,
+            details.get("coverage") or {},
+            details.get("progress"),
+        )
     engine.record_software_audit(
         {
-            "choice": result["choice"],
+            **details,
+            "choice": result.get("choice"),
             "status": result["status"],
-            "report_path": result.get("report_path") or result.get("output_path"),
+            "report_path": details.get("report_path") or details.get("output_path"),
         }
     )
+    progress = result.get("progress") or {}
+    status = result["status"]
+    _editor_progress(
+        engine.repo_root,
+        "software-audit",
+        "Software audit",
+        progress.get("message") or result.get("message") or status,
+        status="WAITING_FOR_AI"
+        if status
+        in {
+            "GENERATE_AUDIT_REPORT",
+            "AUDIT_IN_PROGRESS",
+            "AUDIT_INCOMPLETE",
+            "FIX_FROM_AUDIT_REPORT",
+        }
+        else "WAITING_FOR_HUMAN"
+        if status
+        in {
+            "AUDIT_REPORT_GENERATED",
+            "CHOICE_REQUIRED",
+            "CHOICE_UNAVAILABLE",
+            "SELECTION_REQUIRED",
+        }
+        else status,
+        completed=progress.get("reviewed_files"),
+        total=progress.get("total_files"),
+    )
+    with _progress_console_lock:
+        if result["status"] in _AUDIT_PENDING:
+            if _progress_console_enabled:
+                _audit_progress_roots.add(engine.repo_root)
+        else:
+            _audit_progress_roots.discard(engine.repo_root)
+    if result["status"] in {
+        "GENERATE_AUDIT_REPORT",
+        "SELECTION_REQUIRED",
+        "ITEMS_REQUIRED",
+    }:
+        sink = progress_sink.get()
+        if sink is not None:
+            sink(
+                f"WAITING_FOR_AI | Software audit: {result['status']} | {result.get('message', '')}"
+            )
+    if not _publish_audit_activity(engine) and status in {
+        "ERROR",
+        "CONSENT_UNAVAILABLE",
+    }:
+        workflow.activity(
+            engine,
+            result.get("reason") or result.get("message") or status,
+            status="INTERRUPTED" if status == "CONSENT_UNAVAILABLE" else "FAILED",
+        )
     return result
 
 
 async def _ask_software_audit_choice(ctx: Context) -> str | None:
     """Ask the human for one closing action. Cancel means stop."""
+    sink = progress_sink.get()
+    if sink is not None:
+        sink("WAITING_FOR_HUMAN | Choose the software audit action.")
     if desktop_approval.available():
         selected = await asyncio.to_thread(
             desktop_approval.ask_choice,
             "Software audit",
-            "Choose one action. Closing this window stops without code changes.",
+            "The audit report is complete. Select findings to fix, or exit and keep the report.",
             choice_labels(),
         )
-        return normalize_choice(selected)
+        choice = normalize_choice(selected)
+        if choice is None:
+            raise ValueError(
+                f"The software-audit window returned an unknown choice: {selected!r}"
+            )
+        return choice
     if not _form_supported(ctx):
         return None
     response = await ctx.elicit(
-        "Choose one closing action. Generate the software audit report, "
-        "fix only confirmed issues from that report, or stop. "
+        "The audit report is complete. Select findings to fix, or exit. "
         "Cancel stops without code changes. Nothing is committed or pushed.",
         SoftwareAuditChoice,
     )
@@ -1981,6 +3389,11 @@ async def _ask_audit_items(
     ctx: Context, items: list[dict[str, str]]
 ) -> list[str] | None:
     """Show one unchecked box per audit item. None means the host must show them."""
+    sink = progress_sink.get()
+    if sink is not None:
+        sink(
+            f"WAITING_FOR_HUMAN | Software audit findings: {len(items)} unchecked items; no fixes authorized yet."
+        )
     schema = _checkbox_model(
         "SoftwareAuditFixes",
         items,
@@ -2019,63 +3432,322 @@ async def _ask_audit_items(
     return [item["id"] for item in _checked(items, response.data.model_dump())]
 
 
+async def _wait_for_audit_handoff(selected: Engine) -> None:
+    """Keep an active host request attached until owned native work hands back control."""
+    state = selected.state
+    while True:
+        tasks = {
+            task
+            for task in (
+                _desktop_fix_selection_tasks.get(state.fix_selection.get("request_id")),
+                _desktop_approval_tasks.get(
+                    state.false_positive_approval_form.get("request_id")
+                ),
+                _desktop_audit_tasks.get(state.software_audit.get("request_id")),
+            )
+            if task is not None
+            and task is not asyncio.current_task()
+            and not task.done()
+        }
+        if not tasks:
+            return
+        done, _ = await asyncio.wait(tasks, timeout=_BACKGROUND_HEARTBEAT_SECONDS)
+        for task in done:
+            task.result()
+        if selected.state is not state:
+            raise RuntimeError(
+                "The audit handoff belonged to a replaced run. No audit action was authorized."
+            )
+        if not done:
+            sink = progress_sink.get()
+            if sink is not None:
+                sink(
+                    "Waiting for owned background work/human approval; the host AI will receive the audit handoff when it finishes."
+                )
+        # Done callbacks normally release these entries on the next loop iteration.
+        await asyncio.sleep(0)
+
+
+def _selected_source_ids(selection: dict) -> list[str]:
+    """Separate human-approved host code work from server-owned package/config edits."""
+    identities = selection.get("approved_findings") or {}
+    return [
+        item
+        for item in selection.get("selected_ids", [])
+        if item in identities
+        and not any(
+            key in identities[item] for key in ("package_update", "config_edit")
+        )
+    ]
+
+
+def _workflow_source_ids(selection: dict) -> list[str]:
+    """Include configuration code fixes in job five, never package updates."""
+    identities = selection.get("approved_findings") or {}
+    return [
+        item
+        for item in selection.get("selected_ids", [])
+        if item in identities and "package_update" not in identities[item]
+    ]
+
+
+def _selected_source_handoff(selected: Engine) -> dict[str, Any] | None:
+    """Do not lose human-selected source fixes when a mixed package batch ends."""
+    selection = selected.state.fix_selection
+    ids = (
+        _workflow_source_ids(selection)
+        if selected.state.workflow
+        else _selected_source_ids(selection)
+    )
+    ids = [
+        item
+        for item in ids
+        if f"gitlab:{item}" not in selected.state.workflow.get("code_results", {})
+    ]
+    if not ids or selection.get("status") != "APPROVED":
+        return None
+    result = {
+        "status": "SOURCE_FIXES_REQUIRED",
+        "selected_ids": ids,
+        "findings": [
+            deepcopy(item) for item in selected.state.findings if item["id"] in ids
+        ],
+        "message": "Implement only these human-selected GitLab source fixes. Leave unchecked issues unchanged. Report the current finding with complete_security_run(progress={id,message}). Validate, then call complete_security_run(code_results=[{id,status:fixed|failed,reason,validation}]) for every selected host fix. This offers audit consent, not an automatic scan. Do not commit or push.",
+    }
+    _editor_progress(
+        selected.repo_root,
+        "gitlab-source-fixes",
+        "Selected GitLab source fixes",
+        result["message"],
+        status="WAITING_FOR_AI",
+    )
+    return result
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Choose the closing software audit action",
-        read_only_hint=True,
+        title="Continue jobs or choose software audit action",
+        read_only_hint=False,
         open_world_hint=False,
     )
 )
+@_with_audit_activity
 async def choose_software_audit_action(
     ctx: Context,
     repo_root: str | None = None,
     choice: str | None = None,
     selected_ids: list[str] | None = None,
+    report_ready: bool = False,
+    progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Ask the human to generate an audit report, choose fixes, or stop.
-
-    A fix choice shows one unchecked checkbox per selectable finding. Only
-    checked items may be fixed. This tool does not edit the checkout, commit,
-    or push.
-    """
+    """Await the next job; obtain audit consent, then coverage-check report_ready before unchecked audit fixes."""
     selected = await asyncio.to_thread(_engine_for, repo_root)
+    if (
+        choice is None
+        and selected_ids is None
+        and not report_ready
+        and progress is None
+    ):
+        await _wait_for_audit_handoff(selected)
     blocked = _software_audit_blocked(selected)
     if blocked is not None:
         return blocked
+    if selected.state.workflow:
+        job = selected.state.workflow["current"]
+        if job != 6:
+            if (
+                choice is not None
+                or selected_ids is not None
+                or report_ready
+                or progress is not None
+            ):
+                return workflow.require(selected, 6) or {"status": "ERROR"}
+            result = await complete_security_run(ctx, str(selected.repo_root))
+            return result.structured_content
+    previous = selected.state.software_audit
+    if (
+        choice is None
+        and selected_ids is None
+        and not report_ready
+        and progress is None
+        and previous.get("status") in {"FIX_FROM_AUDIT_REPORT", "ERROR"}
+    ):
+        return deepcopy(previous)
+    if (
+        selected.state.workflow
+        and normalize_choice(choice) == "fix_from_report"
+        and not previous.get("report_complete")
+    ):
+        return {
+            "status": "AUDIT_REPORT_REQUIRED",
+            "message": "Obtain human audit consent, generate the complete report, then select findings. A fix choice cannot authorize a scan.",
+        }
+    if progress is not None:
+        try:
+            details = SoftwareAuditProgress.model_validate(progress)
+        except ValueError as exc:
+            return {"status": "ERROR", "reason": f"Invalid audit progress: {exc}"}
+        reviewed_files, total_files = details.reviewed_files, details.total_files
+        if (
+            report_ready
+            or choice is not None
+            or selected_ids is not None
+            or not previous.get("output_path")
+            or previous.get("status")
+            not in {"GENERATE_AUDIT_REPORT", "AUDIT_IN_PROGRESS", "AUDIT_INCOMPLETE"}
+            or not details.message.strip()
+            or (reviewed_files is None) != (total_files is None)
+            or (
+                reviewed_files is not None
+                and total_files is not None
+                and total_files < reviewed_files
+            )
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "Audit progress requires an active scan, a message, and valid paired file counts; do not combine it with a choice or report_ready.",
+            }
+        try:
+            coverage = await asyncio.to_thread(
+                record_audit_coverage,
+                selected.repo_root,
+                previous.get("coverage") or audit_inventory(selected.repo_root),
+                [item.model_dump() for item in details.files],
+                details.completed_phases,
+                generated_exclusions=[
+                    item.model_dump() for item in details.generated_exclusions
+                ],
+            )
+        except (OSError, ValueError) as exc:
+            return {"status": "ERROR", "reason": str(exc)}
+        if coverage["files"]:
+            reviewed_files, total_files = (
+                len(coverage["reviews"]),
+                len(coverage["files"]),
+            )
+        progress = {
+            "message": " ".join(details.message.split())[:500],
+            "reviewed_files": reviewed_files,
+            "total_files": total_files,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        result = await asyncio.to_thread(
+            _record_audit_result,
+            selected,
+            {
+                **previous,
+                "status": "AUDIT_IN_PROGRESS",
+                "progress": progress,
+                "coverage": coverage,
+            },
+        )
+        _publish_audit_progress(result)
+        return _audit_review_handoff(
+            {key: result[key] for key in ("status", "output_path", "progress")},
+            coverage,
+        )
+    if report_ready:
+        if (
+            choice is not None
+            or selected_ids is not None
+            or not previous.get("output_path")
+            or previous.get("status")
+            not in {
+                "GENERATE_AUDIT_REPORT",
+                "AUDIT_IN_PROGRESS",
+                "ITEMS_REQUIRED",
+                "ERROR",
+                "AUDIT_INCOMPLETE",
+            }
+        ):
+            return {
+                "status": "ERROR",
+                "reason": "report_ready requires a pending generated report; it cannot authorize selected_ids or another choice.",
+            }
+        report = Path(previous["output_path"])
+        if not await asyncio.to_thread(report.is_file):
+            return {
+                "status": "ERROR",
+                "reason": f"Write the requested report before report_ready: {report}",
+            }
+        coverage = previous.get("coverage") or await asyncio.to_thread(
+            audit_inventory, selected.repo_root
+        )
+        gaps = await asyncio.to_thread(
+            audit_coverage_gaps, selected.repo_root, coverage
+        )
+        if gaps["remaining_files"] or gaps["remaining_phases"] or gaps["truncated"]:
+            return await asyncio.to_thread(
+                _record_audit_result,
+                selected,
+                {
+                    "status": "AUDIT_INCOMPLETE",
+                    "choice": "generate_report",
+                    "coverage_gaps": gaps,
+                    "message": "Continue the read-only audit: review every remaining file and phase, refresh changed-file receipts, and update the report before report_ready. Do not add speculative findings to fill a quota.",
+                },
+            )
+        result = await asyncio.to_thread(_audit_fix_from_report, report, None)
+        if result["status"] in {"ERROR", "ITEMS_REQUIRED"}:
+            return await asyncio.to_thread(_record_audit_result, selected, result)
+        await asyncio.to_thread(
+            _record_audit_result,
+            selected,
+            {
+                "status": "AUDIT_REPORT_GENERATED",
+                "choice": None,
+                "report_path": str(report),
+                "report_complete": True,
+            },
+        )
+        if selected.state.workflow:
+            return await choose_software_audit_action(
+                ctx, str(selected.repo_root), choice="fix_from_report"
+            )
+        return await _offer_audit_choices(ctx, selected)
+    elif previous.get("status") in {
+        "GENERATE_AUDIT_REPORT",
+        "AUDIT_IN_PROGRESS",
+        "AUDIT_INCOMPLETE",
+    } and (choice is None or normalize_choice(choice) == previous.get("choice")):
+        return _audit_review_handoff(deepcopy(previous), previous.get("coverage") or {})
     selected_choice = normalize_choice(choice)
+    if choice is None:
+        previous = selected.state.software_audit
+        if selected.state.workflow and not previous:
+            return await _offer_software_audit(ctx, selected)
+        if previous and previous.get("choice") != "fix_from_report":
+            return deepcopy(previous)
+        if not previous:
+            source_work = _selected_source_handoff(selected)
+            if source_work is not None:
+                return source_work
+            return await _offer_software_audit(ctx, selected)
+        selected_choice = "fix_from_report"
     if choice is not None and selected_choice is None:
         return {
             "status": "ERROR",
             "reason": "choice must be generate_report, fix_from_report, or done.",
         }
-    if selected_choice is None:
-        try:
-            selected_choice = await _ask_software_audit_choice(ctx)
-        except (OSError, RuntimeError, ValueError, MCPError) as exc:
-            logger.warning("Software-audit choice was not collected: %s", exc)
-            return {
-                "status": "CHOICE_UNAVAILABLE",
-                "reason": str(exc),
-                "message": "No code was changed. Ask the human again with choose_software_audit_action.",
-            }
-    if selected_choice is None:
-        return {
-            "status": "CHOICE_REQUIRED",
-            "choices": choice_labels(),
-            "message": (
-                "Ask the human which one action to take, then call "
-                "choose_software_audit_action with that choice. Do not choose for the human."
-            ),
-        }
     if selected_choice != "fix_from_report" or selected_ids is not None:
         if selected_choice == "fix_from_report":
-            return await asyncio.to_thread(_software_audit_fix, selected, selected_ids)
-        return await asyncio.to_thread(
+            result = await asyncio.to_thread(
+                _software_audit_fix, selected, selected_ids
+            )
+            return await _finish_empty_audit(ctx, selected, result)
+        result = await asyncio.to_thread(
             _software_audit_result, selected, selected_choice
         )
+        if selected.state.workflow and result["status"] == "DONE":
+            completed = await complete_security_run(ctx, str(selected.repo_root))
+            return completed.structured_content
+        return result
     prepared = await asyncio.to_thread(_software_audit_fix, selected, None)
     if prepared["status"] != "SELECTION_REQUIRED":
-        return prepared
+        return await _finish_empty_audit(ctx, selected, prepared)
+    if selected.state.workflow and desktop_approval.available():
+        return await _open_audit_approval(ctx, selected, "FIX_SELECTION", prepared)
+    audit_state = selected.state
     try:
         checked = await _ask_audit_items(ctx, prepared["items"])
     except (OSError, RuntimeError, ValueError, MCPError) as exc:
@@ -2083,7 +3755,73 @@ async def choose_software_audit_action(
         return prepared
     if checked is None:
         return prepared
-    return await asyncio.to_thread(_software_audit_fix, selected, checked)
+    if (
+        selected.state is not audit_state
+        or selected.state.software_audit.get("output_path") != prepared["report_path"]
+    ):
+        return {
+            "status": "ERROR",
+            "reason": "The audit selection belongs to a replaced run. No fixes were authorized.",
+        }
+    result = await asyncio.to_thread(
+        _software_audit_fix,
+        selected,
+        checked,
+        expected_report_hash=prepared["report_hash"],
+    )
+    return await _finish_empty_audit(ctx, selected, result)
+
+
+async def _finish_empty_audit(ctx: Context, selected: Engine, result: dict) -> dict:
+    """Skipping audit fixes still produces the final unresolved report."""
+    if selected.state.workflow and result["status"] in {"NONE_SELECTED", "NO_FINDINGS"}:
+        completed = await complete_security_run(ctx, str(selected.repo_root))
+        return completed.structured_content
+    return result
+
+
+def _publish_audit_progress(result: dict[str, Any]) -> None:
+    """Label actual reviewed-file counts separately from the unfinished audit."""
+    progress = result.get("progress") or {}
+    completed, total = progress.get("reviewed_files"), progress.get("total_files")
+    counts = (
+        f"{completed}/{total} planned files reviewed"
+        if total is not None
+        else "file total unknown"
+    )
+    text = f"Software audit | {counts} | {progress.get('message') or result['status']} | report/selection still pending"
+    logger.info("%s", text)
+    sink = progress_sink.get()
+    if sink is not None:
+        sink(text)
+
+
+def _live_run_status(selected: Engine) -> dict[str, Any]:
+    """Return live activity without waiting behind long engine mutations."""
+    background = _background_for(selected)
+    if any(
+        item["status"] in {"RUNNING", "WAITING_FOR_HUMAN", "WAITING_FOR_AI"}
+        for item in background
+    ):
+        state = selected.state
+        execution = state.fix_selection.get("package_execution") or {}
+        return {
+            "status": "BACKGROUND_ACTIVE",
+            "server_version": __version__,
+            "repo_root": str(selected.repo_root),
+            "background_tasks": background,
+            "software_audit": deepcopy(state.software_audit),
+            "workflow": deepcopy(state.workflow),
+            "package_execution": {
+                "status": execution.get("status"),
+                "results": list(execution.get("results") or []),
+            },
+            "message": "Live activity snapshot; the engine is still working or waiting. Completed steps are not a successful-validation claim.",
+        }
+    return {
+        **selected.get_run_status(),
+        "background_tasks": background,
+    }
 
 
 @mcp.tool(

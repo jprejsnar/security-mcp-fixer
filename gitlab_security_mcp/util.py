@@ -319,6 +319,20 @@ def atomic_write_text(path: Path, text: str, *, exclusive: bool = False) -> None
         Path(temporary).unlink(missing_ok=True)
 
 
+def environment_secrets() -> list[str | None]:
+    """Share environment credential redaction between logs and editor progress."""
+    return [
+        os.environ.get(name)
+        for name in (
+            "GITLAB_TOKEN",
+            "GITLAB_PERSONAL_ACCESS_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "NVD_API_KEY",
+        )
+    ]
+
+
 def redact(text: str, secrets: list[str | None]) -> str:
     """Remove known secrets from text that may be logged or returned."""
     redacted = text

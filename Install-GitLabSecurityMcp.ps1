@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string] $WheelPath,
-    [string] $InstallDirectory = (Join-Path $env:USERPROFILE 'Tools\gitlab-security-mcp')
+    [string] $InstallDirectory = (Join-Path $env:USERPROFILE 'Tools\gitlab-security-mcp'),
+    [switch] $EnableAuditContinuation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -154,6 +155,16 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw 'Installed dependencies failed pip check. Review the errors above; installation is not verified.'
 }
+if ($EnableAuditContinuation) {
+    & $python -m gitlab_security_mcp.audit_host --install
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Editor audit continuation hook installation failed. Review the error above.'
+    }
+    Write-Host 'Audit continuation hooks installed for Cursor and the VS Code Copilot harness.'
+}
+else {
+    Write-Warning 'Automatic audit continuation requires -EnableAuditContinuation. MCP instructions alone cannot restart a host AI turn.'
+}
 
 $sitePackages = Join-Path $installRoot 'Lib\site-packages'
 $leftovers = @(Get-ChildItem -LiteralPath $sitePackages -Directory |
@@ -163,3 +174,12 @@ if ($leftovers.Count -gt 0) {
         "They were not deleted automatically: " + (($leftovers | ForEach-Object { $_.FullName }) -join ', '))
 }
 Write-Host 'Installation and dependency checks completed. Reopen VS Code/Cursor and start the MCP server.'
+$wheelVersion = [regex]::Match($wheelItem.Name, '^gitlab_security_mcp-([^-]+)-').Groups[1].Value
+$progressVsix = Join-Path $wheelItem.DirectoryName "gitlab-security-progress-$wheelVersion.vsix"
+Write-Host 'In-editor progress requires the companion VSIX installed in EACH editor using Extensions: Install from VSIX.'
+if (Test-Path -LiteralPath $progressVsix -PathType Leaf) {
+    Write-Host "Progress extension: $progressVsix"
+}
+else {
+    Write-Warning "Download gitlab-security-progress-$wheelVersion.vsix alongside the wheel. The Python wheel alone cannot add an editor status bar."
+}

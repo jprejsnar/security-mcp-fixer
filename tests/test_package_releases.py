@@ -178,12 +178,24 @@ def test_missing_support_or_arbitrary_major_exclusions_are_rejected(changes):
 def test_uncomparable_stable_release_never_silently_selects_an_older_version():
     """Report uncomparable stable versions instead of silently choosing older ones."""
     # Arrange
-    versions = ["3.0.0.Final", "2.0.0"]
+    versions = ["3.0.0.vendor-custom", "2.0.0"]
     # Act
     # Assert
     with pytest.raises(ValueError, match="manual version investigation"):
         stable_versions(versions)
     assert stable_versions(["3.0.0-SNAPSHOT", "2.0.0"]) == ["2.0.0"]
+
+
+def test_maven_final_releases_remain_eligible_catalog_targets():
+    """Do not reject the stable Maven spelling that Gradle actually resolves."""
+    # Arrange
+    versions = ["4.2.20.Final", "4.2.19.Final", "4.3.0.CR1"]
+
+    # Act
+    releases = stable_versions(versions, ecosystem="Maven")
+
+    # Assert
+    assert releases == ["4.2.20.Final", "4.2.19.Final"]
 
 
 @pytest.fixture
@@ -361,6 +373,8 @@ def test_no_free_supported_release_blocks_a_previously_selected_plan(release_eng
 
     # Assert
     assert blocked["status"] == "NO_SAFE_FIX"
+    assert blocked["next_tool"] == "select_security_fixes"
+    assert "complete_security_run" in blocked["message"]
     assert len(blocked["selection"]["paid_releases"]) == 3
     with pytest.raises(ValueError, match="select_package_version"):
         engine._require_package_version(engine.state.findings[0]["proposedFix"])

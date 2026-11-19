@@ -229,6 +229,7 @@ class DesktopApproval:
     """Own one visible dialog until a human submits or closes it."""
 
     process: asyncio.subprocess.Process
+    choice_ids: frozenset[str] | None = None
 
     async def wait(self) -> dict:
         """Wait without an approval deadline; validate transport errors explicitly.
@@ -257,6 +258,18 @@ class DesktopApproval:
                 f"Approval window pid={process.pid} returned unreadable output "
                 f"({len(stdout)} bytes, exit {process.returncode})"
             ) from exc
+        if self.choice_ids is not None:
+            choice = response.get("choice") if isinstance(response, dict) else None
+            if not isinstance(choice, str) or choice not in self.choice_ids:
+                raise ValueError(
+                    f"Approval window pid={process.pid} returned an invalid choice"
+                )
+            logger.info(
+                "Approval window pid=%s closed with choice=%s",
+                process.pid,
+                response["choice"],
+            )
+            return response
         if not isinstance(response, dict) or response.get("action") not in {
             "accept",
             "cancel",
@@ -403,10 +416,54 @@ foreach ($item in @($inputData.choices)) {
     $top += 44
 }
 $form.CancelButton = $form.Controls[$form.Controls.Count - 1]
+if ($inputData.notify_ready) {
+    $form.Add_Shown({ [Console]::Out.WriteLine('READY'); [Console]::Out.Flush() })
+}
 [void]$form.ShowDialog()
 $form.Dispose()
 [Console]::Out.WriteLine((@{ choice = $script:selected } | ConvertTo-Json -Compress))
 """
+
+
+async def open_choice(
+    title: str, message: str, choices: list[dict[str, str]]
+) -> DesktopApproval:
+    """Return once a native choice window is visible, without waiting inside the host request."""
+    process = await asyncio.create_subprocess_exec(
+        str(powershell()),
+        "-NoProfile",
+        "-STA",
+        "-Command",
+        _CHOICE_SCRIPT,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    dialog = DesktopApproval(process, frozenset(item["id"] for item in choices))
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("Choice window pipes were not created")
+        payload = {
+            "title": title,
+            "message": message,
+            "choices": choices,
+            "notify_ready": True,
+        }
+        process.stdin.write(json.dumps(payload, ensure_ascii=True).encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        if (await process.stdout.readline()).strip() != b"READY":
+            _, stderr = await process.communicate()
+            raise RuntimeError(
+                f"Choice window pid={process.pid} could not be shown: {_diagnostic_text(stderr)}"
+            )
+        logger.info("Choice window pid=%s is visible", process.pid)
+        return dialog
+    except BaseException:
+        await dialog.close()
+        raise
 
 
 def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:

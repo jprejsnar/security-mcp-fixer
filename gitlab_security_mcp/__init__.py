@@ -1,3 +1,3 @@
 """Local-only GitLab security remediation MCP server."""
 
-__version__ = "1.0.41"
+__version__ = "1.0.49"

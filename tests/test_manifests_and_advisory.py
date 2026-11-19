@@ -1141,6 +1141,28 @@ def test_gradle_report_keeps_configuration_versions_separate(tmp_path, hint):
     }
 
 
+def test_gradle_report_accepts_resolved_netty_final_versions(tmp_path):
+    """Keep the original Maven version after a BOM constraint selects a final release."""
+    # Arrange
+    from gitlab_security_mcp.manifests import gradle_report_package
+
+    manifest = tmp_path / "build.gradle"
+    report = (
+        "runtimeClasspath - Application dependencies.\n"
+        "+--- io.netty:netty-codec-http:4.1.139.Final -> 4.2.20.Final (c)\n"
+        "|    \\--- io.netty:netty-codec-http:4.1.139.Final -> 4.2.20.Final\n"
+        "\\--- io.netty:netty-codec-http:4.2.20.Final (*)\n"
+    )
+
+    # Act
+    hit = gradle_report_package(tmp_path, manifest, "io.netty/netty-codec-http", report)
+
+    # Assert
+    assert hit is not None
+    assert hit.version == "4.2.20.Final"
+    assert hit.configuration_versions == {"runtimeClasspath": ["4.2.20.Final"]}
+
+
 @pytest.mark.parametrize("separate_projects", [False, True])
 def test_gradle_report_only_rejects_conflicts_within_one_project_configuration(
     tmp_path, separate_projects

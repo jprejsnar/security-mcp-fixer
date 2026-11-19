@@ -17,12 +17,13 @@ _FIXED_IN = re.compile(
 
 
 def parse_version(value: str | None) -> Version | None:
-    """Parse a version string, accepting a leading ``v``. Return None if unparseable."""
+    """Parse comparable versions, including Maven's stable Final/RELEASE/GA suffixes."""
     if not value:
         return None
     text = value.strip()
     if text.startswith("v") and text[1:2].isdigit():
         text = text[1:]
+    text = re.sub(r"(?<=\d)[.-](?:final|release|ga)$", "", text, flags=re.IGNORECASE)
     # Maven timestamps and build metadata are kept when packaging can read them.
     try:
         return Version(text)
