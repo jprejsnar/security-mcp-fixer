@@ -66,6 +66,7 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
         capture_output=True,
         text=True,
         timeout=30,
+        encoding="utf-8",
     )
 
 
@@ -222,6 +223,7 @@ def commit_all(repo: Path, message: str = "init") -> None:
         capture_output=True,
         text=True,
         timeout=30,
+        encoding="utf-8",
     )
     subprocess.run(
         [
@@ -239,6 +241,7 @@ def commit_all(repo: Path, message: str = "init") -> None:
         capture_output=True,
         text=True,
         timeout=30,
+        encoding="utf-8",
     )
 
 

@@ -172,7 +172,7 @@ def test_existing_fix_reuses_catalog_only_and_actual_edits_still_read_fresh(tmp_
     assert all(requests.count(url) == 0 for _name, url, _marker in REQUIRED_DOCS[1:])
     assert any("CVE-2020-0002" in url for url in after_shared)
     assert not any("CVE-2020-0001" in source.url for source in second.sources)
-    assert len(path.read_text().splitlines()) == len(requests)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == len(requests)
 
 
 def test_parallel_source_reviews_share_run_receipts_but_edits_stay_fresh():
@@ -679,19 +679,21 @@ def test_http_clients_write_timing_records(tmp_path, operation):
                 ) == {"ok": True}
 
     # Assert
-    records = [json.loads(line) for line in path.read_text().splitlines()]
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
     assert len(records) == 1
     assert records[0]["source"] == ("gitlab" if operation == "gitlab" else "advisory")
     assert records[0]["status_code"] == 200
     assert records[0]["duration_ms"] >= 0
-    assert "secret" not in path.read_text()
+    assert "secret" not in path.read_text(encoding="utf-8")
 
 
 def test_http_log_write_failure_preserves_request_result(tmp_path):
     """Keep successful HTTP work successful when local timing storage is unavailable."""
     # Arrange
     blocked = tmp_path / "blocked"
-    blocked.write_text("not a directory")
+    blocked.write_text("not a directory", encoding="utf-8")
 
     def handler(_request):
         """Return the same response regardless of log storage availability."""
@@ -756,7 +758,9 @@ def test_required_docs_are_requested_together_and_stay_in_order(tmp_path):
     assert [item.name for item in review.sources] == [name for name, _url in selected]
     records = [
         json.loads(line)
-        for line in (tmp_path / "http-timings.jsonl").read_text().splitlines()
+        for line in (tmp_path / "http-timings.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     assert len(records) == len(selected)
     assert {record["url"] for record in records} == {url for _name, url in selected}

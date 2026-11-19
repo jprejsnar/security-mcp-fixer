@@ -539,14 +539,14 @@ def pending_package_batch(package_engine, package_review, request):
     # Arrange
     package_engine.package_policy_path.unlink()
     manifest = package_engine.repo_root / "package.json"
-    data = json.loads(manifest.read_text())
+    data = json.loads(manifest.read_text(encoding="utf-8"))
     packages = [("package", "example"), ("other", "other")]
     packages.extend(
         (f"extra{index}", f"extra{index}")
         for index in range(2, getattr(request, "param", 2))
     )
     data["dependencies"].update({package: "1.0.0" for _, package in packages})
-    manifest.write_text(json.dumps(data))
+    manifest.write_text(json.dumps(data), encoding="utf-8")
     for finding_id, package in packages[1:]:
         second = deepcopy(package_engine.state.findings[0])
         second.update(id=finding_id, component=package)
@@ -648,9 +648,9 @@ def test_changed_dependency_files_prevent_edit_reuse(duplicate_package_update):
     # Arrange
     engine, review, _first = duplicate_package_update
     manifest = engine.repo_root / "package.json"
-    data = json.loads(manifest.read_text())
+    data = json.loads(manifest.read_text(encoding="utf-8"))
     data["dependencies"]["example"] = "1.0.0"
-    manifest.write_text(json.dumps(data))
+    manifest.write_text(json.dumps(data), encoding="utf-8")
 
     # Act
     qualified = engine.qualify_package_update("same-package", review)
@@ -678,7 +678,10 @@ def test_shared_update_failure_restores_original_dependency(duplicate_package_up
 
     def execute(argv, **_kwargs):
         """Reject the target but permit all checks on the restored baseline."""
-        updated = json.loads(manifest.read_text())["dependencies"]["example"] == "1.0.1"
+        updated = (
+            json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]["example"]
+            == "1.0.1"
+        )
         failed = updated and argv[1:] == ["run", "build"]
         return CommandResult(
             argv,
@@ -698,7 +701,10 @@ def test_shared_update_failure_restores_original_dependency(duplicate_package_up
 
     # Assert
     assert result["status"] == "FIX_REJECTED", result
-    assert json.loads(manifest.read_text())["dependencies"]["example"] == "1.0.0"
+    assert (
+        json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]["example"]
+        == "1.0.0"
+    )
     assert all(change["status"] == "ROLLED_BACK" for change in engine.state.changes)
     assert not engine.state.manual_cleanup_required
 
@@ -740,7 +746,7 @@ def test_failed_batch_retains_green_subset(pending_package_batch, failed_kind, b
 
     def execute(argv, **kwargs):
         """Fail only the selected update or the combination of both updates."""
-        installed = json.loads(manifest.read_text())["dependencies"]
+        installed = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]
         affected = (
             all(value == "1.0.1" for value in installed.values())
             if bad == "interaction"
@@ -762,7 +768,7 @@ def test_failed_batch_retains_green_subset(pending_package_batch, failed_kind, b
 
     # Act
     result = engine.run_validation_matrix()
-    installed = json.loads(manifest.read_text())["dependencies"]
+    installed = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]
     payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
 
     # Assert
@@ -819,7 +825,7 @@ def test_failed_batch_verifies_the_restored_baseline(
 
     def execute(argv, **kwargs):
         """Fail builds for any updated dependency, optionally also on the baseline."""
-        installed = json.loads(manifest.read_text())["dependencies"]
+        installed = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]
         failed = (broken_baseline or "1.0.1" in installed.values()) and argv[1:] == [
             "run",
             "build",
@@ -845,7 +851,9 @@ def test_failed_batch_verifies_the_restored_baseline(
         "VALIDATION_FAILED" if broken_baseline else "FIX_REJECTED"
     ), result
     assert len(result["rejected_updates"]) == 2
-    assert set(json.loads(manifest.read_text())["dependencies"].values()) == {"1.0.0"}
+    assert set(
+        json.loads(manifest.read_text(encoding="utf-8"))["dependencies"].values()
+    ) == {"1.0.0"}
     assert result["isolation_trials"][-1]["finding_ids"] == []
     assert engine.state.manual_cleanup_required is broken_baseline
     assert (
@@ -864,7 +872,7 @@ def test_failed_group_is_split_without_discarding_compatible_updates(
 
     def execute(argv, **kwargs):
         """Fail the production build only while the third package is updated."""
-        failed = json.loads(manifest.read_text())["dependencies"][
+        failed = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"][
             "extra2"
         ] == "1.0.1" and argv[1:] == ["run", "build"]
         return CommandResult(
@@ -889,7 +897,9 @@ def test_failed_group_is_split_without_discarding_compatible_updates(
     assert len(result["retained_updates"]) == 3
     assert len(result["isolation_trials"]) <= 5
     assert (
-        list(json.loads(manifest.read_text())["dependencies"].values()).count("1.0.1")
+        list(
+            json.loads(manifest.read_text(encoding="utf-8"))["dependencies"].values()
+        ).count("1.0.1")
         == 3
     )
 

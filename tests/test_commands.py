@@ -253,7 +253,10 @@ def _test_pid_running(pid):
     from pathlib import Path
 
     stat = Path(f"/proc/{pid}/stat")
-    return not stat.exists() or stat.read_text().split(") ", 1)[1][0] != "Z"
+    return (
+        not stat.exists()
+        or stat.read_text(encoding="utf-8").split(") ", 1)[1][0] != "Z"
+    )
 
 
 @pytest.mark.parametrize("outcome", ["exit", "immediate-exit", "timeout", "cancel"])
@@ -333,7 +336,7 @@ def test_command_cleanup_stops_inherited_pipe_descendants(
                 check=False,
             )
             assert result.exit_code == (124 if outcome == "timeout" else 0)
-        descendant = int(pid_file.read_text())
+        descendant = int(pid_file.read_text(encoding="utf-8"))
         deadline = time.monotonic() + 3
         while _test_pid_running(descendant) and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -345,7 +348,7 @@ def test_command_cleanup_stops_inherited_pipe_descendants(
         assert children[0].stderr.closed
     finally:
         if pid_file.exists():
-            descendant = int(pid_file.read_text())
+            descendant = int(pid_file.read_text(encoding="utf-8"))
             if _test_pid_running(descendant):
                 os.kill(descendant, signal.SIGTERM)
         for child in children:

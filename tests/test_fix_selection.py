@@ -982,7 +982,7 @@ def test_native_mcp_selection_edits_only_the_chosen_image(repo, monkeypatch):
     assert selection["selected_ids"] == ["one"]
     assert applied["status"] == "APPLIED", applied
     assert len(forms) == 1
-    assert (repo / "Dockerfile").read_text() == (
+    assert (repo / "Dockerfile").read_text(encoding="utf-8") == (
         "FROM nginx:1.27.0 AS one\nFROM httpd:1.25.1 AS two\n"
     )
     assert server.get_run_status(str(repo))["fix_selection"]["selected_ids"] == ["one"]

@@ -786,7 +786,7 @@ def test_ambiguous_apk_instructions_are_never_rewritten(tmp_path, run, reason):
     # Arrange
     from gitlab_security_mcp.config_findings import assess_config
 
-    (tmp_path / "Dockerfile").write_text(f"FROM alpine:3.24\n{run}\n")
+    (tmp_path / "Dockerfile").write_text(f"FROM alpine:3.24\n{run}\n", encoding="utf-8")
     calls = []
 
     # Act
@@ -812,7 +812,7 @@ def test_apk_pinning_requires_the_kics_rule_and_exact_alpine_evidence(
 
     prefix = "# escape=`\n" if variant == "escape" else ""
     (tmp_path / "Dockerfile").write_text(
-        prefix + "FROM alpine:3.24\nRUN apk add busybox\n"
+        prefix + "FROM alpine:3.24\nRUN apk add busybox\n", encoding="utf-8"
     )
     line = 3 if variant == "escape" else 2
     finding = {
@@ -839,7 +839,11 @@ def test_apk_pinning_requires_the_kics_rule_and_exact_alpine_evidence(
 
     # Assert
     assert assessment.decision == "manual"
-    assert (tmp_path / "Dockerfile").read_text().endswith("RUN apk add busybox\n")
+    assert (
+        (tmp_path / "Dockerfile")
+        .read_text(encoding="utf-8")
+        .endswith("RUN apk add busybox\n")
+    )
     if variant == "lookup_error":
         assert "Supported Alpine branches" in assessment.reason
         assert "left unchanged" in assessment.reason
@@ -853,14 +857,16 @@ def test_multi_line_config_plan_is_all_or_nothing(tmp_path):
     from gitlab_security_mcp.config_findings import apply_config_line, assess_config
 
     path = tmp_path / "Dockerfile"
-    path.write_text("FROM alpine:3.24\nRUN apk add \\\n    busybox \\\n    tini\n")
+    path.write_text(
+        "FROM alpine:3.24\nRUN apk add \\\n    busybox \\\n    tini\n", encoding="utf-8"
+    )
     assessment = assess_config(
         tmp_path,
         {**_apk_finding(2), "location": {"file": "Dockerfile", "startLine": 2}},
         apk_versions=_resolver([]),
     )
     changed = "FROM alpine:3.24\nRUN apk add \\\n    busybox \\\n    tini-static\n"
-    path.write_text(changed)
+    path.write_text(changed, encoding="utf-8")
 
     # Act
     with pytest.raises(ValueError, match="no longer matches"):
@@ -868,7 +874,7 @@ def test_multi_line_config_plan_is_all_or_nothing(tmp_path):
 
     # Assert
     assert len(assessment.plan.line_edits) == 2
-    assert path.read_text() == changed
+    assert path.read_text(encoding="utf-8") == changed
 
 
 def test_windows_approval_applies_and_validates_config_fix_without_another_turn(

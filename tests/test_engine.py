@@ -1049,7 +1049,9 @@ def test_unknown_affected_version_is_not_a_definitive_no_solution(tmp_path):
     # Arrange
     from unittest.mock import Mock
 
-    (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"4.17.20"}}')
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"lodash":"4.17.20"}}', encoding="utf-8"
+    )
     advisory = Mock()
     advisory.lookup.return_value = AdvisoryLookup(
         outcome="no_fix_published", affected=None, summary="No fixed bound published."
@@ -1075,7 +1077,9 @@ def test_parallel_finding_verification_overlaps_advisories_and_persists_both(tmp
 
     from gitlab_security_mcp.fanout import map_ordered
 
-    (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"4.17.20"}}')
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"lodash":"4.17.20"}}', encoding="utf-8"
+    )
     rendezvous = threading.Barrier(2)
     advisory = Mock()
 
@@ -1099,7 +1103,9 @@ def test_parallel_finding_verification_overlaps_advisories_and_persists_both(tmp
 
     # Assert
     assert [result["decision"] for result in results] == ["NO_SAFE_FIX"] * 2
-    saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+    saved = json.loads(
+        (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+    )
     assert set(saved["decisions"]) == {"first", "second"}
     assert len(saved["no_solution"]) == 2
     results[0]["evidence"].append("caller mutation")
@@ -1115,7 +1121,9 @@ def test_exclusive_tools_and_same_finding_wait_for_verification(tmp_path, operat
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import Mock
 
-    (tmp_path / "package.json").write_text('{"dependencies":{"lodash":"4.17.20"}}')
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"lodash":"4.17.20"}}', encoding="utf-8"
+    )
     entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
     advisory = Mock()
 
@@ -2601,7 +2609,9 @@ def test_version_only_update_cannot_fix_explicit_source_change_advisory(tmp_path
     # Arrange
     from unittest.mock import Mock
 
-    (tmp_path / "package.json").write_text('{"dependencies":{"example":"1.0.0"}}')
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"example":"1.0.0"}}', encoding="utf-8"
+    )
     finding = _finding("source-required", "example", "CVE-TEST", "1.0.0")
     finding["description"] = (
         "Version 1.2.0 corrects documentation. Upgrading alone does not fix affected code."
@@ -3656,6 +3666,7 @@ def test_tools_are_registered():
         "submit_false_positive_approvals",
         "generate_local_report",
         "complete_security_run",
+        "choose_software_audit_action",
         "get_run_status",
     }
 
@@ -3677,4 +3688,4 @@ def test_mcp_discovery_catalog_stays_within_context_budget():
         ensure_ascii=False,
     )
     # Assert
-    assert len(catalog) < 11_000
+    assert len(catalog) < 12_000

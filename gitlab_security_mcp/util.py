@@ -13,7 +13,7 @@ import tempfile
 import threading
 import xml.etree.ElementTree as ET
 import xml.parsers.expat as expat
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -177,7 +177,9 @@ def log_concurrency(kind: str, name: str, **fields: object) -> None:
 
 
 @contextmanager
-def logged_lock(lock: threading.Lock | threading.RLock, name: str) -> Iterator[None]:
+def logged_lock(
+    lock: threading.Lock | threading.RLock, name: str
+) -> Generator[None, None, None]:
     """Acquire a lock and log only when another thread already held it.
 
     The wait is measured before the critical section. The record is written
@@ -195,7 +197,7 @@ def logged_lock(lock: threading.Lock | threading.RLock, name: str) -> Iterator[N
 
 
 @contextmanager
-def log_task(name: str) -> Iterator[None]:
+def log_task(name: str) -> Generator[None, None, None]:
     """Log how long a task took and the CPU, memory and GC it used.
 
     The record is one stderr JSON line. It has no arguments, source, or secrets.
@@ -231,7 +233,7 @@ def timed_http_stream(
     log_path: Path | None = None,
     operation: str | None = None,
     **kwargs,
-) -> Iterator[httpx.Response]:
+) -> Generator[httpx.Response, None, None]:
     """Time a request through body consumption and log safe concurrent spans.
 
     Only the final append is serialized. Network and body work stay concurrent.

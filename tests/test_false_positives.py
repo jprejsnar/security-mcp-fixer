@@ -155,7 +155,7 @@ def test_desktop_approval_returns_before_human_response_and_refreshes_report(
 
     # Act
     asyncio.run(exercise())
-    report = json.loads(Path(engine.state.json_report_path).read_text())
+    report = json.loads(Path(engine.state.json_report_path).read_text(encoding="utf-8"))
 
     # Assert
     ctx.elicit.assert_not_called()
@@ -257,6 +257,7 @@ $bounds = Get-ApprovalBounds -WorkingArea $area -RequestedSize (New-Object Syste
         capture_output=True,
         timeout=20,
         creationflags=subprocess.CREATE_NO_WINDOW,
+        encoding="utf-8",
     )
 
     # Assert
@@ -597,7 +598,7 @@ def test_interrupted_native_form_is_not_left_requested(tmp_path, monkeypatch):
 
     # Assert
     assert engine.state.false_positive_approval_form["status"] == "APPROVAL_INTERRUPTED"
-    report = json.loads(Path(engine.state.json_report_path).read_text())
+    report = json.loads(Path(engine.state.json_report_path).read_text(encoding="utf-8"))
     assert report["false_positive_approval_form"]["status"] == "APPROVAL_INTERRUPTED"
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -636,7 +637,7 @@ def test_desktop_window_closes_on_server_shutdown_without_authorizing(
     dialog.close.assert_awaited_once()
     assert not server._desktop_approval_tasks
     assert engine.state.false_positive_approval_form["status"] == "APPROVAL_INTERRUPTED"
-    report = json.loads(Path(engine.state.json_report_path).read_text())
+    report = json.loads(Path(engine.state.json_report_path).read_text(encoding="utf-8"))
     assert report["false_positive_approval_form"]["status"] == "APPROVAL_INTERRUPTED"
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -678,7 +679,7 @@ def test_desktop_approval_failures_are_reported_without_dismissal(
     assert engine.state.false_positive_approval_form["status"] == (
         "APPROVAL_UNAVAILABLE" if failure == "launch" else "APPROVAL_INVALID"
     )
-    report = json.loads(Path(engine.state.json_report_path).read_text())
+    report = json.loads(Path(engine.state.json_report_path).read_text(encoding="utf-8"))
     assert report["false_positive_approval_form"]["reason"]
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
@@ -858,7 +859,9 @@ def test_checkbox_submission_is_the_only_write_gate(
         )
         assert result["results"][0]["status"] == "DISMISSED"
         assert engine.false_positive_candidates()["candidates"] == []
-        saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+        saved = json.loads(
+            (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+        )
         assert saved["gitlab_dismissals"][0]["status"] == "DISMISSED"
     if not supported:
         assert result["status"] == "APPROVAL_UNAVAILABLE"
@@ -912,7 +915,9 @@ def test_combined_completion_automatically_offers_the_form_after_saving_report(
     assert saved["false_positive_approval_form"]["status"] == (
         "OK" if supported else "APPROVAL_UNAVAILABLE"
     )
-    snapshot = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+    snapshot = json.loads(
+        (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+    )
     assert payload["server_version"] == saved["server_version"] == __version__
     assert (
         snapshot["server_version"]
@@ -1460,7 +1465,9 @@ def test_ai_review_failures_cannot_become_false_positives(
         result = asyncio.run(
             tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
         )
-    saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+    saved = json.loads(
+        (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+    )
 
     # Assert
     assert result["decision"] == "SOURCE_REVIEW_REQUIRED"
@@ -1689,7 +1696,9 @@ def test_parallel_dismissals_keep_consent_durability_and_independent_proof(
             if operation == "target":
                 if index < MAX_WORKERS:
                     saved = json.loads(
-                        (tmp_path / ".security-mcp" / "run-state.json").read_text()
+                        (tmp_path / ".security-mcp" / "run-state.json").read_text(
+                            encoding="utf-8"
+                        )
                     )
                     assert len(saved["gitlab_dismissals"]) == len(approved)
                     assert all(
@@ -1870,7 +1879,9 @@ def test_partial_failures_are_persisted_and_reported(tmp_path):
 
     def fail(*args):
         """Verify durable intent, then simulate a lost mutation response."""
-        saved = json.loads((tmp_path / ".security-mcp" / "run-state.json").read_text())
+        saved = json.loads(
+            (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+        )
         assert saved["gitlab_dismissals"][0]["status"] == "PENDING"
         raise httpx.ReadTimeout("Response lost")
 
@@ -2064,14 +2075,16 @@ def test_dismissal_requires_independent_persisted_state_and_reason(tmp_path, mod
         DISMISS_FALSE_POSITIVE,
         DISMISSAL_CONFIRMATION_QUERY,
     ]
-    events = [json.loads(line) for line in path.read_text().splitlines()]
+    events = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
     assert [row["operation"] for row in events] == [
         "DismissalTarget",
         "DismissFalsePositive",
         "ConfirmFalsePositiveDismissal",
     ]
-    assert "test-token" not in path.read_text()
-    assert "Reviewed" not in path.read_text()
+    assert "test-token" not in path.read_text(encoding="utf-8")
+    assert "Reviewed" not in path.read_text(encoding="utf-8")
     if mode in {"confirmed", "transition_reason"}:
         assert result["verification"]["dismissal_reason"] == "FALSE_POSITIVE"
         assert result["verification"]["verified_at"]
@@ -2548,7 +2561,9 @@ def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
         "group/app",
         engine.state.decisions["finding-2"]["reason"],
     )
-    saved = json.loads(Path(result.structured_content["json_report"]).read_text())
+    saved = json.loads(
+        Path(result.structured_content["json_report"]).read_text(encoding="utf-8")
+    )
     assert saved["false_positive_approval_form"]["selected_ids"] == ["finding-2"]
     assert saved["false_positive_approval"]["not_confirmed_dismissed"] == 1
 

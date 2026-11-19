@@ -15,6 +15,7 @@ _MAX_DIAGNOSTIC_CHARS = 2000
 
 SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
@@ -369,6 +370,7 @@ async def open_dialog(
 
 _CHOICE_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
@@ -421,6 +423,8 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
         ),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
@@ -478,6 +482,8 @@ def ask_checkboxes(
         input=json.dumps(payload, ensure_ascii=True),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )

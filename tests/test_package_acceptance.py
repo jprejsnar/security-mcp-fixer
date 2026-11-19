@@ -39,7 +39,7 @@ def test_unmatched_runtime_dependency_cannot_be_fixed_by_a_pin(
     """Do not confuse a literal force or an unresolved constraint with remediation."""
     # Arrange
     manifest = tmp_path / "build.gradle"
-    manifest.write_text("plugins { id 'java' }\n" + pin)
+    manifest.write_text("plugins { id 'java' }\n" + pin, encoding="utf-8")
     inspected = configuration or "runtimeClasspath"
     runner = Mock()
     runner.run.side_effect = lambda argv, **kwargs: CommandResult(
@@ -89,7 +89,7 @@ def test_unmatched_runtime_dependency_cannot_be_fixed_by_a_pin(
     )
     assert "Next: inspect the scanner's artifact" in decision[1]
     assert "No update was applied" in decision[1]
-    assert manifest.read_text() == "plugins { id 'java' }\n" + pin
+    assert manifest.read_text(encoding="utf-8") == "plugins { id 'java' }\n" + pin
     assert runner.run.call_count == 2
     assert runner.run.call_args_list[0].args[0][-2:] == ["--configuration", inspected]
     assert runner.run.call_args.args[0][-1] == "dependencies"
@@ -102,14 +102,15 @@ def test_existing_gradle_property_and_policy_row_are_preserved(tmp_path, filenam
     original = (
         'dependencies { implementation("example:library:${libraryMinVersion}") }\n'
     )
-    (tmp_path / filename).write_text(original)
+    (tmp_path / filename).write_text(original, encoding="utf-8")
     (tmp_path / "gradle.properties").write_text(
-        "libraryMinVersion=1.0.0\notherVersion=7.0.0\n"
+        "libraryMinVersion=1.0.0\notherVersion=7.0.0\n", encoding="utf-8"
     )
     policy = tmp_path / ".github" / "versions.md"
     policy.parent.mkdir()
     policy.write_text(
-        "| Pin | Value | Source |\n|---|---|---|\n| libraryMinVersion | `1.0.0` | `gradle.properties` |\n"
+        "| Pin | Value | Source |\n|---|---|---|\n| libraryMinVersion | `1.0.0` | `gradle.properties` |\n",
+        encoding="utf-8",
     )
     hit = PackageHit(
         "Maven",
@@ -129,11 +130,13 @@ def test_existing_gradle_property_and_policy_row_are_preserved(tmp_path, filenam
 
     # Assert
     assert result["status"] == "APPLIED"
-    assert (tmp_path / filename).read_text() == original
-    assert (
-        tmp_path / "gradle.properties"
-    ).read_text() == "libraryMinVersion=1.0.1\notherVersion=7.0.0\n"
-    assert "| libraryMinVersion | `1.0.1` | `gradle.properties` |" in policy.read_text()
+    assert (tmp_path / filename).read_text(encoding="utf-8") == original
+    assert (tmp_path / "gradle.properties").read_text(
+        encoding="utf-8"
+    ) == "libraryMinVersion=1.0.1\notherVersion=7.0.0\n"
+    assert "| libraryMinVersion | `1.0.1` | `gradle.properties` |" in policy.read_text(
+        encoding="utf-8"
+    )
     assert set(result["files"]) == {
         filename,
         "gradle.properties",
@@ -148,11 +151,12 @@ def test_catalog_reference_updates_its_existing_central_policy(tmp_path):
     catalog.parent.mkdir()
     catalog.write_text(
         '[versions]\nlibraryFloor = "1.0.0"\n[libraries]\n'
-        'library = { module = "example:library", version.ref = "libraryFloor" }\n'
+        'library = { module = "example:library", version.ref = "libraryFloor" }\n',
+        encoding="utf-8",
     )
     policy = tmp_path / ".github" / "versions.md"
     policy.parent.mkdir()
-    policy.write_text("| Pin | Value | Source |\n|---|---|---|\n")
+    policy.write_text("| Pin | Value | Source |\n|---|---|---|\n", encoding="utf-8")
     hit = PackageHit(
         "Maven",
         "gradle",
@@ -171,10 +175,11 @@ def test_catalog_reference_updates_its_existing_central_policy(tmp_path):
 
     # Assert
     assert result["status"] == "APPLIED"
-    assert 'libraryFloor = "1.0.1"' in catalog.read_text()
-    assert 'version.ref = "libraryFloor"' in catalog.read_text()
+    assert 'libraryFloor = "1.0.1"' in catalog.read_text(encoding="utf-8")
+    assert 'version.ref = "libraryFloor"' in catalog.read_text(encoding="utf-8")
     assert (
-        "| libraryFloor | `1.0.1` | `gradle/libs.versions.toml` |" in policy.read_text()
+        "| libraryFloor | `1.0.1` | `gradle/libs.versions.toml` |"
+        in policy.read_text(encoding="utf-8")
     )
     assert set(plan.files) == {"gradle/libs.versions.toml", ".github/versions.md"}
 
@@ -224,7 +229,9 @@ def test_build_scripts_cannot_sneak_in_test_execution(tmp_path, monkeypatch, scr
     # Arrange
     import json
 
-    (tmp_path / "package.json").write_text(json.dumps({"scripts": scripts}))
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": scripts}), encoding="utf-8"
+    )
     launch = Mock()
     monkeypatch.setattr("gitlab_security_mcp.commands.subprocess.Popen", launch)
     runner = CommandRunner(tmp_path)
@@ -239,11 +246,12 @@ def test_build_scripts_cannot_sneak_in_test_execution(tmp_path, monkeypatch, scr
 def _gradle_wrapper(root, version):
     """Declare a wrapper without executing its fixture launchers."""
     for name in ("gradlew", "gradlew.bat"):
-        (root / name).write_text("")
+        (root / name).write_text("", encoding="utf-8")
     properties = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
     properties.parent.mkdir(parents=True)
     properties.write_text(
-        f"distributionUrl=https\\://services.gradle.org/distributions/gradle-{version}-bin.zip\n"
+        f"distributionUrl=https\\://services.gradle.org/distributions/gradle-{version}-bin.zip\n",
+        encoding="utf-8",
     )
 
 
@@ -274,7 +282,7 @@ def test_masked_test_failures_cannot_be_accepted(output):
 def test_gradle_policy_reuses_production_build_without_tests(tmp_path, version):
     """Share a production build and explicitly skip legacy unit-check policies."""
     # Arrange
-    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
     if version is not None:
         _gradle_wrapper(tmp_path, version)
 
@@ -339,13 +347,15 @@ def test_gradle_policy_reuses_production_build_without_tests(tmp_path, version):
 def test_gradle_build_does_not_execute_or_require_tests(tmp_path, mode, modern):
     """Do not execute tests or make production acceptance depend on test reports."""
     # Arrange
-    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
     if modern:
         _gradle_wrapper(tmp_path, "9.9.0")
     report = tmp_path / "build" / "test-results" / "test" / "TEST-App.xml"
     report.parent.mkdir(parents=True)
     if mode == "stale":
-        report.write_text('<testsuite tests="4" failures="0" errors="0"/>')
+        report.write_text(
+            '<testsuite tests="4" failures="0" errors="0"/>', encoding="utf-8"
+        )
 
     def execute(argv, **kwargs):
         """Produce build results without scheduling any test task."""
@@ -413,7 +423,7 @@ def test_transitive_java_override_preserves_existing_bom(
     """Plan a targeted transitive fix instead of rejecting every BOM-managed update."""
     # Arrange
     path = tmp_path / filename
-    path.write_text(original)
+    path.write_text(original, encoding="utf-8")
     hit = PackageHit(
         "Maven", manager, "example:library", "1.0.0", None, filename, None, False
     )
@@ -425,19 +435,22 @@ def test_transitive_java_override_preserves_existing_bom(
     # Assert
     assert plan.strategy == "override"
     assert result["status"] == "APPLIED"
-    assert expected in path.read_text()
+    assert expected in path.read_text(encoding="utf-8")
     if "enforcedPlatform" in original:
         assert plan.as_dict()["gradle_force"] is True
-        assert "resolutionStrategy.force" in path.read_text()
-        assert "strictly(" not in path.read_text()
+        assert "resolutionStrategy.force" in path.read_text(encoding="utf-8")
+        assert "strictly(" not in path.read_text(encoding="utf-8")
         assert (
             "Runtime compatibility with the platform remains unverified"
             in plan.description
         )
     assert (
-        ("bom:app:1" in path.read_text())
+        ("bom:app:1" in path.read_text(encoding="utf-8"))
         if manager == "gradle"
-        else ("<artifactId>app</artifactId><version>1</version>" in path.read_text())
+        else (
+            "<artifactId>app</artifactId><version>1</version>"
+            in path.read_text(encoding="utf-8")
+        )
     )
     assert result["files"] == (
         [filename, "gradle.properties"] if manager == "gradle" else [filename]
@@ -489,7 +502,7 @@ def test_quoted_or_commented_platform_does_not_change_override_strategy(
     """Do not introduce a broader force because documentation mentions a platform."""
     # Arrange
     manifest = tmp_path / "build.gradle"
-    manifest.write_text(source)
+    manifest.write_text(source, encoding="utf-8")
     hit = PackageHit(
         "Maven", "gradle", "example:library", "1.0.0", None, manifest.name, None, False
     )
@@ -658,12 +671,12 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     original = "plugins { id 'java' }\ndependencies { }\n"
     if outcome == "enforced_platform":
         original += 'dependencies { implementation(enforcedPlatform("bom:app:1")) }\n'
-    manifest.write_text(original)
+    manifest.write_text(original, encoding="utf-8")
     properties = tmp_path / "gradle.properties"
-    properties.write_text("unrelatedPin=7.0.0\n")
+    properties.write_text("unrelatedPin=7.0.0\n", encoding="utf-8")
     policy = tmp_path / ".github" / "versions.md"
     policy.parent.mkdir()
-    policy.write_text("| Pin | Value | Source |\n|---|---|---|\n")
+    policy.write_text("| Pin | Value | Source |\n|---|---|---|\n", encoding="utf-8")
     if modern:
         _gradle_wrapper(tmp_path, "9.9.0")
     packages = [
@@ -678,7 +691,7 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     def execute(argv, **kwargs):
         """Resolve real manifest edits and fail only the offending updated coordinate."""
         assert_allowed(argv, tmp_path)
-        pins = properties.read_text()
+        pins = properties.read_text(encoding="utf-8")
         bad = "securityMcp.example.library.version=1.0.1" in pins
         failed = "assemble" in argv and (
             (bad and outcome in {"build", "build_only_failure"})
@@ -811,9 +824,11 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
             """Release the human response only after the actual tool call has ended."""
             assert initial["status"] == "AWAITING_HUMAN", initial
             task = server._desktop_fix_selection_tasks[initial["request_id"]]
-            assert manifest.read_text() == original
+            assert manifest.read_text(encoding="utf-8") == original
             if outcome == "checkout_changed":
-                (tmp_path / "Changed.java").write_text("class Changed {}")
+                (tmp_path / "Changed.java").write_text(
+                    "class Changed {}", encoding="utf-8"
+                )
             answer.set()
             await task
 
@@ -851,7 +866,7 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
         assert engine.state.fix_selection["status"] == "INVALID"
         assert engine.state.fix_selection["selected_ids"] == []
         assert not engine.state.changes
-        assert manifest.read_text() == original
+        assert manifest.read_text(encoding="utf-8") == original
         assert not any("assemble" in call.args[0] for call in runner.run.call_args_list)
         dialog.close.assert_awaited_once()
         return
@@ -872,8 +887,8 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
             "docs": "PARTIAL_FAILURE",
         }[outcome]
     ), execution
-    text = manifest.read_text()
-    pins = properties.read_text()
+    text = manifest.read_text(encoding="utf-8")
+    pins = properties.read_text(encoding="utf-8")
     assert ("securityMcp.example.library.version=1.0.1" in pins) == (
         outcome in {"success", "mcp", "build_only", "codec_build", "enforced_platform"}
     )
@@ -885,7 +900,7 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
     if outcome in {"success", "mcp", "build_only", "codec_build", "enforced_platform"}:
         assert (
             "| securityMcp.example.library.version | `1.0.1` | `gradle.properties` |"
-            in policy.read_text()
+            in policy.read_text(encoding="utf-8")
         )
     assert engine.state.json_report_path
     if outcome != "checkout_changed":
@@ -961,13 +976,13 @@ def test_cross_stack_failure_reverts_only_offending_update(
         "maven": "<project><dependencies><dependency><groupId>example</groupId><artifactId>library</artifactId><version>1.0.0</version></dependency><dependency><groupId>other</groupId><artifactId>library</artifactId><version>1.0.0</version></dependency></dependencies></project>",
     }[manager]
     manifest = tmp_path / filename
-    manifest.write_text(original)
+    manifest.write_text(original, encoding="utf-8")
     runner = Mock()
 
     def execute(argv, **kwargs):
         """Fail only one updated coordinate and the selected validation stage."""
         assert_allowed(argv, tmp_path)
-        text = manifest.read_text()
+        text = manifest.read_text(encoding="utf-8")
         bad = {
             "nuget": 'Include="Example" Version="1.0.1"' in text,
             "gradle": "'example:library:1.0.1'" in text,
@@ -1049,7 +1064,9 @@ def test_cross_stack_failure_reverts_only_offending_update(
     assert result["status"] == "VALIDATION_COMPLETE", result
     assert result["retained_updates"] == ["1"]
     assert [item["finding_id"] for item in result["rejected_updates"]] == ["0"]
-    assert "1.0.0" in manifest.read_text() and "1.0.1" in manifest.read_text()
+    assert "1.0.0" in manifest.read_text(
+        encoding="utf-8"
+    ) and "1.0.1" in manifest.read_text(encoding="utf-8")
     assert not engine.state.manual_cleanup_required
 
 
@@ -1073,9 +1090,11 @@ def test_java_override_requires_actual_resolved_fixed_version(
         "// security-mcp:start" if manager == "gradle" else "<dependencyManagement>"
     )
     manifest = tmp_path / filename
-    manifest.write_text("dependencies { }\n" if manager == "gradle" else "<project/>")
+    manifest.write_text(
+        "dependencies { }\n" if manager == "gradle" else "<project/>", encoding="utf-8"
+    )
     if manager == "maven":
-        manifest.write_text("<project></project>")
+        manifest.write_text("<project></project>", encoding="utf-8")
     finding = {
         "id": "transitive",
         "component": "example:library",
@@ -1089,7 +1108,11 @@ def test_java_override_requires_actual_resolved_fixed_version(
     def execute(argv, **kwargs):
         """Resolve the target only when the simulated dependency resolver honors it."""
         assert_allowed(argv, tmp_path)
-        version = resolved_version if marker in manifest.read_text() else "1.0.0"
+        version = (
+            resolved_version
+            if marker in manifest.read_text(encoding="utf-8")
+            else "1.0.0"
+        )
         dependencies = f"{configuration} - selected classpath\n" + (
             f"\\--- example:library:{version}\n" if version else "No dependencies\n"
         )
@@ -1141,14 +1164,17 @@ def test_java_override_requires_actual_resolved_fixed_version(
     )
     assert engine.apply_minimal_fix("transitive")["status"] == "APPLIED"
     if configuration not in {None, "runtimeClasspath"}:
-        assert f'configurations.named("{configuration}")' in manifest.read_text()
-        assert 'configurations.named("securityAnalysis")' in manifest.read_text()
-        assert "resolutionStrategy.force" in manifest.read_text()
-        assert "strictly(" not in manifest.read_text()
-        assert (
-            "securityMcp.example.library.version=1.0.1"
-            in (tmp_path / "gradle.properties").read_text()
+        assert f'configurations.named("{configuration}")' in manifest.read_text(
+            encoding="utf-8"
         )
+        assert 'configurations.named("securityAnalysis")' in manifest.read_text(
+            encoding="utf-8"
+        )
+        assert "resolutionStrategy.force" in manifest.read_text(encoding="utf-8")
+        assert "strictly(" not in manifest.read_text(encoding="utf-8")
+        assert "securityMcp.example.library.version=1.0.1" in (
+            tmp_path / "gradle.properties"
+        ).read_text(encoding="utf-8")
 
     # Act
     result = engine.run_validation_matrix()
@@ -1157,7 +1183,9 @@ def test_java_override_requires_actual_resolved_fixed_version(
     assert result["status"] == (
         "VALIDATION_COMPLETE" if resolved_version == "1.0.1" else "FIX_REJECTED"
     ), result
-    assert (marker in manifest.read_text()) == (resolved_version == "1.0.1")
+    assert (marker in manifest.read_text(encoding="utf-8")) == (
+        resolved_version == "1.0.1"
+    )
 
 
 def test_non_runtime_catalog_dependency_overrides_the_owning_build(tmp_path):
@@ -1169,9 +1197,9 @@ def test_non_runtime_catalog_dependency_overrides_the_owning_build(tmp_path):
         '[versions]\nlibraryFloor = "1.0.0"\n[libraries]\n'
         'library = { module = "example:library", version.ref = "libraryFloor" }\n'
     )
-    catalog.write_text(original)
+    catalog.write_text(original, encoding="utf-8")
     build = tmp_path / "build.gradle"
-    build.write_text("plugins { id 'java' }\n")
+    build.write_text("plugins { id 'java' }\n", encoding="utf-8")
     hit = PackageHit(
         "Maven",
         "gradle",
@@ -1194,9 +1222,9 @@ def test_non_runtime_catalog_dependency_overrides_the_owning_build(tmp_path):
     assert result["status"] == "APPLIED"
     assert plan.files == ["build.gradle", "gradle.properties"]
     assert plan.as_dict()["gradle_configurations"] == ["checkstyle"]
-    assert 'configurations.named("checkstyle")' in build.read_text()
-    assert "resolutionStrategy.force" in build.read_text()
-    assert catalog.read_text() == original
+    assert 'configurations.named("checkstyle")' in build.read_text(encoding="utf-8")
+    assert "resolutionStrategy.force" in build.read_text(encoding="utf-8")
+    assert catalog.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.parametrize("failure", ["none", "first", "all"])
@@ -1302,12 +1330,16 @@ def test_version_alignment_follows_selective_package_rollback(tmp_path, failure)
     assert result["status"] == (
         "FIX_REJECTED" if failure == "all" else "VALIDATION_COMPLETE"
     ), result
-    assert document.read_text() == (
+    assert document.read_text(encoding="utf-8") == (
         f"bad:library {'1.0.1' if failure == 'none' else '1.0.0'}\n"
         f"good:library {'2.0.0' if failure == 'all' else '2.0.1'}\n"
     )
-    assert ("good:library:2.0.1" in manifest.read_text()) == (failure != "all")
-    assert ("bad:library:1.0.0" in manifest.read_text()) == (failure != "none")
+    assert ("good:library:2.0.1" in manifest.read_text(encoding="utf-8")) == (
+        failure != "all"
+    )
+    assert ("bad:library:1.0.0" in manifest.read_text(encoding="utf-8")) == (
+        failure != "none"
+    )
     assert not engine.state.manual_cleanup_required
     if failure == "first":
         assert result["retained_updates"] == ["1"]

@@ -1977,13 +1977,6 @@ async def _ask_software_audit_choice(ctx: Context) -> str | None:
     return normalize_choice(response.data.action)
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Choose the closing software audit action",
-        read_only_hint=True,
-        open_world_hint=False,
-    )
-)
 async def _ask_audit_items(
     ctx: Context, items: list[dict[str, str]]
 ) -> list[str] | None:
@@ -2026,6 +2019,13 @@ async def _ask_audit_items(
     return [item["id"] for item in _checked(items, response.data.model_dump())]
 
 
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Choose the closing software audit action",
+        read_only_hint=True,
+        open_world_hint=False,
+    )
+)
 async def choose_software_audit_action(
     ctx: Context,
     repo_root: str | None = None,

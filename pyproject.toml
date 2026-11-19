@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gitlab-security-mcp"
-version = "1.0.40"
+version = "1.0.41"
 description = "Local-only MCP server that verifies GitLab security findings and applies minimal fixes."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,7 +34,10 @@ target-version = "py311"
 extend-exclude = ["build", "dist", "*.egg-info", ".venv"]
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "UP", "B", "D", "ASYNC", "LOG", "G", "PLE", "SIM115"]
+# Enable only the explicitly selected preview rules; formatter output stays stable.
+preview = true
+explicit-preview-rules = true
+select = ["E", "W", "F", "I", "UP", "B", "D", "ASYNC", "LOG", "G", "PLE", "SIM115", "UP052", "PLW1514"]
 ignore = ["E501", "D203", "D213"]
 
 [tool.ruff.lint.per-file-ignores]

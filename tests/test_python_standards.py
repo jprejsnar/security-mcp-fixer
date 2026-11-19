@@ -12,6 +12,41 @@ SOURCE_FILES = sorted((ROOT / "gitlab_security_mcp").glob("*.py")) + [
     ROOT / "server.py"
 ]
 PYTHON_FILES = SOURCE_FILES + sorted((ROOT / "tests").glob("*.py"))
+SUBPROCESS_CALLS = {"call", "check_call", "check_output", "Popen", "run"}
+
+
+def implicit_text_encodings(tree: ast.AST) -> list[ast.Call]:
+    """Return text I/O and text-mode subprocess calls that omit ``encoding``."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or any(
+            keyword.arg == "encoding" for keyword in node.keywords
+        ):
+            continue
+        func = node.func
+        name = getattr(func, "attr", getattr(func, "id", None))
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        if name in {"read_text", "write_text"}:
+            found.append(node)
+        elif name == "open" and not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "tarfile"
+        ):
+            position = 1 if isinstance(func, ast.Name) else 0
+            mode = keywords.get("mode")
+            if mode is None and len(node.args) > position:
+                mode = node.args[position]
+            value = mode.value if isinstance(mode, ast.Constant) else "r"
+            if not (isinstance(value, str) and "b" in value):
+                found.append(node)
+        elif name in SUBPROCESS_CALLS and any(
+            isinstance(keywords.get(flag), ast.Constant)
+            and keywords[flag].value is True
+            for flag in ("text", "universal_newlines")
+        ):
+            found.append(node)
+    return found
 
 
 @pytest.mark.parametrize(
@@ -43,6 +78,25 @@ def test_python_objects_are_documented(source_path):
 
     # Assert
     assert not missing, "Missing documentation: " + ", ".join(missing)
+
+
+@pytest.mark.parametrize(
+    "source_path", PYTHON_FILES, ids=lambda path: path.relative_to(ROOT).as_posix()
+)
+def test_text_io_declares_encoding(source_path):
+    """Keep text decoding identical on Python 3.11 and 3.15's UTF-8 default."""
+    # Arrange
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(source_path))
+
+    # Act
+    missing = [
+        f"{node.lineno}: {ast.unparse(node.func)}"
+        for node in implicit_text_encodings(tree)
+    ]
+
+    # Assert
+    assert not missing, "Text I/O without encoding: " + ", ".join(missing)
 
 
 @pytest.mark.parametrize("mode", ["check", "format"])
