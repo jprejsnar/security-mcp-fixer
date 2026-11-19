@@ -365,3 +365,135 @@ async def open_dialog(
     except BaseException:
         await dialog.close()
         raise
+
+
+_CHOICE_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
+$inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$form = New-Object System.Windows.Forms.Form
+$form.Text = [string]$inputData.title
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.ClientSize = New-Object System.Drawing.Size(760, 280)
+$label = New-Object System.Windows.Forms.Label
+$label.Text = [string]$inputData.message
+$label.AutoSize = $false
+$label.SetBounds(16, 16, 728, 72)
+$form.Controls.Add($label)
+$script:selected = 'done'
+$top = 100
+foreach ($item in @($inputData.choices)) {
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = [string]$item.label
+    $button.Tag = [string]$item.id
+    $button.SetBounds(16, $top, 728, 36)
+    $button.Add_Click({
+        $script:selected = [string]$this.Tag
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Close()
+    })
+    $form.Controls.Add($button)
+    $top += 44
+}
+$form.CancelButton = $form.Controls[$form.Controls.Count - 1]
+[void]$form.ShowDialog()
+$form.Dispose()
+[Console]::Out.WriteLine((@{ choice = $script:selected } | ConvertTo-Json -Compress))
+"""
+
+
+def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
+    """Show one Windows button per choice and return the selected id.
+
+    Closing the window or choosing the last listed stop action returns ``done``.
+    There is no selection deadline.
+    """
+    completed = subprocess.run(
+        [str(powershell()), "-NoProfile", "-STA", "-Command", _CHOICE_SCRIPT],
+        input=json.dumps(
+            {"title": title, "message": message, "choices": choices},
+            ensure_ascii=True,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
+        raise RuntimeError(
+            f"The software-audit choice window exited with code {completed.returncode}: {detail}"
+        )
+    try:
+        response = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "The software-audit choice window returned unreadable output"
+        ) from exc
+    choice = response.get("choice") if isinstance(response, dict) else None
+    if not isinstance(choice, str) or not choice:
+        raise ValueError(
+            "The software-audit choice window returned an invalid response"
+        )
+    logger.info("Software-audit choice window closed with choice=%s", choice)
+    return choice
+
+
+def ask_checkboxes(
+    message: str,
+    properties: dict,
+    *,
+    title: str,
+    detail_header: str,
+    submit_label: str,
+) -> dict:
+    """Show one unchecked box per item and wait until the human submits or cancels.
+
+    The returned action is ``accept`` or ``cancel``. An accept with no checked
+    boxes is an empty selection, not a request to fix every item.
+    """
+    payload = {
+        "host_process_id": os.getpid(),
+        "message": message,
+        "title": title,
+        "detail_header": detail_header,
+        "submit_label": submit_label,
+        "choices": [
+            {
+                "key": key,
+                "title": value["title"],
+                "summary": value["summary"],
+                "enabled": value.get("enabled", True),
+            }
+            for key, value in properties.items()
+        ],
+    }
+    completed = subprocess.run(
+        [str(powershell()), "-NoProfile", "-STA", "-Command", SCRIPT],
+        input=json.dumps(payload, ensure_ascii=True),
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
+        raise RuntimeError(
+            f"The audit-item window exited with code {completed.returncode}: {detail}"
+        )
+    try:
+        response = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise ValueError("The audit-item window returned unreadable output") from exc
+    if not isinstance(response, dict) or response.get("action") not in {
+        "accept",
+        "cancel",
+    }:
+        raise ValueError("The audit-item window returned an invalid response")
+    logger.info("Audit-item window closed with action=%s", response["action"])
+    return response

@@ -3076,6 +3076,13 @@ class Engine:
         return {"status": "OK"}
 
     @_serialized
+    def record_software_audit(self, details: dict) -> dict:
+        """Remember the human's closing audit choice. It authorizes no Git write."""
+        self.state.software_audit = deepcopy(details)
+        self._remember()
+        return {"status": "OK"}
+
+    @_serialized
     def resolve_desktop_approval(
         self,
         request_id: str,

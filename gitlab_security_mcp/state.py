@@ -43,6 +43,7 @@ class RunState:
     gitlab_dismissals: list[dict] = field(default_factory=list)
     false_positive_approval_form: dict = field(default_factory=dict)
     fix_selection: dict = field(default_factory=dict)
+    software_audit: dict = field(default_factory=dict)
     server_version: str = __version__
 
     def save(self, repo_root: Path) -> None:

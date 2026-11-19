@@ -13,10 +13,11 @@ import sys
 import threading
 from collections import deque
 from copy import deepcopy
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import gmtime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from mcp.server import MCPServer
@@ -45,6 +46,15 @@ from gitlab_security_mcp import __version__, desktop_approval
 from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
+from gitlab_security_mcp.software_audit import (
+    audit_items,
+    audit_report_path,
+    choice_labels,
+    latest_audit_report,
+    normalize_choice,
+    project_file_name,
+    render_audit_prompt,
+)
 from gitlab_security_mcp.util import logged_lock, redact
 from gitlab_security_mcp.versions import is_major_upgrade
 
@@ -97,6 +107,11 @@ Each tool description is the procedure for that step.
 9. generate_aaa_test only for a supported base-image change
 10. run_validation_matrix once for the batch
 11. complete_security_run, which offers the human approval checkboxes once
+12. choose_software_audit_action once the approval window is no longer waiting.
+   The human chooses one action: write the software audit report to the home
+   directory, check which report findings to fix, or stop. Fix mode starts
+   with every checkbox unchecked and fixes only the checked items. Do not
+   choose for the human. Do not commit, push, or open a merge request.
 If select_security_fixes returns AWAITING_HUMAN, stop and wait. The Windows
 window has no review deadline. On submission the server automatically qualifies,
 applies and production-build validates the selected package updates and selected
@@ -407,6 +422,7 @@ async def _progress_middleware(
             "complete_security_run",
             "generate_local_report",
             "submit_false_positive_approvals",
+            "choose_software_audit_action",
         }:
             _progress_console_enabled = True
     loop = asyncio.get_running_loop()
@@ -1733,15 +1749,341 @@ async def complete_security_run(
     for key in ("message", "reason"):
         if review.get(key):
             note += f"\n{review[key]}"
+    if review["status"] == "AWAITING_HUMAN":
+        note += "\nAfter the approval window closes, call choose_software_audit_action once."
+    else:
+        note += (
+            "\nCall choose_software_audit_action once. The human chooses whether to "
+            "generate a home-directory software audit report, fix only confirmed issues "
+            "from that report, or stop. Do not commit or push."
+        )
     return CallToolResult(
         content=[TextContent(text=note), *report.content],
         structuredContent={
             **report.structured_content,
             "false_positive_review": review,
+            "software_audit_next_tool": "choose_software_audit_action",
         },
         isError=report.is_error
         or review["status"] in {"ERROR", "PARTIAL_FAILURE", "APPROVAL_INVALID"},
     )
+
+
+class SoftwareAuditChoice(BaseModel):
+    """One closing action chosen by the human."""
+
+    action: Literal["generate_report", "fix_from_report", "done"] = Field(
+        description=(
+            "generate_report writes the audit markdown to the home directory. "
+            "fix_from_report applies only confirmed issues from that report. "
+            "done stops without code changes."
+        )
+    )
+
+
+def _audit_revision(engine: Engine) -> str:
+    """Return the current branch and commit, or an explicit unverified marker."""
+    try:
+        return f"{engine.git.current_branch()} {engine.git.head()}"
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return "unverified"
+
+
+def _audit_project_name(engine: Engine) -> str:
+    """Return the file-safe GitLab project name for the active checkout."""
+    return project_file_name(engine.state.gitlab_project_path, engine.repo_root.name)
+
+
+def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
+    """Return a wait result while a human window or package batch is still open."""
+    selection = engine.state.fix_selection or {}
+    if (selection.get("package_execution") or {}).get("status") in {
+        "QUEUED",
+        "RUNNING",
+    }:
+        return {
+            "status": "REMEDIATION_RUNNING",
+            "message": "Wait until the approved package batch finishes. Do not start the software audit yet.",
+        }
+    if selection.get("presentation") == "WINDOWS_DIALOG" and selection.get(
+        "status"
+    ) in {"REQUESTED", "AWAITING_HUMAN"}:
+        return {
+            "status": "AWAITING_HUMAN",
+            "message": "Wait for the open fix-selection window before choosing a software audit action.",
+        }
+    approval = engine.state.false_positive_approval_form or {}
+    if approval.get("presentation") == "WINDOWS_DIALOG" and approval.get("status") in {
+        "REQUESTED",
+        "AWAITING_HUMAN",
+    }:
+        return {
+            "status": "AWAITING_HUMAN",
+            "message": "Wait for the open false-positive window before choosing a software audit action.",
+        }
+    return None
+
+
+def _software_audit_result(engine: Engine, choice: str) -> dict[str, Any]:
+    """Describe the one human-selected closing action. This writes no repository file."""
+    when = datetime.now(UTC)
+    project_name = _audit_project_name(engine)
+    if choice == "generate_report":
+        destination = audit_report_path(project_name, when)
+        result = {
+            "status": "GENERATE_AUDIT_REPORT",
+            "choice": choice,
+            "output_path": str(destination),
+            "audit_prompt": render_audit_prompt(when, _audit_revision(engine)),
+            "message": (
+                "Write the software audit markdown to output_path and nowhere else. "
+                "Follow audit_prompt exactly, including its selectable-findings section. "
+                "One checkbox is shown later for each of those lines. "
+                "Do not change application code, tests, dependencies, CI, or GitLab. "
+                "Do not commit or push."
+            ),
+        }
+    else:
+        result = {
+            "status": "DONE",
+            "choice": "done",
+            "message": "No further action. Do not change code, commit, or push.",
+        }
+    return _record_audit_result(engine, result)
+
+
+def _audit_fix_from_report(
+    report: Path, selected_ids: list[str] | None
+) -> dict[str, Any]:
+    """Return the human-checked audit items, or ask for that selection first."""
+    try:
+        items = audit_items(report.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return {
+            "status": "ERROR",
+            "choice": "fix_from_report",
+            "reason": f"The software audit report could not be read: {exc}",
+        }
+    if not items:
+        return {
+            "status": "ITEMS_REQUIRED",
+            "choice": "fix_from_report",
+            "report_path": str(report),
+            "message": (
+                "The report has no selectable-findings lines. Regenerate it with one "
+                "`- ID | severity | location | problem` line per finding. "
+                "Do not invent items and do not change code."
+            ),
+        }
+    if selected_ids is None:
+        return {
+            "status": "SELECTION_REQUIRED",
+            "choice": "fix_from_report",
+            "report_path": str(report),
+            "items": items,
+            "message": (
+                "Show one unchecked checkbox per item. Call choose_software_audit_action "
+                "again with choice fix_from_report and selected_ids set to the checked ids only. "
+                "An empty selection fixes nothing. Do not choose for the human."
+            ),
+        }
+    known = {item["id"] for item in items}
+    unknown = [item_id for item_id in selected_ids if item_id not in known]
+    if unknown:
+        return {
+            "status": "ERROR",
+            "choice": "fix_from_report",
+            "reason": "selected_ids includes an id that is not in the audit report: "
+            + ", ".join(unknown),
+        }
+    selected = [item for item in items if item["id"] in set(selected_ids)]
+    if not selected:
+        return {
+            "status": "NONE_SELECTED",
+            "choice": "fix_from_report",
+            "report_path": str(report),
+            "selected_items": [],
+            "message": "No audit items were checked. Do not change code, commit, or push.",
+        }
+    return {
+        "status": "FIX_FROM_AUDIT_REPORT",
+        "choice": "fix_from_report",
+        "report_path": str(report),
+        "selected_items": selected,
+        "message": (
+            "Fix only selected_items. Leave every unchecked audit item unchanged. "
+            "Use the smallest change and prefer an annotation when that is a real fix. "
+            "Do not rewrite a file, invent an issue, or change a false positive. "
+            "Before editing, read the current public guidance for this repository's "
+            "languages and frameworks. Every fix needs its own AAA unit test. "
+            "The code and tests must compile with no errors and no warnings. "
+            "Do not commit, push, or open a merge request. "
+            "The human reviews the diff and decides whether it is committed."
+        ),
+    }
+
+
+def _software_audit_fix(
+    engine: Engine, selected_ids: list[str] | None
+) -> dict[str, Any]:
+    """Resolve a fix choice to checked report items. This writes no repository file."""
+    existing = latest_audit_report(_audit_project_name(engine))
+    if existing is None:
+        result = {
+            "status": "REPORT_REQUIRED",
+            "choice": "fix_from_report",
+            "message": (
+                "No software audit report for this project is in the home directory. "
+                "Generate that report first. Do not invent findings and do not change code."
+            ),
+        }
+    else:
+        result = _audit_fix_from_report(existing, selected_ids)
+    return _record_audit_result(engine, result)
+
+
+def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, Any]:
+    """Store the closing choice and return the same result."""
+    engine.record_software_audit(
+        {
+            "choice": result["choice"],
+            "status": result["status"],
+            "report_path": result.get("report_path") or result.get("output_path"),
+        }
+    )
+    return result
+
+
+async def _ask_software_audit_choice(ctx: Context) -> str | None:
+    """Ask the human for one closing action. Cancel means stop."""
+    if desktop_approval.available():
+        selected = await asyncio.to_thread(
+            desktop_approval.ask_choice,
+            "Software audit",
+            "Choose one action. Closing this window stops without code changes.",
+            choice_labels(),
+        )
+        return normalize_choice(selected)
+    if not _form_supported(ctx):
+        return None
+    response = await ctx.elicit(
+        "Choose one closing action. Generate the software audit report, "
+        "fix only confirmed issues from that report, or stop. "
+        "Cancel stops without code changes. Nothing is committed or pushed.",
+        SoftwareAuditChoice,
+    )
+    if response.action != "accept" or response.data is None:
+        return "done"
+    return normalize_choice(response.data.action)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Choose the closing software audit action",
+        read_only_hint=True,
+        open_world_hint=False,
+    )
+)
+async def _ask_audit_items(
+    ctx: Context, items: list[dict[str, str]]
+) -> list[str] | None:
+    """Show one unchecked box per audit item. None means the host must show them."""
+    schema = _checkbox_model(
+        "SoftwareAuditFixes",
+        items,
+        lambda item: (
+            f"{item['id']}: {item['problem']}",
+            f"{item['severity']} at {item['location']}",
+        ),
+    )
+    if desktop_approval.available():
+        properties = schema.model_json_schema()["properties"]
+        for index, item in enumerate(items):
+            properties[f"finding_{index}"]["summary"] = (
+                f"{item['severity']} at {item['location']}"
+            )
+        response = await asyncio.to_thread(
+            desktop_approval.ask_checkboxes,
+            "Check only the audit items to fix. Every box starts unchecked. "
+            "Fix checked items changes only those items. Cancel fixes nothing.",
+            properties,
+            title="Software audit fixes",
+            detail_header="Finding",
+            submit_label="Fix checked items",
+        )
+        if response.get("action") != "accept":
+            return []
+        return [item["id"] for item in _checked(items, response.get("content") or {})]
+    if not _form_supported(ctx):
+        return None
+    response = await ctx.elicit(
+        "Check only the audit items to fix. Every box starts unchecked. "
+        "Submit fixes only the checked items. Cancel fixes nothing.",
+        schema,
+    )
+    if response.action != "accept" or response.data is None:
+        return []
+    return [item["id"] for item in _checked(items, response.data.model_dump())]
+
+
+async def choose_software_audit_action(
+    ctx: Context,
+    repo_root: str | None = None,
+    choice: str | None = None,
+    selected_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Ask the human to generate an audit report, choose fixes, or stop.
+
+    A fix choice shows one unchecked checkbox per selectable finding. Only
+    checked items may be fixed. This tool does not edit the checkout, commit,
+    or push.
+    """
+    selected = await asyncio.to_thread(_engine_for, repo_root)
+    blocked = _software_audit_blocked(selected)
+    if blocked is not None:
+        return blocked
+    selected_choice = normalize_choice(choice)
+    if choice is not None and selected_choice is None:
+        return {
+            "status": "ERROR",
+            "reason": "choice must be generate_report, fix_from_report, or done.",
+        }
+    if selected_choice is None:
+        try:
+            selected_choice = await _ask_software_audit_choice(ctx)
+        except (OSError, RuntimeError, ValueError, MCPError) as exc:
+            logger.warning("Software-audit choice was not collected: %s", exc)
+            return {
+                "status": "CHOICE_UNAVAILABLE",
+                "reason": str(exc),
+                "message": "No code was changed. Ask the human again with choose_software_audit_action.",
+            }
+    if selected_choice is None:
+        return {
+            "status": "CHOICE_REQUIRED",
+            "choices": choice_labels(),
+            "message": (
+                "Ask the human which one action to take, then call "
+                "choose_software_audit_action with that choice. Do not choose for the human."
+            ),
+        }
+    if selected_choice != "fix_from_report" or selected_ids is not None:
+        if selected_choice == "fix_from_report":
+            return await asyncio.to_thread(_software_audit_fix, selected, selected_ids)
+        return await asyncio.to_thread(
+            _software_audit_result, selected, selected_choice
+        )
+    prepared = await asyncio.to_thread(_software_audit_fix, selected, None)
+    if prepared["status"] != "SELECTION_REQUIRED":
+        return prepared
+    try:
+        checked = await _ask_audit_items(ctx, prepared["items"])
+    except (OSError, RuntimeError, ValueError, MCPError) as exc:
+        logger.warning("Audit-item checkboxes were not collected: %s", exc)
+        return prepared
+    if checked is None:
+        return prepared
+    return await asyncio.to_thread(_software_audit_fix, selected, checked)
 
 
 @mcp.tool(

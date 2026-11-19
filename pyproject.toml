@@ -22,6 +22,9 @@ dev = ["anyio>=4.16.0,<5", "pytest>=9.2.0", "ruff>=0.17.5,<1"]
 [project.scripts]
 gitlab-security-mcp = "gitlab_security_mcp.server:main"
 
+[tool.setuptools.package-data]
+gitlab_security_mcp = ["software_audit_prompt.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

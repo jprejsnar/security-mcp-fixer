@@ -5,7 +5,7 @@ It retrieves active findings, verifies installed dependencies against public
 advisories, qualifies compatible package updates, applies supported minimal edits,
 and produces local Markdown and JSON reports.
 
-The MCP host starts this Python process and calls its fifteen tools over stdio.
+The MCP host starts this Python process and calls its sixteen tools over stdio.
 One process can hold several application checkouts at once. Each checkout keeps
 its own run, and later calls select it with `repo_root` when more than one is
 active. There is no HTTP listener. "Local" describes execution and where edits
@@ -424,7 +424,7 @@ all of these changes; updating source files does not update an installed wheel.
 
 | Area | Current behavior |
 | --- | --- |
-| One-request completion | `select_security_fixes` obtains separate human consent before remediation edits. `complete_security_run` saves the report, automatically invokes the false-positive checkbox form once, and refreshes the report with actual outcomes. It reuses current assessments without another scan. There are fifteen tools. |
+| One-request completion | `select_security_fixes` obtains separate human consent before remediation edits. `complete_security_run` saves the report, automatically invokes the false-positive checkbox form once, and refreshes the report with actual outcomes. It reuses current assessments without another scan. There are sixteen tools. |
 | Source-backed AI assessments | The calling host AI reviews Java, .NET/C#, TypeScript/Node.js, Python, JavaScript, Dockerfiles and nginx configurations against the current Oracle Java, Microsoft C#/.NET, TypeScript, JavaScript, Node.js, Python, Dockerfile and nginx pages. TypeScript reviews also apply the utility-type limits (Partial, Pick, Omit, and the rest are compile-time only). A conclusion is accepted only after those pages and any cited CVE and CWE pages are read. Missing source, a scanner flag, or an advisory miss never proves a false positive. |
 | Deprecated sampling removed | Source review always uses the calling host AI and its code tools, not deprecated MCP sampling or a separate model/API key. `HOST_REVIEW_REQUIRED` means the AI must continue the workflow, not ask the user to analyze code. |
 | Human-only GitLab dismissal | Completion automatically offers initially unchecked approvals for eligible assessments. Cancel to keep reviewing, then explicitly request `submit_false_positive_approvals` to reopen. Only selected findings are dismissed as `FALSE_POSITIVE`, using the exact displayed reason. Identity, project, source freshness and independently read-back state/reason are checked; unknown outcomes are not automatically retried. |
@@ -613,7 +613,7 @@ runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
-  launcher["Root server.py: source launcher"] --> tools["Package server.py: fifteen MCP tools and error boundary"]
+  launcher["Root server.py: source launcher"] --> tools["Package server.py: sixteen MCP tools and error boundary"]
   tools --> desktop["desktop_approval.py: Windows fix-selection and false-positive windows"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Severity positions, Windows console, notifications and bounded transcript"]
@@ -773,7 +773,13 @@ flowchart TD
   selected -->|"No: decline, cancel or unchecked"| finalReport["Generate final report with actual approval and validation outcomes"]
   eligible -->|"No: include the blocker or no-candidate status"| finalReport
   dismiss --> finalReport
-  finalReport --> reviewDiff["Human reviews reports and git diff; commit and push manually"]
+  finalReport --> auditChoice["choose_software_audit_action: one human choice"]
+  auditChoice -->|"Generate report"| auditReport["Host writes the audit markdown to the home directory. No code changes."]
+  auditChoice -->|"Fix confirmed issues"| auditBoxes["One unchecked checkbox per finding. Only checked items continue."]
+  auditBoxes --> auditFixes["Host applies the smallest fix for each checked item, each with an AAA test. No commit or push."]
+  auditChoice -->|"Stop"| reviewDiff["Human reviews reports and git diff; commit and push manually"]
+  auditReport --> reviewDiff
+  auditFixes --> reviewDiff
 ```
 
 ### Tool reference
@@ -799,6 +805,7 @@ checkout is active.
 | `submit_false_positive_approvals(repo_root=None)` | Open human approval checkboxes, automatically invoked by completion or explicitly requested to reopen. Only selected findings are dismissed; no AI approval argument is accepted. |
 | `complete_security_run(repo_root=None)` | Save reports, automatically offer human approval checkboxes once, then refresh reports with actual outcomes. Does not rescan or rerun verification. |
 | `generate_local_report(repo_root=None)` | Legacy finishing name: save Markdown/JSON reports, offer the same human-only false-positive approvals as `complete_security_run`, and refresh actual outcomes. It is not a report-only bypass. |
+| `choose_software_audit_action(repo_root=None, choice=None, selected_ids=None)` | After approval is no longer waiting, ask the human to generate a home-directory software audit report, check the findings to fix, or stop. Fix mode shows one unchecked checkbox per selectable finding and fixes only the checked items. The server does not edit, commit, or push. |
 | `get_run_status(repo_root=None)` | Return phase, counts and package-validation status; retract stale green package evidence. |
 
 ### Human selection and surgical fixes
@@ -2418,7 +2425,7 @@ installation.
    For a native Copilot connection, stop/start is the restart operation; for an
    editor-managed connection, use **Restart Server** when available.
 5. Check that tool discovery includes `complete_security_run` and
-   `review_false_positives` among the fifteen tools. Run the read-only status
+   `review_false_positives` among the sixteen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
    edits before requesting a new run. Its `server_version` must be `1.0.40`
@@ -2438,8 +2445,8 @@ installation.
 4. Reopen Cursor and enable/reload the server. Review connection logs and trust
    prompts. If a conversation still has a stale tool list after restarting,
    start a fresh Agent chat; do not treat an old chat response as tool discovery.
-5. Confirm the fifteen tools include `select_security_fixes`, `complete_security_run` and
-   `submit_false_positive_approvals`, then run the read-only status check below. Start a
+5. Confirm the sixteen tools include `select_security_fixes`, `complete_security_run`,
+   `submit_false_positive_approvals`, and `choose_software_audit_action`, then run the read-only status check below. Start a
    new remediation run only after reviewing preserved edits and prechecks.
 
 An IDE upgrade, MCP package upgrade and model change are different operations.
@@ -3153,7 +3160,7 @@ for deployment and restart differences.
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
-| An installed wheel still shows old behavior or fewer than fifteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
+| An installed wheel still shows old behavior or fewer than sixteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
 | `WinError 32` during installation | Close all VS Code/Cursor windows, including Agents/background windows, and retry the helper from standalone PowerShell. It detects a lock before pip changes the installation; it never terminates applications automatically. |
 | `Unexpected token 'install'` or a quoted pip path in PowerShell | Use the installer helper as one command, or run venv creation and pip installation as separate commands. An executable path in quotes needs PowerShell's `&` invocation operator. Do not join the two examples into one expression. |
 | `Ignoring invalid distribution ~itlab-security-mcp` | An interrupted install left recovery directories. The helper reports exact leftover paths without deleting them; resolve the file lock and repair the installation before manually reviewing any leftovers. A newer-pip notice is informational. |
