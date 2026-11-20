@@ -34,6 +34,7 @@ from gitlab_security_mcp.official_docs import (
     cited_security_pages_ok,
 )
 from gitlab_security_mcp.report import render
+from gitlab_security_mcp.source_findings import assessment_false_positive_comment
 from tests.conftest import documentation_client
 
 GID = "gid://gitlab/Vulnerability/123"
@@ -91,6 +92,14 @@ def _engine(tmp_path):
         "finding-2": {"decision": "MANUAL_REVIEW", "reason": "Evidence missing."},
     }
     return engine
+
+
+def _comment(engine, finding_id):
+    """Return the structured GitLab comment expected for a non-source false positive."""
+    finding = next(item for item in engine.state.findings if item["id"] == finding_id)
+    return assessment_false_positive_comment(
+        finding, engine.state.decisions[finding_id]
+    )
 
 
 def _context(
@@ -887,7 +896,7 @@ def test_checkbox_submission_is_the_only_write_gate(
     assert engine.gitlab.dismiss_false_positive.call_count == writes
     if writes:
         engine.gitlab.dismiss_false_positive.assert_called_once_with(
-            GID, "finding-1", "group/app", engine.state.decisions["finding-1"]["reason"]
+            GID, "finding-1", "group/app", _comment(engine, "finding-1")
         )
         assert result["results"][0]["status"] == "DISMISSED"
         assert engine.false_positive_candidates()["candidates"] == []
@@ -2495,7 +2504,7 @@ def test_real_sdk_form_dispatch_selects_only_the_checked_finding(
             "gid://gitlab/Vulnerability/124",
             "finding-2",
             "group/app",
-            engine.state.decisions["finding-2"]["reason"],
+            _comment(engine, "finding-2"),
         )
     else:
         engine.gitlab.dismiss_false_positive.assert_not_called()
@@ -2591,7 +2600,7 @@ def test_complete_run_sends_native_checkboxes_over_the_mcp_connection(
         "gid://gitlab/Vulnerability/124",
         "finding-2",
         "group/app",
-        engine.state.decisions["finding-2"]["reason"],
+        _comment(engine, "finding-2"),
     )
     saved = json.loads(
         Path(result.structured_content["json_report"]).read_text(encoding="utf-8")
@@ -2759,3 +2768,47 @@ def test_branch_resolution_requires_main_evidence_human_approval_and_freshness(
         assert result["status"] == ("OK" if change is None else "PARTIAL_FAILURE")
         if mutations:
             assert mutations[0]["variables"]["comment"] == decision["reason"]
+
+
+def test_dependency_false_positive_uploads_a_complete_description(tmp_path):
+    """A one-line reason is not enough context for the GitLab dismissal record."""
+    # Arrange
+    engine = _engine(tmp_path)
+    engine.state.findings[0] = normalize_finding(
+        {
+            "id": GID,
+            "uuid": "finding-1",
+            "title": "Prototype pollution in lodash",
+            "reportType": "DEPENDENCY_SCANNING",
+            "identifiers": [{"externalType": "cve", "externalId": "CVE-2026-1"}],
+            "location": {
+                "file": "package-lock.json",
+                "dependency": {"package": {"name": "lodash"}, "version": "4.17.21"},
+            },
+        },
+        None,
+    )
+    engine.state.decisions["finding-1"]["evidence"] = [
+        "Local npm package lodash version 4.17.21 in package-lock.json.",
+        "OSV: affected range <4.17.21.",
+    ]
+
+    # Act
+    candidates = engine.false_positive_candidates()["candidates"]
+    engine.dismiss_false_positives(candidates)
+
+    # Assert
+    comment = engine.gitlab.dismiss_false_positive.call_args.args[3]
+    for expected in (
+        'GitLab finding "Prototype pollution in lodash"',
+        "Scanner category: dependency_scanning",
+        "Package: lodash 4.17.21",
+        "CVE-2026-1",
+        "Location: package-lock.json",
+        "Why this is not the flagged issue: The installed version is outside the affected range.",
+        "- OSV: affected range <4.17.21.",
+    ):
+        assert expected in comment
+    assert candidates[0]["description"] == (
+        "The installed version is outside the affected range."
+    )

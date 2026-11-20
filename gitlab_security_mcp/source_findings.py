@@ -262,6 +262,28 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
     }
 
 
+def assessment_false_positive_comment(finding: dict, assessment: dict) -> str:
+    """Describe a non-source false positive with the identity and evidence GitLab keeps."""
+    location = finding.get("location") or {}
+    place = location.get("file") or location.get("image") or "not reported"
+    package = " ".join(
+        str(part)
+        for part in (finding.get("component"), finding.get("installedVersion"))
+        if part
+    )
+    lines = [
+        f'False-positive assessment for GitLab finding "{finding.get("title") or finding.get("id")}".',
+        f"Scanner category: {finding.get('category') or 'not reported'}",
+        f"Package: {package or 'not reported'}",
+        f"Identifiers: {', '.join(map(str, finding.get('identifiers') or [])) or 'none reported'}",
+        f"Location: {place}",
+        f"Why this is not the flagged issue: {str(assessment.get('reason') or '').strip()}",
+        "Evidence:",
+        *(f"- {item}" for item in assessment.get("evidence") or []),
+    ]
+    return "\n".join(lines)[:50000]
+
+
 def audit_false_positive_comment(
     finding: dict, review: dict, documentation: list[dict]
 ) -> str:

@@ -5,7 +5,7 @@ It retrieves active findings, verifies installed dependencies against public
 advisories, qualifies compatible package updates, applies supported minimal edits,
 and produces local Markdown and JSON reports.
 
-The MCP host starts this Python process and calls its sixteen tools over stdio.
+The MCP host starts this Python process and calls its seventeen tools over stdio.
 One process can hold several application checkouts at once. Each checkout keeps
 its own run, and later calls select it with `repo_root` when more than one is
 active. There is no HTTP listener. "Local" describes execution and where edits
@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.48.** In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.49** (progress extension 1.0.51). In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -44,9 +44,11 @@ Declining the audit still generates the final report. Jobs cannot be started
 out of order. An interrupted or unavailable approval never implies consent.
 
 **In-editor progress requires both release files:** install the Python wheel,
-then install `gitlab-security-progress-1.0.48.vsix` in **each** editor using
+then install `gitlab-security-progress-1.0.51.vsix` in **each** editor using
 **Extensions: Install from VSIX**. The wheel alone cannot force an editor status
 bar or persistent notification. See [the progress extension](editor-progress/README.md).
+The server also mirrors progress to `~/.cache/gitlab-security-mcp/progress/`, so
+the graphical bar appears even when the audited checkout is not an open folder.
 
 Release 1.0.48 adds a persistent editor tab with a real graphical progress bar,
 counts, percentage, current activity and seven-job checklist. **Show Task
@@ -475,6 +477,7 @@ Start with [installation](#installing-the-local-mcp-server), choose your
 ## Contents
 
 - [Changes delivered on November 13, 2026](#changes-delivered-on-november-13-2026)
+- [How it works: complete flow and state transitions](#how-it-works-complete-flow-and-state-transitions)
 - [Architecture](#architecture)
 - [Workflow](#workflow)
 - [Safety boundaries](#safety-boundaries)
@@ -596,7 +599,8 @@ remaining count/phases, and registered generated exclusions. Incomplete-report
 responses also bound their path list and explicitly flag when more paths remain;
 changed-file gaps remain review targets. Initial audit handoffs still include
 the full prompt and inventory. Nothing is removed from live/saved audit evidence:
-after context loss, `get_run_status(repo_root=...)` recovers the complete
+after context loss, `get_run_status(repo_root=..., include_audit_details=True)`
+recovers the complete
 `software_audit` context. Do not poll that large snapshot for routine progress.
 The audit prompt recommends related-file batches, batched local hashes,
 reuse of unchanged evidence, and section-level report edits, without reducing
@@ -611,6 +615,202 @@ Release 1.0.15 validation: **308 related server and consent tests passed**,
 including sixteen new context-budget/compaction cases and both native Windows
 approval tests. Resource, deprecation, unraisable-exception and background-thread
 warnings were treated as errors. Ruff lint/format and whitespace checks passed.
+
+## How it works: complete flow and state transitions
+
+This section summarizes everything the server does in one run, from the chat
+request `run gitlab-security on this repo` to the final unresolved report. The
+server enforces job order: a tool called out of order returns
+`JOB_ORDER_REQUIRED` instead of skipping a job. Every human choice starts
+unchecked; cancel or an empty selection authorizes nothing and moves to the next
+job. Nothing is committed, pushed, or merged.
+
+### End-to-end flowchart
+
+```mermaid
+flowchart TD
+  request["Chat request: run gitlab-security on this repo"] --> job1
+
+  subgraph job1["Job 1: Pre-checks"]
+    pre["run_prechecks: Git checkout, main or today's branch, clean tree, no merge or rebase, corporate DNS"]
+    pulls["pull_main_twice: git pull --ff-only twice"]
+    branch["create_security_branch: create security-fixes-Month-dd-YYYY or safely reuse it after log review and guarded cleanup"]
+    pre --> pulls --> branch
+  end
+
+  subgraph job2["Job 2: Download GitLab findings"]
+    list["list_security_findings: tracked main, Needs triage or Confirmed, Still detected, plus non-main findings GitLab reports resolved on main"]
+    verify["verify_security_finding per finding, up to 8 in parallel"]
+    evidence["Local manifests and lockfiles, Gradle or Maven dependency trees, OSV then GitHub then NVD advisories, CVE and CWE pages"]
+    hostReview["Source and config findings: host AI reads the cited file and line, then submits a hash-bound source_review"]
+    decision{"Decision"}
+    list --> verify --> evidence --> decision
+    verify --> hostReview --> verify
+  end
+
+  subgraph job3["Job 3: Package updates"]
+    release["select_package_version: latest supported stable release from the public catalog"]
+    review["Host AI reviews exact-version docs, API compatibility and license"]
+    pkgForm["select_security_fixes: unchecked package checkboxes"]
+    batch["Server qualifies and applies all checked updates, then runs production build checks; unit tests are not executed"]
+    isolate["On build failure: isolate failing groups, roll back incompatible updates, keep the passing subset"]
+    release --> review --> pkgForm --> batch
+    batch -->|"Build fails"| isolate
+  end
+
+  subgraph job4["Job 4: False positives"]
+    fpList["review_false_positives: evidence-backed candidates only"]
+    fpForm["submit_false_positive_approvals: unchecked checkboxes showing the exact comment"]
+    dismiss["GitLab vulnerabilityDismiss FALSE_POSITIVE with the structured description, then independent read-back"]
+    fpList --> fpForm -->|"Checked only"| dismiss
+  end
+
+  subgraph job5["Job 5: GitLab source and config fixes"]
+    srcForm["select_security_fixes: new unchecked source and config checkboxes"]
+    configFix["Server applies documented Dockerfile, nginx and GitLab CI line fixes after a fresh docs read, then validates"]
+    hostFix["Host AI fixes other checked source findings and reports fixed or failed with validation evidence"]
+    srcForm --> configFix
+    srcForm --> hostFix
+  end
+
+  subgraph job6["Job 6: Optional deep-dive software audit"]
+    consent{"Run the audit? Yes or No"}
+    prompt["Server prints the full audit prompt to the console and log, and creates an INCOMPLETE draft in the home directory"]
+    deps["Host AI reads build dependencies and their official version-specific docs"]
+    scan["Host AI reviews every inventoried file in batches, submitting file and phase receipts"]
+    ready["report_ready=True: server checks coverage and the saved report"]
+    auditForm["Unchecked checkbox per selectable finding"]
+    auditFix["Host AI fixes only checked items, each with an AAA test"]
+    consent -->|"Yes"| prompt --> deps --> scan --> ready
+    ready -->|"Gaps remain"| scan
+    ready -->|"Coverage complete"| auditForm -->|"Checked only"| auditFix
+  end
+
+  subgraph job7["Job 7: Final report"]
+    final["Write and open .security-mcp/reports/unresolved-remediation.md plus Markdown and JSON reports"]
+  end
+
+  branch --> list
+  decision -->|"CHANGE_REQUIRED package"| release
+  decision -->|"FALSE_POSITIVE"| fpList
+  decision -->|"Confirmed source or config issue"| srcForm
+  decision -->|"MANUAL_REVIEW, NO_SAFE_FIX or REPRODUCTION_REQUIRED"| final
+  batch --> fpList
+  isolate --> fpList
+  pkgForm -->|"Nothing checked"| fpList
+  dismiss --> srcForm
+  fpForm -->|"Nothing checked"| srcForm
+  configFix --> consent
+  hostFix --> consent
+  srcForm -->|"Nothing checked"| consent
+  consent -->|"No"| final
+  auditForm -->|"Nothing checked"| final
+  auditFix --> final
+  final --> human["Human reviews reports and git diff, then commits and pushes manually"]
+```
+
+Running alongside every job:
+
+- **Progress:** each update is written to `.security-mcp/progress.json` and a
+  per-user mirror. The editor extension shows a status-bar meter, notification,
+  and a **GitLab Security Progress** tab. On Windows, a separate console window
+  shows text progress.
+- **Evidence logs:** command output goes to `.security-mcp/command-logs/`,
+  hashes and exit codes to `audit.jsonl`, HTTP timings to `http-timings.jsonl`,
+  and an inspection snapshot to `run-state.json`. Snapshots are never reloaded
+  as permission.
+- **Audit continuation hooks (opt-in):** Cursor and Copilot stop hooks continue
+  an unfinished approved audit for the same session, up to 24 turns (8 for
+  Copilot), and stop when no new progress is recorded.
+
+### Workflow job states
+
+Each of the seven jobs moves through these states. Only one job is `RUNNING` at
+a time, and finishing a job starts the next one.
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING
+  PENDING --> RUNNING : previous job finished
+  RUNNING --> WAITING_FOR_HUMAN : unchecked selection or Yes/No window open
+  WAITING_FOR_HUMAN --> RUNNING : human submits or cancels
+  RUNNING --> WAITING_FOR_AI : host AI must review, fix, or report outcomes
+  WAITING_FOR_AI --> RUNNING : host submits progress or outcomes
+  RUNNING --> FINISHED : job work complete
+  RUNNING --> SKIPPED : nothing to do or audit declined
+  RUNNING --> FAILED : blocking error or manual cleanup required
+  FINISHED --> [*]
+  SKIPPED --> [*]
+  FAILED --> [*]
+```
+
+If manual checkout cleanup is required, the current job is marked `FAILED`, the
+remaining jobs are marked `SKIPPED`, and the run goes straight to the final
+report.
+
+### Run status transitions
+
+`get_run_status` reports these run-level statuses. Failure states stop the run
+for that checkout; rerun `run_prechecks` after resolving the cause.
+
+```mermaid
+stateDiagram-v2
+  [*] --> NOT_STARTED
+  NOT_STARTED --> PRECHECK_PASSED : run_prechecks
+  NOT_STARTED --> PRECHECK_FAILED : dirty tree, wrong branch, Git operation, DNS
+  PRECHECK_PASSED --> PULLS_SUCCEEDED : pull_main_twice
+  PRECHECK_PASSED --> PULL_FAILED : pull failed or tree changed
+  PRECHECK_PASSED --> PREPARATION_FAILED : dependency preparation failed
+  PULLS_SUCCEEDED --> BRANCH_CREATED : create_security_branch
+  PULLS_SUCCEEDED --> BRANCH_CREATION_FAILED : branch unsafe or checkout failed
+  BRANCH_CREATED --> FINDINGS_LISTED : list_security_findings
+  FINDINGS_LISTED --> FIXES_IN_PROGRESS : approved edit applied
+  FIXES_IN_PROGRESS --> VALIDATION_COMPLETE : production builds pass
+  FIXES_IN_PROGRESS --> VALIDATION_INCOMPLETE : required tool or evidence missing
+  FIXES_IN_PROGRESS --> VALIDATION_FAILED : production build fails
+  VALIDATION_FAILED --> VALIDATION_COMPLETE : failed updates isolated and rolled back
+  FINDINGS_LISTED --> REPORT_GENERATED : no edits approved
+  VALIDATION_COMPLETE --> REPORT_GENERATED : final report
+  VALIDATION_INCOMPLETE --> REPORT_GENERATED : final report
+  VALIDATION_FAILED --> REPORT_GENERATED : final report
+  PRECHECK_FAILED --> [*]
+  PULL_FAILED --> [*]
+  PREPARATION_FAILED --> [*]
+  BRANCH_CREATION_FAILED --> [*]
+  REPORT_GENERATED --> [*]
+```
+
+### Software audit states (job 6)
+
+```mermaid
+stateDiagram-v2
+  [*] --> CONSENT_REQUESTED
+  CONSENT_REQUESTED --> DONE : human chooses No or cancels
+  CONSENT_REQUESTED --> GENERATE_AUDIT_REPORT : human chooses Yes
+  GENERATE_AUDIT_REPORT --> AUDIT_IN_PROGRESS : first file and phase receipts
+  AUDIT_IN_PROGRESS --> AUDIT_IN_PROGRESS : more receipts
+  AUDIT_IN_PROGRESS --> AUDIT_INCOMPLETE : report_ready with files or phases remaining
+  AUDIT_INCOMPLETE --> AUDIT_IN_PROGRESS : review continues
+  AUDIT_IN_PROGRESS --> ITEMS_REQUIRED : report still a draft or missing selectable section
+  ITEMS_REQUIRED --> AUDIT_IN_PROGRESS : host rewrites the report
+  AUDIT_IN_PROGRESS --> AUDIT_REPORT_GENERATED : coverage complete and report saved
+  AUDIT_REPORT_GENERATED --> NO_FINDINGS : section 7 says No selectable findings
+  AUDIT_REPORT_GENERATED --> SELECTION_REQUIRED : unchecked finding checkboxes shown
+  SELECTION_REQUIRED --> NONE_SELECTED : nothing checked or cancel
+  SELECTION_REQUIRED --> FIX_FROM_AUDIT_REPORT : items checked
+  FIX_FROM_AUDIT_REPORT --> CODE_FIX_RESULTS_REQUIRED : outcome missing for a checked item
+  CODE_FIX_RESULTS_REQUIRED --> FIX_FROM_AUDIT_REPORT : host reports fixed or failed
+  FIX_FROM_AUDIT_REPORT --> [*] : all outcomes reported, job 7 starts
+  DONE --> [*]
+  NO_FINDINGS --> [*]
+  NONE_SELECTED --> [*]
+```
+
+The first `GENERATE_AUDIT_REPORT` response delivers the full prompt and file
+inventory once. Later responses are compact (counts, next files, remaining
+phases) to keep AI token use low. The full prompt, inventory and receipts stay
+on disk and are returned only by `get_run_status(..., include_audit_details=True)`
+after context loss.
 
 ## Architecture
 
@@ -707,7 +907,7 @@ runs one allowlisted command at a time.
 
 ```mermaid
 flowchart TB
-  launcher["Root server.py: source launcher"] --> tools["Package server.py: sixteen MCP tools and error boundary"]
+  launcher["Root server.py: source launcher"] --> tools["Package server.py: seventeen MCP tools and error boundary"]
   tools --> desktop["desktop_approval.py: Windows fix-selection and false-positive windows"]
   tools --> progress["Request-scoped progress middleware"]
   progress --> hostDisplay["Severity positions, Windows console, notifications and bounded transcript"]
@@ -900,7 +1100,7 @@ checkout is active.
 | `complete_security_run(repo_root=None, code_results=None, progress=None)` | Advance the seven sequential jobs. Report each selected host code outcome as `{id,status:"fixed" or "failed",reason,validation}`; a fixed outcome requires actual validation evidence. Send `{id,message}` in `progress` while fixing a selected item. Ask audit consent after source work; finish with displayed unresolved Markdown, including failed audit fixes. Host outcomes are attestations, not independent MCP validation. |
 | `generate_local_report(repo_root=None)` | Legacy alias for `complete_security_run`; follows the same ordered job gates. It is not a report-only or approval-order bypass. |
 | `choose_software_audit_action(repo_root=None, choice=None, selected_ids=None, report_ready=False, progress=None)` | Await owned work and collect the next sequential job handoff. In job 6 obtain Yes/No consent, then submit file/phase coverage and write the reserved audit report. `report_ready=True` checks coverage before opening unchecked findings. Cancel/empty selection proceeds to the final report. |
-| `get_run_status(repo_root=None)` | Return phase, counts, package-validation status, and the saved software-audit result. During owned background work, return a nonblocking activity snapshot and finished execution steps instead of waiting behind a build's engine lock. Completed steps do not imply successful validation. |
+| `get_run_status(repo_root=None, include_audit_details=False)` | Return phase, counts, package-validation status, and a compact software-audit summary. Pass `include_audit_details=True` only after context loss to recover the full audit prompt, inventory and receipts. During owned background work, return a nonblocking activity snapshot and finished execution steps instead of waiting behind a build's engine lock. Completed steps do not imply successful validation. |
 
 Software audit reports use clickable filename-and-line links (`#L12`) for VS Code
 and Cursor. The host resolves links from the saved report's home-directory
@@ -1735,7 +1935,7 @@ sequenceDiagram
 
   Approver->>Policy: Provision exact-version approvals and mandatory checks
   Host->>MCP: run_prechecks then pull_main_twice
-  MCP->>Repo: Pull main twice; do not clean/install before approved work
+  MCP->>Repo: Pull main twice, no clean or install before approved work
   alt Pull or preparation fails
     MCP-->>Host: Stop before branch creation and security checks
   else Checkout prepared
@@ -1751,9 +1951,9 @@ sequenceDiagram
   Host->>MCP: select_security_fixes
   MCP-->>Reviewer: Unchecked choices with current and proposed versions, scope and risk
   alt Windows native selection
-  MCP-->>Host: AWAITING_HUMAN; request ends, no human-review deadline
+  MCP-->>Host: AWAITING_HUMAN, request ends, no human-review deadline
   Reviewer->>MCP: Approve checked fixes or cancel in the separate window
-  Note over Host,MCP: On Windows the following package steps run inside the server without a second host request; only source work needs Agent continuation
+  Note over Host,MCP: On Windows the following package steps run inside the server without a second host request, and only source work needs Agent continuation
   else Other operating systems
   Reviewer->>MCP: Select permitted issues or skip code fixes
   end
@@ -1774,7 +1974,7 @@ sequenceDiagram
     else Fresh exact plan
       MCP->>Docs: Read the required publisher pages together
       MCP-->>Host: Live completed-document text bar
-      Note over Docs,MCP: Named CVE and CWE pages are read; a failed record blocks a false positive, not the edit
+      Note over Docs,MCP: Named CVE and CWE pages are read. A failed record blocks a false positive, not the edit
       alt A required page cannot be read
         MCP-->>Host: DOCS_REQUIRED and no file change
       else Current pages were read
@@ -1793,7 +1993,7 @@ sequenceDiagram
   Host->>MCP: run_validation_matrix once after all updates
   MCP->>Policy: Recheck approval, markers and policy hash
   MCP->>Repo: Production builds, exact dependency proof and test-free checks
-  MCP-->>Host: Live command output and timing; tests disabled
+  MCP-->>Host: Live command output and timing, tests disabled
   alt Complete batch passes
     MCP-->>Host: VALIDATION_COMPLETE, all retained packages VALIDATED
   else Failed batch
@@ -2315,23 +2515,23 @@ Never paste real tokens into agent chat or commit them in configuration files.
    `${GITLAB_TOKEN}` is a native Copilot environment reference, not a VS Code input
    prompt. Provide that variable securely to the host first.
 
-```json
-{
-  "mcpServers": {
-    "gitlab-security": {
-      "type": "stdio",
-      "command": "C:\\Users\\YOUR_USER\\Tools\\gitlab-security-mcp\\Scripts\\gitlab-security-mcp.exe",
-      "args": [],
-      "tools": ["*"],
-      "env": {
-        "GITLAB_TOKEN": "${GITLAB_TOKEN}",
-        "GITLAB_API_URL": "https://gitlab.com/api/v4",
-        "REPO_ROOT": "C:\\path\\to\\application-repo"
-      }
-    }
-  }
-}
-```
+   ```json
+   {
+     "mcpServers": {
+       "gitlab-security": {
+         "type": "stdio",
+         "command": "C:\\Users\\YOUR_USER\\Tools\\gitlab-security-mcp\\Scripts\\gitlab-security-mcp.exe",
+         "args": [],
+         "tools": ["*"],
+         "env": {
+           "GITLAB_TOKEN": "${GITLAB_TOKEN}",
+           "GITLAB_API_URL": "https://gitlab.com/api/v4",
+           "REPO_ROOT": "C:\\path\\to\\application-repo"
+         }
+       }
+     }
+   }
+   ```
 
 4. Review the trust request and enable the tools. In that session's MCP controls,
    start `gitlab-security`; inspect its output if startup fails.
@@ -2620,10 +2820,10 @@ installation.
    For a native Copilot connection, stop/start is the restart operation; for an
    editor-managed connection, use **Restart Server** when available.
 5. Check that tool discovery includes `complete_security_run` and
-   `review_false_positives` among the sixteen tools. Run the read-only status
+   `review_false_positives` among the seventeen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.48`
+   edits before requesting a new run. Its `server_version` must be `1.0.49`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -2640,7 +2840,7 @@ installation.
 4. Reopen Cursor and enable/reload the server. Review connection logs and trust
    prompts. If a conversation still has a stale tool list after restarting,
    start a fresh Agent chat; do not treat an old chat response as tool discovery.
-5. Confirm the sixteen tools include `select_security_fixes`, `complete_security_run`,
+5. Confirm the seventeen tools include `select_security_fixes`, `complete_security_run`,
    `submit_false_positive_approvals`, and `choose_software_audit_action`, then run the read-only status check below. Start a
    new remediation run only after reviewing preserved edits and prechecks.
 
@@ -2778,8 +2978,10 @@ than relying only on a short natural-language success message.
 ### Live progress and HTTP timings
 
 For progress **inside** Cursor or VS Code, install the companion
-`gitlab-security-progress-1.0.48.vsix` using **Extensions: Install from VSIX**
-in both editors, and open the audited checkout as a workspace folder.
+`gitlab-security-progress-1.0.51.vsix` using **Extensions: Install from VSIX**
+in both editors. The audited checkout does not need to be an open workspace
+folder: the extension also reads the per-user mirror in
+`~/.cache/gitlab-security-mcp/progress/` (mirrors older than 12 hours are ignored).
 It watches inspection-only `.security-mcp/progress.json` files and displays a
 status-bar spinner, progress notification, and **GitLab Security Progress**
 output channel. Click the status item or run **GitLab Security: Show Task
@@ -3397,7 +3599,7 @@ for deployment and restart differences.
 | `VALIDATION_INCOMPLETE` or `VALIDATION_FAILED` | Inspect failures and rollback results. Do not adapt production/tests. Provision missing checks before requalification; preserved user edits require manual cleanup. |
 | Restart loses the active run | Expected: snapshots are inspection-only. Review existing edits/branch before preparing a new clean-main run; no automatic resume or rollback exists. |
 | Source hotfix appears ignored | Confirm the host uses the root source launcher and restart the MCP process between runs. |
-| An installed wheel still shows old behavior or fewer than sixteen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
+| An installed wheel still shows old behavior or fewer than seventeen tools | Verify `pip show gitlab-security-mcp` in the exact configured environment, confirm the launcher path, and stop/start the correct host/harness connection. A source-clone update does not replace an installed wheel. Start a fresh Agent chat if discovery remains stale. |
 | `WinError 32` during installation | Close all VS Code/Cursor windows, including Agents/background windows, and retry the helper from standalone PowerShell. It detects a lock before pip changes the installation; it never terminates applications automatically. |
 | `Unexpected token 'install'` or a quoted pip path in PowerShell | Use the installer helper as one command, or run venv creation and pip installation as separate commands. An executable path in quotes needs PowerShell's `&` invocation operator. Do not join the two examples into one expression. |
 | `Ignoring invalid distribution ~itlab-security-mcp` | An interrupted install left recovery directories. The helper reports exact leftover paths without deleting them; resolve the file lock and repair the installation before manually reviewing any leftovers. A newer-pip notice is informational. |

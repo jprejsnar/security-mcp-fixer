@@ -81,6 +81,7 @@ from gitlab_security_mcp.report import write_report
 from gitlab_security_mcp.security_artifacts import review_security_artifacts
 from gitlab_security_mcp.source_findings import (
     assess_source,
+    assessment_false_positive_comment,
     audit_false_positive_comment,
     pending_source_reviews,
 )
@@ -2929,7 +2930,12 @@ class Engine:
                         "title": finding.get("title"),
                         "location": finding.get("location") or {},
                         "description": description,
-                        "reason": finding.get("falsePositiveAudit") or reason,
+                        "reason": finding.get("falsePositiveAudit")
+                        or (
+                            reason
+                            if resolution
+                            else assessment_false_positive_comment(finding, assessment)
+                        ),
                         "assessment": deepcopy(assessment),
                         "source_review": deepcopy(finding.get("sourceReview")),
                         **(
