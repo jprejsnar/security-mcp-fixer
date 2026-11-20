@@ -418,7 +418,43 @@ def test_render_audit_prompt_fills_the_date_and_revision():
     assert "## Evidence required before a finding" in text
     assert "## Review order" in text
     assert "### 8. Unfinished work" in text
+    assert "## Build dependencies and official documentation" in text
+    assert text.index("## Build dependencies") < text.index("## Review order")
+    flat = " ".join(text.split())
+    assert "Never compact, paraphrase, shorten, or drop this prompt's own" in flat
+    assert "include_audit_details=True" in text
     assert "### 9. Investigated and rejected" in text
+
+
+def test_audit_start_prints_the_exact_prompt_to_the_console(tmp_path, monkeypatch):
+    """The developer sees the full prompt; it is not echoed back into AI context."""
+    # Arrange
+    import hashlib as digest
+
+    engine = _engine(tmp_path / "checkout")
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    console = Mock()
+    monkeypatch.setattr(server, "_console_for_progress", lambda: console)
+
+    # Act
+    result = asyncio.run(
+        server.choose_software_audit_action(
+            _context(), str(engine.repo_root), choice="generate_report"
+        )
+    )
+
+    # Assert
+    prompt = result["audit_prompt"]
+    shown = [
+        call.args[0]
+        for call in console.write.call_args_list
+        if "Software audit prompt" in call.args[0]
+    ]
+    assert len(shown) == 1
+    assert prompt in shown[0]
+    assert f"{len(prompt)} characters" in shown[0]
+    assert digest.sha256(prompt.encode("utf-8")).hexdigest() in shown[0]
+    assert "Software audit prompt" not in json.dumps(result)
 
 
 def test_generate_report_returns_the_prompt_and_home_path(tmp_path, monkeypatch):

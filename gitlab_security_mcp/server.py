@@ -3159,6 +3159,20 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
     )
 
 
+def _show_audit_prompt(engine: Engine, prompt: str) -> None:
+    """Show the exact prompt to the developer; console and log never enter AI context."""
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    header = (
+        f"===== Software audit prompt for {engine.repo_root} "
+        f"({len(prompt)} characters, sha256 {digest}) ====="
+    )
+    text = f"{header}\n{prompt}\n===== End of software audit prompt ====="
+    logger.info("%s", text)
+    console = _console_for_progress()
+    if console is not None:
+        console.write(text)
+
+
 def _software_audit_result(
     engine: Engine, choice: str, *, select_after_report: bool = False
 ) -> dict[str, Any]:
@@ -3201,6 +3215,7 @@ def _software_audit_result(
                 "only after coverage passes. Report selected fix outcomes with complete_security_run to finish the final unresolved report."
             ),
         }
+        _show_audit_prompt(engine, result["audit_prompt"])
     else:
         result = {
             "status": "DONE",

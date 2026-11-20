@@ -62,6 +62,34 @@ If a path is incomplete on purpose (mock data, TODO, method that throws "not imp
 
 Conditional security items are the only exception to proven reachability and caller evidence: the dangerous call must exist and be opened, and you must state which caller or reachability evidence could not be established. Keep them in section 3 only, separate from confirmed findings; do not present a hypothetical input as observed behavior.
 
+## Build dependencies and official documentation
+
+Complete this preflight before reviewing application code for the audit categories.
+
+1. Read every build and dependency manifest that is present: `package.json`,
+   `pnpm-workspace.yaml`, `.nvmrc`/`engines`, `pom.xml`, `build.gradle(.kts)`,
+   `settings.gradle(.kts)`, `gradle/libs.versions.toml`, `gradle.properties`,
+   `*.csproj`, `Directory.Packages.props`, `Directory.Build.props`, `global.json`,
+   `pyproject.toml`, `requirements*.txt`, Dockerfile base images, and CI
+   tool/runtime versions. Read lockfiles only to resolve exact installed versions;
+   they remain out of scope as finding targets.
+2. List the runtimes, frameworks, and libraries the reviewed code actually uses for
+   security, data access, messaging, HTTP, concurrency, resource lifetime, and error
+   handling, with their exact resolved versions.
+3. For each listed dependency, read the publisher's official online documentation
+   for that version: API reference, thread-safety and disposal/lifetime rules,
+   configuration defaults, security guidance, release notes, and breaking-change or
+   migration notes. Use official publisher or project sources only, not blogs or
+   answers. If documentation cannot be retrieved, record that in section 6.
+4. Record each source URL and version in section 1. Read each dependency's
+   documentation once and keep a concise summary of the facts that apply to this
+   code; do not re-read it for every file.
+
+Documentation defines the correct contract; it does not replace code evidence. A
+finding still needs every item in "Evidence required before a finding". Do not
+report an outdated or vulnerable version alone; dependency upgrades are handled
+by the separate GitLab package job.
+
 ## Review order
 
 Review in this order and record each entry point you opened:
@@ -141,9 +169,18 @@ Do not copy an inventory entry as an assessment or claim an unread file was read
   the next paths, remaining counts/phases, and registered generated exclusions.
   A bounded path list is not the whole remaining scope: continue until the count
   reaches zero and every phase is complete. After context loss only, recover
-  `software_audit` through `get_run_status(repo_root=...)`; it retains the full
+  `software_audit` through
+  `get_run_status(repo_root=..., include_audit_details=True)`; it retains the full
   prompt, inventory, receipts, and any complete coverage-gap list. Do not poll
   that large snapshot for progress; use the GUI and batch acknowledgments.
+- Use context compaction throughout the audit. Compact what you have already
+  gathered: file contents, search output, dependency documentation, and tool
+  results become concise notes (path, hash, behaviors traced, candidate findings
+  with exact line numbers, and the documentation facts that apply). Never compact,
+  paraphrase, shorten, or drop this prompt's own instructions, evidence
+  requirements, severity rules, output format, or human-approval boundaries.
+  After any compaction, follow the original prompt text, not a summary of it; if
+  it is no longer in context, recover it as described above before continuing.
 - Update only changed report sections after each batch, keeping the report on
   disk. Do not rewrite or repeat the entire report in chat for each update.
 
@@ -202,6 +239,7 @@ Produce the report in this structure:
 
 ### 1. Scope summary
 Brief note on what was reviewed, which stacks were detected, and which (if any) project AI rules/skills/instructions were loaded.
+List each build dependency reviewed with its resolved version and the official documentation URL read for it.
 Record every entry point opened in review order, including each action's auth scheme and authorization rule. Mark anything not reviewed as a limitation rather than implying full coverage.
 
 ### 2. Functional, reliability, performance, and quality findings
