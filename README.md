@@ -590,6 +590,23 @@ findings merely to open approvals. Use the existing completion flow once.
 No IDE settings are changed automatically, and no model API or tokenizer
 dependency is added.
 
+Software-audit continuation responses omit the already-delivered prompt,
+full inventory, and past receipts. They return up to 20 next paths, the actual
+remaining count/phases, and registered generated exclusions. Incomplete-report
+responses also bound their path list and explicitly flag when more paths remain;
+changed-file gaps remain review targets. Initial audit handoffs still include
+the full prompt and inventory. Nothing is removed from live/saved audit evidence:
+after context loss, `get_run_status(repo_root=...)` recovers the complete
+`software_audit` context. Do not poll that large snapshot for routine progress.
+The audit prompt recommends related-file batches, batched local hashes,
+reuse of unchanged evidence, and section-level report edits, without reducing
+required source coverage, evidence, approvals, or completion checks.
+
+A synthetic resumed audit with 495 inventory files and 140 existing review
+receipts decreased from **91,012 to 2,273 characters (97.5%)**, using compact JSON
+serialization before and after the change. This measures the repeated handoff,
+not the initial prompt, required source reads, or billed model tokens.
+
 Release 1.0.15 validation: **308 related server and consent tests passed**,
 including sixteen new context-budget/compaction cases and both native Windows
 approval tests. Resource, deprecation, unraisable-exception and background-thread

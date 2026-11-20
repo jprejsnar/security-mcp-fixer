@@ -126,6 +126,27 @@ complete their phase receipt only after checking applicability. File counts
 are derived from receipts; declaring a numeric total is not evidence of review.
 Do not copy an inventory entry as an assessment or claim an unread file was read.
 
+### Context-efficient execution
+
+- Review related files in batches, usually 10-20 when practical. Open bounded,
+  line-numbered ranges and expand them wherever a caller, contract, or behavior
+  remains unclear; search hits alone never count as a review.
+- Reuse unchanged source, guidance, and evidence already read in the current
+  context. Reopen changed files or anything needed to resolve uncertainty.
+  Do not repeatedly load every rule/skill body or unrelated reference document.
+- Compute current full-file hashes together locally for the files actually read.
+  Submit only new or refreshed receipts, with concise, file-specific behavioral
+  assessments; do not resend previous receipts or echo file contents in progress.
+- Initial consent supplies the full prompt and inventory. Later handoffs supply
+  the next paths, remaining counts/phases, and registered generated exclusions.
+  A bounded path list is not the whole remaining scope: continue until the count
+  reaches zero and every phase is complete. After context loss only, recover
+  `software_audit` through `get_run_status(repo_root=...)`; it retains the full
+  prompt, inventory, receipts, and any complete coverage-gap list. Do not poll
+  that large snapshot for progress; use the GUI and batch acknowledgments.
+- Update only changed report sections after each batch, keeping the report on
+  disk. Do not rewrite or repeat the entire report in chat for each update.
+
 A progress receipt and a finished delegated review are intermediate results, not
 permission to end the audit turn. Continue opening the remaining inventory and
 recording genuine receipts until all coverage and phases are complete. Do not

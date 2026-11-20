@@ -3058,36 +3058,65 @@ def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
 
 
 def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, Any]:
-    """Make unfinished review an executable continuation, not a final-answer cue."""
-    remaining = [
-        path
-        for path in coverage.get("files", [])
-        if path not in coverage.get("reviews", {})
-    ]
-    return {
-        **result,
-        "continue_review": True,
-        "generated_exclusions": coverage.get("generated_exclusions", []),
-        "remaining_file_count": len(remaining),
-        "next_files": remaining[:20],
-        "remaining_phases": sorted(
-            REVIEW_PHASES - set(coverage.get("completed_phases", []))
-        )
-        if coverage.get("files")
-        else [],
-        "next_action": (
-            "Continue the read-only audit now, including after delegated reviews finish. "
-            "A progress receipt is not a completed job: do not end the turn with a "
-            "partial findings summary or ask the developer to type continue. "
-            "Persist actual findings incrementally to output_path, replacing the "
-            "server's explicitly incomplete progress draft. "
-            "Read the next unreviewed non-generated files and submit "
-            "their real progress.files receipts. Finish every remaining file and "
-            "phase, write output_path, then call choose_software_audit_action with "
-            "the same repo_root and report_ready=True. That call opens the unchecked "
-            "fix-selection GUI. Wait for its human selection before any code changes."
-        ),
+    """Return bounded continuation context without discarding recoverable evidence."""
+    gaps = (
+        result.get("coverage_gaps") if result["status"] == "AUDIT_INCOMPLETE" else None
+    )
+    remaining = (
+        gaps["remaining_files"]
+        if gaps is not None
+        else [
+            path
+            for path in coverage.get("files", [])
+            if path not in coverage.get("reviews", {})
+        ]
+    )
+    response = {
+        key: value
+        for key, value in result.items()
+        if key not in {"audit_prompt", "coverage", "coverage_gaps"}
     }
+    if result["status"] == "GENERATE_AUDIT_REPORT":
+        response.update(
+            {key: result[key] for key in ("audit_prompt", "coverage") if key in result}
+        )
+    if gaps is not None:
+        response["coverage_gaps"] = {
+            **gaps,
+            "remaining_files": remaining[:20],
+            "remaining_file_count": len(remaining),
+            "remaining_files_truncated": len(remaining) > 20,
+        }
+    return deepcopy(
+        {
+            **response,
+            "continue_review": True,
+            "generated_exclusions": coverage.get("generated_exclusions", []),
+            "remaining_file_count": len(remaining),
+            "next_files": remaining[:20],
+            "remaining_phases": gaps["remaining_phases"]
+            if gaps is not None
+            else sorted(REVIEW_PHASES - set(coverage.get("completed_phases", [])))
+            if coverage.get("files")
+            else [],
+            "context_recovery_tool": "get_run_status",
+            "next_action": (
+                "Continue the read-only audit now, including after delegated reviews finish. "
+                "A progress receipt is not a completed job: do not end the turn with a "
+                "partial findings summary or ask the developer to type continue. "
+                "Persist actual findings incrementally to output_path, replacing the "
+                "server's explicitly incomplete progress draft. "
+                "Read the next unreviewed non-generated files and submit "
+                "their real progress.files receipts. Finish every remaining file and "
+                "phase, write output_path, then call choose_software_audit_action with "
+                "the same repo_root and report_ready=True. That call opens the unchecked "
+                "fix-selection GUI. Wait for its human selection before any code changes. "
+                "Reuse audit_prompt and evidence already read. Only after context loss, "
+                "call get_run_status with the same repo_root to recover software_audit's "
+                "full prompt, inventory, receipts and coverage gaps."
+            ),
+        }
+    )
 
 
 def _software_audit_result(
@@ -3271,6 +3300,8 @@ def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, An
             **{
                 key: previous[key]
                 for key in (
+                    "repo_root",
+                    "audit_prompt",
                     "output_path",
                     "coverage",
                     "report_complete",
@@ -3677,7 +3708,7 @@ async def choose_software_audit_action(
             audit_coverage_gaps, selected.repo_root, coverage
         )
         if gaps["remaining_files"] or gaps["remaining_phases"] or gaps["truncated"]:
-            return await asyncio.to_thread(
+            incomplete = await asyncio.to_thread(
                 _record_audit_result,
                 selected,
                 {
@@ -3687,6 +3718,7 @@ async def choose_software_audit_action(
                     "message": "Continue the read-only audit: review every remaining file and phase, refresh changed-file receipts, and update the report before report_ready. Do not add speculative findings to fill a quota.",
                 },
             )
+            return _audit_review_handoff(incomplete, coverage)
         result = await asyncio.to_thread(_audit_fix_from_report, report, None)
         if result["status"] in {"ERROR", "ITEMS_REQUIRED"}:
             return await asyncio.to_thread(_record_audit_result, selected, result)
@@ -3710,7 +3742,7 @@ async def choose_software_audit_action(
         "AUDIT_IN_PROGRESS",
         "AUDIT_INCOMPLETE",
     } and (choice is None or normalize_choice(choice) == previous.get("choice")):
-        return _audit_review_handoff(deepcopy(previous), previous.get("coverage") or {})
+        return _audit_review_handoff(previous, previous.get("coverage") or {})
     selected_choice = normalize_choice(choice)
     if choice is None:
         previous = selected.state.software_audit

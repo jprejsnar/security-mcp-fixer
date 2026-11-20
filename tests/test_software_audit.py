@@ -453,6 +453,82 @@ def test_generate_report_returns_the_prompt_and_home_path(tmp_path, monkeypatch)
     context.elicit.assert_not_called()
 
 
+@pytest.mark.parametrize("status", ["AUDIT_IN_PROGRESS", "AUDIT_INCOMPLETE"])
+def test_audit_continuation_bounds_context_without_losing_recovery(
+    tmp_path, monkeypatch, status
+):
+    """Keep large review histories recoverable without repeating them each turn."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    paths = [
+        f"backend/src/main/java/example/Service{index:03}.java" for index in range(495)
+    ]
+    coverage = {
+        "files": paths,
+        "reviews": {
+            path: {
+                "path": path,
+                "sha256": f"{index:064x}",
+                "assessment": "Read implementation, caller and handwritten test; traced authorization, persistence, exception output and resource lifetime.",
+            }
+            for index, path in enumerate(paths[:140])
+        },
+        "completed_phases": ["entry_points"],
+        "generated_exclusions": [],
+        "truncated": False,
+    }
+    original = {
+        "status": status,
+        "choice": "generate_report",
+        "repo_root": str(engine.repo_root),
+        "output_path": str(tmp_path / "audit.md"),
+        "audit_prompt": render_audit_prompt(datetime.now(UTC), "abc123"),
+        "coverage": coverage,
+    }
+    remaining = paths[140:]
+    if status == "AUDIT_INCOMPLETE":
+        remaining = [paths[0], *remaining]
+        original["coverage_gaps"] = {
+            "remaining_files": remaining,
+            "total_files": 495,
+            "reviewed_files": 139,
+            "remaining_phases": [
+                "data_access",
+                "errors_logs",
+                "resource_lifetime",
+                "ui_siblings",
+            ],
+            "truncated": False,
+        }
+    engine.record_software_audit(original)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+
+    # Act
+    resumed = asyncio.run(
+        server.choose_software_audit_action(_context(), str(engine.repo_root))
+    )
+    recovered = server.get_run_status(str(engine.repo_root))
+
+    # Assert
+    assert "audit_prompt" not in resumed
+    assert "coverage" not in resumed
+    assert resumed["continue_review"] is True
+    assert resumed["next_files"] == remaining[:20]
+    assert resumed["remaining_file_count"] == len(remaining)
+    assert set(resumed["remaining_phases"]) == REVIEW_PHASES - {"entry_points"}
+    assert resumed["context_recovery_tool"] == "get_run_status"
+    if status == "AUDIT_INCOMPLETE":
+        gaps = resumed["coverage_gaps"]
+        assert gaps["remaining_files"] == remaining[:20]
+        assert gaps["remaining_file_count"] == len(remaining)
+        assert gaps["remaining_files_truncated"] is True
+    assert recovered["software_audit"] == engine.state.software_audit == original
+    size = len(json.dumps(resumed, separators=(",", ":")))
+    assert size < 5000
+    assert size < len(json.dumps(original, separators=(",", ":"))) * 0.1
+
+
 def test_progress_draft_is_persisted_but_cannot_be_accepted_as_a_finished_report(
     tmp_path, monkeypatch
 ):
@@ -1525,6 +1601,13 @@ def test_partial_review_is_rejected_but_one_evidenced_finding_is_allowed(
         )
         assert partial["status"] == "AUDIT_INCOMPLETE"
         assert partial["coverage_gaps"]["remaining_files"] == ["Repository.java"]
+        assert partial["continue_review"] is True
+        assert partial["next_files"] == ["Repository.java"]
+        assert "audit_prompt" not in partial
+        recovered = server.get_run_status(str(root))["software_audit"]
+        assert recovered["audit_prompt"] == initial["audit_prompt"]
+        assert recovered["repo_root"] == str(root)
+        assert recovered["coverage_gaps"]["remaining_files"] == ["Repository.java"]
         context.elicit.assert_not_called()
         await server.choose_software_audit_action(
             context,
