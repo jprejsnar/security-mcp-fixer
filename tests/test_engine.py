@@ -1415,8 +1415,45 @@ def test_progress_mcp_text_is_bounded_and_keeps_report_last():
     assert result.content[-1].text == final
     assert result.structured_content["final_summary_markdown"] == final
     assert result.structured_content["progress_output"] == [
-        f"Progress {index}" for index in range(6, 70)
+        f"Progress {index}" for index in range(70 - server._TRANSCRIPT_LINES, 70)
     ]
+
+
+def test_returned_progress_skips_repeats_and_clips_long_lines():
+    """Heartbeat repeats and long log lines must not inflate the result the AI rereads."""
+    # Arrange
+    import asyncio
+    from types import SimpleNamespace
+
+    from gitlab_security_mcp import server
+    from gitlab_security_mcp.commands import progress_sink
+
+    delivered = []
+
+    async def report(progress, total, message):
+        """Record every live notification the host receives."""
+        delivered.append(message)
+
+    async def call_next(context):
+        """Emit a repeated heartbeat and one oversized line."""
+        for _ in range(10):
+            progress_sink.get()("Waiting for Gradle")
+        progress_sink.get()("x" * 1800)
+        return {"status": "DONE"}
+
+    context = SimpleNamespace(
+        method="tools/call", session=SimpleNamespace(report_progress=report)
+    )
+
+    # Act
+    result = asyncio.run(server._progress_middleware(context, call_next))
+
+    # Assert
+    assert result["progress_output"] == [
+        "Waiting for Gradle",
+        "x" * server._TRANSCRIPT_CHARS,
+    ]
+    assert len(delivered) == 11
 
 
 @pytest.mark.parametrize("with_progress", [False, True])

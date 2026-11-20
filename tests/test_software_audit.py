@@ -508,7 +508,8 @@ def test_audit_continuation_bounds_context_without_losing_recovery(
     resumed = asyncio.run(
         server.choose_software_audit_action(_context(), str(engine.repo_root))
     )
-    recovered = server.get_run_status(str(engine.repo_root))
+    recovered = server.get_run_status(str(engine.repo_root), include_audit_details=True)
+    default_status = server.get_run_status(str(engine.repo_root))
 
     # Assert
     assert "audit_prompt" not in resumed
@@ -524,15 +525,71 @@ def test_audit_continuation_bounds_context_without_losing_recovery(
         assert gaps["remaining_file_count"] == len(remaining)
         assert gaps["remaining_files_truncated"] is True
     assert recovered["software_audit"] == engine.state.software_audit == original
+    compact = default_status["software_audit"]
+    assert "audit_prompt" not in compact and "coverage" not in compact
+    assert compact["coverage_summary"]["reviewed_files"] == 140
+    assert compact["coverage_summary"]["total_files"] == 495
+    assert "include_audit_details=True" in compact["full_details"]
+    assert len(json.dumps(default_status)) < 5000
     size = len(json.dumps(resumed, separators=(",", ":")))
     assert size < 5000
     assert size < len(json.dumps(original, separators=(",", ":"))) * 0.1
+
+
+@pytest.mark.parametrize("status", ["FIX_FROM_AUDIT_REPORT", "ERROR", "DONE"])
+def test_repeated_audit_polls_do_not_resend_saved_receipts(
+    tmp_path, monkeypatch, status
+):
+    """A host waiting on selected fixes must not receive the full review history each poll."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    paths = [f"src/Service{index:03}.java" for index in range(495)]
+    saved = {
+        "status": status,
+        "choice": "fix_from_report" if status != "DONE" else "done",
+        "output_path": str(tmp_path / "audit.md"),
+        "report_complete": True,
+        "audit_prompt": render_audit_prompt(datetime.now(UTC), "abc123"),
+        "selected_items": [
+            {"id": "R01", "severity": "High", "location": "a:1", "problem": "x"}
+        ],
+        "coverage": {
+            "files": paths,
+            "reviews": {
+                path: {"path": path, "sha256": "a" * 64, "assessment": "x" * 300}
+                for path in paths
+            },
+            "completed_phases": sorted(REVIEW_PHASES),
+            "truncated": False,
+        },
+    }
+    engine.record_software_audit(saved)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+
+    # Act
+    polls = [
+        asyncio.run(
+            server.choose_software_audit_action(_context(), str(engine.repo_root))
+        )
+        for _ in range(3)
+    ]
+
+    # Assert
+    for poll in polls:
+        assert poll["status"] == status
+        assert "coverage" not in poll and "audit_prompt" not in poll
+        assert poll["coverage_summary"]["reviewed_files"] == 495
+        assert poll["selected_items"] == saved["selected_items"]
+        assert len(json.dumps(poll)) < 3000
+    assert engine.state.software_audit == saved
 
 
 def test_progress_draft_is_persisted_but_cannot_be_accepted_as_a_finished_report(
     tmp_path, monkeypatch
 ):
     """Full file coverage does not turn a progress-only draft into findings."""
+    # Arrange
     engine = _engine(tmp_path / "checkout")
     source = engine.repo_root / "app.java"
     source.write_text("class App {}", encoding="utf-8")
@@ -566,12 +623,14 @@ def test_progress_draft_is_persisted_but_cannot_be_accepted_as_a_finished_report
     with report.open("a", encoding="utf-8") as stream:
         stream.write("\n### 7. Selectable findings\nNo selectable findings.\n")
 
+    # Act
     result = asyncio.run(
         server.choose_software_audit_action(
             context, str(engine.repo_root), report_ready=True
         )
     )
 
+    # Assert
     assert result["status"] == "ITEMS_REQUIRED"
     assert "draft" in result["message"].lower()
     assert not engine.state.software_audit.get("report_complete")
@@ -582,6 +641,7 @@ def test_progress_persistence_never_replaces_host_written_findings(
     tmp_path, monkeypatch
 ):
     """Keep the AI's report intact when a later progress receipt arrives."""
+    # Arrange
     engine = _engine(tmp_path / "checkout")
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     initial = asyncio.run(
@@ -595,12 +655,14 @@ def test_progress_persistence_never_replaces_host_written_findings(
     )
     report.write_text(findings, encoding="utf-8")
 
+    # Act
     asyncio.run(
         server.choose_software_audit_action(
             _context(), str(engine.repo_root), progress={"message": "Review complete."}
         )
     )
 
+    # Assert
     assert report.read_text(encoding="utf-8") == findings
 
 
@@ -1375,6 +1437,7 @@ def test_project_generated_outputs_are_excluded_with_current_config_evidence(
     tmp_path, manifest, content
 ):
     """Support custom output paths without hiding handwritten sibling projects."""
+    # Arrange
     project = tmp_path / "backend"
     output = project / "custom-client"
     output.mkdir(parents=True)
@@ -1392,11 +1455,13 @@ def test_project_generated_outputs_are_excluded_with_current_config_evidence(
     }
     exclusion = {"path": "backend/custom-client", "evidence": evidence}
 
+    # Act
     updated = record_audit_coverage(
         tmp_path, audit_inventory(tmp_path), [], [], generated_exclusions=[exclusion]
     )
     gaps = audit_coverage_gaps(tmp_path, updated)
 
+    # Assert
     assert updated["generated_exclusions"] == [exclusion]
     assert "backend/custom-client/Api.java" not in updated["files"]
     assert f"backend/{manifest}" in updated["files"]
@@ -1423,6 +1488,7 @@ def test_project_generated_outputs_are_excluded_with_current_config_evidence(
 @pytest.mark.parametrize("output", [".", "..", "build.gradle"])
 def test_generated_exclusion_cannot_hide_checkout_or_its_evidence(tmp_path, output):
     """A declaration must be bounded and keep its handwritten evidence reviewable."""
+    # Arrange
     config = tmp_path / "build.gradle"
     config.write_text(
         "openApiGenerate { outputDir = 'custom-client' }", encoding="utf-8"
@@ -1436,7 +1502,8 @@ def test_generated_exclusion_cannot_hide_checkout_or_its_evidence(tmp_path, outp
         },
     }
 
-    with pytest.raises(ValueError, match="generated exclusion"):
+    # Act
+    with pytest.raises(ValueError) as raised:
         record_audit_coverage(
             tmp_path,
             audit_inventory(tmp_path),
@@ -1445,9 +1512,13 @@ def test_generated_exclusion_cannot_hide_checkout_or_its_evidence(tmp_path, outp
             generated_exclusions=[exclusion],
         )
 
+    # Assert
+    assert "generated exclusion" in str(raised.value)
+
 
 def test_generated_exclusion_prunes_folder_before_opening_source(tmp_path, monkeypatch):
     """Inspect project configuration, not the contents of custom generated trees."""
+    # Arrange
     output = tmp_path / "custom-client"
     output.mkdir()
     (output / "Api.java").write_text("class Api {}", encoding="utf-8")
@@ -1466,13 +1537,16 @@ def test_generated_exclusion_prunes_folder_before_opening_source(tmp_path, monke
     original_open = Path.open
 
     def checked_open(path, *args, **kwargs):
+        """Fail if inventory opens anything inside the excluded output tree."""
         assert not path.is_relative_to(output)
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", checked_open)
 
+    # Act
     inventory = audit_inventory(tmp_path, generated_exclusions=[exclusion])
 
+    # Assert
     assert inventory["files"] == ["build.gradle"]
 
 
@@ -1480,6 +1554,7 @@ def test_audit_progress_registers_and_retains_project_generated_file_exclusion(
     tmp_path, monkeypatch
 ):
     """Apply config-backed exclusions through the MCP handoff, not just a local helper."""
+    # Arrange
     engine = _engine(tmp_path / "checkout")
     root = engine.repo_root
     (root / "src").mkdir()
@@ -1505,6 +1580,7 @@ def test_audit_progress_registers_and_retains_project_generated_file_exclusion(
     monkeypatch.setattr(server, "_engine_for", lambda repo_root: engine)
     monkeypatch.setenv("PROGRESS_CONSOLE", "off")
 
+    # Act
     first = asyncio.run(
         server.choose_software_audit_action(
             _context(),
@@ -1521,6 +1597,7 @@ def test_audit_progress_registers_and_retains_project_generated_file_exclusion(
         )
     )
 
+    # Assert
     for result in (first, second):
         assert result["generated_exclusions"] == [exclusion]
         assert result["next_files"] == ["build.gradle", "src/Service.java"]
@@ -1604,7 +1681,9 @@ def test_partial_review_is_rejected_but_one_evidenced_finding_is_allowed(
         assert partial["continue_review"] is True
         assert partial["next_files"] == ["Repository.java"]
         assert "audit_prompt" not in partial
-        recovered = server.get_run_status(str(root))["software_audit"]
+        recovered = server.get_run_status(str(root), include_audit_details=True)[
+            "software_audit"
+        ]
         assert recovered["audit_prompt"] == initial["audit_prompt"]
         assert recovered["repo_root"] == str(root)
         assert recovered["coverage_gaps"]["remaining_files"] == ["Repository.java"]

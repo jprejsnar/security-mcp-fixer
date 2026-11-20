@@ -23,6 +23,8 @@ _ACTIVE = {
     "ITEMS_REQUIRED",
 }
 _PREFIX = "[gitlab-security-mcp audit continuation]"
+# Each continuation is a paid host turn; never scale the cap with repository size.
+_MAX_CONTINUATIONS = 24
 
 
 def _session(payload: dict) -> str | None:
@@ -158,9 +160,7 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
         raise RuntimeError(
             "Audit continuation stopped: no new review receipts, phases or report content. The audit is incomplete; inspect the host blocker instead of repeatedly asking to continue."
         )
-    if attempts >= len(coverage.get("files", [])) + 8 or (
-        host == "copilot" and attempts >= 8
-    ):
+    if attempts >= _MAX_CONTINUATIONS or (host == "copilot" and attempts >= 8):
         raise RuntimeError(
             "Audit continuation reached the editor's safe turn budget. The report remains incomplete; host limits must not be bypassed."
         )

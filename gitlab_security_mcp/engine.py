@@ -1633,11 +1633,22 @@ class Engine:
             )
             self._record_validation_sites(finding, [catalog["source"]])
             if review is None:
+                floor = plan.get("advisory_floor", plan["target"])
+                minimum = parse_version(floor)
+                eligible = [
+                    raw
+                    for raw in catalog["versions"]
+                    if minimum is None or (parse_version(raw) or minimum) >= minimum
+                ]
                 return {
                     "status": "RELEASE_REVIEW_REQUIRED",
                     "finding_id": finding_id,
-                    "catalog": catalog,
-                    "advisory_floor": plan.get("advisory_floor", plan["target"]),
+                    "catalog": {
+                        "source": catalog["source"],
+                        "versions": eligible,
+                        "omitted_below_floor": len(catalog["versions"]) - len(eligible),
+                    },
+                    "advisory_floor": floor,
                     "requirements": (
                         "Review publisher support, actual project runtime compatibility, and target-version "
                         "fees. Supply target=<exact reviewed eligible version>,"

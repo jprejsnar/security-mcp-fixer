@@ -514,3 +514,28 @@ def test_known_paid_target_is_blocked_even_with_corporate_policy(
     payload, report = render(engine.state, staged=[], diff_stat="", diff_files="")
     assert payload["license_investigations"]["one"]["target"] == "1.0.1"
     assert "PAID OR RESTRICTED LICENSE" in report
+
+
+def test_release_review_sends_only_selectable_versions(release_engine, monkeypatch):
+    """Releases below the advisory floor can never be selected, so do not spend tokens on them."""
+    # Arrange
+    old = [f"0.{index}.0" for index in range(300)]
+    monkeypatch.setattr(
+        "gitlab_security_mcp.engine.release_catalog",
+        lambda *args, **kwargs: {
+            "source": "https://registry.npmjs.org/example",
+            "versions": ["3.0.0", "2.0.0", "1.0.1", "1.0.0", *old],
+        },
+    )
+
+    # Act
+    result = release_engine.select_package_version("one")
+
+    # Assert
+    assert result["status"] == "RELEASE_REVIEW_REQUIRED"
+    assert result["advisory_floor"] == "1.0.1"
+    assert result["catalog"]["versions"] == ["3.0.0", "2.0.0", "1.0.1"]
+    assert result["catalog"]["omitted_below_floor"] == 301
+    assert release_engine.select_package_version("one", _support())["status"] == (
+        "VERSION_SELECTED"
+    )

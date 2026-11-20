@@ -581,9 +581,15 @@ def test_native_preparation_rejects_unreviewed_target_or_license(tmp_path, inval
     result = engine.prepare_package_updates(candidates, {"one": review})
 
     # Assert
-    assert result["status"] == "PACKAGE_REVIEW_REQUIRED"
-    assert result["required_reviews"][0]["finding_id"] == "one"
-    assert invalid in result["required_reviews"][0]["reason"]
+    if invalid == "blocked":
+        # An explicit block finishes the job as unresolved instead of looping on reviews.
+        assert result["status"] == "READY"
+        assert result["all_blocked"] is True
+        assert result["reviews"]["one"]["blocked_reason"] == review["blocked_reason"]
+    else:
+        assert result["status"] == "PACKAGE_REVIEW_REQUIRED"
+        assert result["required_reviews"][0]["finding_id"] == "one"
+        assert invalid in result["required_reviews"][0]["reason"]
     engine.runner.run.assert_not_called()
     assert not engine.state.changes
 

@@ -46,12 +46,16 @@ def audit(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("host", ["cursor", "copilot", "vscode-local"])
 def test_owned_audit_continues_and_preserves_receipts_and_native_output(audit, host):
+    """Continue only the owning session, in each host's native response shape."""
+    # Arrange
     state_path, state, report, payload = audit
     before = state_path.read_bytes()
     handle_event(host, "post", payload)
 
+    # Act
     first = handle_event(host, "stop", payload)
 
+    # Assert
     if host == "cursor":
         message = first["followup_message"]
     elif host == "copilot":
@@ -75,62 +79,97 @@ def test_owned_audit_continues_and_preserves_receipts_and_native_output(audit, h
 
 
 def test_saved_audit_state_alone_never_starts_continuation(audit):
+    """Saved JSON without an observed live tool call grants no continuation."""
+    # Arrange
     _, _, report, payload = audit
 
-    assert handle_event("cursor", "stop", payload) == {}
+    # Act
+    result = handle_event("cursor", "stop", payload)
+
+    # Assert
+    assert result == {}
     assert not report.exists()
 
 
 def test_other_sessions_cannot_continue_the_owned_audit(audit):
+    """Another conversation cannot inherit the owner's continuation."""
+    # Arrange
     _, _, _, payload = audit
     handle_event("cursor", "post", payload)
 
-    assert (
-        handle_event(
-            "cursor", "stop", {**payload, "conversation_id": "other-conversation"}
-        )
-        == {}
+    # Act
+    result = handle_event(
+        "cursor", "stop", {**payload, "conversation_id": "other-conversation"}
     )
+
+    # Assert
+    assert result == {}
 
 
 @pytest.mark.parametrize("status", ["aborted", "error"])
 def test_cancelled_or_failed_turn_is_not_resubmitted(audit, status):
+    """An aborted or failed turn deactivates continuation instead of retrying it."""
+    # Arrange
     _, _, _, payload = audit
     handle_event("cursor", "post", payload)
 
-    assert handle_event("cursor", "stop", {**payload, "status": status}) == {}
+    # Act
+    stopped = handle_event("cursor", "stop", {**payload, "status": status})
+
+    # Assert
+    assert stopped == {}
     assert handle_event("cursor", "stop", payload) == {}
 
 
 def test_new_user_prompt_does_not_resurrect_a_previous_audit(audit):
+    """A new human prompt ends automatic continuation of the earlier audit."""
+    # Arrange
     _, _, _, payload = audit
     handle_event("copilot", "post", payload)
     handle_event("copilot", "prompt", {**payload, "prompt": "Explain Rust support."})
 
-    assert handle_event("copilot", "stop", payload) == {}
+    # Act
+    result = handle_event("copilot", "stop", payload)
+
+    # Assert
+    assert result == {}
 
 
 def test_failed_or_denied_tool_does_not_trigger_an_automatic_retry(audit):
+    """A denied tool call must not be retried by the stop hook."""
+    # Arrange
     _, _, _, payload = audit
     handle_event("cursor", "post", payload)
     handle_event("cursor", "failure", {**payload, "failure_type": "permission_denied"})
 
-    assert handle_event("cursor", "stop", payload) == {}
+    # Act
+    result = handle_event("cursor", "stop", payload)
+
+    # Assert
+    assert result == {}
 
 
 @pytest.mark.parametrize(
     "status", ["SELECTION_REQUIRED", "FIX_FROM_AUDIT_REPORT", "DONE"]
 )
 def test_human_selection_and_completed_jobs_are_never_auto_approved(audit, status):
+    """Human selection and finished audits are never continued automatically."""
+    # Arrange
     state_path, state, _, payload = audit
     handle_event("cursor", "post", payload)
     state["software_audit"]["status"] = status
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
-    assert handle_event("cursor", "stop", payload) == {}
+    # Act
+    result = handle_event("cursor", "stop", payload)
+
+    # Assert
+    assert result == {}
 
 
 def test_hook_install_preserves_existing_entries_and_is_idempotent(tmp_path):
+    """Merge hooks without replacing user entries, and do not duplicate them."""
+    # Arrange
     cursor = tmp_path / ".cursor" / "hooks.json"
     cursor.parent.mkdir()
     existing = {"command": "existing-user-hook", "timeout": 5}
@@ -146,7 +185,10 @@ def test_hook_install_preserves_existing_entries_and_is_idempotent(tmp_path):
     )
     python = tmp_path / "runtime with spaces" / "python.exe"
 
+    # Act
     paths = install_hooks(tmp_path, python)
+
+    # Assert
     assert install_hooks(tmp_path, python) == paths
 
     config = json.loads(cursor.read_text(encoding="utf-8"))
@@ -164,22 +206,58 @@ def test_hook_install_preserves_existing_entries_and_is_idempotent(tmp_path):
 
 
 def test_malformed_hook_input_is_reported_instead_of_claiming_success():
+    """Invalid hook JSON exits nonzero with a diagnostic and no host instruction."""
+    # Arrange
+    argv = [
+        sys.executable,
+        "-m",
+        "gitlab_security_mcp.audit_host",
+        "--host",
+        "cursor",
+        "--event",
+        "stop",
+    ]
+
+    # Act
     result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "gitlab_security_mcp.audit_host",
-            "--host",
-            "cursor",
-            "--event",
-            "stop",
-        ],
+        argv,
         input="not-json",
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
+        timeout=60,
     )
 
+    # Assert
     assert result.returncode == 1
     assert "GitLab security audit hook:" in result.stderr
     assert not result.stdout.strip()
+
+
+def test_continuation_turns_are_capped_independent_of_repository_size(audit):
+    """Each automatic continuation is a paid AI turn; a large inventory must not raise the cap."""
+    # Arrange
+    from gitlab_security_mcp import audit_host
+
+    state_path, state, _, payload = audit
+    files = [f"src/File{index}.java" for index in range(495)]
+    state["software_audit"]["coverage"] = {
+        "files": files,
+        "reviews": {},
+        "completed_phases": [],
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    handle_event("cursor", "post", payload)
+    turns = 0
+
+    # Act
+    with pytest.raises(RuntimeError, match="safe turn budget"):
+        for name in files:
+            state["software_audit"]["coverage"]["reviews"][name] = {"sha256": "a" * 64}
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            assert handle_event("cursor", "stop", payload)["followup_message"]
+            turns += 1
+
+    # Assert
+    assert turns == audit_host._MAX_CONTINUATIONS < len(files)

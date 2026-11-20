@@ -435,6 +435,9 @@ def _finish_progress_call(terminal: bool) -> _ProgressConsole | None:
 _background_status: dict[tuple[Path, str], dict[str, Any]] = {}
 _background_status_lock = threading.Lock()
 _BACKGROUND_HEARTBEAT_SECONDS = 5
+# Returned transcripts are re-read by the host AI; live notifications stay unbounded.
+_TRANSCRIPT_LINES = 32
+_TRANSCRIPT_CHARS = 500
 _AUDIT_PENDING = {
     "AWAITING_HUMAN",
     "CONSENT_REQUIRED",
@@ -792,7 +795,7 @@ async def _progress_middleware(
             _progress_console_enabled = True
     loop = asyncio.get_running_loop()
     messages: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
-    transcript: deque[str] = deque(maxlen=64)
+    transcript: deque[str] = deque(maxlen=_TRANSCRIPT_LINES)
     finished = threading.Event()
     editor_task = uuid4().hex
     latest = "Starting " + str(name or "MCP task")
@@ -829,7 +832,9 @@ async def _progress_middleware(
         """Keep the most recent updates if a client consumes notifications slowly."""
         if finished.is_set():
             return
-        transcript.append(text)
+        line = text[:_TRANSCRIPT_CHARS]
+        if not transcript or transcript[-1] != line:
+            transcript.append(line)
         if messages.full():
             messages.get_nowait()
             messages.task_done()
@@ -1026,7 +1031,7 @@ def _run(
     try:
         selected = _engine_for(repo_root)
         if tool_name == "get_run_status":
-            return _live_run_status(selected)
+            return _live_run_status(selected, **kwargs)
         stages = {
             "pull_main_twice": (1,),
             "create_security_branch": (1,),
@@ -2537,7 +2542,7 @@ async def _continue_workflow(
             if missing:
                 return missing
         elif audit.get("status") not in {"DONE", "NONE_SELECTED", "NO_FINDINGS"}:
-            return deepcopy(audit)
+            return _compact_audit(audit)
         workflow.advance(
             selected,
             status="SKIPPED" if not audit.get("output_path") else "FINISHED",
@@ -2881,7 +2886,7 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
             "CONSENT_REQUIRED",
             "CONSENT_UNAVAILABLE",
         }:
-            return deepcopy(previous)
+            return _compact_audit(previous)
         state = selected.state
         workflow.activity(
             selected,
@@ -2957,7 +2962,7 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
             )
     pending = await asyncio.to_thread(selected.begin_software_audit)
     if not pending.pop("created"):
-        return pending
+        return _compact_audit(pending)
     return await asyncio.to_thread(_software_audit_result, selected, "generate_report")
 
 
@@ -3025,10 +3030,42 @@ def _audit_project_name(engine: Engine) -> str:
     return project_file_name(engine.state.gitlab_project_path, engine.repo_root.name)
 
 
+def _compact_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    """Summarize saved audit state; resending its prompt and receipts multiplies AI tokens."""
+    compact = {
+        key: deepcopy(value)
+        for key, value in audit.items()
+        if key not in {"audit_prompt", "coverage", "coverage_gaps"}
+    }
+    coverage = audit.get("coverage") or {}
+    if coverage:
+        compact["coverage_summary"] = {
+            "reviewed_files": len(coverage.get("reviews", {})),
+            "total_files": len(coverage.get("files", [])),
+            "completed_phases": list(coverage.get("completed_phases", [])),
+            "truncated": bool(coverage.get("truncated")),
+        }
+    gaps = audit.get("coverage_gaps") or {}
+    if gaps:
+        remaining = gaps.get("remaining_files") or []
+        compact["coverage_gaps"] = {
+            **deepcopy(gaps),
+            "remaining_files": remaining[:20],
+            "remaining_file_count": len(remaining),
+            "remaining_files_truncated": len(remaining) > 20,
+        }
+    if coverage or "audit_prompt" in audit:
+        compact["full_details"] = (
+            "Omitted to save tokens. Only after context loss call "
+            "get_run_status(repo_root=..., include_audit_details=True)."
+        )
+    return compact
+
+
 def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
     """Return a wait result while a human window or package batch is still open."""
     if engine.state.software_audit.get("status") == "AWAITING_HUMAN":
-        return deepcopy(engine.state.software_audit)
+        return _compact_audit(engine.state.software_audit)
     selection = engine.state.fix_selection or {}
     if (selection.get("package_execution") or {}).get("status") in {
         "QUEUED",
@@ -3112,8 +3149,8 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
                 "the same repo_root and report_ready=True. That call opens the unchecked "
                 "fix-selection GUI. Wait for its human selection before any code changes. "
                 "Reuse audit_prompt and evidence already read. Only after context loss, "
-                "call get_run_status with the same repo_root to recover software_audit's "
-                "full prompt, inventory, receipts and coverage gaps."
+                "call get_run_status with the same repo_root and include_audit_details=True "
+                "to recover software_audit's full prompt, inventory, receipts and coverage gaps."
             ),
         }
     )
@@ -3281,7 +3318,7 @@ def _software_audit_fix(
             engine, "fix_from_report", select_after_report=True
         )
     if not pending.get("report_complete"):
-        return deepcopy(pending)
+        return _compact_audit(pending)
     result = _audit_fix_from_report(existing, selected_ids, expected_report_hash)
     if destination:
         result.update(
@@ -3603,7 +3640,7 @@ async def choose_software_audit_action(
         and progress is None
         and previous.get("status") in {"FIX_FROM_AUDIT_REPORT", "ERROR"}
     ):
-        return deepcopy(previous)
+        return _compact_audit(previous)
     if (
         selected.state.workflow
         and normalize_choice(choice) == "fix_from_report"
@@ -3749,7 +3786,7 @@ async def choose_software_audit_action(
         if selected.state.workflow and not previous:
             return await _offer_software_audit(ctx, selected)
         if previous and previous.get("choice") != "fix_from_report":
-            return deepcopy(previous)
+            return _compact_audit(previous)
         if not previous:
             source_work = _selected_source_handoff(selected)
             if source_work is not None:
@@ -3828,8 +3865,15 @@ def _publish_audit_progress(result: dict[str, Any]) -> None:
         sink(text)
 
 
-def _live_run_status(selected: Engine) -> dict[str, Any]:
+def _live_run_status(
+    selected: Engine, *, include_audit_details: bool = False
+) -> dict[str, Any]:
     """Return live activity without waiting behind long engine mutations."""
+    audit = (
+        deepcopy(selected.state.software_audit)
+        if include_audit_details
+        else _compact_audit(selected.state.software_audit)
+    )
     background = _background_for(selected)
     if any(
         item["status"] in {"RUNNING", "WAITING_FOR_HUMAN", "WAITING_FOR_AI"}
@@ -3842,7 +3886,7 @@ def _live_run_status(selected: Engine) -> dict[str, Any]:
             "server_version": __version__,
             "repo_root": str(selected.repo_root),
             "background_tasks": background,
-            "software_audit": deepcopy(state.software_audit),
+            "software_audit": audit,
             "workflow": deepcopy(state.workflow),
             "package_execution": {
                 "status": execution.get("status"),
@@ -3852,6 +3896,7 @@ def _live_run_status(selected: Engine) -> dict[str, Any]:
         }
     return {
         **selected.get_run_status(),
+        "software_audit": audit,
         "background_tasks": background,
     }
 
@@ -3861,9 +3906,15 @@ def _live_run_status(selected: Engine) -> dict[str, Any]:
         title="Get run status", read_only_hint=True, open_world_hint=False
     )
 )
-def get_run_status(repo_root: str | None = None) -> dict[str, Any]:
-    """Return the current phase, branch, and counts for one checkout."""
-    return _run("get_run_status", repo_root=repo_root)
+def get_run_status(
+    repo_root: str | None = None, include_audit_details: bool = False
+) -> dict[str, Any]:
+    """Return phase, branch and counts; audit prompt/receipts only on explicit recovery."""
+    return _run(
+        "get_run_status",
+        repo_root=repo_root,
+        include_audit_details=include_audit_details,
+    )
 
 
 def main() -> None:
