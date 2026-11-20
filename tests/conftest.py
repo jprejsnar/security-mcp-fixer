@@ -15,6 +15,14 @@ def no_interactive_approval_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_progress_mirror(tmp_path_factory, monkeypatch):
+    """Keep editor progress mirrors out of the developer's real home directory."""
+    directory = tmp_path_factory.mktemp("progress-mirror")
+    monkeypatch.setenv("GITLAB_SECURITY_PROGRESS_DIR", str(directory))
+    return directory
+
+
+@pytest.fixture(autouse=True)
 def corporate_dns(monkeypatch):
     """Keep corporate DNS deterministic and offline unless a test overrides it."""
     from unittest.mock import Mock

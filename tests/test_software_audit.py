@@ -585,6 +585,31 @@ def test_repeated_audit_polls_do_not_resend_saved_receipts(
     assert engine.state.software_audit == saved
 
 
+def test_first_audit_handoff_keeps_the_prompt_its_message_references(
+    tmp_path, monkeypatch
+):
+    """Compaction must not strip audit_prompt/coverage while the message still cites them."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    (engine.repo_root / "app.java").write_text("class App {}", encoding="utf-8")
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+    asyncio.run(
+        server.choose_software_audit_action(
+            _context(), str(engine.repo_root), choice="generate_report"
+        )
+    )
+
+    # Act
+    audit = server.get_run_status(str(engine.repo_root))["software_audit"]
+
+    # Assert
+    assert audit["status"] == "GENERATE_AUDIT_REPORT"
+    assert "Follow audit_prompt exactly" in audit["message"]
+    assert "## Evidence required before a finding" in audit["audit_prompt"]
+    assert audit["coverage"]["files"] == ["app.java"]
+
+
 def test_progress_draft_is_persisted_but_cannot_be_accepted_as_a_finished_report(
     tmp_path, monkeypatch
 ):
@@ -1786,3 +1811,24 @@ def test_mixed_selection_returns_approved_source_work_before_the_audit(
     assert result["selected_ids"] == ["source"]
     assert [item["id"] for item in result["findings"]] == ["source"]
     assert engine.state.software_audit == {}
+
+
+def test_repeated_persistence_of_one_batch_adds_one_progress_section(tmp_path):
+    """Server and editor hooks persist the same batch; the AI-read draft must not repeat it."""
+    # Arrange
+    from gitlab_security_mcp.software_audit import persist_audit_draft
+
+    report = tmp_path / "project_2026-11-20T000000Z_software_audit_report.md"
+    coverage = {"files": ["a.py", "b.py"], "reviews": {"a.py": {}}}
+
+    # Act
+    for _ in range(3):
+        persist_audit_draft(report, tmp_path, coverage, {"message": "Batch 1"})
+    coverage["reviews"]["b.py"] = {}
+    persist_audit_draft(report, tmp_path, coverage, {"message": "Batch 2"})
+
+    # Assert
+    text = report.read_text(encoding="utf-8")
+    assert text.count("## Review progress") == 2
+    assert "## Review progress: 2/2 files" in text
+    assert text.count("Activity: Batch 1") == 1

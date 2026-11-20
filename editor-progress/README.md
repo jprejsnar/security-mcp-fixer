@@ -1,8 +1,13 @@
 # GitLab Security Progress
 
 Install the supplied VSIX in **each** editor (VS Code and Cursor) using
-**Extensions: Install from VSIX**. Use MCP server 1.0.47 or newer and open the
-audited repository as a workspace folder.
+**Extensions: Install from VSIX**. Use MCP server 1.0.47 or newer.
+
+The server writes `.security-mcp/progress.json` in the audited checkout and a
+mirror under `~/.cache/gitlab-security-mcp/progress/` (override with
+`GITLAB_SECURITY_PROGRESS_DIR`). The extension reads both, so the graphical bar
+appears even when the audited repository is not an open workspace folder.
+Mirrors older than 12 hours are ignored.
 
 Version 1.0.48 displays a persistent **GitLab Security Progress** editor tab
 with a graphical progress bar, exact counts/percentage, current activity and

@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { parseSnapshot, taskText } = require("../progress-model");
-const { activate, createPresenter } = require("../extension");
+const { activate, createPresenter, newestPerRepository } = require("../extension");
 
 function snapshot(overrides = {}) {
   return {
@@ -246,3 +246,87 @@ for (const trusted of [true, false]) {
     for (const subscription of context.subscriptions) subscription.dispose();
   });
 }
+
+test("a run in a checkout that is not open still shows the graphical bar", async () => {
+  // Arrange
+  const ui = harness();
+  const disposable = { dispose() {} };
+  const uri = name => ({ name, toString: () => `file:///mirror/${name}` });
+  ui.vscode.FileType = { File: 1 };
+  ui.vscode.Uri = { file: () => uri(""), joinPath: (_base, name) => uri(name) };
+  ui.vscode.commands = { registerCommand: () => disposable };
+  ui.vscode.workspace = {
+    workspaceFolders: [],
+    getWorkspaceFolder: () => undefined,
+    findFiles: async () => [],
+    createFileSystemWatcher: () => ({
+      ...disposable, onDidCreate: () => disposable,
+      onDidChange: () => disposable, onDidDelete: () => disposable
+    }),
+    fs: {
+      readDirectory: async () => [["run.json", 1], ["notes.txt", 1]],
+      stat: async () => ({ size: 1000 }),
+      readFile: async () => Buffer.from(JSON.stringify(snapshot()))
+    }
+  };
+  const context = { subscriptions: [] };
+
+  // Act
+  await activate(context, ui.vscode);
+
+  // Assert
+  assert.match(ui.bars.at(-1).text, /50%.*Waiting for AI/);
+  assert.equal(ui.panels.length, 1);
+  for (const subscription of context.subscriptions) subscription.dispose();
+});
+
+test("workspace and mirror copies of one run are shown once, and old mirrors are ignored", () => {
+  // Arrange
+  const now = Date.parse("2026-11-20T12:00:00Z");
+  const older = { repo_root: "C:\\Repo", updated_at: "2026-11-20T11:00:00Z", tasks: [] };
+  const newer = { repo_root: "c:\\repo", updated_at: "2026-11-20T11:59:00Z", tasks: [] };
+  const abandoned = { repo_root: "C:\\Other", updated_at: "2026-11-18T00:00:00Z", tasks: [] };
+
+  // Act
+  const shown = newestPerRepository([
+    { snapshot: older, mirror: false },
+    { snapshot: newer, mirror: true },
+    { snapshot: abandoned, mirror: true }
+  ], now);
+
+  // Assert
+  assert.deepEqual(shown, [newer]);
+});
+
+test("stale mirror files are not reread on every poll", async () => {
+  // Arrange
+  const ui = harness();
+  let reads = 0;
+  const disposable = { dispose() {} };
+  const uri = name => ({ name, toString: () => `file:///mirror/${name}` });
+  ui.vscode.FileType = { File: 1 };
+  ui.vscode.Uri = { file: () => uri(""), joinPath: (_base, name) => uri(name) };
+  ui.vscode.commands = { registerCommand: () => disposable };
+  ui.vscode.workspace = {
+    workspaceFolders: [],
+    getWorkspaceFolder: () => undefined,
+    findFiles: async () => [],
+    createFileSystemWatcher: () => ({
+      ...disposable, onDidCreate: () => disposable,
+      onDidChange: () => disposable, onDidDelete: () => disposable
+    }),
+    fs: {
+      readDirectory: async () => [["old.json", 1]],
+      stat: async () => ({ size: 1000, mtime: Date.now() - 13 * 60 * 60 * 1000 }),
+      readFile: async () => { reads++; return Buffer.from(JSON.stringify(snapshot())); }
+    }
+  };
+  const context = { subscriptions: [] };
+
+  // Act
+  await activate(context, ui.vscode);
+
+  // Assert
+  assert.equal(reads, 0);
+  for (const subscription of context.subscriptions) subscription.dispose();
+});

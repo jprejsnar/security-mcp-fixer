@@ -261,3 +261,32 @@ def test_continuation_turns_are_capped_independent_of_repository_size(audit):
 
     # Assert
     assert turns == audit_host._MAX_CONTINUATIONS < len(files)
+
+
+@pytest.mark.parametrize("host", ["cursor", "copilot", "vscode-local"])
+def test_host_differences_come_only_from_its_profile(audit, host):
+    """Shared continuation logic is host-agnostic; each profile supplies the native shape."""
+    # Arrange
+    from gitlab_security_mcp.audit_host import _MAX_CONTINUATIONS, HOSTS, _continuation
+
+    _, _, report, payload = audit
+    root = Path(payload["cwd"]).resolve()
+    handle_event(host, "post", payload)
+    profile = HOSTS[host]
+
+    # Act
+    reply = handle_event(host, "stop", payload)
+
+    # Assert
+    message = _continuation(root, report)
+    assert reply == profile.reply(message)
+    assert "choose_software_audit_action" in message
+    for rule in (
+        "run prechecks or create another run",
+        "generator configuration and exclude all generated outputs",
+        "finish every file/phase",
+        "fix only checked items",
+        "Do not commit or push",
+    ):
+        assert rule in message
+    assert profile.max_turns <= _MAX_CONTINUATIONS

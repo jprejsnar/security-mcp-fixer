@@ -1,6 +1,29 @@
 "use strict";
 
+const os = require("os");
+const path = require("path");
 const { activeStates, parseSnapshot, taskText } = require("./progress-model");
+
+// Mirrors let the GUI follow a run whose checkout is not an open workspace folder.
+const MIRROR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+function mirrorDirectory() {
+  return process.env.GITLAB_SECURITY_PROGRESS_DIR ||
+    path.join(os.homedir(), ".cache", "gitlab-security-mcp", "progress");
+}
+
+function newestPerRepository(snapshots, now = Date.now()) {
+  const newest = new Map();
+  for (const { snapshot, mirror } of snapshots) {
+    if (mirror && now - Date.parse(snapshot.updated_at) > MIRROR_MAX_AGE_MS) continue;
+    const key = (snapshot.repo_root || "").toLowerCase();
+    const previous = newest.get(key);
+    if (!previous || Date.parse(snapshot.updated_at) > Date.parse(previous.updated_at)) {
+      newest.set(key, snapshot);
+    }
+  }
+  return [...newest.values()];
+}
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, character => ({
@@ -168,14 +191,21 @@ async function activate(context, vscode = require("vscode")) {
   const presenter = createPresenter(vscode);
   const snapshots = new Map();
   const known = new Map();
+  const mirrors = new Set();
   const failures = new Set();
   const displayedReports = new Set();
-  const render = () => presenter.update([...snapshots.values()]);
+  const render = () => presenter.update(newestPerRepository(
+    [...snapshots].map(([key, snapshot]) => ({ snapshot, mirror: mirrors.has(key) }))
+  ));
 
   async function refresh(uri) {
     known.set(uri.toString(), uri);
     try {
       const stat = await vscode.workspace.fs.stat(uri);
+      if (mirrors.has(uri.toString()) && Date.now() - stat.mtime > MIRROR_MAX_AGE_MS) {
+        snapshots.delete(uri.toString());
+        return;
+      }
       if (stat.size > 256 * 1024) throw new Error("Progress snapshot exceeds 256 KiB.");
       const bytes = await vscode.workspace.fs.readFile(uri);
       const next = parseSnapshot(Buffer.from(bytes).toString("utf8"));
@@ -218,10 +248,21 @@ async function activate(context, vscode = require("vscode")) {
       known.set(uri.toString(), uri);
     }
     for (const [key, uri] of known) {
-      if (!vscode.workspace.getWorkspaceFolder(uri)) {
+      if (!mirrors.has(key) && !vscode.workspace.getWorkspaceFolder(uri)) {
         known.delete(key);
         snapshots.delete(key);
       }
+    }
+    try {
+      const directory = vscode.Uri.file(mirrorDirectory());
+      for (const [name, type] of await vscode.workspace.fs.readDirectory(directory)) {
+        if (type !== vscode.FileType.File || !name.endsWith(".json")) continue;
+        const uri = vscode.Uri.joinPath(directory, name);
+        mirrors.add(uri.toString());
+        known.set(uri.toString(), uri);
+      }
+    } catch {
+      // No mirror directory yet means no run has published outside a workspace.
     }
     await Promise.all([...known.values()].map(refresh));
     render();
@@ -249,4 +290,4 @@ async function activate(context, vscode = require("vscode")) {
   await poll();
 }
 
-module.exports = { activate, createPresenter };
+module.exports = { activate, createPresenter, newestPerRepository };

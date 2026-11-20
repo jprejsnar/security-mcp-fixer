@@ -85,3 +85,24 @@ def test_final_workflow_receipt_survives_more_than_ten_finished_tool_calls(tmp_p
         ]
         == task["started_at"]
     )
+
+
+def test_progress_is_mirrored_for_editors_that_did_not_open_the_checkout(
+    tmp_path, isolated_progress_mirror
+):
+    """The GUI must find a run even when the audited checkout is not a workspace folder."""
+    # Arrange
+    first, second = tmp_path / "one", tmp_path / "two"
+
+    # Act
+    progress.publish(first, "audit", "Audit", "Reading", completed=1, total=4)
+    progress.publish(second, "audit", "Audit", "Reading")
+
+    # Assert
+    local = (first / ".security-mcp" / "progress.json").read_text(encoding="utf-8")
+    mirrored = progress.mirror_path(first)
+    assert mirrored.parent == isolated_progress_mirror
+    assert mirrored.read_text(encoding="utf-8") == local
+    assert json.loads(local)["repo_root"] == str(first)
+    assert progress.mirror_path(second) != mirrored
+    assert len(list(isolated_progress_mirror.glob("*.json"))) == 2

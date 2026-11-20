@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -14,6 +15,20 @@ from gitlab_security_mcp.util import atomic_write_text, environment_secrets, red
 _lock = threading.Lock()
 _tasks: dict[Path, dict[str, dict]] = {}
 ACTIVE = {"RUNNING", "WAITING_FOR_HUMAN", "WAITING_FOR_AI"}
+
+
+def mirror_directory() -> Path:
+    """Return the per-user folder the editor reads when the checkout is not open."""
+    override = os.environ.get("GITLAB_SECURITY_PROGRESS_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".cache" / "gitlab-security-mcp" / "progress"
+
+
+def mirror_path(root: Path) -> Path:
+    """Name each checkout's mirror by a stable hash of its normalized path."""
+    key = hashlib.sha256(os.path.normcase(str(root)).encode()).hexdigest()[:32]
+    return mirror_directory() / f"{key}.json"
 
 
 def publish(
@@ -61,18 +76,19 @@ def publish(
         )
         for key in finished[:-10]:
             del tasks[key]
+        text = json.dumps(
+            {
+                "server_version": __version__,
+                "pid": os.getpid(),
+                "repo_root": str(root),
+                "updated_at": now,
+                "tasks": list(tasks.values()),
+            },
+            ensure_ascii=False,
+        )
         path = root / ".security-mcp" / "progress.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
-            path,
-            json.dumps(
-                {
-                    "server_version": __version__,
-                    "pid": os.getpid(),
-                    "repo_root": str(root),
-                    "updated_at": now,
-                    "tasks": list(tasks.values()),
-                },
-                ensure_ascii=False,
-            ),
-        )
+        atomic_write_text(path, text)
+        mirror = mirror_path(root)
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(mirror, text)

@@ -3032,6 +3032,9 @@ def _audit_project_name(engine: Engine) -> str:
 
 def _compact_audit(audit: dict[str, Any]) -> dict[str, Any]:
     """Summarize saved audit state; resending its prompt and receipts multiplies AI tokens."""
+    if audit.get("status") == "GENERATE_AUDIT_REPORT":
+        # Its message tells the host to follow audit_prompt and coverage.files.
+        return deepcopy(audit)
     compact = {
         key: deepcopy(value)
         for key, value in audit.items()

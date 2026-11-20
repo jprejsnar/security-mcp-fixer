@@ -152,10 +152,24 @@ def persist_audit_draft(
         atomic_write_text(report, initial, exclusive=True)
     except FileExistsError:
         with report.open(encoding="utf-8") as stream:
-            if not audit_report_is_draft(stream.readline()):
-                return
+            text = stream.read()
+        if not audit_report_is_draft(text):
+            return
+        # The server and both editor hooks persist the same batch; the AI rereads this file.
+        if _progress_body(text) == _progress_body(receipt):
+            return
         with report.open("a", encoding="utf-8", newline="") as stream:
             stream.write(receipt)
+
+
+def _progress_body(text: str) -> list[str]:
+    """Return the last progress section's counts, activity and phases, not timestamp."""
+    section = text.rsplit("\n## Review progress", 1)[-1]
+    return [
+        line
+        for line in section.strip().splitlines()
+        if not line.startswith("- Updated:")
+    ]
 
 
 def _generated_source(path: Path) -> bool:

@@ -8,6 +8,8 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from gitlab_security_mcp.software_audit import (
@@ -25,6 +27,69 @@ _ACTIVE = {
 _PREFIX = "[gitlab-security-mcp audit continuation]"
 # Each continuation is a paid host turn; never scale the cap with repository size.
 _MAX_CONTINUATIONS = 24
+
+
+@dataclass(frozen=True)
+class HostProfile:
+    """Describe one editor's native hook contract; shared logic stays host-agnostic."""
+
+    reply: Callable[[str], dict]
+    max_turns: int = _MAX_CONTINUATIONS
+    requires_completed_status: bool = False
+    hook_file: tuple[str, ...] = ()
+    events: tuple[tuple[str, str], ...] = ()
+    entry: Callable[[str, str], dict] | None = None
+
+
+def _cursor_entry(command: str, event: str) -> dict:
+    """Cursor's stop loop limit must be lifted; the turn cap is enforced here instead."""
+    entry = {"command": command, "timeout": 15}
+    if event == "stop":
+        entry["loop_limit"] = None
+    return entry
+
+
+def _copilot_entry(command: str, _event: str) -> dict:
+    """Copilot selects its shell by key name."""
+    shell = "powershell" if os.name == "nt" else "bash"
+    return {"type": "command", shell: command, "timeoutSec": 15}
+
+
+HOSTS: dict[str, HostProfile] = {
+    "cursor": HostProfile(
+        reply=lambda message: {"followup_message": message},
+        requires_completed_status=True,
+        hook_file=(".cursor", "hooks.json"),
+        events=(
+            ("afterMCPExecution", "post"),
+            ("postToolUseFailure", "failure"),
+            ("beforeSubmitPrompt", "prompt"),
+            ("stop", "stop"),
+        ),
+        entry=_cursor_entry,
+    ),
+    "copilot": HostProfile(
+        reply=lambda message: {"decision": "block", "reason": message},
+        max_turns=8,
+        hook_file=(".copilot", "hooks", "gitlab-security-audit.json"),
+        events=(
+            ("PostToolUse", "post"),
+            ("PostToolUseFailure", "failure"),
+            ("UserPromptSubmit", "prompt"),
+            ("Stop", "stop"),
+        ),
+        entry=_copilot_entry,
+    ),
+    "vscode-local": HostProfile(
+        reply=lambda message: {
+            "hookSpecificOutput": {
+                "hookEventName": "Stop",
+                "decision": "block",
+                "reason": message,
+            }
+        },
+    ),
+}
 
 
 def _session(payload: dict) -> str | None:
@@ -70,8 +135,42 @@ def _save_binding(path: Path, binding: dict) -> None:
     atomic_write_text(path, json.dumps(binding, indent=2))
 
 
+def _fingerprint(coverage: dict, report_text: str) -> str:
+    """Identify real review progress so a stalled host is not re-prompted."""
+    evidence = {
+        "reviews": {
+            name: item["sha256"] for name, item in coverage.get("reviews", {}).items()
+        },
+        "phases": sorted(coverage.get("completed_phases", [])),
+        "report": None
+        if audit_report_is_draft(report_text)
+        else hashlib.sha256(report_text.encode()).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
+
+def _continuation(root: Path, report: Path) -> str:
+    """Return the per-turn instruction resent on every continuation."""
+    return (
+        f"{_PREFIX} Continue the EXISTING approved audit; do not ask the developer "
+        "to type continue. First call choose_software_audit_action with repo_root="
+        f"{json.dumps(str(root))} only, and follow its live in-memory handoff. "
+        "Saved JSON is not authorization. Do not restart MCP, run prechecks or "
+        "create another run. Preserve existing receipts and review only remaining "
+        "non-generated first-party inputs. Inspect each project's generator "
+        "configuration and exclude all generated outputs before implementation review. "
+        f"Write actual audit findings incrementally to {json.dumps(str(report))}; "
+        "replace the marked INCOMPLETE draft, finish every file/phase, then call "
+        "report_ready=True to open the real unchecked findings window. "
+        "Do not change source, tests, dependencies or configuration before human "
+        "fix selection. Once the developer selects, follow that live MCP handoff "
+        "and fix only checked items. Do not commit or push."
+    )
+
+
 def handle_event(host: str, event: str, payload: dict) -> dict:
     """Continue only an audit observed on this session's own live MCP tool call."""
+    profile = HOSTS[host]
     owner = _session(payload)
     if not owner or payload.get("agent_id") or payload.get("agentId"):
         return {}
@@ -129,7 +228,8 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
         return {}
     if event != "stop" or not owned or not binding.get("active") or not pending:
         return {}
-    if (host == "cursor" and payload.get("status") != "completed") or payload.get(
+    completed = payload.get("status") == "completed"
+    if (profile.requires_completed_status and not completed) or payload.get(
         "stop_reason", payload.get("stopReason", "end_turn")
     ) != "end_turn":
         _save_binding(path, {**binding, "active": False})
@@ -139,87 +239,37 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
     report = Path(audit["output_path"])
     coverage = audit.get("coverage") or {}
     persist_audit_draft(report, root, coverage, audit.get("progress"))
-    text = report.read_text(encoding="utf-8")
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {
-                "reviews": {
-                    name: item["sha256"]
-                    for name, item in coverage.get("reviews", {}).items()
-                },
-                "phases": sorted(coverage.get("completed_phases", [])),
-                "report": None
-                if audit_report_is_draft(text)
-                else hashlib.sha256(text.encode()).hexdigest(),
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
+    fingerprint = _fingerprint(coverage, report.read_text(encoding="utf-8"))
     attempts = binding.get("attempts", 0)
     if fingerprint == binding.get("fingerprint"):
         raise RuntimeError(
             "Audit continuation stopped: no new review receipts, phases or report content. The audit is incomplete; inspect the host blocker instead of repeatedly asking to continue."
         )
-    if attempts >= _MAX_CONTINUATIONS or (host == "copilot" and attempts >= 8):
+    if attempts >= profile.max_turns:
         raise RuntimeError(
             "Audit continuation reached the editor's safe turn budget. The report remains incomplete; host limits must not be bypassed."
         )
     _save_binding(
         path, {**binding, "fingerprint": fingerprint, "attempts": attempts + 1}
     )
-    message = (
-        f"{_PREFIX} Continue the EXISTING approved audit; do not ask the developer "
-        "to type continue. First call choose_software_audit_action with repo_root="
-        f"{json.dumps(str(root))} only, and follow its live in-memory handoff. "
-        "Saved JSON is not authorization. Do not restart MCP, run prechecks or "
-        "create another run. Preserve existing receipts and review only remaining "
-        "non-generated first-party inputs. Inspect each project's generator "
-        "configuration and exclude all generated outputs before implementation review. "
-        f"Write actual audit findings incrementally to {json.dumps(str(report))}; "
-        "replace the marked INCOMPLETE draft, finish every file/phase, then call "
-        "report_ready=True to open the real unchecked findings window. "
-        "Do not change source, tests, dependencies or configuration before human "
-        "fix selection. Once the developer selects, follow that live MCP handoff "
-        "and fix only checked items. Do not commit or push."
-    )
-    if host == "cursor":
-        return {"followup_message": message}
-    if host == "vscode-local":
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "Stop",
-                "decision": "block",
-                "reason": message,
-            }
-        }
-    return {"decision": "block", "reason": message}
+    return profile.reply(_continuation(root, report))
+
+
+def _hook_command(python: Path, host: str, event: str) -> str:
+    """Quote the interpreter for the platform shell each editor uses."""
+    args = ["-m", "gitlab_security_mcp.audit_host", "--host", host, "--event", event]
+    if os.name == "nt":
+        return "& '" + str(python).replace("'", "''") + "' " + " ".join(args)
+    return shlex.join([str(python), *args])
 
 
 def install_hooks(home: Path, python: Path) -> list[Path]:
     """Merge dedicated user hooks without replacing existing editor hooks."""
     written = []
-    for host, path, events in (
-        (
-            "cursor",
-            home / ".cursor" / "hooks.json",
-            {
-                "afterMCPExecution": "post",
-                "postToolUseFailure": "failure",
-                "beforeSubmitPrompt": "prompt",
-                "stop": "stop",
-            },
-        ),
-        (
-            "copilot",
-            home / ".copilot" / "hooks" / "gitlab-security-audit.json",
-            {
-                "PostToolUse": "post",
-                "PostToolUseFailure": "failure",
-                "UserPromptSubmit": "prompt",
-                "Stop": "stop",
-            },
-        ),
-    ):
+    for host, profile in HOSTS.items():
+        if profile.entry is None:
+            continue
+        path = home.joinpath(*profile.hook_file)
         config = (
             json_object(path.read_text(encoding="utf-8"))
             if path.exists()
@@ -230,32 +280,7 @@ def install_hooks(home: Path, python: Path) -> list[Path]:
         hooks = config.setdefault("hooks", {})
         if not isinstance(hooks, dict):
             raise ValueError(f"Invalid hooks object: {path}")
-        for name, event in events.items():
-            args = [
-                str(python),
-                "-m",
-                "gitlab_security_mcp.audit_host",
-                "--host",
-                host,
-                "--event",
-                event,
-            ]
-            command = (
-                "& '" + str(python).replace("'", "''") + "' " + " ".join(args[1:])
-                if os.name == "nt"
-                else shlex.join(args)
-            )
-            entry = (
-                {"command": command, "timeout": 15}
-                if host == "cursor"
-                else {
-                    "type": "command",
-                    "powershell" if os.name == "nt" else "bash": command,
-                    "timeoutSec": 15,
-                }
-            )
-            if host == "cursor" and event == "stop":
-                entry["loop_limit"] = None
+        for name, event in profile.events:
             previous = hooks.setdefault(name, [])
             if not isinstance(previous, list):
                 raise ValueError(f"Invalid hook event list {name}: {path}")
@@ -263,7 +288,7 @@ def install_hooks(home: Path, python: Path) -> list[Path]:
                 item
                 for item in previous
                 if "gitlab_security_mcp.audit_host" not in json.dumps(item)
-            ] + [entry]
+            ] + [profile.entry(_hook_command(python, host, event), event)]
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path, json.dumps(config, indent=2) + "\n")
         written.append(path)
@@ -274,7 +299,7 @@ def main() -> None:
     """Read one native hook payload or install the opt-in editor integration."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--install", action="store_true")
-    parser.add_argument("--host", choices=("cursor", "copilot", "vscode-local"))
+    parser.add_argument("--host", choices=tuple(HOSTS))
     parser.add_argument("--event", choices=("post", "prompt", "stop", "failure"))
     args = parser.parse_args()
     try:
