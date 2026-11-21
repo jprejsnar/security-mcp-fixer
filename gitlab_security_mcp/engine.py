@@ -108,6 +108,7 @@ from gitlab_security_mcp.versions import (
     parse_fixed_versions,
     parse_version,
 )
+from gitlab_security_mcp.workflow import JOB_PACKAGES, JOB_SOURCE
 
 _RAISE_REPO_ROOT_CONTAINS_AN_UNRESOLVED_HOST_PLACEHOLDER_SET = "REPO_ROOT contains an unresolved host placeholder. Set REPO_ROOT to the absolute application checkout path, or call run_prechecks(repo_root=<absolute checkout path>). Restart the MCP server after changing its configuration."
 _RAISE_REPOSITORY_DIRECTORY_DOES_NOT_EXIST_SET_REPO_ROOT = "Repository directory does not exist: {}. Set REPO_ROOT or call run_prechecks(repo_root=<absolute checkout path>)."
@@ -1089,7 +1090,7 @@ class Engine:
         if self.state.status not in AFTER_BRANCH:
             return {"status": "ERROR", "reason": "Verify findings in this run first"}
         job = self.state.workflow.get("current")
-        if self.state.changes and job != 5:
+        if self.state.changes and job != JOB_SOURCE:
             return {
                 "status": "SELECTION_LOCKED",
                 "reason": "Edits already exist. Validate this authorized batch before starting a fresh clean run.",
@@ -1097,7 +1098,7 @@ class Engine:
         candidates = []
         for finding in self.state.findings:
             package = "package_update" in self._fix_identity(finding)
-            if (job == 3 and not package) or (job == 5 and package):
+            if (job == JOB_PACKAGES and not package) or (job == JOB_SOURCE and package):
                 continue
             assessment = self.state.decisions.get(finding["id"]) or {}
             if assessment.get("decision") not in {
@@ -1380,7 +1381,7 @@ class Engine:
             }
         approved = selection.get("approved_findings") or {}
         if operation == "run_validation_matrix":
-            if self.state.workflow.get("current") == 5:
+            if self.state.workflow.get("current") == JOB_SOURCE:
                 approved = {
                     **self.state.workflow.get("package_selection", {}).get(
                         "approved_findings", {}

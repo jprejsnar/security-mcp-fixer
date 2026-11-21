@@ -9,6 +9,7 @@ from gitlab_security_mcp.gitlab_client import dismissal_is_confirmed
 from gitlab_security_mcp.source_findings import pending_source_reviews
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import atomic_write_text
+from gitlab_security_mcp.workflow import JOB_REPORT
 
 
 def _table_cell(value: object) -> str:
@@ -337,7 +338,7 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
             )
     lines.extend(["", "## Workflow jobs"])
     for job in state.workflow.get("jobs", []):
-        status = "FINISHED" if job["number"] == 7 else job["status"]
+        status = "FINISHED" if job["number"] == JOB_REPORT else job["status"]
         lines.append(f"- {job['number']}. {job['label']}: {status}")
     if state.workflow.get("blocked"):
         lines.extend(["", f"Run blocker: {_table_cell(state.workflow['blocked'])}"])

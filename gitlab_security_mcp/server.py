@@ -71,6 +71,16 @@ from gitlab_security_mcp.util import (
     redact,
 )
 from gitlab_security_mcp.versions import is_major_upgrade
+from gitlab_security_mcp.workflow import (
+    JOB_AUDIT,
+    JOB_COUNT,
+    JOB_DOWNLOAD,
+    JOB_FALSE_POSITIVES,
+    JOB_PACKAGES,
+    JOB_PRECHECKS,
+    JOB_REPORT,
+    JOB_SOURCE,
+)
 
 _RAISE_UNEXPECTED_WORKFLOW_JOB = "Unexpected workflow job"
 _RAISE_THE_HUMAN_FIX_SELECTION_RESPONSE_DOES_NOT_MATCH = (
@@ -883,7 +893,7 @@ async def _progress_middleware(
             _editor_progress(
                 Path(root).expanduser().resolve(),
                 editor_task,
-                "Job 1/7: Pre-checks",
+                f"Job {JOB_PRECHECKS}/{JOB_COUNT}: Pre-checks",
                 text,
                 status=status,
             )
@@ -1091,15 +1101,15 @@ def _run(
         if tool_name == "get_run_status":
             return _live_run_status(selected, **kwargs)
         stages = {
-            "pull_main_twice": (1,),
-            "create_security_branch": (1,),
-            "list_security_findings": (2,),
-            "verify_security_finding": (3, 4),
-            "select_package_version": (3,),
-            "qualify_package_update": (3,),
-            "apply_minimal_fix": (3, 5),
-            "generate_aaa_test": (5,),
-            "run_validation_matrix": (3, 5),
+            "pull_main_twice": (JOB_PRECHECKS,),
+            "create_security_branch": (JOB_PRECHECKS,),
+            "list_security_findings": (JOB_DOWNLOAD,),
+            "verify_security_finding": (JOB_PACKAGES, JOB_FALSE_POSITIVES),
+            "select_package_version": (JOB_PACKAGES,),
+            "qualify_package_update": (JOB_PACKAGES,),
+            "apply_minimal_fix": (JOB_PACKAGES, JOB_SOURCE),
+            "generate_aaa_test": (JOB_SOURCE,),
+            "run_validation_matrix": (JOB_PACKAGES, JOB_SOURCE),
         }
         blocked = (
             workflow.require(selected, *stages[tool_name])
@@ -1111,9 +1121,9 @@ def _run(
         if (
             tool_name == "run_prechecks"
             and selected.state.workflow
-            and selected.state.workflow["current"] not in {1, 7}
+            and selected.state.workflow["current"] not in {JOB_PRECHECKS, JOB_REPORT}
         ):
-            return workflow.require(selected, 1, 7)
+            return workflow.require(selected, JOB_PRECHECKS, JOB_REPORT)
         if tool_name in {
             "qualify_package_update",
             "apply_minimal_fix",
@@ -1642,10 +1652,10 @@ async def _open_fix_selection(
         dialog = await desktop_approval.open_dialog(
             f"Repository: {selected.repo_root}\r\n"
             + (
-                "Job 3/7 - PACKAGE UPDATES ONLY (frontend and backend). Source fixes have a separate later selection.\r\n"
-                if selected.state.workflow.get("current") == 3
-                else "Job 5/7 - SOURCE/CONFIG FIXES ONLY. Package selection and false-positive review are finished.\r\n"
-                if selected.state.workflow.get("current") == 5
+                f"Job {JOB_PACKAGES}/{JOB_COUNT} - PACKAGE UPDATES ONLY (frontend and backend). Source fixes have a separate later selection.\r\n"
+                if selected.state.workflow.get("current") == JOB_PACKAGES
+                else f"Job {JOB_SOURCE}/{JOB_COUNT} - SOURCE/CONFIG FIXES ONLY. Package selection and false-positive review are finished.\r\n"
+                if selected.state.workflow.get("current") == JOB_SOURCE
                 else ""
             )
             + "Select only the package updates or scoped code fixes you authorize. All boxes start unchecked. "
@@ -1657,9 +1667,9 @@ async def _open_fix_selection(
             properties,
             title=(
                 "GitLab security: choose package updates"
-                if selected.state.workflow.get("current") == 3
+                if selected.state.workflow.get("current") == JOB_PACKAGES
                 else "GitLab security: choose source fixes"
-                if selected.state.workflow.get("current") == 5
+                if selected.state.workflow.get("current") == JOB_SOURCE
                 else "GitLab security: choose updates and code fixes"
             ),
             detail_header="Proposed change and decision details",
@@ -1754,11 +1764,11 @@ async def select_security_fixes(
 ) -> dict[str, Any] | InputRequiredResult:
     """Unchecked human GUI: job 3 packages, job 5 source. package_reviews[id] uses workflow evidence; blocked_reason disables unsafe updates."""
     selected = await asyncio.to_thread(_engine_for, repo_root)
-    blocked = workflow.require(selected, 3, 5)
+    blocked = workflow.require(selected, JOB_PACKAGES, JOB_SOURCE)
     if blocked:
         return blocked
     job = selected.state.workflow.get("current")
-    if job == 3:
+    if job == JOB_PACKAGES:
         missing = [
             item["id"]
             for item in selected.state.findings
@@ -1810,7 +1820,7 @@ async def select_security_fixes(
         )
         if prepared["status"] != "READY":
             return prepared
-        if job == 3:
+        if job == JOB_PACKAGES:
             selected.state.workflow["package_reviews"] = deepcopy(prepared["reviews"])
             selected._remember()
         if prepared.get("all_blocked"):
@@ -1844,10 +1854,10 @@ async def select_security_fixes(
         response = await _fix_form_response(
             ctx,
             (
-                "Job 3/7: Select frontend/backend PACKAGE UPDATES only. Source choices come after false-positive review. "
-                if job == 3
-                else "Job 5/7: Select GitLab SOURCE/CONFIG fixes only. Package updates and false-positive review are finished. "
-                if job == 5
+                f"Job {JOB_PACKAGES}/{JOB_COUNT}: Select frontend/backend PACKAGE UPDATES only. Source choices come after false-positive review. "
+                if job == JOB_PACKAGES
+                else f"Job {JOB_SOURCE}/{JOB_COUNT}: Select GitLab SOURCE/CONFIG fixes only. Package updates and false-positive review are finished. "
+                if job == JOB_SOURCE
                 else ""
             )
             + f"Choose which security issues may be fixed in {selected.repo_root}. "
@@ -2080,7 +2090,7 @@ async def submit_false_positive_approvals(
     Completion calls once; reopen only on explicit human request after cancellation.
     """
     selected = await asyncio.to_thread(_engine_for, repo_root)
-    blocked = workflow.require(selected, 4)
+    blocked = workflow.require(selected, JOB_FALSE_POSITIVES)
     if blocked:
         return blocked
     previous = selected.state.false_positive_approval_form
@@ -2349,7 +2359,7 @@ class CodeFixResult(BaseModel):
 def _record_code_results(selected: Engine, results: list[dict] | None) -> dict | None:
     """Require a result for each approved host-led fix before leaving its job."""
     state = selected.state
-    audit = state.workflow["current"] == 6
+    audit = state.workflow["current"] == JOB_AUDIT
     ids = (
         [item["id"] for item in state.software_audit.get("selected_items", [])]
         if audit
@@ -2440,7 +2450,7 @@ async def _continue_workflow(
     if progress is not None:
         if (
             code_results is not None
-            or job not in {5, 6}
+            or job not in {JOB_SOURCE, JOB_AUDIT}
             or not isinstance(progress.get("message"), str)
             or not progress["message"].strip()
         ):
@@ -2450,7 +2460,7 @@ async def _continue_workflow(
             }
         ids = (
             [item["id"] for item in state.software_audit.get("selected_items", [])]
-            if job == 6
+            if job == JOB_AUDIT
             else state.fix_selection.get("selected_ids", [])
         )
         if progress.get("id") not in ids:
@@ -2463,14 +2473,14 @@ async def _continue_workflow(
             f"{progress['id']}: {progress['message']}",
             status="WAITING_FOR_AI",
         )
-        if job == 6:
+        if job == JOB_AUDIT:
             state.software_audit["fix_progress"] = {
                 "message": f"{progress['id']}: {progress['message']}",
                 "updated_at": datetime.now(UTC).isoformat(),
             }
             selected._remember()
         return {"status": "CODE_FIX_IN_PROGRESS", "current_job": job}
-    if code_results is not None and job not in {5, 6}:
+    if code_results is not None and job not in {JOB_SOURCE, JOB_AUDIT}:
         return {
             "status": "ERROR",
             "reason": "Code outcomes require the selected source or audit-fix job.",
@@ -2484,20 +2494,20 @@ async def _continue_workflow(
         )
     if state.workflow.get("blocked"):
         first = state.workflow["current"]
-        while state.workflow["current"] < 7:
+        while state.workflow["current"] < JOB_COUNT:
             workflow.advance(
                 selected,
                 status="FAILED" if state.workflow["current"] == first else "SKIPPED",
                 message=state.workflow["blocked"],
             )
-        job = 7
-    if job in {1, 2}:
+        job = JOB_REPORT
+    if job in {JOB_PRECHECKS, JOB_DOWNLOAD}:
         return {
             "status": "JOB_ORDER_REQUIRED",
             "current_job": job,
             "message": "Finish pre-checks/branch preparation, then download GitLab findings.",
         }
-    if job == 3:
+    if job == JOB_PACKAGES:
         selection = state.fix_selection
         if not selection or selection.get("status") in {"REQUESTED", "AWAITING_HUMAN"}:
             return {
@@ -2537,8 +2547,8 @@ async def _continue_workflow(
             selected,
             message="Package job finished; unresolved updates remain in the final report.",
         )
-        job = 4
-    if job == 4:
+        job = JOB_FALSE_POSITIVES
+    if job == JOB_FALSE_POSITIVES:
         missing = [
             item["id"]
             for item in state.findings
@@ -2566,8 +2576,8 @@ async def _continue_workflow(
             selected,
             message="False-positive review finished; only human-checked findings were submitted.",
         )
-        job = 5
-    if job == 5:
+        job = JOB_SOURCE
+    if job == JOB_SOURCE:
         if not state.fix_selection:
             return {
                 "status": "SOURCE_SELECTION_REQUIRED",
@@ -2584,8 +2594,8 @@ async def _continue_workflow(
             selected,
             message="Selected GitLab source work finished; asking whether to run the audit.",
         )
-        job = 6
-    if job == 6:
+        job = JOB_AUDIT
+    if job == JOB_AUDIT:
         audit = state.software_audit
         if not audit or audit.get("status") in {
             "REQUESTED",
@@ -2604,7 +2614,7 @@ async def _continue_workflow(
             status="SKIPPED" if not audit.get("output_path") else "FINISHED",
             message="Software audit job finished.",
         )
-    if state.workflow["current"] == 7:
+    if state.workflow["current"] == JOB_REPORT:
         if state.workflow.get("final_report"):
             return deepcopy(state.workflow["final_result"])
         await asyncio.to_thread(selected.generate_local_report)
@@ -2928,7 +2938,7 @@ async def _open_audit_approval(
 async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any]:
     """Request a fresh post-remediation report before offering audit fixes."""
     if selected.state.workflow:
-        blocked = workflow.require(selected, 6)
+        blocked = workflow.require(selected, JOB_AUDIT)
         if blocked:
             return blocked
         previous = selected.state.software_audit
@@ -3692,14 +3702,14 @@ async def choose_software_audit_action(
         return blocked
     if selected.state.workflow:
         job = selected.state.workflow["current"]
-        if job != 6:
+        if job != JOB_AUDIT:
             if (
                 choice is not None
                 or selected_ids is not None
                 or report_ready
                 or progress is not None
             ):
-                return workflow.require(selected, 6) or {"status": "ERROR"}
+                return workflow.require(selected, JOB_AUDIT) or {"status": "ERROR"}
             result = await complete_security_run(ctx, str(selected.repo_root))
             return result.structured_content
     previous = selected.state.software_audit

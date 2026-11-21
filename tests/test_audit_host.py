@@ -219,7 +219,9 @@ def test_install_command_prints_written_hook_paths(tmp_path, monkeypatch, capsys
     lines = captured.out.splitlines()
     assert lines
     assert captured.err == ""
-    assert [Path(line) for line in lines] == install_hooks(tmp_path, Path(sys.executable))
+    assert [Path(line) for line in lines] == install_hooks(
+        tmp_path, Path(sys.executable)
+    )
 
 
 def test_malformed_hook_input_is_reported_instead_of_claiming_success():

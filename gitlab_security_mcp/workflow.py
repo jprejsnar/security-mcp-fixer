@@ -22,6 +22,16 @@ JOB_LABELS = (
     "Optional deep-dive software audit and selected fixes",
     "Display unresolved remediation report",
 )
+(
+    JOB_PRECHECKS,
+    JOB_DOWNLOAD,
+    JOB_PACKAGES,
+    JOB_FALSE_POSITIVES,
+    JOB_SOURCE,
+    JOB_AUDIT,
+    JOB_REPORT,
+) = range(1, len(JOB_LABELS) + 1)
+JOB_COUNT = len(JOB_LABELS)
 
 
 def start(engine: Engine) -> None:
@@ -59,11 +69,11 @@ def activity(engine: Engine, message: str, *, status: str = "RUNNING") -> None:
         publish(
             engine.repo_root,
             "workflow",
-            f"Job {number}/7: {JOB_LABELS[number - 1]}",
+            f"Job {number}/{JOB_COUNT}: {JOB_LABELS[number - 1]}",
             message,
             status=status,
             completed=finished,
-            total=7,
+            total=JOB_COUNT,
             unit="jobs finished",
             jobs=deepcopy(workflow["jobs"]),
             final_report=workflow.get("final_report", False),
@@ -78,7 +88,7 @@ def advance(engine: Engine, *, status: str = "FINISHED", message: str = "") -> N
         workflow = engine.state.workflow
         job = workflow["jobs"][workflow["current"] - 1]
         job.update(status=status, message=message)
-        if workflow["current"] < 7:
+        if workflow["current"] < JOB_COUNT:
             workflow["current"] += 1
             workflow["jobs"][workflow["current"] - 1]["status"] = "RUNNING"
         engine._remember()
