@@ -24,7 +24,7 @@ run gitlab-security on this repo
 This is one chat request, not a terminal command. The workflow runs these
 **seven separate jobs, one at a time**:
 
-1. **Pre-checks**, including safe main/branch preparation.
+1. **Pre-checks**, including safe preparation of `main` or today's `security-fixes-YYYY-MM-DD` branch.
 2. **Download security findings from GitLab.**
 3. **Package updates:** unchecked GUI choices for frontend/backend packages,
    followed by only the approved updates and their validation.
@@ -650,7 +650,7 @@ What each job still does:
 - **Job 1.** `run_prechecks` requires a Git checkout on `main` or today's exact
   security branch, a clean tree, no merge or rebase, and corporate DNS.
   `pull_main_twice` runs `git pull --ff-only` twice. `create_security_branch`
-  creates `security-fixes-Month-dd-YYYY` or reuses that exact name after log
+  creates `security-fixes-YYYY-MM-DD` or reuses that exact name after log
   review and guarded cleanup. `PRECHECK_FAILED`, `PULL_FAILED`,
   `PREPARATION_FAILED`, and `BRANCH_CREATION_FAILED` set the job blocked. The
   failing tool stops there. The next `complete_security_run` marks that job
@@ -703,7 +703,8 @@ What each job still does:
   `SKIPPED`, and starts job 7.
   `CONSENT_UNAVAILABLE` authorizes no scan. **Yes** records
   `GENERATE_AUDIT_REPORT`, prints the prompt, and creates an `INCOMPLETE` draft
-  at the reserved home-directory path. The host reads build dependencies and
+  at `~/Project_YYYY-MM-DDTHHMMSSZ_software_audit_report.md`. That stamp is UTC
+  ISO 8601 basic time, without colons, so it is a legal Windows file name. The host reads build dependencies and
   their official docs, then reviews inventoried files in batches.
   `AUDIT_IN_PROGRESS` accepts more receipts. `AUDIT_INCOMPLETE` means gaps
   remain and review continues. `ITEMS_REQUIRED` means the report is still a
@@ -894,7 +895,7 @@ flowchart TB
   server -->|"Allowlisted checks; server API tokens removed from the child environment"| commands["Local subprocesses"]
   commands --> checkout
   commands -->|"Resolved origin selects project path; trusted API stays configured"| origin["Git origin"]
-  commands -->|"Two fast-forward pulls and guarded same-day branch reuse"| checkout
+  commands -->|"Two fast-forward pulls and reuse of security-fixes-YYYY-MM-DD"| checkout
   commands -->|"Necessary dependency refresh and production builds; no test execution"| product["Installed toolchains and package managers"]
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
@@ -1041,9 +1042,9 @@ checkout is active.
 
 | Tool | Responsibility and gate |
 | --- | --- |
-| `run_prechecks(repo_root=None)` | Require clean `main` or today's exact security branch; reject Git operations in progress. Prior runtime errors block same-day reuse without overwriting the previous snapshot. |
+| `run_prechecks(repo_root=None)` | Require clean `main` or today's exact `security-fixes-YYYY-MM-DD` branch; reject Git operations in progress. Prior log errors are reported and do not block a fresh run or preserve the previous snapshot as permission. |
 | `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. Dependency preparation is deferred until an approved update/build needs it. |
-| `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-Month-dd-YYYY` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
+| `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-YYYY-MM-DD` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
 | `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
 | `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
 | `select_security_fixes(repo_root=None, package_reviews=None)` | Job 3 shows package-only unchecked GUI choices; job 5 shows a fresh source/config-only GUI after false-positive review. On Windows, supply exact-target package reviews before selection. No AI selection arguments. Only checked findings authorize edits; source fixes remain host-led. |
@@ -1215,7 +1216,7 @@ and `NOT_RUN_NO_APPROVED_FIXES` rather than claiming validation passed.
 
 ### Reusing today's security branch
 
-Only the exact branch name matching the server's current local date is reused.
+Only `security-fixes-YYYY-MM-DD`, using the machine's current local calendar date, is reused.
 An existing local branch is checked out without force; an origin-only branch is
 fetched and checked out with its upstream. A clean checkout is required. Starting
 on today's branch temporarily checks out `main` for the two fast-forward pulls;
@@ -3099,8 +3100,8 @@ Get-ChildItem .\.security-mcp\reports\security-remediation-report-*
 To read a known report path returned by the tool:
 
 ```powershell
-Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-November-03-2026.md'
-Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-November-03-2026.json' -Raw | ConvertFrom-Json
+Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-2026-11-03.md'
+Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-2026-11-03.json' -Raw | ConvertFrom-Json
 ```
 
 On macOS/Linux, use `ls .security-mcp/reports/` and `cat` with the actual
@@ -3184,8 +3185,8 @@ a command-line replacement for the agent request above.
 
 1. Install runtime dependencies and configure your MCP host.
 2. Review exact-target license terms and manager documentation; provide production builds and test-free corporate approvals/checks when configured.
-3. Use clean `main` or today's allowed security branch in `REPO_ROOT`; finish
-   any in-progress Git operation. Prior errors block same-day reuse.
+3. Use clean `main` or today's `security-fixes-YYYY-MM-DD` branch in `REPO_ROOT`; finish
+   any in-progress Git operation. Prior log errors do not block that reuse.
 4. Start/reload `gitlab-security` and enable its tools.
 5. Ask the host agent to follow the [workflow](#workflow).
 6. Review the returned unresolved table, validation/isolation evidence, local reports, and `git diff`.

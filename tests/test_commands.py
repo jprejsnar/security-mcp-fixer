@@ -612,8 +612,8 @@ def test_modified_tracked_security_files_are_not_ignored():
     assert dirty == status.splitlines()
 
 
-def test_branch_name_uses_english_month():
-    """Branch name uses english month."""
+def test_branch_name_uses_an_iso_date():
+    """Name the security branch with an ISO 8601 calendar date."""
     # Arrange
     day = date(2026, 11, 1)
 
@@ -621,7 +621,7 @@ def test_branch_name_uses_english_month():
     name = branch_name_for(day)
 
     # Assert
-    assert name == "security-fixes-November-01-2026"
+    assert name == "security-fixes-2026-11-01"
 
 
 def test_git_mutations_are_rejected(repo):
@@ -681,7 +681,7 @@ def test_commits_pushes_tags_notes_and_branch_deletion_are_forbidden(repo, argv)
 def test_security_branch_checkout_is_allowed(repo):
     """Security branch checkout is allowed."""
     # Arrange
-    checkout = ["git", "checkout", "-b", "security-fixes-November-01-2026"]
+    checkout = ["git", "checkout", "-b", "security-fixes-2026-11-01"]
     refresh = [
         "npm",
         "install",

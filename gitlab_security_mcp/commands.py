@@ -115,7 +115,7 @@ ALLOWED_SCRIPTS = {
     "security:smoke",
     "security:licenses",
 }
-_SECURITY_BRANCH = re.compile(r"^security-fixes-[A-Z][a-z]+-\d{2}-\d{4}$")
+_SECURITY_BRANCH = re.compile(r"^security-fixes-\d{4}-\d{2}-\d{2}$")
 _READ_SIZE = 8192
 progress_sink: ContextVar[Callable[[str], None] | None] = ContextVar(
     "security_mcp_progress", default=None

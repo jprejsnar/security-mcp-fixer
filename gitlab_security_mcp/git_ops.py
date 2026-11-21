@@ -41,20 +41,6 @@ _RAISE_REMOTE_IS_OUTSIDE_THE_CONFIGURED_GITLAB_URL_PREFIX = (
     "Remote is outside the configured GitLab URL prefix"
 )
 
-MONTHS = (
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-)
 IN_PROGRESS = (
     "MERGE_HEAD",
     "rebase-merge",
@@ -66,8 +52,8 @@ IN_PROGRESS = (
 
 
 def branch_name_for(day: date) -> str:
-    """English month name, independent of the machine locale."""
-    return f"security-fixes-{MONTHS[day.month - 1]}-{day.day:02d}-{day.year}"
+    """Return today's security branch using an ISO 8601 calendar date."""
+    return f"security-fixes-{day.isoformat()}"
 
 
 def _porcelain_paths(line: str) -> list[str]:

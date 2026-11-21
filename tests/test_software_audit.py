@@ -405,7 +405,7 @@ def test_render_audit_prompt_fills_the_date_and_revision():
     moment = datetime(2026, 11, 18, tzinfo=UTC)
 
     # Act
-    text = render_audit_prompt(moment, "security-fixes-November-18-2026 abc123")
+    text = render_audit_prompt(moment, "security-fixes-2026-11-18 abc123")
 
     # Assert
     assert "{{CURRENT_DATE}}" not in text
