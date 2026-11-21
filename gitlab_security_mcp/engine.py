@@ -1704,7 +1704,7 @@ class Engine:
                 raise ValueError(
                     f"Latest eligible target {target} is affected or could not be verified against public advisories; manual investigation required"
                 )
-            decision, reason, evidence, proposed, prompt = self._decide(
+            decision, reason, evidence, proposed, _prompt = self._decide(
                 finding, package_target=target
             )
             if decision != "CHANGE_REQUIRED" or proposed is None:
@@ -3032,11 +3032,11 @@ class Engine:
                 TypeError,
                 AttributeError,
             ) as exc:
-                outcome = dict(
-                    status="ERROR",
-                    error=self.gitlab._clean(str(exc)),
-                    action="Check GitLab before retrying; a failed response does not prove no remote change occurred.",
-                )
+                outcome = {
+                    "status": "ERROR",
+                    "error": self.gitlab._clean(str(exc)),
+                    "action": "Check GitLab before retrying; a failed response does not prove no remote change occurred.",
+                }
                 logger.warning(
                     "GitLab false-positive dismissal failed for %s: %s",
                     item["id"],

@@ -1281,7 +1281,7 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
     try:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired as exc:
-        logging.getLogger("gitlab_security_mcp").error(
+        logging.getLogger("gitlab_security_mcp").exception(
             "Command process was not reaped after termination pid=%s", process.pid
         )
         raise RuntimeError(

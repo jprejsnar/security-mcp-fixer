@@ -466,6 +466,22 @@ _audit_activity_tasks: dict[Path, tuple[object, asyncio.Task]] = {}
 _desktop_audit_tasks: dict[str, asyncio.Task] = {}
 
 
+def _seconds_since(stamp: str) -> int | None:
+    """Return whole seconds since an ISO time, treating a naive stamp as UTC.
+
+    ``datetime.fromisoformat`` leaves a stamp without an offset naive. Subtracting
+    that from an aware UTC clock raises ``TypeError``. An unreadable stamp returns
+    ``None`` so the audit heartbeat keeps running.
+    """
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return max(0, int((datetime.now(UTC) - moment).total_seconds()))
+
+
 def _publish_audit_activity(selected: Engine) -> bool:
     """Distinguish a responsive server from unobserved host-AI work."""
     audit = selected.state.software_audit
@@ -503,15 +519,8 @@ def _publish_audit_activity(selected: Engine) -> bool:
         )
         message = f"{stage}. {progress.get('message') or 'Approved; waiting for the host AI to report its work.'}"
         updated = progress.get("updated_at") or audit.get("requested_at")
-        if updated:
-            age = max(
-                0,
-                int(
-                    (
-                        datetime.now(UTC) - datetime.fromisoformat(updated)
-                    ).total_seconds()
-                ),
-            )
+        age = _seconds_since(updated) if isinstance(updated, str) else None
+        if age is not None:
             message += f" Last AI update {age}s ago; MCP server responsive."
         activity_status = "WAITING_FOR_AI"
         label = (

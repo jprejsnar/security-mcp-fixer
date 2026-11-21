@@ -1868,3 +1868,28 @@ def test_repeated_persistence_of_one_batch_adds_one_progress_section(tmp_path):
     assert text.count("## Review progress") == 2
     assert "## Review progress: 2/2 files" in text
     assert text.count("Activity: Batch 1") == 1
+
+
+def test_audit_age_treats_a_naive_stamp_as_utc():
+    """A host timestamp without an offset still yields an age."""
+    # Arrange
+    stamp = datetime.now(UTC).replace(tzinfo=None).isoformat()
+
+    # Act
+    age = server._seconds_since(stamp)
+
+    # Assert
+    assert age is not None
+    assert age >= 0
+
+
+def test_audit_age_ignores_an_unreadable_stamp():
+    """A bad timestamp does not stop the audit heartbeat."""
+    # Arrange
+    stamp = "not-a-time"
+
+    # Act
+    age = server._seconds_since(stamp)
+
+    # Assert
+    assert age is None

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from itertools import pairwise
 from pathlib import Path
 from subprocess import SubprocessError
 from urllib.parse import urlparse
@@ -75,7 +76,7 @@ def _alignment_document(relative: str) -> bool:
         (".windsurf", "rules"),
         (".windsurf", "skills"),
     }
-    return any(pair in sections for pair in zip(parts, parts[1:], strict=False)) or (
+    return any(pair in sections for pair in pairwise(parts)) or (
         len(parts) >= 2
         and parts[-2] == ".github"
         and parts[-1]
