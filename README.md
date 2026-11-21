@@ -627,87 +627,102 @@ job. Nothing is committed, pushed, or merged.
 
 ### End-to-end flowchart
 
+The picture is the job order. Decisions, empty selections, and failures do not
+jump over a later job. Those outcomes are named under the chart and in the three
+state diagrams that follow.
+
 ```mermaid
 flowchart TD
-  request["Chat request: run gitlab-security on this repo"] --> job1
-
-  subgraph job1["Job 1: Pre-checks"]
-    pre["run_prechecks: Git checkout, main or today's branch, clean tree, no merge or rebase, corporate DNS"]
-    pulls["pull_main_twice: git pull --ff-only twice"]
-    branch["create_security_branch: create security-fixes-Month-dd-YYYY or safely reuse it after log review and guarded cleanup"]
-    pre --> pulls --> branch
-  end
-
-  subgraph job2["Job 2: Download GitLab findings"]
-    list["list_security_findings: tracked main, Needs triage or Confirmed, Still detected, plus non-main findings GitLab reports resolved on main"]
-    verify["verify_security_finding per finding, up to 8 in parallel"]
-    evidence["Local manifests and lockfiles, Gradle or Maven dependency trees, OSV then GitHub then NVD advisories, CVE and CWE pages"]
-    hostReview["Source and config findings: host AI reads the cited file and line, then submits a hash-bound source_review"]
-    decision{"Decision"}
-    list --> verify --> evidence --> decision
-    verify --> hostReview --> verify
-  end
-
-  subgraph job3["Job 3: Package updates"]
-    release["select_package_version: latest supported stable release from the public catalog"]
-    review["Host AI reviews exact-version docs, API compatibility and license"]
-    pkgForm["select_security_fixes: unchecked package checkboxes"]
-    batch["Server qualifies and applies all checked updates, then runs production build checks; unit tests are not executed"]
-    isolate["On build failure: isolate failing groups, roll back incompatible updates, keep the passing subset"]
-    release --> review --> pkgForm --> batch
-    batch -->|"Build fails"| isolate
-  end
-
-  subgraph job4["Job 4: False positives"]
-    fpList["review_false_positives: evidence-backed candidates only"]
-    fpForm["submit_false_positive_approvals: unchecked checkboxes showing the exact comment"]
-    dismiss["GitLab vulnerabilityDismiss FALSE_POSITIVE with the structured description, then independent read-back"]
-    fpList --> fpForm -->|"Checked only"| dismiss
-  end
-
-  subgraph job5["Job 5: GitLab source and config fixes"]
-    srcForm["select_security_fixes: new unchecked source and config checkboxes"]
-    configFix["Server applies documented Dockerfile, nginx and GitLab CI line fixes after a fresh docs read, then validates"]
-    hostFix["Host AI fixes other checked source findings and reports fixed or failed with validation evidence"]
-    srcForm --> configFix
-    srcForm --> hostFix
-  end
-
-  subgraph job6["Job 6: Optional deep-dive software audit"]
-    consent{"Run the audit? Yes or No"}
-    prompt["Server prints the full audit prompt to the console and log, and creates an INCOMPLETE draft in the home directory"]
-    deps["Host AI reads build dependencies and their official version-specific docs"]
-    scan["Host AI reviews every inventoried file in batches, submitting file and phase receipts"]
-    ready["report_ready=True: server checks coverage and the saved report"]
-    auditForm["Unchecked checkbox per selectable finding"]
-    auditFix["Host AI fixes only checked items, each with an AAA test"]
-    consent -->|"Yes"| prompt --> deps --> scan --> ready
-    ready -->|"Gaps remain"| scan
-    ready -->|"Coverage complete"| auditForm -->|"Checked only"| auditFix
-  end
-
-  subgraph job7["Job 7: Final report"]
-    final["Write and open .security-mcp/reports/unresolved-remediation.md plus Markdown and JSON reports"]
-  end
-
-  branch --> list
-  decision -->|"CHANGE_REQUIRED package"| release
-  decision -->|"FALSE_POSITIVE"| fpList
-  decision -->|"Confirmed source or config issue"| srcForm
-  decision -->|"MANUAL_REVIEW, NO_SAFE_FIX or REPRODUCTION_REQUIRED"| final
-  batch --> fpList
-  isolate --> fpList
-  pkgForm -->|"Nothing checked"| fpList
-  dismiss --> srcForm
-  fpForm -->|"Nothing checked"| srcForm
-  configFix --> consent
-  hostFix --> consent
-  srcForm -->|"Nothing checked"| consent
-  consent -->|"No"| final
-  auditForm -->|"Nothing checked"| final
-  auditFix --> final
-  final --> human["Human reviews reports and git diff, then commits and pushes manually"]
+  request["Chat request: run gitlab-security on this repo"] --> j1["1 Pre-checks"]
+  j1 --> j2["2 Download GitLab security findings"]
+  j2 --> j3["3 Select and apply package updates"]
+  j3 --> j4["4 Review and upload false positives"]
+  j4 --> j5["5 Select and fix GitLab source findings"]
+  j5 --> j6{"6 Optional deep-dive software audit and selected fixes"}
+  j6 -->|Yes| audit["Prompt, file coverage, unchecked finding choices, checked fixes only"]
+  j6 -->|No or cancel| j7["7 Display unresolved remediation report"]
+  audit --> j7
+  j7 --> human["Human reviews reports and the diff, then commits and pushes manually"]
 ```
+
+What each job still does:
+
+- **Job 1.** `run_prechecks` requires a Git checkout on `main` or today's exact
+  security branch, a clean tree, no merge or rebase, and corporate DNS.
+  `pull_main_twice` runs `git pull --ff-only` twice. `create_security_branch`
+  creates `security-fixes-Month-dd-YYYY` or reuses that exact name after log
+  review and guarded cleanup. `PRECHECK_FAILED`, `PULL_FAILED`,
+  `PREPARATION_FAILED`, and `BRANCH_CREATION_FAILED` set the job blocked. The
+  failing tool stops there. The next `complete_security_run` marks that job
+  `FAILED`, marks jobs 2–6 `SKIPPED`, and writes the job 7 report.
+- **Job 2.** `list_security_findings` loads tracked `main` findings in Needs
+  triage or Confirmed that are still detected, plus non-main findings GitLab
+  reports resolved on `main`. A successful list advances to job 3. `ERROR` or a
+  status ending in `_FAILED` blocks the run the same way as job 1. Verification
+  starts in job 3, not in this job.
+- **Job 3.** Package findings are assessed here. `verify_security_finding` may
+  overlap for up to eight findings. Each one uses local manifests, lockfiles,
+  Gradle or Maven trees, then OSV, GitHub, and NVD, plus named CVE and CWE
+  pages. The same finding stays serialized. Source and config findings loop
+  until the host submits a hash-bound `source_review`. `CHANGE_REQUIRED`,
+  `FALSE_POSITIVE`, confirmed source or config issues, `MANUAL_REVIEW`,
+  `NO_SAFE_FIX`, and `REPRODUCTION_REQUIRED` stay recorded for the later job
+  that handles them. `select_package_version` chooses the latest supported
+  stable release. The host reviews that exact version's docs, API compatibility,
+  and license. `select_security_fixes` shows unchecked package boxes.
+  `PACKAGE_SELECTION_REQUIRED` means the boxes are not done.
+  `PACKAGE_FIXES_REQUIRED` means a checked update is not applied or recorded as
+  blocked. Checked updates are qualified and applied, then production builds
+  run. Unit tests are not executed. A build failure isolates failing groups,
+  rolls back incompatible updates, and keeps the passing subset
+  (`VALIDATION_FAILED`, then `VALIDATION_COMPLETE` when recovery holds).
+  `VALIDATION_REQUIRED` waits for `run_validation_matrix`. Nothing checked writes
+  no package edits and the job still finishes into job 4. Manual cleanup required
+  during package execution marks this job `FAILED`, skips the rest, and goes to
+  job 7. The same cleanup stop applies if it happens in a later job.
+- **Job 4.** Remaining source and config reviews finish here.
+  `verify_security_finding` is still accepted while a decision is
+  `SOURCE_REVIEW_REQUIRED`. `FINDING_REVIEW_REQUIRED` is returned until that
+  review is recorded. `review_false_positives` lists evidence-backed candidates.
+  `submit_false_positive_approvals` shows unchecked boxes with the exact
+  comment. Checked findings are dismissed in GitLab as `FALSE_POSITIVE` and
+  read back. Cancel or nothing checked dismisses nothing. The job still
+  finishes into job 5.
+- **Job 5.** `select_security_fixes` opens a new unchecked form for source and
+  config findings. `SOURCE_SELECTION_REQUIRED` means that form is not done. The
+  server applies documented Dockerfile, nginx, and GitLab CI line fixes after a
+  fresh docs read, then validates them. `generate_aaa_test` adds an
+  Arrange-Act-Assert test only for a supported base-image fix. The host fixes
+  the other checked source findings and reports each as `fixed` or `failed`
+  with validation evidence.
+  `CODE_FIX_RESULTS_REQUIRED` waits until every checked host item has an
+  outcome. Nothing checked fixes nothing. The job still finishes into job 6.
+- **Job 6.** Consent is `CONSENT_REQUIRED` when no form is available,
+  `REQUESTED` while a host form is open, or `AWAITING_HUMAN` for the Windows
+  window. **No** or cancel records `DONE`, leaves no audit file, marks the job
+  `SKIPPED`, and starts job 7.
+  `CONSENT_UNAVAILABLE` authorizes no scan. **Yes** records
+  `GENERATE_AUDIT_REPORT`, prints the prompt, and creates an `INCOMPLETE` draft
+  at the reserved home-directory path. The host reads build dependencies and
+  their official docs, then reviews inventoried files in batches.
+  `AUDIT_IN_PROGRESS` accepts more receipts. `AUDIT_INCOMPLETE` means gaps
+  remain and review continues. `ITEMS_REQUIRED` means the report is still a
+  draft or has no selectable section. Coverage complete records
+  `AUDIT_REPORT_GENERATED`. `NO_FINDINGS` means section 7 says there is nothing
+  to select. Otherwise `SELECTION_REQUIRED` shows one unchecked box per
+  finding. `NONE_SELECTED` fixes nothing. Checked items are
+  `FIX_FROM_AUDIT_REPORT`. The host applies only those items. Every fix needs its
+  own AAA unit test. `CODE_FIX_RESULTS_REQUIRED` waits for each outcome.
+  A Yes path finishes the job as `FINISHED` because the report path exists.
+  See [Software audit states (job 6)](#software-audit-states-job-6).
+- **Job 7.** Writes and opens `.security-mcp/reports/unresolved-remediation.md`
+  plus the Markdown and JSON reports. The human reviews the reports and
+  `git diff`, then commits and pushes manually. A repeated
+  `complete_security_run` returns the saved report.
+
+A tool called out of order returns `JOB_ORDER_REQUIRED` with
+`next_tool=complete_security_run`. It does not create edit or dismissal
+permission.
 
 Running alongside every job:
 
@@ -737,16 +752,20 @@ stateDiagram-v2
   RUNNING --> WAITING_FOR_AI : host AI must review, fix, or report outcomes
   WAITING_FOR_AI --> RUNNING : host submits progress or outcomes
   RUNNING --> FINISHED : job work complete
-  RUNNING --> SKIPPED : nothing to do or audit declined
+  RUNNING --> SKIPPED : audit declined, or a later job after a blocker
   RUNNING --> FAILED : blocking error or manual cleanup required
   FINISHED --> [*]
   SKIPPED --> [*]
   FAILED --> [*]
 ```
 
-If manual checkout cleanup is required, the current job is marked `FAILED`, the
-remaining jobs are marked `SKIPPED`, and the run goes straight to the final
-report.
+The checklist item stays `RUNNING` while progress reports `WAITING_FOR_HUMAN` or
+`WAITING_FOR_AI`. An empty or cancelled selection finishes that job as
+`FINISHED` and writes nothing. `SKIPPED` is the declined audit, and every job
+after a blocker. If manual checkout cleanup is required, or a precheck, pull,
+branch, or listing failure set the run blocked, the current job is marked
+`FAILED`, the remaining jobs are marked `SKIPPED`, and the run goes straight to
+the final report.
 
 ### Run status transitions
 
@@ -763,6 +782,7 @@ stateDiagram-v2
   PRECHECK_PASSED --> PREPARATION_FAILED : dependency preparation failed
   PULLS_SUCCEEDED --> BRANCH_CREATED : create_security_branch
   PULLS_SUCCEEDED --> BRANCH_CREATION_FAILED : branch unsafe or checkout failed
+  PULLS_SUCCEEDED --> PREPARATION_FAILED : reused-branch DNS or pnpm preparation failed
   BRANCH_CREATED --> FINDINGS_LISTED : list_security_findings
   FINDINGS_LISTED --> FIXES_IN_PROGRESS : approved edit applied
   FIXES_IN_PROGRESS --> VALIDATION_COMPLETE : production builds pass
@@ -784,15 +804,31 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-  [*] --> CONSENT_REQUESTED
-  CONSENT_REQUESTED --> DONE : human chooses No or cancels
-  CONSENT_REQUESTED --> GENERATE_AUDIT_REPORT : human chooses Yes
+  [*] --> CONSENT_REQUIRED : no form available
+  [*] --> REQUESTED : host form open
+  [*] --> AWAITING_HUMAN : Windows Yes or No window
+  CONSENT_REQUIRED --> DONE : human chooses No or cancels
+  REQUESTED --> DONE : human chooses No or cancels
+  AWAITING_HUMAN --> DONE : human chooses No or cancels
+  CONSENT_REQUIRED --> GENERATE_AUDIT_REPORT : human chooses Yes
+  REQUESTED --> GENERATE_AUDIT_REPORT : human chooses Yes
+  AWAITING_HUMAN --> GENERATE_AUDIT_REPORT : human chooses Yes
+  CONSENT_REQUIRED --> CONSENT_UNAVAILABLE : consent interrupted
+  REQUESTED --> CONSENT_UNAVAILABLE : consent interrupted
+  AWAITING_HUMAN --> CONSENT_UNAVAILABLE : consent interrupted
+  CONSENT_UNAVAILABLE --> CONSENT_REQUIRED : ask again when no form is available
+  CONSENT_UNAVAILABLE --> REQUESTED : ask again with a host form
+  CONSENT_UNAVAILABLE --> AWAITING_HUMAN : ask again with the Windows window
   GENERATE_AUDIT_REPORT --> AUDIT_IN_PROGRESS : first file and phase receipts
   AUDIT_IN_PROGRESS --> AUDIT_IN_PROGRESS : more receipts
   AUDIT_IN_PROGRESS --> AUDIT_INCOMPLETE : report_ready with files or phases remaining
   AUDIT_INCOMPLETE --> AUDIT_IN_PROGRESS : review continues
+  GENERATE_AUDIT_REPORT --> AUDIT_INCOMPLETE : report_ready with files or phases remaining
+  AUDIT_INCOMPLETE --> ITEMS_REQUIRED : report still a draft or missing selectable section
+  GENERATE_AUDIT_REPORT --> ITEMS_REQUIRED : report still a draft or missing selectable section
   AUDIT_IN_PROGRESS --> ITEMS_REQUIRED : report still a draft or missing selectable section
-  ITEMS_REQUIRED --> AUDIT_IN_PROGRESS : host rewrites the report
+  ITEMS_REQUIRED --> AUDIT_INCOMPLETE : report_ready with files or phases remaining
+  ITEMS_REQUIRED --> AUDIT_REPORT_GENERATED : report rewritten and coverage complete
   AUDIT_IN_PROGRESS --> AUDIT_REPORT_GENERATED : coverage complete and report saved
   AUDIT_REPORT_GENERATED --> NO_FINDINGS : section 7 says No selectable findings
   AUDIT_REPORT_GENERATED --> SELECTION_REQUIRED : unchecked finding checkboxes shown
@@ -986,95 +1022,16 @@ for a previously absent file. They cannot restore files after a restart.
 
 ## Workflow
 
-This is the recommended host-agent flow, not an autonomous loop inside the
-server. Stop on a failed run gate or validation requirement. Findings without a
-safe fix are recorded and may be followed by other eligible findings.
-
-```mermaid
-flowchart TD
-  startRun["Host starts or selects one checkout run"] --> prechecks["run_prechecks repo_root: clean main or today's security branch; no Git operation in progress"]
-  prechecks --> dns["Resolve corporate DNS and review prior logs for branch reuse"]
-  dns --> precheckGate{"Prechecks passed?"}
-  precheckGate -->|"No"| stopRun["Stop that checkout and report the failure"]
-  precheckGate -->|"Yes"| pulls["pull_main_twice: git pull --ff-only twice"]
-  pulls --> pullGate{"Both pulls passed and tree remains clean?"}
-  pullGate -->|"No"| stopRun
-  pullGate -->|"Yes"| branch["create_security_branch: create or safely reuse today's exact dated branch"]
-  branch --> reusePrep["For reuse: review logs and guarded cleanup; no eager dependency commands"]
-  reusePrep --> branchGate{"Branch ready?"}
-  branchGate -->|"No"| stopRun
-  branchGate -->|"Yes"| listing["list_security_findings: active main and explicitly resolved non-main findings"]
-  listing --> retrievalGate{"Retrieval succeeded without truncation?"}
-  retrievalGate -->|"No"| stopRun
-  retrievalGate -->|"Yes"| moreFindings{"Unprocessed findings remain?"}
-  moreFindings -->|"No"| fixSelection["select_security_fixes: unchecked eligible choices; blocked rows disabled; build-only trials disclosed"]
-  fixSelection --> selectionMode{"Windows native selection?"}
-  selectionMode -->|"Yes"| selectionWait["No review deadline. Submit the checked choices."]
-  selectionMode -->|"No: host-controlled form"| approvedFixes{"Human selected any issues?"}
-  selectionWait --> windowsKind{"What was checked?"}
-  windowsKind -->|"Package updates"| serverBatch["Server qualifies, edits, and production-build validates those packages"]
-  serverBatch --> reports
-  windowsKind -->|"Dockerfile, nginx or GitLab CI line fixes"| serverConfig["Server applies each documented edit after a fresh docs read, then validates it"]
-  serverConfig --> reports
-  windowsKind -->|"Other source-code fixes"| sourceContinue["Host continues only those source fixes"]
-  sourceContinue --> editKind
-  windowsKind -->|"Nothing"| reports
-  approvedFixes -->|"No: skip code, continue independent false positives"| reports
-  approvedFixes -->|"Yes: selected issues only"| editKind
-  moreFindings -->|"Yes"| verify["verify_security_finding: source workflow or local package/advisory evidence"]
-  verify --> decisionGate{"Decision?"}
-  decisionGate -->|"SOURCE_REVIEW_REQUIRED"| sourceReview["Host opens the GitLab file and line and reads that code"]
-  sourceReview --> sourceGate{"Sufficient evidence available?"}
-  sourceGate -->|"Yes: plain 2-sentence reason plus hash-bound trace"| verify
-  sourceGate -->|"No: explicit blocker"| unresolved
-  decisionGate -->|"CONFIRMED_VULNERABILITY without a supported plan"| sourceDefect["Retain confirmed source issue for later human fix selection"]
-  sourceDefect --> unresolved
-  decisionGate -->|"FALSE_POSITIVE"| retained["Retain evidence and continue"]
-  decisionGate -->|"MANUAL_REVIEW or NO_SAFE_FIX"| unresolved["Retain unresolved reason and continue"]
-  decisionGate -->|"REPRODUCTION_REQUIRED"| reproduction["Host-led approved local fuzzing reproduction, not a package fix"]
-  reproduction --> unresolved
-  retained --> moreFindings
-  unresolved --> moreFindings
-  decisionGate -->|"CHANGE_REQUIRED"| queued["Retain verified plan for human selection, no edits yet"]
-  queued --> moreFindings
-  editKind{"What kind of selected edit?"}
-  editKind -->|"Confirmed source defect"| sourceFix["Host applies annotation-first surgical fix only with sufficient evidence and reproduction"]
-  sourceFix --> nextFix
-  editKind -->|"Package update"| qualify["Review package docs and policy, then qualify_package_update"]
-  qualify --> qualifiedGate{"Exact-target review and required policy accepted?"}
-  qualifiedGate -->|"No: incomplete target review or required policy"| nextFix
-  qualifiedGate -->|"Yes"| readDocs["Server reads required publisher pages together"]
-  editKind -->|"Image tag or cited nginx or GitLab CI line"| readDocs
-  readDocs --> docsGate{"Every required page read?"}
-  docsGate -->|"No: DOCS_REQUIRED"| nextFix
-  docsGate -->|"Yes"| apply["apply_minimal_fix: local edit only"]
-  apply --> appliedGate{"APPLIED?"}
-  appliedGate -->|"No"| blockedEdit{"Safe restoration permits continuation?"}
-  blockedEdit -->|"Yes: retain failure reason"| nextFix
-  blockedEdit -->|"No: manual cleanup required"| reports
-  appliedGate -->|"Yes"| regression["Keep package callers unchanged, generate_aaa_test only for supported images"]
-  regression --> nextFix{"More selected fixes? Retain exact reasons for rejected edits."}
-  nextFix -->|"Yes"| editKind
-  nextFix -->|"No"| postChecks["run_validation_matrix: production builds, dependency proof and test-free policy checks"]
-  postChecks --> validationGate{"VALIDATION_COMPLETE?"}
-  validationGate -->|"Yes"| reports["complete_security_run: reuse current assessments"]
-  validationGate -->|"No"| rollbackGate["Engine isolates failed groups and verifies retained subset or baseline"]
-  rollbackGate -->|"Retain green subset or report blocked recovery"| reports
-  reports --> eligible{"Eligible false positives?"}
-  eligible -->|"Yes"| form["Unchecked checkboxes: Windows window, or a host form"]
-  form --> selected{"Human submitted checked selections?"}
-  selected -->|"Yes"| dismiss["Validate identity and fresh source; dismiss only selected findings with exact reasons"]
-  selected -->|"No: decline, cancel or unchecked"| finalReport["Generate final report with actual approval and validation outcomes"]
-  eligible -->|"No: include the blocker or no-candidate status"| finalReport
-  dismiss --> finalReport
-  finalReport --> auditChoice["choose_software_audit_action: one human choice"]
-  auditChoice -->|"Generate report"| auditReport["Host writes the audit markdown to the home directory. No code changes."]
-  auditChoice -->|"Fix confirmed issues"| auditBoxes["One unchecked checkbox per finding. Only checked items continue."]
-  auditBoxes --> auditFixes["Host applies the smallest fix for each checked item, each with an AAA test. No commit or push."]
-  auditChoice -->|"Stop"| reviewDiff["Human reviews reports and git diff; commit and push manually"]
-  auditReport --> reviewDiff
-  auditFixes --> reviewDiff
-```
+The host follows the [end-to-end flowchart](#end-to-end-flowchart). That sequence
+is not an autonomous loop inside the server. Call the tool named by the current
+job. A call out of order returns `JOB_ORDER_REQUIRED` and creates no edit or
+dismissal permission. Stop when a run gate returns `PRECHECK_FAILED`,
+`PULL_FAILED`, `PREPARATION_FAILED`, or `BRANCH_CREATION_FAILED`; the next
+`complete_security_run` records that job `FAILED`, skips the remaining jobs, and
+writes the unresolved report. Findings without a safe fix stay recorded for that
+report. They do not skip jobs 3 through 6. Empty or cancelled selections write
+nothing and still advance one job. Job 6 **No** or cancel records `DONE` and
+marks that job `SKIPPED`. Nothing is committed or pushed.
 
 ### Tool reference
 

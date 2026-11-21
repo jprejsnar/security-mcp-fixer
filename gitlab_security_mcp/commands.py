@@ -818,50 +818,6 @@ class CommandRunner:
             )
         return result
 
-    def _discover_test_suites(
-        self, argv: list[str], timeout: int, workdir: Path
-    ) -> int | None:
-        """Ask a plain Jest script for this run's files without executing tests."""
-        manager = tool_name(argv[0])
-        if manager not in {"npm", "pnpm", "yarn"} or argv[1:] != ["test"]:
-            return None
-        try:
-            manifest = json.loads(
-                (workdir / "package.json").read_text(encoding="utf-8")
-            )
-            scripts = manifest.get("scripts", {})
-            script = scripts.get("test", "")
-            if (
-                not isinstance(script, str)
-                or not re.match(r"^\s*jest(?:\s|$)", script)
-                or _bad_argument(script)
-                or scripts.get("pretest")
-                or scripts.get("posttest")
-            ):
-                return None
-            discovery = self._run_locked(
-                [*argv, *(["--"] if manager == "npm" else []), "--listTests", "--json"],
-                timeout=min(timeout, 30),
-                check=False,
-                workdir=workdir,
-            )
-            if discovery.exit_code or discovery.truncated:
-                return None
-            for line in discovery.stdout.splitlines():
-                if not line.strip().startswith("["):
-                    continue
-                try:
-                    paths = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(paths, list) and all(
-                    isinstance(path, str) for path in paths
-                ):
-                    return len(set(paths)) or None
-        except (OSError, ValueError, RuntimeError):
-            return None
-        return None
-
     def _start_readers(
         self,
         process: subprocess.Popen[str],

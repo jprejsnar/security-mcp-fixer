@@ -891,17 +891,15 @@ def test_build_progress_is_emitted_before_command_finishes(tmp_path, monkeypatch
         ["mvn", "--batch-mode", "clean", "verify"],
     ],
 )
-def test_test_commands_never_start_children_or_discovery(tmp_path, monkeypatch, argv):
-    """Reject test commands before spawning a runner or enumerating its suites."""
+def test_test_commands_never_start_children(tmp_path, monkeypatch, argv):
+    """Reject test commands before spawning a runner."""
     # Arrange
     from unittest.mock import Mock
 
     from gitlab_security_mcp import commands
 
     launch = Mock()
-    discovery = Mock()
     monkeypatch.setattr(commands.subprocess, "Popen", launch)
-    monkeypatch.setattr(commands.CommandRunner, "_discover_test_suites", discovery)
 
     # Act
     with pytest.raises(PermissionError):
@@ -909,7 +907,6 @@ def test_test_commands_never_start_children_or_discovery(tmp_path, monkeypatch, 
 
     # Assert
     launch.assert_not_called()
-    discovery.assert_not_called()
 
 
 @pytest.mark.parametrize(

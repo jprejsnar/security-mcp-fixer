@@ -370,15 +370,6 @@ def audit_report_path(project_name: str, when: datetime) -> Path:
     return Path.home() / f"{project_name}_{stamp}_software_audit_report.md"
 
 
-def latest_audit_report(project_name: str) -> Path | None:
-    """Return the newest home-directory audit report for one project, if one exists."""
-    matches = sorted(
-        Path.home().glob(f"{project_name}_*_software_audit_report.md"),
-        key=lambda path: path.stat().st_mtime,
-    )
-    return matches[-1] if matches else None
-
-
 def audit_items(text: str) -> list[dict[str, str]]:
     """Return the checkbox rows from the report's selectable-findings section.
 
