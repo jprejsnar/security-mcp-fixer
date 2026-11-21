@@ -23,8 +23,27 @@ from urllib.parse import quote
 
 import httpx
 
+_RAISE_EXPECTED_A_JSON_OBJECT = "Expected a JSON object"
+_RAISE_XML_ENTITY_DECLARATIONS_ARE_NOT_ALLOWED = (
+    "XML entity declarations are not allowed"
+)
+_RAISE_EXTERNAL_XML_ENTITIES_ARE_NOT_ALLOWED = "External XML entities are not allowed"
+_RAISE_MISSING = "Missing {}"
+_RAISE_UNSAFE = "Unsafe {}"
+
 _HTTP_LOG_LOCK = threading.Lock()
 logger = logging.getLogger("gitlab_security_mcp")
+GIT_OPERATION_FAILURES = (OSError, RuntimeError, ValueError, SubprocessError)
+CONVERTED_DEFECTS = (AttributeError, LookupError, TypeError)
+ADVISORY_READ_FAILURES = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    json.JSONDecodeError,
+    httpx.HTTPError,
+    *CONVERTED_DEFECTS,
+)
+PROGRESS_PUBLISH_FAILURES = (OSError, RuntimeError, ValueError, TypeError)
 
 
 def utc_now_iso() -> str:
@@ -285,7 +304,7 @@ def json_object(text: str) -> dict:
     """Parse JSON metadata and reject null, array, and scalar roots."""
     data = json.loads(text)
     if not isinstance(data, dict):
-        raise ValueError("Expected a JSON object")
+        raise ValueError(_RAISE_EXPECTED_A_JSON_OBJECT)
     return data
 
 
@@ -376,11 +395,11 @@ def parse_xml(source: str | bytes | bytearray) -> ET.Element:
 
     def reject_entity(*_args: object) -> None:
         """Stop parsing when the document declares an entity."""
-        raise expat.ExpatError("XML entity declarations are not allowed")
+        raise expat.ExpatError(_RAISE_XML_ENTITY_DECLARATIONS_ARE_NOT_ALLOWED)
 
     def reject_external(*_args: object) -> None:
         """Stop parsing when the document requests an external entity."""
-        raise expat.ExpatError("External XML entities are not allowed")
+        raise expat.ExpatError(_RAISE_EXTERNAL_XML_ENTITIES_ARE_NOT_ALLOWED)
 
     parser.ordered_attributes = 1
     parser.buffer_text = 1
@@ -430,11 +449,11 @@ def resolve_inside(root: Path, raw: str | Path) -> Path | None:
 def safe_token(value: str, *, label: str) -> str:
     """Reject values that must never be interpolated into a command line."""
     if not value or not isinstance(value, str):
-        raise ValueError(f"Missing {label}")
+        raise ValueError(_RAISE_MISSING.format(label))
     if len(value) > 300 or any(char in value for char in "\r\n\t|&;<>`$\\\"'"):
-        raise ValueError(f"Unsafe {label}")
+        raise ValueError(_RAISE_UNSAFE.format(label))
     if value.startswith("-") or ".." in value:
-        raise ValueError(f"Unsafe {label}")
+        raise ValueError(_RAISE_UNSAFE.format(label))
     if not re.fullmatch(r"[A-Za-z0-9_@./+:-]{1,300}", value):
-        raise ValueError(f"Unsafe {label}")
+        raise ValueError(_RAISE_UNSAFE.format(label))
     return value

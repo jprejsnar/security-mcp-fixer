@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import sys
 from collections.abc import Callable
@@ -17,6 +18,15 @@ from gitlab_security_mcp.software_audit import (
     persist_audit_draft,
 )
 from gitlab_security_mcp.util import atomic_write_text, json_object
+
+_RAISE_AUDIT_CONTINUATION_STOPPED_NO_NEW_REVIEW_RECEIPTS_PHASES = "Audit continuation stopped: no new review receipts, phases or report content. The audit is incomplete; inspect the host blocker instead of repeatedly asking to continue."
+_RAISE_AUDIT_CONTINUATION_REACHED_THE_EDITOR_S_SAFE_TURN = "Audit continuation reached the editor's safe turn budget. The report remains incomplete; host limits must not be bypassed."
+_RAISE_THE_HOOK_INTERPRETER_PATH_CONTAINS_A_CHARACTER_THE = "The hook interpreter path contains a character the editor shell cannot quote safely."
+_RAISE_UNSUPPORTED_HOOK_CONFIGURATION_VERSION = (
+    "Unsupported hook configuration version: {}"
+)
+_RAISE_INVALID_HOOKS_OBJECT = "Invalid hooks object: {}"
+_RAISE_INVALID_HOOK_EVENT_LIST = "Invalid hook event list {}: {}"
 
 _ACTIVE = {
     "GENERATE_AUDIT_REPORT",
@@ -243,24 +253,34 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
     attempts = binding.get("attempts", 0)
     if fingerprint == binding.get("fingerprint"):
         raise RuntimeError(
-            "Audit continuation stopped: no new review receipts, phases or report content. The audit is incomplete; inspect the host blocker instead of repeatedly asking to continue."
+            _RAISE_AUDIT_CONTINUATION_STOPPED_NO_NEW_REVIEW_RECEIPTS_PHASES
         )
     if attempts >= profile.max_turns:
-        raise RuntimeError(
-            "Audit continuation reached the editor's safe turn budget. The report remains incomplete; host limits must not be bypassed."
-        )
+        raise RuntimeError(_RAISE_AUDIT_CONTINUATION_REACHED_THE_EDITOR_S_SAFE_TURN)
     _save_binding(
         path, {**binding, "fingerprint": fingerprint, "attempts": attempts + 1}
     )
     return profile.reply(_continuation(root, report))
 
 
+_HOOK_PATH_UNSAFE = re.compile(r"[\x00-\x1f'`]")
+
+
+def _emit_hook(response: dict) -> None:
+    """Write one hook response and flush so the editor reads the stream immediately."""
+    sys.stdout.write(json.dumps(response, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
 def _hook_command(python: Path, host: str, event: str) -> str:
     """Quote the interpreter for the platform shell each editor uses."""
+    executable = str(python)
+    if _HOOK_PATH_UNSAFE.search(executable):
+        raise ValueError(_RAISE_THE_HOOK_INTERPRETER_PATH_CONTAINS_A_CHARACTER_THE)
     args = ["-m", "gitlab_security_mcp.audit_host", "--host", host, "--event", event]
     if os.name == "nt":
-        return "& '" + str(python).replace("'", "''") + "' " + " ".join(args)
-    return shlex.join([str(python), *args])
+        return "& '" + executable.replace("'", "''") + "' " + " ".join(args)
+    return shlex.join([executable, *args])
 
 
 def install_hooks(home: Path, python: Path) -> list[Path]:
@@ -276,14 +296,14 @@ def install_hooks(home: Path, python: Path) -> list[Path]:
             else {"version": 1}
         )
         if config.get("version", 1) != 1:
-            raise ValueError(f"Unsupported hook configuration version: {path}")
+            raise ValueError(_RAISE_UNSUPPORTED_HOOK_CONFIGURATION_VERSION.format(path))
         hooks = config.setdefault("hooks", {})
         if not isinstance(hooks, dict):
-            raise ValueError(f"Invalid hooks object: {path}")
+            raise ValueError(_RAISE_INVALID_HOOKS_OBJECT.format(path))
         for name, event in profile.events:
             previous = hooks.setdefault(name, [])
             if not isinstance(previous, list):
-                raise ValueError(f"Invalid hook event list {name}: {path}")
+                raise ValueError(_RAISE_INVALID_HOOK_EVENT_LIST.format(name, path))
             hooks[name] = [
                 item
                 for item in previous
@@ -310,7 +330,7 @@ def main() -> None:
         if args.host is None or args.event is None:
             parser.error("--host and --event are required for hook execution")
         response = handle_event(args.host, args.event, json_object(sys.stdin.read()))
-        print(json.dumps(response))
+        _emit_hook(response)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"GitLab security audit hook: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

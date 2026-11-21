@@ -9,6 +9,38 @@ from urllib.parse import unquote, urlsplit
 
 from gitlab_security_mcp.commands import CommandResult, CommandRunner
 
+_RAISE_REMOTE_CONTAINS_CONTROL_CHARACTERS = "Remote contains control characters"
+_RAISE_INVALID_TRUSTED_GITLAB_API_URL = "Invalid trusted GitLab API URL"
+_RAISE_REMOTE_IS_NOT_ON_THE_TRUSTED_GITLAB_API = (
+    "Remote is not on the trusted GitLab API host"
+)
+_RAISE_REMOTE_DOES_NOT_IDENTIFY_A_NAMESPACE_PROJECT_PATH = (
+    "Remote does not identify a namespace/project path"
+)
+_RAISE_CANNOT_INFER_A_GITLAB_PROJECT_FROM_ORIGIN_ON = "Cannot infer a GitLab project from origin on the configured GitLab API server. Use a canonical HTTPS/SSH GitLab origin, configure GITLAB_API_URL once for a trusted self-hosted instance, or supply project_id explicitly. No credentials were taken from the remote URL."
+_RAISE_THIS_DIRECTORY_IS_NOT_A_GIT_WORKING_TREE = (
+    "This directory is not a git working tree"
+)
+_RAISE_GIT_ORIGIN_COULD_NOT_BE_READ_COMPLETELY_CONFIGURE = "Git origin could not be read completely. Configure a GitLab origin or supply project_id explicitly to list_security_findings."
+_RAISE_GIT_ORIGIN_MUST_HAVE_EXACTLY_ONE_FETCH_URL = (
+    "Git origin must have exactly one fetch URL for automatic project discovery"
+)
+_RAISE_COULD_NOT_VERIFY_THE_SECURITY_BRANCH_ON_ORIGIN = "Could not verify the security branch on origin: git ls-remote failed or its output was truncated. Check network/VPN and Git access; branch absence was not inferred."
+_RAISE_TRACKED_SECURITY_FILE_INVENTORY_WAS_TRUNCATED_CLEANUP_IS = (
+    "Tracked security-file inventory was truncated; cleanup is unsafe"
+)
+_RAISE_UNSUPPORTED_GIT_REMOTE_URL = "Unsupported Git remote URL"
+_RAISE_REMOTE_URL_CONTAINS_QUERY_FRAGMENT_DATA = (
+    "Remote URL contains query/fragment data"
+)
+_RAISE_REMOTE_AND_API_ORIGINS_DO_NOT_MATCH = "Remote and API origins do not match"
+_RAISE_ORIGIN_IS_NOT_A_SUPPORTED_NETWORK_GIT_REMOTE = (
+    "Origin is not a supported network Git remote"
+)
+_RAISE_REMOTE_IS_OUTSIDE_THE_CONFIGURED_GITLAB_URL_PREFIX = (
+    "Remote is outside the configured GitLab URL prefix"
+)
+
 MONTHS = (
     "January",
     "February",
@@ -74,7 +106,7 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
     """
     try:
         if any(ord(char) < 32 or ord(char) == 127 for char in remote):
-            raise ValueError("Remote contains control characters")
+            raise ValueError(_RAISE_REMOTE_CONTAINS_CONTROL_CHARACTERS)
         api = urlsplit(api_url)
         if (
             api.scheme not in {"https", "http"}
@@ -82,9 +114,9 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
             or api.username
             or api.password
         ):
-            raise ValueError("Invalid trusted GitLab API URL")
+            raise ValueError(_RAISE_INVALID_TRUSTED_GITLAB_API_URL)
         if api.query or api.fragment or not api.path.rstrip("/").endswith("/api/v4"):
-            raise ValueError("Invalid trusted GitLab API URL")
+            raise ValueError(_RAISE_INVALID_TRUSTED_GITLAB_API_URL)
         api_port = api.port or (443 if api.scheme == "https" else 80)
         if "://" in remote:
             parsed = urlsplit(remote)
@@ -92,35 +124,35 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
                 parsed.scheme not in {"https", "http", "ssh", "git"}
                 or not parsed.hostname
             ):
-                raise ValueError("Unsupported Git remote URL")
+                raise ValueError(_RAISE_UNSUPPORTED_GIT_REMOTE_URL)
             host = parsed.hostname
             path = parsed.path
             remote_port = parsed.port
             web = parsed.scheme in {"https", "http"}
             if parsed.query or parsed.fragment:
-                raise ValueError("Remote URL contains query/fragment data")
+                raise ValueError(_RAISE_REMOTE_URL_CONTAINS_QUERY_FRAGMENT_DATA)
             if web and (
                 parsed.scheme != api.scheme
                 or (remote_port or (443 if parsed.scheme == "https" else 80))
                 != api_port
             ):
-                raise ValueError("Remote and API origins do not match")
+                raise ValueError(_RAISE_REMOTE_AND_API_ORIGINS_DO_NOT_MATCH)
         else:
             match = re.fullmatch(r"(?:[^/@:\s]+@)?(\[[^\]]+\]|[^/:\s]+):(.+)", remote)
             if not match:
-                raise ValueError("Origin is not a supported network Git remote")
+                raise ValueError(_RAISE_ORIGIN_IS_NOT_A_SUPPORTED_NETWORK_GIT_REMOTE)
             host, path = match.groups()
             host = host.strip("[]")
             web = False
         if host.lower() != api.hostname.lower():
-            raise ValueError("Remote is not on the trusted GitLab API host")
+            raise ValueError(_RAISE_REMOTE_IS_NOT_ON_THE_TRUSTED_GITLAB_API)
         path = unquote(path).strip("/")
         if web:
             prefix = unquote(api.path.rstrip("/")[: -len("/api/v4")]).strip("/")
             if prefix:
                 if not path.startswith(prefix + "/"):
                     raise ValueError(
-                        "Remote is outside the configured GitLab URL prefix"
+                        _RAISE_REMOTE_IS_OUTSIDE_THE_CONFIGURED_GITLAB_URL_PREFIX
                     )
                 path = path[len(prefix) + 1 :]
         path = path.removesuffix(".git")
@@ -131,15 +163,10 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
             or any(char.isspace() or char in "\\%?#\0" for char in part)
             for part in parts
         ):
-            raise ValueError("Remote does not identify a namespace/project path")
+            raise ValueError(_RAISE_REMOTE_DOES_NOT_IDENTIFY_A_NAMESPACE_PROJECT_PATH)
         return path
     except ValueError:
-        raise ValueError(
-            "Cannot infer a GitLab project from origin on the configured GitLab API server. "
-            "Use a canonical HTTPS/SSH GitLab origin, configure GITLAB_API_URL once "
-            "for a trusted self-hosted instance, or supply project_id explicitly. "
-            "No credentials were taken from the remote URL."
-        ) from None
+        raise ValueError(_RAISE_CANNOT_INFER_A_GITLAB_PROJECT_FROM_ORIGIN_ON) from None
 
 
 class GitOps:
@@ -166,7 +193,7 @@ class GitOps:
         """Raise unless the repository root is a git working tree."""
         result = self._git(["rev-parse", "--is-inside-work-tree"])
         if result.stdout.strip() != "true":
-            raise RuntimeError("This directory is not a git working tree")
+            raise RuntimeError(_RAISE_THIS_DIRECTORY_IS_NOT_A_GIT_WORKING_TREE)
 
     def current_branch(self) -> str:
         """Return the branch name, or an empty string when HEAD is detached."""
@@ -176,15 +203,10 @@ class GitOps:
         """Ask Git for origin so worktrees, submodules and URL rewrites are honored."""
         result = self._git(["remote", "get-url", "--all", "origin"], check=False)
         if result.exit_code != 0 or result.truncated:
-            raise RuntimeError(
-                "Git origin could not be read completely. Configure a GitLab origin "
-                "or supply project_id explicitly to list_security_findings."
-            )
+            raise RuntimeError(_RAISE_GIT_ORIGIN_COULD_NOT_BE_READ_COMPLETELY_CONFIGURE)
         urls = result.stdout.splitlines()
         if len(urls) != 1 or not urls[0].strip():
-            raise ValueError(
-                "Git origin must have exactly one fetch URL for automatic project discovery"
-            )
+            raise ValueError(_RAISE_GIT_ORIGIN_MUST_HAVE_EXACTLY_ONE_FETCH_URL)
         return gitlab_project_from_remote(urls[0].strip(), api_url)
 
     def head(self) -> str:
@@ -218,11 +240,7 @@ class GitOps:
         """Return whether origin has this branch; an unreadable remote is an error."""
         result = self._git(["ls-remote", "--heads", "origin", name], check=False)
         if result.exit_code != 0 or result.truncated:
-            raise RuntimeError(
-                "Could not verify the security branch on origin: git ls-remote failed "
-                "or its output was truncated. Check network/VPN and Git access; "
-                "branch absence was not inferred."
-            )
+            raise RuntimeError(_RAISE_COULD_NOT_VERIFY_THE_SECURITY_BRANCH_ON_ORIGIN)
         return bool(result.stdout.strip())
 
     def staged_names(self) -> list[str]:
@@ -235,7 +253,7 @@ class GitOps:
         result = self._git(["ls-files", "--cached", "-z", "--", ".security-mcp"])
         if result.truncated:
             raise RuntimeError(
-                "Tracked security-file inventory was truncated; cleanup is unsafe"
+                _RAISE_TRACKED_SECURITY_FILE_INVENTORY_WAS_TRUNCATED_CLEANUP_IS
             )
         return set(result.stdout.split("\0")) - {""}
 

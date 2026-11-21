@@ -12,6 +12,10 @@ from pathlib import Path
 from gitlab_security_mcp import __version__
 from gitlab_security_mcp.util import atomic_write_text, environment_secrets, redact
 
+_RAISE_PROGRESS_NEEDS_VALID_PAIRED_COMPLETION_COUNTS = (
+    "Progress needs valid paired completion counts."
+)
+
 _lock = threading.Lock()
 _tasks: dict[Path, dict[str, dict]] = {}
 ACTIVE = {"RUNNING", "WAITING_FOR_HUMAN", "WAITING_FOR_AI"}
@@ -48,7 +52,7 @@ def publish(
     if (completed is None) != (total is None) or (
         completed is not None and total is not None and not 0 <= completed <= total
     ):
-        raise ValueError("Progress needs valid paired completion counts.")
+        raise ValueError(_RAISE_PROGRESS_NEEDS_VALID_PAIRED_COMPLETION_COUNTS)
     now = datetime.now(UTC).isoformat()
     with _lock:
         tasks = _tasks.setdefault(root, {})

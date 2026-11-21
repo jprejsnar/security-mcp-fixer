@@ -9,6 +9,17 @@ from gitlab_security_mcp.manifests import SKIP_DIRS
 from gitlab_security_mcp.source_findings import read_source_evidence
 from gitlab_security_mcp.util import resolve_inside
 
+_RAISE_CITED_TEXT_IS_NOT_IN_THE_FILE_THE = (
+    "Cited text is not in the file the server hashed"
+)
+_RAISE_NOT_A_FILE_INSIDE_THE_CHECKOUT = "Not a file inside the checkout: {}"
+_RAISE_NOT_A_PERMITTED_SOURCE_CONFIGURATION_FILE = (
+    "Not a permitted source/configuration file: {}"
+)
+_RAISE_AI_SOURCE_REVIEW_EXCEEDED_ITS_COMPLETE_FILE_EVIDENCE = (
+    "AI source review exceeded its complete-file evidence budget"
+)
+
 MAX_REVIEW_BYTES = 256_000
 SOURCE_SUFFIXES = {
     ".ts",
@@ -66,14 +77,16 @@ class SourceEvidence:
         """Reject traversal, generated directories, and non-source files."""
         path = resolve_inside(self.root, relative)
         if path is None or not path.is_file():
-            raise ValueError(f"Not a file inside the checkout: {relative}")
+            raise ValueError(_RAISE_NOT_A_FILE_INSIDE_THE_CHECKOUT.format(relative))
         parts = path.relative_to(self.root.resolve()).parts
         if any(part.lower() in SKIP_DIRS for part in parts[:-1]) or (
             path.suffix.lower() not in SOURCE_SUFFIXES
             and path.name.lower() not in SOURCE_NAMES
             and config_kind(str(path)) is None
         ):
-            raise ValueError(f"Not a permitted source/configuration file: {relative}")
+            raise ValueError(
+                _RAISE_NOT_A_PERMITTED_SOURCE_CONFIGURATION_FILE.format(relative)
+            )
         return path
 
     def read(self, relative: str) -> dict:
@@ -85,7 +98,7 @@ class SourceEvidence:
             size = len(row["content"].encode("utf-8"))
             if self.bytes_read + size > MAX_REVIEW_BYTES:
                 raise ValueError(
-                    "AI source review exceeded its complete-file evidence budget"
+                    _RAISE_AI_SOURCE_REVIEW_EXCEEDED_ITS_COMPLETE_FILE_EVIDENCE
                 )
             self.bytes_read += size
             self.reads[key] = row
@@ -100,7 +113,7 @@ def cited_lines(row: dict, source: str) -> dict:
     """
     cited = row.get("cited_text", "")
     if cited and cited not in source:
-        raise ValueError("Cited text is not in the file the server hashed")
+        raise ValueError(_RAISE_CITED_TEXT_IS_NOT_IN_THE_FILE_THE)
     context = row.get("context")
     return {
         "path": row["path"],

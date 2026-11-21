@@ -21,7 +21,13 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import log_unexpected, redact, timed_http_stream
+from gitlab_security_mcp.util import (
+    ADVISORY_READ_FAILURES,
+    PROGRESS_PUBLISH_FAILURES,
+    log_unexpected,
+    redact,
+    timed_http_stream,
+)
 from gitlab_security_mcp.versions import (
     collect_fixed_versions,
     describe_ranges,
@@ -30,6 +36,19 @@ from gitlab_security_mcp.versions import (
     osv_version_affected,
     parse_version,
 )
+
+_RAISE_ADVISORY_RESPONSE_MUST_BE_A_JSON_OBJECT_OR = (
+    "Advisory response must be a JSON object or array"
+)
+_RAISE_NVD_SERVER_COOLDOWN_REQUIRES_1F_S_RETRY_THIS = "NVD server cooldown requires {:.1f}s; retry this lookup later. The per-call wait limit is 60s; no request was sent."
+_RAISE_ADVISORY_QUERY_RESPONSE_MUST_BE_A_JSON_OBJECT = (
+    "Advisory query response must be a JSON object"
+)
+_RAISE_ADVISORY_RESPONSE_EXCEEDS_THE_SIZE_LIMIT = (
+    "Advisory response exceeds the size limit"
+)
+_RAISE_CVE_CNA_RESPONSE_DOES_NOT_IDENTIFY = "CVE CNA response does not identify {}"
+_RAISE_NVD_REQUESTED_A_1F_S_RETRY_AFTER_COOLDOWN = "NVD requested a {:.1f}s Retry-After cooldown; retry this lookup later rather than ignoring the server limit."
 
 # The advisory exists, but it does not name the package we found locally.
 # That can be a GitLab mislabel or a naming mismatch, so a person decides.
@@ -62,8 +81,7 @@ def _nvd_wait(has_key: bool) -> None:
         delay = earliest - monotonic()
         if delay > _MAX_NVD_RETRY_WAIT:
             raise httpx.RequestError(
-                f"NVD server cooldown requires {delay:.1f}s; retry this lookup later. "
-                "The per-call wait limit is 60s; no request was sent."
+                _RAISE_NVD_SERVER_COOLDOWN_REQUIRES_1F_S_RETRY_THIS.format(delay)
             )
         if delay > 0:
             message = f"NVD API pacing: waiting {delay:.1f}s before the next request."
@@ -72,7 +90,7 @@ def _nvd_wait(has_key: bool) -> None:
             if sink is not None:
                 try:
                     sink(message)
-                except Exception:
+                except PROGRESS_PUBLISH_FAILURES:
                     logger.warning(
                         "Could not publish NVD pacing progress", exc_info=True
                     )
@@ -236,13 +254,7 @@ class AdvisoryClient:
         try:
             try:
                 result = self._lookup(finding, ecosystem, package, version)
-            except (
-                httpx.HTTPError,
-                ValueError,
-                TypeError,
-                AttributeError,
-                RuntimeError,
-            ) as exc:
+            except ADVISORY_READ_FAILURES as exc:
                 log_unexpected(exc, "advisory lookup")
                 result = AdvisoryLookup(
                     outcome="lookup_failed",
@@ -426,7 +438,7 @@ class AdvisoryClient:
                     f"osv:{ident}: advisory withdrawn at {payload['withdrawn']}; "
                     "ignored as active evidence. Withdrawal alone does not establish a false positive.",
                 )
-        except Exception as exc:
+        except ADVISORY_READ_FAILURES as exc:
             log_unexpected(exc, f"OSV advisory read {ident}")
             return ident, None, self._clean(f"osv:{ident}: {exc}")
         return ident, payload if isinstance(payload, dict) else None, None
@@ -441,7 +453,9 @@ class AdvisoryClient:
                 not isinstance(payload, dict)
                 or (payload.get("cveMetadata") or {}).get("cveId") != ident
             ):
-                raise ValueError(f"CVE CNA response does not identify {ident}")
+                raise ValueError(
+                    _RAISE_CVE_CNA_RESPONSE_DOES_NOT_IDENTIFY.format(ident)
+                )
             sources.append(f"cve:{ident}")
             return payload
         except (httpx.HTTPError, ValueError) as exc:
@@ -455,7 +469,7 @@ class AdvisoryClient:
         ident, params = item
         try:
             payload = self._get_json(GITHUB_ADVISORIES, params=params, headers=headers)
-        except Exception as exc:
+        except ADVISORY_READ_FAILURES as exc:
             log_unexpected(exc, f"GitHub advisory read {ident}")
             return ident, None, self._clean(f"github:{ident}: {exc}")
         return ident, payload, None
@@ -480,8 +494,9 @@ class AdvisoryClient:
                             )
                         if delay > _MAX_NVD_RETRY_WAIT:
                             raise httpx.RequestError(
-                                f"NVD requested a {delay:.1f}s Retry-After cooldown; "
-                                "retry this lookup later rather than ignoring the server limit."
+                                _RAISE_NVD_REQUESTED_A_1F_S_RETRY_AFTER_COOLDOWN.format(
+                                    delay
+                                )
                             ) from exc
                     if delay is None or attempt == _NVD_ATTEMPTS - 1:
                         raise
@@ -491,7 +506,7 @@ class AdvisoryClient:
                         attempt + 2,
                         _NVD_ATTEMPTS,
                     )
-        except Exception as exc:
+        except ADVISORY_READ_FAILURES as exc:
             log_unexpected(exc, f"NVD advisory read {cve}")
             errors.append(self._clean(f"nvd:{cve}: {exc}"))
             return None
@@ -594,12 +609,12 @@ class AdvisoryClient:
                 response.raise_for_status()
                 payload = _decode_advisory(response)
             if not isinstance(payload, dict):
-                raise ValueError("Advisory query response must be a JSON object")
+                raise ValueError(_RAISE_ADVISORY_QUERY_RESPONSE_MUST_BE_A_JSON_OBJECT)
             return payload
 
         payload = self._cached_json(key, fetch)
         if payload is not None and not isinstance(payload, dict):
-            raise ValueError("Advisory query response must be a JSON object")
+            raise ValueError(_RAISE_ADVISORY_QUERY_RESPONSE_MUST_BE_A_JSON_OBJECT)
         return payload
 
     def _record_site(self, url: str) -> None:
@@ -623,7 +638,7 @@ def _bounded_bytes(response: httpx.Response, limit: int) -> bytes:
     for chunk in response.iter_bytes():
         size += len(chunk)
         if size > limit:
-            raise ValueError("Advisory response exceeds the size limit")
+            raise ValueError(_RAISE_ADVISORY_RESPONSE_EXCEEDS_THE_SIZE_LIMIT)
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -632,7 +647,7 @@ def _decode_advisory(response: httpx.Response) -> dict | list:
     """Parse one advisory JSON body after enforcing the size limit."""
     payload = json.loads(_bounded_bytes(response, _MAX_ADVISORY_BYTES))
     if not isinstance(payload, (dict, list)):
-        raise ValueError("Advisory response must be a JSON object or array")
+        raise ValueError(_RAISE_ADVISORY_RESPONSE_MUST_BE_A_JSON_OBJECT_OR)
     return payload
 
 

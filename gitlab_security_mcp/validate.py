@@ -26,6 +26,19 @@ from gitlab_security_mcp.manifests import (
 )
 from gitlab_security_mcp.util import log_unexpected, parse_xml, read_bounded
 
+_RAISE_PACKAGE_JSON_SCRIPTS_MUST_CONTAIN_NONEMPTY_COMMAND_STRINGS = (
+    "package.json scripts must contain nonempty command strings"
+)
+_RAISE_JAVA_BUILD_DISCOVERY_WAS_TRUNCATED_MANUAL_REVIEW_IS = (
+    "Java build discovery was truncated; manual review is required"
+)
+_RAISE_GRADLE_TEST_VALIDATION_REQUIRES_A_WORKING_DIRECTORY = (
+    "Gradle test validation requires a working directory"
+)
+_RAISE_JUNIT_REPORT_EXCEEDS_10_MIB = "JUnit report exceeds 10 MiB: {}"
+_RAISE_INVALID_JUNIT_REPORT = "Invalid JUnit report {}: {}"
+_RAISE_JUNIT_REPORT_CONTAINS_FAILING_TESTS = "JUnit report contains failing tests: {}"
+
 
 def run_validation(
     root: Path,
@@ -311,7 +324,9 @@ def _node(
     if any(
         not isinstance(script, str) or not script.strip() for script in scripts.values()
     ):
-        raise ValueError("package.json scripts must contain nonempty command strings")
+        raise ValueError(
+            _RAISE_PACKAGE_JSON_SCRIPTS_MUST_CONTAIN_NONEMPTY_COMMAND_STRINGS
+        )
     tool = resolve_tool(manager, which)
     if not tool:
         return [_row(None, "SKIPPED", True, f"{manager} is not on PATH.")]
@@ -475,9 +490,7 @@ def _java(
     rows: list[dict] = []
     files, truncated = iter_files(root)
     if truncated:
-        raise ValueError(
-            "Java build discovery was truncated; manual review is required"
-        )
+        raise ValueError(_RAISE_JAVA_BUILD_DISCOVERY_WAS_TRUNCATED_MANUAL_REVIEW_IS)
     for build in builds:
         for component in java_build_roots(root, build, files):
             if build == "gradle":
@@ -774,7 +787,7 @@ def _execute_product_check(
 def _gradle_test_reports(root: Path | None) -> dict[Path, tuple[int, int]]:
     """Fingerprint standard Gradle JUnit reports before running the test task."""
     if root is None:
-        raise ValueError("Gradle test validation requires a working directory")
+        raise ValueError(_RAISE_GRADLE_TEST_VALIDATION_REQUIRES_A_WORKING_DIRECTORY)
     pattern = os.path.join("**", "build", "test-results", "test", "TEST-*.xml")
     return {
         path: (stat.st_mtime_ns, stat.st_size)
@@ -792,19 +805,21 @@ def _executed_gradle_tests(
         if before.get(path) == stamp:
             continue
         if stamp[1] > 10 * 1024 * 1024:
-            raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
+            raise ValueError(_RAISE_JUNIT_REPORT_EXCEEDS_10_MIB.format(path))
         try:
             contents = read_bounded(path, 10 * 1024 * 1024)
             if contents is None:
-                raise ValueError(f"JUnit report exceeds 10 MiB: {path}")
+                raise ValueError(_RAISE_JUNIT_REPORT_EXCEEDS_10_MIB.format(path))
             report = parse_xml(contents)
         except ParseError as exc:
-            raise ValueError(f"Invalid JUnit report {path}: {exc}") from exc
+            raise ValueError(_RAISE_INVALID_JUNIT_REPORT.format(path, exc)) from exc
         for suite in report.iter("testsuite"):
             tests = int(suite.get("tests", "0"))
             skipped = int(suite.get("skipped", "0"))
             if int(suite.get("failures", "0")) or int(suite.get("errors", "0")):
-                raise ValueError(f"JUnit report contains failing tests: {path}")
+                raise ValueError(
+                    _RAISE_JUNIT_REPORT_CONTAINS_FAILING_TESTS.format(path)
+                )
             count += max(0, tests - skipped)
     return count
 

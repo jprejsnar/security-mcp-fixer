@@ -31,6 +31,13 @@ from gitlab_security_mcp.official_docs import manager_documentation
 from gitlab_security_mcp.util import json_object, log_unexpected, resolve_inside
 from gitlab_security_mcp.versions import parse_version
 
+_RAISE_REFUSING_TO_READ_OUTSIDE_THE_REPOSITORY = (
+    "Refusing to read outside the repository: {}"
+)
+_RAISE_REFUSING_A_LOCKFILE_REFRESH_OUTSIDE_THE_REPOSITORY = (
+    "Refusing a lockfile refresh outside the repository: {}"
+)
+
 MAX_AUTO_SCORE = 3
 PACKAGE_TIMEOUT = 300
 # Versions come from public advisories and are written into manifests and
@@ -542,7 +549,9 @@ def _node_spec(root: Path, manifest: str, plan: Plan) -> str | None:
     """Derive a replacement spec from the current local dependency entry."""
     path = resolve_inside(root, manifest)
     if path is None:
-        raise ValueError(f"Refusing to read outside the repository: {manifest}")
+        raise ValueError(
+            _RAISE_REFUSING_TO_READ_OUTSIDE_THE_REPOSITORY.format(manifest)
+        )
     data = json_object(path.read_text(encoding="utf-8"))
     for section in DEPENDENCY_SECTIONS:
         specs = data.get(section) or {}
@@ -575,7 +584,9 @@ def _refresh_node_lock(
     )
     resolved = resolve_inside(root, entry)
     if resolved is None:
-        raise ValueError(f"Refusing a lockfile refresh outside the repository: {entry}")
+        raise ValueError(
+            _RAISE_REFUSING_A_LOCKFILE_REFRESH_OUTSIDE_THE_REPOSITORY.format(entry)
+        )
     workdir = resolved.parent
     tool = resolve_tool(plan.manager or "npm", which)
     if not tool:
@@ -663,7 +674,7 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
         resolved = resolve_inside(root, lock)
         if resolved is None:
             raise ValueError(
-                f"Refusing a lockfile refresh outside the repository: {lock}"
+                _RAISE_REFUSING_A_LOCKFILE_REFRESH_OUTSIDE_THE_REPOSITORY.format(lock)
             )
         tool = resolve_tool("dotnet", which)
         if not tool:

@@ -9,6 +9,44 @@ from gitlab_security_mcp.config_findings import config_kind
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_pages
 from gitlab_security_mcp.util import log_unexpected, read_bounded, resolve_inside
 
+_RAISE_IS_NOT_AN_EXISTING_FILE_INSIDE_THE_CHECKOUT = (
+    "{} is not an existing file inside the checkout"
+)
+_RAISE_EXCEEDS_THE_SOURCE_REVIEW_SIZE_LIMIT = "{} exceeds the source-review size limit"
+_RAISE_SOURCE_REVIEW_REQUIRES_FALSE_POSITIVE_CONFIRMED_VULNERABILITY_OR = (
+    "Source review requires FALSE_POSITIVE, CONFIRMED_VULNERABILITY, or MANUAL_REVIEW"
+)
+_RAISE_SOURCE_REVIEW_REQUIRES_FINDING_ANALYSIS_OR_LEGACY_PATTERN = (
+    "Source review requires finding_analysis (or legacy pattern_analysis)"
+)
+_RAISE_SOURCE_REVIEW_REQUIRES_1_TO_100_REVIEWED_FILES = (
+    "Source review requires 1 to 100 reviewed_files"
+)
+_RAISE_SOURCE_REVIEW_MUST_INCLUDE_THE_SCANNER_CITED_FILE = (
+    "Source review must include the scanner-cited file"
+)
+_RAISE_SOURCE_REVIEW_REQUIRES = "Source review requires {}"
+_RAISE_FALSE_POSITIVE_REASON_MUST_BE_AT_MOST_CHARACTERS = "False-positive reason must be at most {:,} characters. Use at most 2 short sentences in everyday words: what the warning claims and why the code at the line GitLab reported does not do that. Keep the code trace in finding_analysis, reachability_analysis, input_origin and reviewed_files."
+_RAISE_EACH_REVIEWED_FILE_REQUIRES_PATH_SHA256_AND_ASSESSMENT = (
+    "Each reviewed file requires path, sha256 and assessment"
+)
+_RAISE_REVIEWED_FILE_PATH_IS_MISSING = "Reviewed file path is missing"
+_RAISE_REVIEWED_FILE_CHANGED_OR_SHA256_IS_MISSING = (
+    "Reviewed file changed or SHA256 is missing: {}"
+)
+_RAISE_REVIEWED_FILE_ASSESSMENT_IS_MISSING = "Reviewed file assessment is missing: {}"
+_RAISE_FALSE_POSITIVE_FILE_ASSESSMENT_MUST_DESCRIBE_IN_A = (
+    "False-positive file assessment must describe {} in a complete sentence"
+)
+_RAISE_SAST_FINDING_HAS_NO_SOURCE_FILE_PATH = "SAST finding has no source-file path"
+_RAISE_SCANNER_CITED_SOURCE_LINE_IS_MISSING_OR_OUT = (
+    "Scanner-cited source line is missing or out of range"
+)
+_RAISE_FALSE_POSITIVE_MUST_BE_A_COMPLETE_SENTENCE_DESCRIBING = (
+    "False-positive {} must be a complete sentence describing the cited code"
+)
+_RAISE_SOURCE_REVIEW_MUST_BE_AN_OBJECT = "source_review must be an object"
+
 _MIN_AUDIT_SENTENCE = 24
 _MAX_APPROVAL_REASON = 400
 
@@ -52,10 +90,12 @@ def _read_source(root: Path, relative: str) -> bytes:
     """Read one bounded, existing checkout file without following paths outside it."""
     path = resolve_inside(root, relative)
     if path is None or not path.is_file():
-        raise ValueError(f"{relative} is not an existing file inside the checkout")
+        raise ValueError(
+            _RAISE_IS_NOT_AN_EXISTING_FILE_INSIDE_THE_CHECKOUT.format(relative)
+        )
     contents = read_bounded(path, MAX_SOURCE_BYTES)
     if contents is None:
-        raise ValueError(f"{relative} exceeds the source-review size limit")
+        raise ValueError(_RAISE_EXCEEDS_THE_SOURCE_REVIEW_SIZE_LIMIT.format(relative))
     return contents
 
 
@@ -115,11 +155,11 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
         "MANUAL_REVIEW",
     }:
         raise ValueError(
-            "Source review requires FALSE_POSITIVE, CONFIRMED_VULNERABILITY, or MANUAL_REVIEW"
+            _RAISE_SOURCE_REVIEW_REQUIRES_FALSE_POSITIVE_CONFIRMED_VULNERABILITY_OR
         )
     for key in ("reason", "input_origin", "reachability_analysis"):
         if not isinstance(review.get(key), str) or not review[key].strip():
-            raise ValueError(f"Source review requires {key}")
+            raise ValueError(_RAISE_SOURCE_REVIEW_REQUIRES.format(key))
     analysis_key = (
         "finding_analysis" if "finding_analysis" in review else "pattern_analysis"
     )
@@ -128,52 +168,60 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
         or not review[analysis_key].strip()
     ):
         raise ValueError(
-            "Source review requires finding_analysis (or legacy pattern_analysis)"
+            _RAISE_SOURCE_REVIEW_REQUIRES_FINDING_ANALYSIS_OR_LEGACY_PATTERN
         )
     if review.get("decision") == "FALSE_POSITIVE":
         if len(review["reason"].strip()) > _MAX_APPROVAL_REASON:
             raise ValueError(
-                f"False-positive reason must be at most {_MAX_APPROVAL_REASON:,} characters. "
-                "Use at most 2 short sentences in everyday words: what the warning "
-                "claims and why the code at the line GitLab reported does not do "
-                "that. Keep the code trace in finding_analysis, "
-                "reachability_analysis, input_origin and reviewed_files."
+                _RAISE_FALSE_POSITIVE_REASON_MUST_BE_AT_MOST_CHARACTERS.format(
+                    _MAX_APPROVAL_REASON
+                )
             )
         for key in ("reason", "input_origin", analysis_key, "reachability_analysis"):
             if len(review[key].strip()) < _MIN_AUDIT_SENTENCE:
                 raise ValueError(
-                    f"False-positive {key} must be a complete sentence describing the cited code"
+                    _RAISE_FALSE_POSITIVE_MUST_BE_A_COMPLETE_SENTENCE_DESCRIBING.format(
+                        key
+                    )
                 )
     reviewed = review.get("reviewed_files")
     if not isinstance(reviewed, list) or not reviewed or len(reviewed) > 100:
-        raise ValueError("Source review requires 1 to 100 reviewed_files")
+        raise ValueError(_RAISE_SOURCE_REVIEW_REQUIRES_1_TO_100_REVIEWED_FILES)
     paths = set()
     evidence = []
     for item in reviewed:
         if not isinstance(item, dict):
-            raise ValueError("Each reviewed file requires path, sha256 and assessment")
+            raise ValueError(
+                _RAISE_EACH_REVIEWED_FILE_REQUIRES_PATH_SHA256_AND_ASSESSMENT
+            )
         relative = item.get("path")
         if not isinstance(relative, str) or not relative.strip():
-            raise ValueError("Reviewed file path is missing")
+            raise ValueError(_RAISE_REVIEWED_FILE_PATH_IS_MISSING)
         contents = _read_source(root, relative)
         digest = hashlib.sha256(contents).hexdigest()
         if item.get("sha256") != digest:
-            raise ValueError(f"Reviewed file changed or SHA256 is missing: {relative}")
+            raise ValueError(
+                _RAISE_REVIEWED_FILE_CHANGED_OR_SHA256_IS_MISSING.format(relative)
+            )
         assessment = item.get("assessment")
         if not isinstance(assessment, str) or not assessment.strip():
-            raise ValueError(f"Reviewed file assessment is missing: {relative}")
+            raise ValueError(
+                _RAISE_REVIEWED_FILE_ASSESSMENT_IS_MISSING.format(relative)
+            )
         if (
             review.get("decision") == "FALSE_POSITIVE"
             and len(assessment.strip()) < _MIN_AUDIT_SENTENCE
         ):
             raise ValueError(
-                f"False-positive file assessment must describe {relative} in a complete sentence"
+                _RAISE_FALSE_POSITIVE_FILE_ASSESSMENT_MUST_DESCRIBE_IN_A.format(
+                    relative
+                )
             )
         paths.add(resolve_inside(root, relative))
         evidence.append(f"Reviewed {relative} SHA256={digest}: {assessment}")
     cited = resolve_inside(root, finding["location"]["file"])
     if cited not in paths:
-        raise ValueError("Source review must include the scanner-cited file")
+        raise ValueError(_RAISE_SOURCE_REVIEW_MUST_INCLUDE_THE_SCANNER_CITED_FILE)
     evidence.extend(
         f"{key}: {review[key]}"
         for key in ("input_origin", analysis_key, "reachability_analysis")
@@ -221,12 +269,12 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
     try:
         relative = location.get("file")
         if not isinstance(relative, str) or not relative:
-            raise ValueError("SAST finding has no source-file path")
+            raise ValueError(_RAISE_SAST_FINDING_HAS_NO_SOURCE_FILE_PATH)
         contents = _read_source(root, relative)
         lines = contents.decode("utf-8").splitlines()
         number = int(location.get("startLine") or 0)
         if number < 1 or number > len(lines):
-            raise ValueError("Scanner-cited source line is missing or out of range")
+            raise ValueError(_RAISE_SCANNER_CITED_SOURCE_LINE_IS_MISSING_OR_OUT)
         workflow["source"] = {
             "path": relative,
             "sha256": hashlib.sha256(contents).hexdigest(),
@@ -243,7 +291,7 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
         )
         if review is not None:
             if not isinstance(review, dict):
-                raise ValueError("source_review must be an object")
+                raise ValueError(_RAISE_SOURCE_REVIEW_MUST_BE_AN_OBJECT)
             evidence.extend(_review_source(root, finding, review))
             return {
                 "decision": review["decision"],

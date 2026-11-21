@@ -87,6 +87,8 @@ from gitlab_security_mcp.source_findings import (
 )
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import (
+    GIT_OPERATION_FAILURES,
+    PROGRESS_PUBLISH_FAILURES,
     atomic_write_text,
     log_task,
     log_unexpected,
@@ -105,6 +107,96 @@ from gitlab_security_mcp.versions import (
     lowest_fixed,
     parse_fixed_versions,
     parse_version,
+)
+
+_RAISE_REPO_ROOT_CONTAINS_AN_UNRESOLVED_HOST_PLACEHOLDER_SET = "REPO_ROOT contains an unresolved host placeholder. Set REPO_ROOT to the absolute application checkout path, or call run_prechecks(repo_root=<absolute checkout path>). Restart the MCP server after changing its configuration."
+_RAISE_REPOSITORY_DIRECTORY_DOES_NOT_EXIST_SET_REPO_ROOT = "Repository directory does not exist: {}. Set REPO_ROOT or call run_prechecks(repo_root=<absolute checkout path>)."
+_RAISE_CALL_SELECT_PACKAGE_VERSION_BEFORE_APPROVAL_THE_ADVISORY = "Call select_package_version before approval: the advisory fix is only a minimum, not proof of the latest supported runtime-compatible stable release"
+_RAISE_PAID_OR_RESTRICTED_LICENSE_AUTOMATIC_UPGRADE_BLOCKED_FLAG = "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; flag this target for user investigation even when an older version or corporate approval is free."
+_RAISE_SOURCE_REVIEW_IS_ONLY_SUPPORTED_FOR_SOURCE_CONFIGURATION = (
+    "source_review is only supported for source/configuration SAST or IaC findings"
+)
+_RAISE_NO_DNS_ADDRESSES_RETURNED = "No DNS addresses returned"
+_RAISE_CHECKOUT_VERIFICATION_FAILED_CURRENT_BRANCH_IS = (
+    "Checkout verification failed. Current branch is {}."
+)
+_RAISE_SERVER_SHUTDOWN_INTERRUPTED_THE_APPROVED_PACKAGE_BATCH = (
+    "Server shutdown interrupted the approved package batch."
+)
+_RAISE_THE_LATEST_ELIGIBLE_TARGET_IS_R_BUT_THE = "The latest eligible target is {!r}, but the release review does not identify that exact target. Review the current catalog and resubmit; a newly published release cannot inherit an older target's support or fee review."
+_RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED_OR_COULD_NOT = "Latest eligible target {} is affected or could not be verified against public advisories; manual investigation required"
+_RAISE_LATEST_ELIGIBLE_RELEASE_CANNOT_BE_PLANNED = (
+    "Latest eligible release cannot be planned: {}"
+)
+_RAISE_DOCUMENTATION_REVIEW_MUST_IDENTIFY_THE_EXACT_ECOSYSTEM_PACKAGE = (
+    "Documentation review must identify the exact ecosystem, package, and target"
+)
+_RAISE_MAVEN_WRAPPER_AND_MVN_ARE_UNAVAILABLE_DEPENDENCY_TREE = (
+    "Maven wrapper and mvn are unavailable; dependency tree not inspected"
+)
+_RAISE_MAVEN_DID_NOT_REPORT_THIS_COORDINATE_AS_RESOLVED = (
+    "Maven did not report this coordinate as resolved; absence is not a false positive"
+)
+_RAISE_MAVEN_REPORTED_AN_UNSUPPORTED_RESOLVED_VERSION = (
+    "Maven reported an unsupported resolved version"
+)
+_RAISE_CHECKOUT_CHANGED_DURING_GRADLE_DEPENDENCY_INSPECTION_RETRY_AGAINST = (
+    "Checkout changed during Gradle dependency inspection; retry against a stable tree."
+)
+_RAISE_GRADLE_CONFIGURATION_MUST_BE_AN_EXACT_SCANNER_SUPPLIED = (
+    "Gradle configuration must be an exact scanner-supplied configuration name"
+)
+_RAISE_GRADLE_WRAPPER_AND_GRADLE_ARE_UNAVAILABLE_DEPENDENCY_TREE = (
+    "Gradle wrapper and gradle are unavailable; dependency tree not inspected."
+)
+_RAISE_CANNOT_REUSE_A_BRANCH_WITH_A_DIRTY_WORKING = (
+    "Cannot reuse a branch with a dirty working tree or Git operation in progress"
+)
+_RAISE_PROVIDE_THE_COMPLETE_COMPATIBILITY_LICENSE_REVIEW_FOR_THIS = "Provide the complete compatibility/license review for this exact package and target."
+_RAISE_THE_APPROVED_PACKAGE_BATCH_BELONGS_TO_A_REPLACED = (
+    "The approved package batch belongs to a replaced run."
+)
+_RAISE_CHECKOUT_CHANGED_OUTSIDE_THE_APPROVED_BATCH_REVIEW_THE = "Checkout changed outside the approved batch. Review the changes and obtain fresh documentation evidence."
+_RAISE_CALL_QUALIFY_PACKAGE_UPDATE_WITH_DOCUMENTATION_LICENSE_REVIEW = "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
+_RAISE_CHECKOUT_OR_QUALIFICATION_POLICY_CHANGED_REQUALIFY_THE_EXACT = (
+    "Checkout or qualification policy changed; requalify the exact plan"
+)
+_RAISE_QUALIFICATION_POLICY_CHANGED_ISOLATION_REQUIRES_A_FRESH_REVIEW = (
+    "Qualification policy changed; isolation requires a fresh review"
+)
+_RAISE_VERSION_ALIGNMENT_DOCUMENT_MOVED_OUTSIDE_THE_CHECKOUT = (
+    "Version-alignment document moved outside the checkout"
+)
+_RAISE_PACKAGE_QUALIFICATION_IS_MISSING = "Package qualification is missing"
+_RAISE_PACKAGE_QUALIFICATION_PREDATES_BUILD_ONLY_NO_CODE_CHECKS = "Package qualification predates build-only/no-code checks; requalification is required"
+_RAISE_QUALIFICATION_POLICY_CHANGED_AFTER_APPLICATION_RE_REVIEW_REQUIRED = (
+    "Qualification policy changed after application; re-review required"
+)
+_RAISE_PRODUCTION_BUILD_VALIDATION_FAILED_OR_IS_INCOMPLETE_CANDIDATE = (
+    "Production build validation failed or is incomplete; candidate cannot be accepted"
+)
+_RAISE_POST_UPDATE_CONFIGURED_PRODUCT_CHECKS_DID_NOT_PASS = (
+    "Post-update configured product checks did not pass"
+)
+_RAISE_GITLAB_DISMISSAL_HAS_NO_MATCHING_INDEPENDENT_READ_BACK = (
+    "GitLab dismissal has no matching independent read-back proof"
+)
+_RAISE_A_BLOCKED_PACKAGE_REQUIRES_AN_EXPLICIT_EVIDENCE_BASED = (
+    "A blocked package requires an explicit evidence-based reason."
+)
+_RAISE_GRADLE_DID_NOT_RESOLVE_THE_EXACT_FIXED_VERSION = "Gradle did not resolve the exact fixed version in every required configuration; a missing dependency/configuration or a declaration/pin alone is not remediation"
+_RAISE_MAVEN_DEPENDENCY_TREE_DID_NOT_CONFIRM_THE_EXACT = (
+    "Maven dependency tree did not confirm the exact overridden fixed version"
+)
+_RAISE_MAVEN_DEPENDENCY_INSPECTION_EXITED = "Maven dependency inspection exited {}: {}"
+_RAISE_CHECKOUT_CHANGED_DURING_MAVEN_DEPENDENCY_INSPECTION = (
+    "Checkout changed during Maven dependency inspection"
+)
+_RAISE_TRUNCATED_MAVEN_DEPENDENCY_OUTPUT_HAS_NO_COMPLETE_LOCAL = (
+    "Truncated Maven dependency output has no complete local log"
+)
+_RAISE_MAVEN_DEPENDENCY_LOG_EXCEEDS_THE_8_MIB_INSPECTION = (
+    "Maven dependency log exceeds the 8 MiB inspection limit"
 )
 
 logger = logging.getLogger("gitlab_security_mcp")
@@ -389,16 +481,12 @@ class Engine:
         configured = configured or os.getcwd()
         if "${" in configured:
             raise ValueError(
-                "REPO_ROOT contains an unresolved host placeholder. Set REPO_ROOT "
-                "to the absolute application checkout path, or call "
-                "run_prechecks(repo_root=<absolute checkout path>). Restart the MCP "
-                "server after changing its configuration."
+                _RAISE_REPO_ROOT_CONTAINS_AN_UNRESOLVED_HOST_PLACEHOLDER_SET
             )
         root = Path(configured).expanduser().resolve()
         if not root.is_dir():
             raise ValueError(
-                f"Repository directory does not exist: {root}. Set REPO_ROOT or "
-                "call run_prechecks(repo_root=<absolute checkout path>)."
+                _RAISE_REPOSITORY_DIRECTORY_DOES_NOT_EXIST_SET_REPO_ROOT.format(root)
             )
         timeout = int(os.environ.get("VALIDATION_TIMEOUT_SEC", "600"))
         return cls(
@@ -434,7 +522,7 @@ class Engine:
         self._progress(None, "Checking corporate DNS for nexus.ert.com")
         try:
             if not getaddrinfo("nexus.ert.com", 443, type=SOCK_STREAM):
-                raise gaierror("No DNS addresses returned")
+                raise gaierror(_RAISE_NO_DNS_ADDRESSES_RETURNED)
         except OSError as exc:
             reason = (
                 "Cannot resolve nexus.ert.com. Connect to corporate VPN first, "
@@ -469,7 +557,7 @@ class Engine:
             return {**dns_failure, "no_changes_attempted": True}
         try:
             self.git.ensure_work_tree()
-        except Exception as exc:
+        except GIT_OPERATION_FAILURES as exc:
             log_unexpected(exc, "Git work-tree verification")
             self.state.status = "PRECHECK_FAILED"
             self.state.stop_stage = "precheck"
@@ -532,7 +620,7 @@ class Engine:
                         "no_changes_attempted": True,
                     },
                 )
-        except Exception as exc:
+        except GIT_OPERATION_FAILURES as exc:
             logger.exception("precheck failed")
             return self._stop(
                 "PRECHECK_FAILED",
@@ -631,7 +719,7 @@ class Engine:
                             "results": results,
                         },
                     )
-            except Exception as exc:
+            except GIT_OPERATION_FAILURES as exc:
                 log_unexpected(exc, f"pull {number} of main")
                 return self._stop(
                     "PULL_FAILED",
@@ -748,7 +836,7 @@ class Engine:
             if reused:
                 if self.git.dirty_lines() or self.git.in_progress_operation():
                     raise RuntimeError(
-                        "Cannot reuse a branch with a dirty working tree or Git operation in progress"
+                        _RAISE_CANNOT_REUSE_A_BRANCH_WITH_A_DIRTY_WORKING
                     )
                 if local:
                     self.git.run(["checkout", name])
@@ -766,7 +854,9 @@ class Engine:
             current = self.git.current_branch()
             if current != name:
                 raise RuntimeError(
-                    f"Checkout verification failed. Current branch is {current}."
+                    _RAISE_CHECKOUT_VERIFICATION_FAILED_CURRENT_BRANCH_IS.format(
+                        current
+                    )
                 )
             if reused:
                 tracked = self.git.tracked_security_paths()
@@ -792,7 +882,7 @@ class Engine:
                             "failed_command": preparation[-1]["argv"],
                         },
                     )
-        except Exception as exc:
+        except GIT_OPERATION_FAILURES as exc:
             log_unexpected(exc, f"security branch preparation {name}")
             return self._stop(
                 "BRANCH_CREATION_FAILED",
@@ -1380,7 +1470,7 @@ class Engine:
                     for key in ("ecosystem", "package", "target")
                 ):
                     raise ValueError(
-                        "Provide the complete compatibility/license review for this exact package and target."
+                        _RAISE_PROVIDE_THE_COMPLETE_COMPATIBILITY_LICENSE_REVIEW_FOR_THIS
                     )
                 if "blocked_reason" in review:
                     if (
@@ -1388,7 +1478,7 @@ class Engine:
                         or not review["blocked_reason"].strip()
                     ):
                         raise ValueError(
-                            "A blocked package requires an explicit evidence-based reason."
+                            _RAISE_A_BLOCKED_PACKAGE_REQUIRES_AN_EXPLICIT_EVIDENCE_BASED
                         )
                     prepared[item["id"]] = deepcopy(review)
                     continue
@@ -1489,15 +1579,15 @@ class Engine:
             with self._lock:
                 if cancelled.is_set():
                     raise InterruptedError(
-                        "Server shutdown interrupted the approved package batch."
+                        _RAISE_SERVER_SHUTDOWN_INTERRUPTED_THE_APPROVED_PACKAGE_BATCH
                     )
                 if self.state.fix_selection.get("request_id") != request_id:
                     raise RuntimeError(
-                        "The approved package batch belongs to a replaced run."
+                        _RAISE_THE_APPROVED_PACKAGE_BATCH_BELONGS_TO_A_REPLACED
                     )
                 if tree_snapshot(self.repo_root) != expected_tree:
                     raise ValueError(
-                        "Checkout changed outside the approved batch. Review the changes and obtain fresh documentation evidence."
+                        _RAISE_CHECKOUT_CHANGED_OUTSIDE_THE_APPROVED_BATCH_REVIEW_THE
                     )
                 started_at = utc_now_iso()
                 started = monotonic()
@@ -1570,7 +1660,7 @@ class Engine:
                 failed |= validation["status"] != "VALIDATION_COMPLETE"
             if cancelled.is_set():
                 raise InterruptedError(
-                    "Server shutdown interrupted the approved package batch."
+                    _RAISE_SERVER_SHUTDOWN_INTERRUPTED_THE_APPROVED_PACKAGE_BATCH
                 )
             status = "PARTIAL_FAILURE" if failed else "COMPLETED"
         except InterruptedError as exc:
@@ -1673,9 +1763,9 @@ class Engine:
                     finding["evidence"].append(warning)
             if "target" not in review or review["target"] != selection["target"]:
                 raise ValueError(
-                    f"The latest eligible target is {selection['target']!r}, but the release review "
-                    "does not identify that exact target. Review the current catalog and resubmit; "
-                    "a newly published release cannot inherit an older target's support or fee review."
+                    _RAISE_THE_LATEST_ELIGIBLE_TARGET_IS_R_BUT_THE.format(
+                        selection["target"]
+                    )
                 )
             if selection["target"] is None:
                 selection["status"] = "BLOCKED"
@@ -1702,13 +1792,17 @@ class Engine:
             self._record_validation_sites(finding, target_advisory.validation_sites)
             if target_advisory.affected is not False:
                 raise ValueError(
-                    f"Latest eligible target {target} is affected or could not be verified against public advisories; manual investigation required"
+                    _RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED_OR_COULD_NOT.format(
+                        target
+                    )
                 )
             decision, reason, evidence, proposed, _prompt = self._decide(
                 finding, package_target=target
             )
             if decision != "CHANGE_REQUIRED" or proposed is None:
-                raise ValueError(f"Latest eligible release cannot be planned: {reason}")
+                raise ValueError(
+                    _RAISE_LATEST_ELIGIBLE_RELEASE_CANNOT_BE_PLANNED.format(reason)
+                )
             selection["status"] = "SELECTED"
             finding["packageVersionSelection"] = deepcopy(selection)
             proposed["release_selection"] = selection
@@ -1762,8 +1856,7 @@ class Engine:
             or selection.get("status") != "SELECTED"
         ):
             raise ValueError(
-                "Call select_package_version before approval: the advisory fix is only a minimum, "
-                "not proof of the latest supported runtime-compatible stable release"
+                _RAISE_CALL_SELECT_PACKAGE_VERSION_BEFORE_APPROVAL_THE_ADVISORY
             )
 
     @_serialized
@@ -1811,7 +1904,7 @@ class Engine:
                 for key in ("ecosystem", "package", "target")
             ):
                 raise ValueError(
-                    "Documentation review must identify the exact ecosystem, package, and target"
+                    _RAISE_DOCUMENTATION_REVIEW_MUST_IDENTIFY_THE_EXACT_ECOSYSTEM_PACKAGE
                 )
             self._progress(
                 finding_id, "Reviewing exact-target APIs, callers, and license policy"
@@ -1978,7 +2071,7 @@ class Engine:
                     != "production-build-resolution-no-tests-v6"
                 ):
                     raise ValueError(
-                        "Call qualify_package_update with documentation, license review or configured policy, and passing checks before this edit"
+                        _RAISE_CALL_QUALIFY_PACKAGE_UPDATE_WITH_DOCUMENTATION_LICENSE_REVIEW
                     )
                 policy = self._package_policy(proposed, receipt["review"])
                 self._require_package_version(proposed)
@@ -1986,7 +2079,7 @@ class Engine:
                     "tree"
                 ] != tree_snapshot(self.repo_root):
                     raise ValueError(
-                        "Checkout or qualification policy changed; requalify the exact plan"
+                        _RAISE_CHECKOUT_OR_QUALIFICATION_POLICY_CHANGED_REQUALIFY_THE_EXACT
                     )
                 review_major_upgrade(self.repo_root, proposed, receipt["review"])
                 receipt["dependency_before"] = backup_dependency_files(
@@ -2356,7 +2449,7 @@ class Engine:
                 policy = self._package_policy(receipt["plan"], receipt["review"])
                 if policy["policy_sha256"] != receipt["policy_sha256"]:
                     raise ValueError(
-                        "Qualification policy changed; isolation requires a fresh review"
+                        _RAISE_QUALIFICATION_POLICY_CHANGED_ISOLATION_REQUIRES_A_FRESH_REVIEW
                     )
             rollback = rollback_dependency_files(
                 self.repo_root,
@@ -2434,7 +2527,7 @@ class Engine:
                 destination = resolve_inside(self.repo_root, path)
                 if destination is None:
                     raise ValueError(
-                        "Version-alignment document moved outside the checkout"
+                        _RAISE_VERSION_ALIGNMENT_DOCUMENT_MOVED_OUTSIDE_THE_CHECKOUT
                     )
                 atomic_write_text(
                     destination, render_version_alignment(change, selected_plans)
@@ -2637,19 +2730,19 @@ class Engine:
             receipt = (finding or {}).get("packageQualification") or {}
             try:
                 if not receipt.get("plan"):
-                    raise ValueError("Package qualification is missing")
+                    raise ValueError(_RAISE_PACKAGE_QUALIFICATION_IS_MISSING)
                 if (
                     receipt.get("check_contract")
                     != "production-build-resolution-no-tests-v6"
                 ):
                     raise ValueError(
-                        "Package qualification predates build-only/no-code checks; requalification is required"
+                        _RAISE_PACKAGE_QUALIFICATION_PREDATES_BUILD_ONLY_NO_CODE_CHECKS
                     )
                 receipt["post_results"] = deepcopy(outcome["results"])
                 policy = self._package_policy(receipt["plan"], receipt["review"])
                 if policy["policy_sha256"] != receipt["policy_sha256"]:
                     raise ValueError(
-                        "Qualification policy changed after application; re-review required"
+                        _RAISE_QUALIFICATION_POLICY_CHANGED_AFTER_APPLICATION_RE_REVIEW_REQUIRED
                     )
                 validate_edits(
                     self.repo_root,
@@ -2660,7 +2753,7 @@ class Engine:
                 )
                 if outcome["status"] != "VALIDATION_COMPLETE":
                     raise ValueError(
-                        "Production build validation failed or is incomplete; candidate cannot be accepted"
+                        _RAISE_PRODUCTION_BUILD_VALIDATION_FAILED_OR_IS_INCOMPLETE_CANDIDATE
                     )
                 plan = receipt["plan"]
                 if plan.get("manager") == "gradle" and ":" in plan.get("package", ""):
@@ -2692,7 +2785,7 @@ class Engine:
                         )
                     ):
                         raise ValueError(
-                            "Gradle did not resolve the exact fixed version in every required configuration; a missing dependency/configuration or a declaration/pin alone is not remediation"
+                            _RAISE_GRADLE_DID_NOT_RESOLVE_THE_EXACT_FIXED_VERSION
                         )
                     receipt["resolved_dependency"] = {
                         "package": plan["package"],
@@ -2724,7 +2817,7 @@ class Engine:
                     }
                     if versions != {plan["target"]}:
                         raise ValueError(
-                            "Maven dependency tree did not confirm the exact overridden fixed version"
+                            _RAISE_MAVEN_DEPENDENCY_TREE_DID_NOT_CONFIRM_THE_EXACT
                         )
                 checks = run_checks(
                     self.repo_root,
@@ -2741,7 +2834,7 @@ class Engine:
                     for row in checks
                 ):
                     raise ValueError(
-                        "Post-update configured product checks did not pass"
+                        _RAISE_POST_UPDATE_CONFIGURED_PRODUCT_CHECKS_DID_NOT_PASS
                     )
                 validated_tree = validate_edits(
                     self.repo_root,
@@ -3023,7 +3116,7 @@ class Engine:
                     or outcome.get("vulnerability_id") != item["vulnerability_id"]
                 ):
                     raise RuntimeError(
-                        "GitLab dismissal has no matching independent read-back proof"
+                        _RAISE_GITLAB_DISMISSAL_HAS_NO_MATCHING_INDEPENDENT_READ_BACK
                     )
             except (
                 httpx.HTTPError,
@@ -3331,8 +3424,7 @@ class Engine:
                         "reason": "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; user investigation required.",
                     }
             raise ValueError(
-                "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; flag this target "
-                "for user investigation even when an older version or corporate approval is free."
+                _RAISE_PAID_OR_RESTRICTED_LICENSE_AUTOMATIC_UPGRADE_BLOCKED_FLAG
             )
         if self._package_policy_required or self.package_policy_path.exists():
             return load_policy(self.repo_root, self.package_policy_path, plan)
@@ -3417,7 +3509,7 @@ class Engine:
             ) or resolve_tool("mvn", self.which)
             if not tool:
                 raise ValueError(
-                    "Maven wrapper and mvn are unavailable; dependency tree not inspected"
+                    _RAISE_MAVEN_WRAPPER_AND_MVN_ARE_UNAVAILABLE_DEPENDENCY_TREE
                 )
             with self._gradle_lock:
                 before = tree_snapshot(self.repo_root)
@@ -3439,7 +3531,10 @@ class Engine:
                     )
                     if result.exit_code:
                         raise ValueError(
-                            f"Maven dependency inspection exited {result.exit_code}: {(result.stderr or result.stdout)[-500:]}"
+                            _RAISE_MAVEN_DEPENDENCY_INSPECTION_EXITED.format(
+                                result.exit_code,
+                                (result.stderr or result.stdout)[-500:],
+                            )
                         )
                     output = result.stdout
                     if result.truncated:
@@ -3452,12 +3547,12 @@ class Engine:
                             self.repo_root / ".security-mcp" / "command-logs"
                         ):
                             raise ValueError(
-                                "Truncated Maven dependency output has no complete local log"
+                                _RAISE_TRUNCATED_MAVEN_DEPENDENCY_OUTPUT_HAS_NO_COMPLETE_LOCAL
                             )
                         raw = read_bounded(log, 8 * 1024 * 1024)
                         if raw is None:
                             raise ValueError(
-                                "Maven dependency log exceeds the 8 MiB inspection limit"
+                                _RAISE_MAVEN_DEPENDENCY_LOG_EXCEEDS_THE_8_MIB_INSPECTION
                             )
                         output = raw.decode("utf-8")
                     parsed = GradleReport()
@@ -3470,7 +3565,7 @@ class Engine:
                         ).add(match[2])
                     if tree_snapshot(self.repo_root) != before:
                         raise ValueError(
-                            "Checkout changed during Maven dependency inspection"
+                            _RAISE_CHECKOUT_CHANGED_DURING_MAVEN_DEPENDENCY_INSPECTION
                         )
                     self._gradle_reports[key] = (before, parsed, dict(row), set())
                     if len(self._gradle_reports) > MAX_WORKERS:
@@ -3482,7 +3577,7 @@ class Engine:
             }
             if not versions:
                 raise ValueError(
-                    "Maven did not report this coordinate as resolved; absence is not a false positive"
+                    _RAISE_MAVEN_DID_NOT_REPORT_THIS_COORDINATE_AS_RESOLVED
                 )
             known = {
                 version: parsed
@@ -3490,7 +3585,7 @@ class Engine:
                 if (parsed := parse_version(version)) is not None
             }
             if len(known) != len(versions):
-                raise ValueError("Maven reported an unsupported resolved version")
+                raise ValueError(_RAISE_MAVEN_REPORTED_AN_UNSUPPORTED_RESOLVED_VERSION)
             version = finding.get("installedVersion")
             if version not in versions:
                 version = min(known, key=known.__getitem__)
@@ -3589,7 +3684,7 @@ class Engine:
                         report = raw.decode("utf-8")
             if tree_snapshot(self.repo_root) != before:
                 raise ValueError(
-                    "Checkout changed during Gradle dependency inspection; retry against a stable tree."
+                    _RAISE_CHECKOUT_CHANGED_DURING_GRADLE_DEPENDENCY_INSPECTION_RETRY_AGAINST
                 )
             parsed = (
                 parse_gradle_report(report)
@@ -3660,7 +3755,7 @@ class Engine:
                 or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,100}", configuration) is None
             ):
                 raise ValueError(
-                    "Gradle configuration must be an exact scanner-supplied configuration name"
+                    _RAISE_GRADLE_CONFIGURATION_MUST_BE_AN_EXACT_SCANNER_SUPPLIED
                 )
             row["configuration"] = configuration
             tool = java_wrapper(
@@ -3668,7 +3763,7 @@ class Engine:
             ) or resolve_tool("gradle", self.which)
             if not tool:
                 raise ValueError(
-                    "Gradle wrapper and gradle are unavailable; dependency tree not inspected."
+                    _RAISE_GRADLE_WRAPPER_AND_GRADLE_ARE_UNAVAILABLE_DEPENDENCY_TREE
                 )
             scoped_inspection = None
             for scope in (None,) if configurations else (configuration, None):
@@ -3857,7 +3952,7 @@ class Engine:
             )
         if source_review is not None:
             raise ValueError(
-                "source_review is only supported for source/configuration SAST or IaC findings"
+                _RAISE_SOURCE_REVIEW_IS_ONLY_SUPPORTED_FOR_SOURCE_CONFIGURATION
             )
         if category in {"api_fuzzing", "coverage_fuzzing"}:
             reason = (
@@ -4469,7 +4564,7 @@ class Engine:
             bar = "#" * 20 if " finished:" in step else "?" * 20
             try:
                 sink(f"[{bar}] {package} / {label}: {step}")
-            except Exception:
+            except PROGRESS_PUBLISH_FAILURES:
                 logger.warning("Could not publish step progress", exc_info=True)
 
     def _finding(self, finding_id: str) -> dict | None:

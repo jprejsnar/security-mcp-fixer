@@ -22,6 +22,84 @@ from gitlab_security_mcp.util import (
 )
 from gitlab_security_mcp.versions import bump_npm_spec, parse_version, range_allows
 
+_RAISE_UNRECOGNIZED_GITHUB_VERSIONS_MD_PINS_TABLE_MANUAL_POLICY = (
+    "Unrecognized .github/versions.md pins table; manual policy mapping is required"
+)
+_RAISE_UNKNOWN_JAVA_BUILD_MANAGER = "Unknown Java build manager: {}"
+_RAISE_MAVEN_REACTOR_MODULES_CONTAIN_A_CYCLE = "Maven reactor modules contain a cycle"
+_RAISE_JAVA_PROJECT_MUST_STAY_INSIDE_THE_REPOSITORY = (
+    "Java project must stay inside the repository"
+)
+_RAISE_PNPM_OVERRIDES_MUST_BE_A_JSON_OBJECT = "{}: pnpm overrides must be a JSON object"
+_RAISE_GRADLE_DID_NOT_RESOLVE_A_CONCRETE_VERSION_OF = (
+    "Gradle did not resolve a concrete version of {}"
+)
+_RAISE_GRADLE_SELECTED_CONFLICTING_VERSIONS_OF_WITHIN_A_CONFIGURATION = (
+    "Gradle selected conflicting versions of {} within a configuration"
+)
+_RAISE_GRADLE_SELECTED_MULTIPLE_CONFIGURATION_VERSIONS_OF_SCANNER_VERSION = "Gradle selected multiple configuration versions of {}; scanner version {} was not observed"
+_RAISE_VERSIONS_AND_LIBRARIES_MUST_BE_TOML_TABLES = (
+    "{}: versions and libraries must be TOML tables"
+)
+_RAISE_REFUSING_TO_WRITE_OUTSIDE_THE_REPOSITORY = (
+    "Refusing to write outside the repository: {}"
+)
+_RAISE_A_JAVA_OVERRIDE_REQUIRES_AN_EXACT_GROUP_ARTIFACT = (
+    "A Java override requires an exact group:artifact coordinate"
+)
+_RAISE_JAVA_OVERRIDES_REQUIRE_A_BUILD_GRADLE_BUILD_GRADLE = (
+    "Java overrides require a build.gradle, build.gradle.kts or pom.xml"
+)
+_RAISE_PROFILE_SPECIFIC_OR_PREFIXED_MAVEN_DEPENDENCY_MANAGEMENT_REQUIRES = (
+    "Profile-specific or prefixed Maven dependency management requires review"
+)
+_RAISE_DUPLICATE_GRADLE_VERSION_PROPERTIES_REQUIRE_REVIEW = (
+    "Duplicate Gradle version properties require review"
+)
+_RAISE_DUPLICATE_CENTRAL_VERSION_POLICY_ROWS_REQUIRE_REVIEW = (
+    "Duplicate central version-policy rows require review"
+)
+_RAISE_JAVA_BUILD_DISCOVERY_WAS_TRUNCATED_MANUAL_REVIEW_IS = (
+    "Java build discovery was truncated; manual review is required"
+)
+_RAISE_MUST_BE_A_JSON_OBJECT = "{}: {} must be a JSON object"
+_RAISE_COULD_NOT_PARSE = "Could not parse {}"
+_RAISE_AMBIGUOUS_EXISTING_GRADLE_SECURITY_PROPERTY_REQUIRES_REVIEW_IT = "Ambiguous/existing Gradle security property requires review; it will not be overwritten"
+_RAISE_MAVEN_PROJECT_CLOSING_ELEMENT_IS_MISSING_OR_AMBIGUOUS = (
+    "Maven project closing element is missing or ambiguous"
+)
+_RAISE_REPOSITORY_VERSION_POLICY_REQUIRES_AN_EXPLICIT_PROPERTY_CATALOG = "Repository version policy requires an explicit property/catalog mapping; do not guess a new literal version pin"
+_RAISE_REFERENCED_GRADLE_VERSION_PROPERTY_WAS_NOT_FOUND_NO = (
+    "Referenced Gradle version property was not found; no replacement was guessed"
+)
+_RAISE_PNPM_WORKSPACE_YAML_MUST_CONTAIN_A_MAPPING = (
+    "pnpm-workspace.yaml must contain a mapping"
+)
+_RAISE_PNPM_WORKSPACE_OVERRIDES_MUST_CONTAIN_A_MAPPING = (
+    "pnpm workspace overrides must contain a mapping"
+)
+_RAISE_LEGACY_PNPM_OVERRIDES_MUST_CONTAIN_A_MAPPING = (
+    "Legacy pnpm overrides must contain a mapping"
+)
+_RAISE_COULD_NOT_PARSE_PNPM_WORKSPACE_YAML_SAFELY = (
+    "Could not parse pnpm-workspace.yaml safely"
+)
+_RAISE_EXISTING_MANAGED_COORDINATE_REQUIRES_ITS_OWN_VERSION_PROPERTY = (
+    "Existing managed coordinate requires its own version/property update"
+)
+_RAISE_CENTRAL_VERSION_POLICY_REQUIRES_AN_EXPLICIT_CATALOG_VERSION = (
+    "Central version policy requires an explicit catalog version.ref"
+)
+_RAISE_MAVEN_MODULE_MUST_STAY_INSIDE_THE_REPOSITORY = (
+    "Maven module must stay inside the repository"
+)
+_RAISE_CONFLICTING_LEGACY_WORKSPACE_PNPM_OVERRIDES_REQUIRE_REVIEW = (
+    "Conflicting legacy/workspace pnpm overrides require review"
+)
+_RAISE_A_GRADLE_RESOLUTION_OVERRIDE_REQUIRES_EXACT_CONFIGURATION_NAMES = (
+    "A Gradle resolution override requires exact configuration names"
+)
+
 SKIP_DIRS = {
     ".git",
     ".hg",
@@ -220,9 +298,7 @@ def java_build_roots(
     if files is None:
         files, truncated = iter_files(root)
         if truncated:
-            raise ValueError(
-                "Java build discovery was truncated; manual review is required"
-            )
+            raise ValueError(_RAISE_JAVA_BUILD_DISCOVERY_WAS_TRUNCATED_MANUAL_REVIEW_IS)
     if manager == "gradle":
         settings = {
             path.parent
@@ -256,7 +332,7 @@ def java_build_roots(
             }
         )
     if manager != "maven":
-        raise ValueError(f"Unknown Java build manager: {manager}")
+        raise ValueError(_RAISE_UNKNOWN_JAVA_BUILD_MANAGER.format(manager))
     poms = {path.resolve() for path in files if path.name == "pom.xml"}
     included = set()
     members: dict[Path, set[Path]] = {}
@@ -265,7 +341,7 @@ def java_build_roots(
         try:
             project = parse_xml(path.read_bytes())
         except ParseError as exc:
-            raise ValueError(f"Could not parse {path}") from exc
+            raise ValueError(_RAISE_COULD_NOT_PARSE.format(path)) from exc
         for modules in project:
             if _local(modules.tag) != "modules":
                 continue
@@ -274,7 +350,9 @@ def java_build_roots(
                     continue
                 directory = resolve_inside(root, path.parent / module.text.strip())
                 if directory is None:
-                    raise ValueError("Maven module must stay inside the repository")
+                    raise ValueError(
+                        _RAISE_MAVEN_MODULE_MUST_STAY_INSIDE_THE_REPOSITORY
+                    )
                 pom = (
                     directory if directory.name == "pom.xml" else directory / "pom.xml"
                 )
@@ -290,7 +368,7 @@ def java_build_roots(
             visited.add(path)
             pending.extend(members[path] - visited)
     if poms - visited:
-        raise ValueError("Maven reactor modules contain a cycle")
+        raise ValueError(_RAISE_MAVEN_REACTOR_MODULES_CONTAIN_A_CYCLE)
     return roots
 
 
@@ -300,7 +378,7 @@ def java_project_root(
     """Resolve a manifest or catalog to its owning Java build."""
     path = resolve_inside(root, manifest)
     if path is None:
-        raise ValueError("Java project must stay inside the repository")
+        raise ValueError(_RAISE_JAVA_PROJECT_MUST_STAY_INSIDE_THE_REPOSITORY)
     candidates = [
         directory
         for directory in java_build_roots(root, manager, files)
@@ -356,10 +434,10 @@ def _read_json(path: Path) -> dict | None:
         "resolutions",
     ):
         if key in data and not isinstance(data[key], dict):
-            raise ValueError(f"{path}: {key} must be a JSON object")
+            raise ValueError(_RAISE_MUST_BE_A_JSON_OBJECT.format(path, key))
     pnpm = data.get("pnpm", {})
     if "overrides" in pnpm and not isinstance(pnpm["overrides"], dict):
-        raise ValueError(f"{path}: pnpm overrides must be a JSON object")
+        raise ValueError(_RAISE_PNPM_OVERRIDES_MUST_BE_A_JSON_OBJECT.format(path))
     return data
 
 
@@ -549,7 +627,7 @@ def _pom_dependencies(path: Path) -> list[dict[str, str]]:
     try:
         root = parse_xml(path.read_bytes())
     except ParseError as exc:
-        raise ValueError(f"Could not parse {path}") from exc
+        raise ValueError(_RAISE_COULD_NOT_PARSE.format(path)) from exc
     found: list[dict[str, str]] = []
     for node in root.iter():
         if _local(node.tag) != "dependency":
@@ -567,7 +645,7 @@ def _pom_properties(path: Path) -> dict[str, str]:
     try:
         root = parse_xml(path.read_bytes())
     except ParseError as exc:
-        raise ValueError(f"Could not parse {path}") from exc
+        raise ValueError(_RAISE_COULD_NOT_PARSE.format(path)) from exc
     props: dict[str, str] = {}
     for node in root.iter():
         if _local(node.tag) != "properties":
@@ -761,18 +839,24 @@ def gradle_report_package(
     coordinate = f"{group}:{artifact}"
     parsed = parse_gradle_report(report) if isinstance(report, str) else report
     if coordinate in parsed.unresolved:
-        raise ValueError(f"Gradle did not resolve a concrete version of {coordinate}")
+        raise ValueError(
+            _RAISE_GRADLE_DID_NOT_RESOLVE_A_CONCRETE_VERSION_OF.format(coordinate)
+        )
     configurations = parsed.versions.get(coordinate) or {}
     if any(len(versions) > 1 for versions in configurations.values()):
         raise ValueError(
-            f"Gradle selected conflicting versions of {coordinate} within a configuration"
+            _RAISE_GRADLE_SELECTED_CONFLICTING_VERSIONS_OF_WITHIN_A_CONFIGURATION.format(
+                coordinate
+            )
         )
     versions = {version for selected in configurations.values() for version in selected}
     if not configurations:
         return None
     if len(versions) > 1 and hinted not in versions:
         raise ValueError(
-            f"Gradle selected multiple configuration versions of {coordinate}; scanner version {hinted or 'unknown'} was not observed"
+            _RAISE_GRADLE_SELECTED_MULTIPLE_CONFIGURATION_VERSIONS_OF_SCANNER_VERSION.format(
+                coordinate, hinted or "unknown"
+            )
         )
     version = hinted if hinted in versions else next(iter(versions))
     return PackageHit(
@@ -795,11 +879,11 @@ def _toml_library_version(path: Path, coordinate: str) -> tuple[str, str] | None
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"Could not parse {path}") from exc
+        raise ValueError(_RAISE_COULD_NOT_PARSE.format(path)) from exc
     versions = data.get("versions") or {}
     libraries = data.get("libraries") or {}
     if not isinstance(versions, dict) or not isinstance(libraries, dict):
-        raise ValueError(f"{path}: versions and libraries must be TOML tables")
+        raise ValueError(_RAISE_VERSIONS_AND_LIBRARIES_MUST_BE_TOML_TABLES.format(path))
     for library in libraries.values():
         if not isinstance(library, dict):
             continue
@@ -952,7 +1036,9 @@ def _destination(root: Path, relative: str) -> Path:
     """Resolve a repo-relative path and refuse anything that escapes the root."""
     resolved = resolve_inside(root, relative)
     if resolved is None:
-        raise ValueError(f"Refusing to write outside the repository: {relative}")
+        raise ValueError(
+            _RAISE_REFUSING_TO_WRITE_OUTSIDE_THE_REPOSITORY.format(relative)
+        )
     return resolved
 
 
@@ -1029,18 +1115,18 @@ def add_npm_override(
         try:
             data = yaml.load(text) if text.strip() else {}
             if not isinstance(data, dict):
-                raise ValueError("pnpm-workspace.yaml must contain a mapping")
+                raise ValueError(_RAISE_PNPM_WORKSPACE_YAML_MUST_CONTAIN_A_MAPPING)
             overrides = data.setdefault("overrides", {})
             if not isinstance(overrides, dict):
-                raise ValueError("pnpm workspace overrides must contain a mapping")
+                raise ValueError(_RAISE_PNPM_WORKSPACE_OVERRIDES_MUST_CONTAIN_A_MAPPING)
             package_data = _read_json(path.parent / "package.json") or {}
             legacy = (package_data.get("pnpm") or {}).get("overrides") or {}
             if not isinstance(legacy, dict):
-                raise ValueError("Legacy pnpm overrides must contain a mapping")
+                raise ValueError(_RAISE_LEGACY_PNPM_OVERRIDES_MUST_CONTAIN_A_MAPPING)
             for name, value in legacy.items():
                 if name != package and name in overrides and overrides[name] != value:
                     raise ValueError(
-                        "Conflicting legacy/workspace pnpm overrides require review"
+                        _RAISE_CONFLICTING_LEGACY_WORKSPACE_PNPM_OVERRIDES_REQUIRE_REVIEW
                     )
                 overrides.setdefault(name, value)
             overrides[package] = version
@@ -1048,7 +1134,7 @@ def add_npm_override(
                 yaml.dump(data, stream)
                 rendered = stream.getvalue()
         except YAMLError as exc:
-            raise ValueError("Could not parse pnpm-workspace.yaml safely") from exc
+            raise ValueError(_RAISE_COULD_NOT_PARSE_PNPM_WORKSPACE_YAML_SAFELY) from exc
         _write(path, rendered)
         return manifest
     data = _read_json(path)
@@ -1139,7 +1225,7 @@ def add_java_override(
 ) -> None:
     """Pin one resolved Java coordinate without changing the enclosing BOM."""
     if not re.fullmatch(r"[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+", package):
-        raise ValueError("A Java override requires an exact group:artifact coordinate")
+        raise ValueError(_RAISE_A_JAVA_OVERRIDE_REQUIRES_AN_EXACT_GROUP_ARTIFACT)
     path = _destination(root, manifest)
     text = _read(path)
     if path.name in {"build.gradle", "build.gradle.kts"}:
@@ -1159,7 +1245,7 @@ def add_java_override(
             not matches and re.search(rf"(?m)^{re.escape(key)}[ \t]*=", existing)
         ):
             raise ValueError(
-                "Ambiguous/existing Gradle security property requires review; it will not be overwritten"
+                _RAISE_AMBIGUOUS_EXISTING_GRADLE_SECURITY_PROPERTY_REQUIRES_REVIEW_IT
             )
         block = (
             f"{start}\ndependencies {{\n    constraints {{\n"
@@ -1181,7 +1267,7 @@ def add_java_override(
                 for name in names
             ):
                 raise ValueError(
-                    "A Gradle resolution override requires exact configuration names"
+                    _RAISE_A_GRADLE_RESOLUTION_OVERRIDE_REQUIRES_EXACT_CONFIGURATION_NAMES
                 )
             rules = "\n".join(
                 f'configurations.named("{name}") {{\n'
@@ -1207,9 +1293,7 @@ def add_java_override(
             _write(root / ".github" / "versions.md", documentation)
         return
     if path.name != "pom.xml":
-        raise ValueError(
-            "Java overrides require a build.gradle, build.gradle.kts or pom.xml"
-        )
+        raise ValueError(_RAISE_JAVA_OVERRIDES_REQUIRE_A_BUILD_GRADLE_BUILD_GRADLE)
     group, artifact = package.split(":")
     entry = (
         "\n      <dependency>\n"
@@ -1226,7 +1310,7 @@ def add_java_override(
     # Ambiguous profile-specific management requires a narrower reviewed edit.
     if len(management) > 1 or re.search(r"<\w+:project\b|<profiles\b", text):
         raise ValueError(
-            "Profile-specific or prefixed Maven dependency management requires review"
+            _RAISE_PROFILE_SPECIFIC_OR_PREFIXED_MAVEN_DEPENDENCY_MANAGEMENT_REQUIRES
         )
     if management:
         match = management[0]
@@ -1240,7 +1324,7 @@ def add_java_override(
                 rf"<artifactId>\s*{re.escape(artifact)}\s*</artifactId>", dependency[0]
             ):
                 raise ValueError(
-                    "Existing managed coordinate requires its own version/property update"
+                    _RAISE_EXISTING_MANAGED_COORDINATE_REQUIRES_ITS_OWN_VERSION_PROPERTY
                 )
         if "</dependencies>" in body:
             replacement = body.replace(
@@ -1259,7 +1343,9 @@ def add_java_override(
         updated = text[: match.start()] + replacement + text[match.end() :]
     else:
         if text.count("</project>") != 1:
-            raise ValueError("Maven project closing element is missing or ambiguous")
+            raise ValueError(
+                _RAISE_MAVEN_PROJECT_CLOSING_ELEMENT_IS_MISSING_OR_AMBIGUOUS
+            )
         updated = text.replace(
             "</project>",
             (
@@ -1355,7 +1441,7 @@ def gradle_version_files(
         if (root / ".github" / "versions.md").is_file():
             if hit is None or hit[1] == "inline":
                 raise ValueError(
-                    "Central version policy requires an explicit catalog version.ref"
+                    _RAISE_CENTRAL_VERSION_POLICY_REQUIRES_AN_EXPLICIT_CATALOG_VERSION
                 )
             _gradle_version_documentation(root, hit[1], "0.0.0", manifest)
             files.append(".github/versions.md")
@@ -1373,7 +1459,7 @@ def gradle_version_files(
             files.append(".github/versions.md")
     elif (root / ".github" / "versions.md").is_file():
         raise ValueError(
-            "Repository version policy requires an explicit property/catalog mapping; do not guess a new literal version pin"
+            _RAISE_REPOSITORY_VERSION_POLICY_REQUIRES_AN_EXPLICIT_PROPERTY_CATALOG
         )
     return files
 
@@ -1382,7 +1468,7 @@ def _gradle_property_text(text: str, key: str, version: str) -> str:
     """Update an unambiguous exact property without changing other pins."""
     pattern = re.compile(rf"(?m)^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)[^\r\n]*(\r?)$")
     if len(list(pattern.finditer(text))) > 1:
-        raise ValueError("Duplicate Gradle version properties require review")
+        raise ValueError(_RAISE_DUPLICATE_GRADLE_VERSION_PROPERTIES_REQUIRE_REVIEW)
     if pattern.search(text):
         return pattern.sub(lambda match: match[1] + version + match[2], text, count=1)
     newline = "\r\n" if "\r\n" in text else "\n"
@@ -1404,7 +1490,7 @@ def _gradle_version_documentation(
         if line.startswith("|") and line.split("|")[1].strip().strip("`") == key
     ]
     if len(matching) > 1:
-        raise ValueError("Duplicate central version-policy rows require review")
+        raise ValueError(_RAISE_DUPLICATE_CENTRAL_VERSION_POLICY_ROWS_REQUIRE_REVIEW)
     newline = "\r\n" if "\r\n" in text else "\n"
     row = f"| {key} | `{version}` | `{source}` |{newline}"
     if matching:
@@ -1420,9 +1506,7 @@ def _gradle_version_documentation(
         ):
             lines.insert(index + 2, row)
             return "".join(lines)
-    raise ValueError(
-        "Unrecognized .github/versions.md pins table; manual policy mapping is required"
-    )
+    raise ValueError(_RAISE_UNRECOGNIZED_GITHUB_VERSIONS_MD_PINS_TABLE_MANUAL_POLICY)
 
 
 def update_gradle_version(
@@ -1436,7 +1520,7 @@ def update_gradle_version(
         if (root / ".github" / "versions.md").is_file():
             if hit is None or hit[1] == "inline":
                 raise ValueError(
-                    "Central version policy requires an explicit catalog version.ref"
+                    _RAISE_CENTRAL_VERSION_POLICY_REQUIRES_AN_EXPLICIT_CATALOG_VERSION
                 )
             documentation = _gradle_version_documentation(
                 root, hit[1], version, manifest
@@ -1450,9 +1534,7 @@ def update_gradle_version(
         if not properties.is_file() or not re.search(
             rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=", _read(properties)
         ):
-            raise ValueError(
-                "Referenced Gradle version property was not found; no replacement was guessed"
-            )
+            raise ValueError(_RAISE_REFERENCED_GRADLE_VERSION_PROPERTY_WAS_NOT_FOUND_NO)
         updated = _gradle_property_text(_read(properties), key, version)
         documentation = _gradle_version_documentation(
             root, key, version, _rel(root, properties)

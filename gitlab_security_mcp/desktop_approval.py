@@ -10,6 +10,45 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_EXITED_WITH_CODE = (
+    "The software-audit choice window exited with code {}: {}"
+)
+_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_AN_INVALID = (
+    "The software-audit choice window returned an invalid response"
+)
+_RAISE_THE_AUDIT_ITEM_WINDOW_EXITED_WITH_CODE = (
+    "The audit-item window exited with code {}: {}"
+)
+_RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_AN_INVALID_RESPONSE = (
+    "The audit-item window returned an invalid response"
+)
+_RAISE_APPROVAL_WINDOW_PID_EXITED_WITH_CODE = (
+    "Approval window pid={} exited with code {}: {}"
+)
+_RAISE_APPROVAL_WINDOW_PID_RETURNED_AN_INVALID_RESPONSE = (
+    "Approval window pid={} returned an invalid response"
+)
+_RAISE_APPROVAL_WINDOW_PIPES_WERE_NOT_CREATED = "Approval window pipes were not created"
+_RAISE_THE_WINDOWS_APPROVAL_WINDOW_PID_COULD_NOT_BE = (
+    "The Windows approval window pid={} could not be shown (exit {}): {}"
+)
+_RAISE_CHOICE_WINDOW_PIPES_WERE_NOT_CREATED = "Choice window pipes were not created"
+_RAISE_CHOICE_WINDOW_PID_COULD_NOT_BE_SHOWN = (
+    "Choice window pid={} could not be shown: {}"
+)
+_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_UNREADABLE_OUTPUT = (
+    "The software-audit choice window returned unreadable output"
+)
+_RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_UNREADABLE_OUTPUT = (
+    "The audit-item window returned unreadable output"
+)
+_RAISE_APPROVAL_WINDOW_PID_RETURNED_UNREADABLE_OUTPUT_BYTES_EXIT = (
+    "Approval window pid={} returned unreadable output ({} bytes, exit {})"
+)
+_RAISE_APPROVAL_WINDOW_PID_RETURNED_AN_INVALID_CHOICE = (
+    "Approval window pid={} returned an invalid choice"
+)
+
 logger = logging.getLogger("gitlab_security_mcp")
 _MAX_DIAGNOSTIC_CHARS = 2000
 
@@ -242,8 +281,9 @@ class DesktopApproval:
         diagnostics = _diagnostic_text(stderr)
         if process.returncode != 0:
             raise RuntimeError(
-                f"Approval window pid={process.pid} exited with code "
-                f"{process.returncode}: {diagnostics}"
+                _RAISE_APPROVAL_WINDOW_PID_EXITED_WITH_CODE.format(
+                    process.pid, process.returncode, diagnostics
+                )
             )
         if diagnostics:
             logger.warning(
@@ -255,14 +295,17 @@ class DesktopApproval:
             response = json.loads(stdout.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"Approval window pid={process.pid} returned unreadable output "
-                f"({len(stdout)} bytes, exit {process.returncode})"
+                _RAISE_APPROVAL_WINDOW_PID_RETURNED_UNREADABLE_OUTPUT_BYTES_EXIT.format(
+                    process.pid, len(stdout), process.returncode
+                )
             ) from exc
         if self.choice_ids is not None:
             choice = response.get("choice") if isinstance(response, dict) else None
             if not isinstance(choice, str) or choice not in self.choice_ids:
                 raise ValueError(
-                    f"Approval window pid={process.pid} returned an invalid choice"
+                    _RAISE_APPROVAL_WINDOW_PID_RETURNED_AN_INVALID_CHOICE.format(
+                        process.pid
+                    )
                 )
             logger.info(
                 "Approval window pid=%s closed with choice=%s",
@@ -275,7 +318,9 @@ class DesktopApproval:
             "cancel",
         }:
             raise ValueError(
-                f"Approval window pid={process.pid} returned an invalid response"
+                _RAISE_APPROVAL_WINDOW_PID_RETURNED_AN_INVALID_RESPONSE.format(
+                    process.pid
+                )
             )
         logger.info(
             "Approval window pid=%s closed with action=%s",
@@ -347,7 +392,7 @@ async def open_dialog(
     )
     try:
         if process.stdin is None or process.stdout is None:
-            raise RuntimeError("Approval window pipes were not created")
+            raise RuntimeError(_RAISE_APPROVAL_WINDOW_PIPES_WERE_NOT_CREATED)
         payload = {
             "host_process_id": os.getpid(),
             "message": message,
@@ -371,8 +416,9 @@ async def open_dialog(
         if (await process.stdout.readline()).strip() != b"READY":
             _, stderr = await process.communicate()
             raise RuntimeError(
-                f"The Windows approval window pid={process.pid} could not be shown "
-                f"(exit {process.returncode}): {_diagnostic_text(stderr)}"
+                _RAISE_THE_WINDOWS_APPROVAL_WINDOW_PID_COULD_NOT_BE.format(
+                    process.pid, process.returncode, _diagnostic_text(stderr)
+                )
             )
         logger.info("Approval window pid=%s is visible", process.pid)
         return dialog
@@ -443,7 +489,7 @@ async def open_choice(
     dialog = DesktopApproval(process, frozenset(item["id"] for item in choices))
     try:
         if process.stdin is None or process.stdout is None:
-            raise RuntimeError("Choice window pipes were not created")
+            raise RuntimeError(_RAISE_CHOICE_WINDOW_PIPES_WERE_NOT_CREATED)
         payload = {
             "title": title,
             "message": message,
@@ -457,7 +503,9 @@ async def open_choice(
         if (await process.stdout.readline()).strip() != b"READY":
             _, stderr = await process.communicate()
             raise RuntimeError(
-                f"Choice window pid={process.pid} could not be shown: {_diagnostic_text(stderr)}"
+                _RAISE_CHOICE_WINDOW_PID_COULD_NOT_BE_SHOWN.format(
+                    process.pid, _diagnostic_text(stderr)
+                )
             )
         logger.info("Choice window pid=%s is visible", process.pid)
         return dialog
@@ -483,24 +531,25 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
         encoding="utf-8",
         errors="replace",
         check=False,
+        shell=False,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
         raise RuntimeError(
-            f"The software-audit choice window exited with code {completed.returncode}: {detail}"
+            _RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_EXITED_WITH_CODE.format(
+                completed.returncode, detail
+            )
         )
     try:
         response = json.loads(completed.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError) as exc:
         raise ValueError(
-            "The software-audit choice window returned unreadable output"
+            _RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_UNREADABLE_OUTPUT
         ) from exc
     choice = response.get("choice") if isinstance(response, dict) else None
     if not isinstance(choice, str) or not choice:
-        raise ValueError(
-            "The software-audit choice window returned an invalid response"
-        )
+        raise ValueError(_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_AN_INVALID)
     logger.info("Software-audit choice window closed with choice=%s", choice)
     return choice
 
@@ -542,21 +591,26 @@ def ask_checkboxes(
         encoding="utf-8",
         errors="replace",
         check=False,
+        shell=False,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
         raise RuntimeError(
-            f"The audit-item window exited with code {completed.returncode}: {detail}"
+            _RAISE_THE_AUDIT_ITEM_WINDOW_EXITED_WITH_CODE.format(
+                completed.returncode, detail
+            )
         )
     try:
         response = json.loads(completed.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError) as exc:
-        raise ValueError("The audit-item window returned unreadable output") from exc
+        raise ValueError(
+            _RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_UNREADABLE_OUTPUT
+        ) from exc
     if not isinstance(response, dict) or response.get("action") not in {
         "accept",
         "cancel",
     }:
-        raise ValueError("The audit-item window returned an invalid response")
+        raise ValueError(_RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_AN_INVALID_RESPONSE)
     logger.info("Audit-item window closed with action=%s", response["action"])
     return response

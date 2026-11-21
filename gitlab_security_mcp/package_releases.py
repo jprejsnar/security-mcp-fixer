@@ -13,6 +13,64 @@ import httpx
 from gitlab_security_mcp.util import parse_xml, timed_http_stream
 from gitlab_security_mcp.versions import parse_version
 
+_RAISE_RELEASE_CATALOG_CONTAINS_VERSIONS_THAT_CANNOT_BE_COMPARED = "Release catalog contains versions that cannot be compared safely; manual version investigation required: {}"
+_RAISE_PACKAGE_RELEASE_CATALOG_HAS_NO_VALID_VERSION_LIST = (
+    "Package release catalog has no valid version list"
+)
+_RAISE_PACKAGE_RELEASE_CATALOG_CONTAINS_NO_COMPARABLE_STABLE_RELEASES = (
+    "Package release catalog contains no comparable stable releases"
+)
+_RAISE_PROVIDE_A_RELEASE_REVIEW_FOR_THE_ACTUAL_PROJECT = (
+    "Provide a release review for the actual project runtime"
+)
+_RAISE_CONFIRM_PUBLISHER_SUPPORT_AND_COMPATIBILITY_WITH_THE_ACTUAL = (
+    "Confirm publisher support and compatibility with the actual project runtime"
+)
+_RAISE_EXCLUDED_RELEASES_MUST_BE_A_LIST = "excluded_releases must be a list"
+_RAISE_THE_ADVISORY_FIX_FLOOR_IS_NOT_COMPARABLE = (
+    "The advisory fix floor is not comparable"
+)
+_RAISE_RELEASE_EVIDENCE_REQUIRES_AN_ASSESSMENT = (
+    "Release evidence requires an assessment"
+)
+_RAISE_RELEASE_EVIDENCE_REQUIRES_OFFICIAL_SUPPORT_RUNTIME_LICENSE_SOURCES = (
+    "Release evidence requires official support/runtime/license sources"
+)
+_RAISE_MAVEN_RELEASE_CATALOG_DOES_NOT_MATCH_THE_REQUESTED = (
+    "Maven release catalog does not match the requested coordinate"
+)
+_RAISE_PACKAGE_RELEASE_CATALOG_MUST_BE_AN_OBJECT = (
+    "Package release catalog must be an object"
+)
+_RAISE_EXCLUDE_RELEASES_ONLY_FOR_UNSUPPORTED_RUNTIME_INCOMPATIBLE_OR = (
+    "Exclude releases only for unsupported, runtime_incompatible, or paid terms"
+)
+_RAISE_EXCLUDED_RELEASES_MUST_IDENTIFY_DISTINCT_PUBLISHED_STABLE_VERSIONS = (
+    "Excluded releases must identify distinct published stable versions"
+)
+_RAISE_RELEASE_EVIDENCE_SOURCES_MUST_BE_HTTPS_URLS = (
+    "Release evidence sources must be HTTPS URLs"
+)
+_RAISE_RELEASE_EVIDENCE_SOURCES_MUST_BE_CREDENTIAL_FREE_HTTPS = (
+    "Release evidence sources must be credential-free HTTPS URLs"
+)
+_RAISE_NO_SUPPORTED_PUBLIC_RELEASE_CATALOG_FOR_THIS_PACKAGE = (
+    "No supported public release catalog for this package coordinate"
+)
+_RAISE_INVALID_MAVEN_RELEASE_METADATA = "Invalid Maven release metadata: {}"
+_RAISE_NPM_RELEASE_CATALOG_DOES_NOT_MATCH_THE_REQUESTED = (
+    "npm release catalog does not match the requested package"
+)
+_RAISE_NPM_RELEASE_CATALOG_HAS_NO_VERSION_METADATA = (
+    "npm release catalog has no version metadata"
+)
+_RAISE_NPM_RELEASE_CATALOG_CONTAINS_INVALID_VERSION_METADATA = (
+    "npm release catalog contains invalid version metadata"
+)
+_RAISE_PACKAGE_RELEASE_CATALOG_EXCEEDS_THE_SIZE_LIMIT = (
+    "Package release catalog exceeds the size limit"
+)
+
 MAX_RELEASE_BYTES = 20 * 1024 * 1024
 
 
@@ -34,8 +92,9 @@ def stable_versions(versions: list[str], *, ecosystem: str | None = None) -> lis
     unknown = [raw for version, raw in parsed if version is None]
     if unknown:
         raise ValueError(
-            "Release catalog contains versions that cannot be compared safely; "
-            f"manual version investigation required: {', '.join(unknown[:5])}"
+            _RAISE_RELEASE_CATALOG_CONTAINS_VERSIONS_THAT_CANNOT_BE_COMPARED.format(
+                ", ".join(unknown[:5])
+            )
         )
     return [
         raw
@@ -66,9 +125,7 @@ def release_catalog(
             f"{artifact}/maven-metadata.xml"
         )
     else:
-        raise ValueError(
-            "No supported public release catalog for this package coordinate"
-        )
+        raise ValueError(_RAISE_NO_SUPPORTED_PUBLIC_RELEASE_CATALOG_FOR_THIS_PACKAGE)
     with httpx.Client(timeout=30.0) as client:
         with timed_http_stream(
             client,
@@ -82,37 +139,37 @@ def release_catalog(
             for chunk in response.iter_bytes():
                 content.extend(chunk)
                 if len(content) > MAX_RELEASE_BYTES:
-                    raise ValueError("Package release catalog exceeds the size limit")
+                    raise ValueError(
+                        _RAISE_PACKAGE_RELEASE_CATALOG_EXCEEDS_THE_SIZE_LIMIT
+                    )
     if ecosystem == "Maven":
         try:
             metadata = parse_xml(content)
         except ParseError as exc:
-            raise ValueError(f"Invalid Maven release metadata: {exc}") from exc
+            raise ValueError(_RAISE_INVALID_MAVEN_RELEASE_METADATA.format(exc)) from exc
         if (
             metadata.findtext("groupId") != group
             or metadata.findtext("artifactId") != artifact
         ):
-            raise ValueError(
-                "Maven release catalog does not match the requested coordinate"
-            )
+            raise ValueError(_RAISE_MAVEN_RELEASE_CATALOG_DOES_NOT_MATCH_THE_REQUESTED)
         versions = [
             node.text for node in metadata.findall("./versioning/versions/version")
         ]
     else:
         payload = json.loads(content)
         if not isinstance(payload, dict):
-            raise ValueError("Package release catalog must be an object")
+            raise ValueError(_RAISE_PACKAGE_RELEASE_CATALOG_MUST_BE_AN_OBJECT)
         if ecosystem == "npm":
             if payload.get("name") != package:
                 raise ValueError(
-                    "npm release catalog does not match the requested package"
+                    _RAISE_NPM_RELEASE_CATALOG_DOES_NOT_MATCH_THE_REQUESTED
                 )
             releases = payload.get("versions")
             if not isinstance(releases, dict):
-                raise ValueError("npm release catalog has no version metadata")
+                raise ValueError(_RAISE_NPM_RELEASE_CATALOG_HAS_NO_VERSION_METADATA)
             if not all(isinstance(metadata, dict) for metadata in releases.values()):
                 raise ValueError(
-                    "npm release catalog contains invalid version metadata"
+                    _RAISE_NPM_RELEASE_CATALOG_CONTAINS_INVALID_VERSION_METADATA
                 )
             versions = [
                 version
@@ -122,16 +179,16 @@ def release_catalog(
         else:
             versions = payload.get("versions")
     if not isinstance(versions, list):
-        raise ValueError("Package release catalog has no valid version list")
+        raise ValueError(_RAISE_PACKAGE_RELEASE_CATALOG_HAS_NO_VALID_VERSION_LIST)
     published: list[str] = []
     for raw in versions:
         if not isinstance(raw, str):
-            raise ValueError("Package release catalog has no valid version list")
+            raise ValueError(_RAISE_PACKAGE_RELEASE_CATALOG_HAS_NO_VALID_VERSION_LIST)
         published.append(raw)
     stable = stable_versions(published, ecosystem=ecosystem)
     if not stable:
         raise ValueError(
-            "Package release catalog contains no comparable stable releases"
+            _RAISE_PACKAGE_RELEASE_CATALOG_CONTAINS_NO_COMPARABLE_STABLE_RELEASES
         )
     return {"source": url, "versions": stable}
 
@@ -139,18 +196,18 @@ def release_catalog(
 def reviewed_selection(catalog: dict, floor: str, review: dict) -> dict:
     """Choose the newest release not excluded by documented support/runtime/fee evidence."""
     if not isinstance(review, dict):
-        raise ValueError("Provide a release review for the actual project runtime")
+        raise ValueError(_RAISE_PROVIDE_A_RELEASE_REVIEW_FOR_THE_ACTUAL_PROJECT)
     if (
         review.get("supported") is not True
         or review.get("runtime_compatible") is not True
     ):
         raise ValueError(
-            "Confirm publisher support and compatibility with the actual project runtime"
+            _RAISE_CONFIRM_PUBLISHER_SUPPORT_AND_COMPATIBILITY_WITH_THE_ACTUAL
         )
     _evidence(review)
     exclusions = review.get("excluded_releases", [])
     if not isinstance(exclusions, list):
-        raise ValueError("excluded_releases must be a list")
+        raise ValueError(_RAISE_EXCLUDED_RELEASES_MUST_BE_A_LIST)
     excluded = {}
     for item in exclusions:
         if not isinstance(item, dict) or item.get("reason") not in {
@@ -159,18 +216,18 @@ def reviewed_selection(catalog: dict, floor: str, review: dict) -> dict:
             "paid",
         }:
             raise ValueError(
-                "Exclude releases only for unsupported, runtime_incompatible, or paid terms"
+                _RAISE_EXCLUDE_RELEASES_ONLY_FOR_UNSUPPORTED_RUNTIME_INCOMPATIBLE_OR
             )
         _evidence(item)
         version = item.get("version")
         if version not in catalog["versions"] or version in excluded:
             raise ValueError(
-                "Excluded releases must identify distinct published stable versions"
+                _RAISE_EXCLUDED_RELEASES_MUST_IDENTIFY_DISTINCT_PUBLISHED_STABLE_VERSIONS
             )
         excluded[version] = item
     minimum = parse_version(floor)
     if minimum is None:
-        raise ValueError("The advisory fix floor is not comparable")
+        raise ValueError(_RAISE_THE_ADVISORY_FIX_FLOOR_IS_NOT_COMPARABLE)
     candidates = [
         raw
         for raw in catalog["versions"]
@@ -191,15 +248,15 @@ def _evidence(review: dict) -> None:
         not isinstance(review.get("assessment"), str)
         or not review["assessment"].strip()
     ):
-        raise ValueError("Release evidence requires an assessment")
+        raise ValueError(_RAISE_RELEASE_EVIDENCE_REQUIRES_AN_ASSESSMENT)
     sources = review.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError(
-            "Release evidence requires official support/runtime/license sources"
+            _RAISE_RELEASE_EVIDENCE_REQUIRES_OFFICIAL_SUPPORT_RUNTIME_LICENSE_SOURCES
         )
     for source in sources:
         if not isinstance(source, str):
-            raise ValueError("Release evidence sources must be HTTPS URLs")
+            raise ValueError(_RAISE_RELEASE_EVIDENCE_SOURCES_MUST_BE_HTTPS_URLS)
         parsed = urlsplit(source)
         if (
             parsed.scheme != "https"
@@ -208,5 +265,5 @@ def _evidence(review: dict) -> None:
             or parsed.password
         ):
             raise ValueError(
-                "Release evidence sources must be credential-free HTTPS URLs"
+                _RAISE_RELEASE_EVIDENCE_SOURCES_MUST_BE_CREDENTIAL_FREE_HTTPS
             )

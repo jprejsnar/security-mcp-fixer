@@ -64,8 +64,58 @@ from gitlab_security_mcp.software_audit import (
     record_audit_coverage,
     render_audit_prompt,
 )
-from gitlab_security_mcp.util import environment_secrets, logged_lock, redact
+from gitlab_security_mcp.util import (
+    PROGRESS_PUBLISH_FAILURES,
+    environment_secrets,
+    logged_lock,
+    redact,
+)
 from gitlab_security_mcp.versions import is_major_upgrade
+
+_RAISE_UNEXPECTED_WORKFLOW_JOB = "Unexpected workflow job"
+_RAISE_THE_HUMAN_FIX_SELECTION_RESPONSE_DOES_NOT_MATCH = (
+    "The human fix-selection response does not match the live request."
+)
+_RAISE_THE_LOCAL_REPORT_DID_NOT_RETURN_STRUCTURED_REPORT = (
+    "The local report did not return structured report data"
+)
+_RAISE_AUDIT_APPROVAL_NEEDS_A_KNOWN_STAGE_AND_THE = (
+    "Audit approval needs a known stage and the prepared findings."
+)
+_RAISE_A_BLOCKED_UPDATE_CANNOT_BE_SELECTED_OBTAIN_A = (
+    "A blocked update cannot be selected; obtain a new review before approval."
+)
+_RAISE_DUPLICATE_CODE_FIX_OUTCOME_IDS = "Duplicate code-fix outcome IDs."
+_RAISE_THIS_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN = (
+    "This audit approval belongs to a replaced run or request."
+)
+_RAISE_THE_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN = (
+    "The audit approval belongs to a replaced run."
+)
+_RAISE_THE_SOFTWARE_AUDIT_WINDOW_RETURNED_AN_UNKNOWN_CHOICE = (
+    "The software-audit window returned an unknown choice: {!r}"
+)
+_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN = (
+    "The audit handoff belonged to a replaced run. No audit action was authorized."
+)
+_RAISE_MORE_THAN_ONE_REPOSITORY_IS_ACTIVE_PASS_REPO = (
+    "More than one repository is active. Pass repo_root to select the checkout."
+)
+_RAISE_IS_NOT_A_SELECTED_FIX_OR_LACKS_ITS = (
+    "{} is not a selected fix or lacks its outcome reason."
+)
+_RAISE_NEEDS_THE_ACTUAL_VALIDATION_COMMAND_RESULT_BEFORE_REPORTING = (
+    "{} needs the actual validation command/result before reporting fixed."
+)
+_RAISE_THE_REFRESHED_REPORT_DID_NOT_RETURN_STRUCTURED_REPORT = (
+    "The refreshed report did not return structured report data"
+)
+_RAISE_THE_AUDIT_FIX_APPROVAL_SCHEMA_IS_MISSING = (
+    "The audit-fix approval schema is missing."
+)
+_RAISE_AUDIT_FINDINGS_ARE_REQUIRED_FOR_FIX_SELECTION = (
+    "Audit findings are required for fix selection."
+)
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -381,6 +431,7 @@ def _open_progress_console() -> _ProgressConsole | None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            shell=False,
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10),
         )
     except OSError:
@@ -873,7 +924,7 @@ async def _progress_middleware(
             try:
                 sequence += 1
                 await context.session.report_progress(sequence, None, text)
-            except Exception:
+            except (*PROGRESS_PUBLISH_FAILURES, MCPError):
                 logger.warning("Could not send MCP progress", exc_info=True)
             finally:
                 messages.task_done()
@@ -1012,9 +1063,7 @@ def _engine_for(repo_root: str | None) -> Engine:
     with logged_lock(_registry_lock, "registry"):
         if repo_root is None:
             if len(_engines) > 1:
-                raise ValueError(
-                    "More than one repository is active. Pass repo_root to select the checkout."
-                )
+                raise ValueError(_RAISE_MORE_THAN_ONE_REPOSITORY_IS_ACTIVE_PASS_REPO)
             if len(_engines) == 1:
                 return next(iter(_engines.values()))
             created = Engine.from_env(None)
@@ -1366,9 +1415,7 @@ async def _fix_form_response(
             response := ctx.input_responses["fix_selection"], ElicitResult
         )
     ):
-        raise ValueError(
-            "The human fix-selection response does not match the live request."
-        )
+        raise ValueError(_RAISE_THE_HUMAN_FIX_SELECTION_RESPONSE_DOES_NOT_MATCH)
     if response.action == "accept":
         return AcceptedElicitation(data=schema.model_validate(response.content))
     if response.action == "decline":
@@ -1474,9 +1521,7 @@ async def _finish_desktop_fix_selection(
             prepared["reviews"].get(item["id"], {}).get("blocked_reason")
             for item in chosen
         ):
-            raise ValueError(
-                "A blocked update cannot be selected; obtain a new review before approval."
-            )
+            raise ValueError(_RAISE_A_BLOCKED_UPDATE_CANNOT_BE_SELECTED_OBTAIN_A)
         ids = [item["id"] for item in chosen]
         result = await asyncio.to_thread(
             selected.record_fix_selection,
@@ -2346,15 +2391,17 @@ def _record_code_results(selected: Engine, results: list[dict] | None) -> dict |
     try:
         parsed = [CodeFixResult.model_validate(item) for item in results or []]
         if len({item.id for item in parsed}) != len(parsed):
-            raise ValueError("Duplicate code-fix outcome IDs.")
+            raise ValueError(_RAISE_DUPLICATE_CODE_FIX_OUTCOME_IDS)
         for item in parsed:
             if item.id not in ids or not item.reason.strip():
                 raise ValueError(
-                    f"{item.id} is not a selected fix or lacks its outcome reason."
+                    _RAISE_IS_NOT_A_SELECTED_FIX_OR_LACKS_ITS.format(item.id)
                 )
             if item.status == "fixed" and not item.validation.strip():
                 raise ValueError(
-                    f"{item.id} needs the actual validation command/result before reporting fixed."
+                    _RAISE_NEEDS_THE_ACTUAL_VALIDATION_COMMAND_RESULT_BEFORE_REPORTING.format(
+                        item.id
+                    )
                 )
     except ValueError as exc:
         logger.warning("Code outcome rejected: %s", exc)
@@ -2572,7 +2619,7 @@ async def _continue_workflow(
         )
         workflow.activity(selected, result["message"], status="FINISHED")
         return result
-    raise RuntimeError("Unexpected workflow job")
+    raise RuntimeError(_RAISE_UNEXPECTED_WORKFLOW_JOB)
 
 
 async def _complete_legacy(
@@ -2615,7 +2662,7 @@ async def _complete_legacy(
     review = await review_false_positives(ctx, repo_root=selected_root)
     report = await asyncio.to_thread(_generate_local_report, repo_root=selected_root)
     if report.structured_content is None:
-        raise RuntimeError("The local report did not return structured report data")
+        raise RuntimeError(_RAISE_THE_LOCAL_REPORT_DID_NOT_RETURN_STRUCTURED_REPORT)
     if not report.is_error and review["status"] in {
         "REVIEW_READY",
         "APPROVAL_UNAVAILABLE",
@@ -2635,7 +2682,7 @@ async def _complete_legacy(
             )
             if report.structured_content is None:
                 raise RuntimeError(
-                    "The refreshed report did not return structured report data"
+                    _RAISE_THE_REFRESHED_REPORT_DID_NOT_RETURN_STRUCTURED_REPORT
                 )
     note = f"False-positive review: {review['status']}."
     for key in ("message", "reason"):
@@ -2727,9 +2774,7 @@ async def _finish_audit_approval(
             selected.state is not state
             or state.software_audit.get("request_id") != request_id
         ):
-            raise ValueError(
-                "This audit approval belongs to a replaced run or request."
-            )
+            raise ValueError(_RAISE_THIS_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN)
         if stage == "CONSENT":
             await asyncio.to_thread(
                 _software_audit_result, selected, response["choice"]
@@ -2738,7 +2783,7 @@ async def _finish_audit_approval(
                 await complete_security_run(ctx, str(selected.repo_root))
         else:
             if schema is None:
-                raise ValueError("The audit-fix approval schema is missing.")
+                raise ValueError(_RAISE_THE_AUDIT_FIX_APPROVAL_SCHEMA_IS_MISSING)
             values = (
                 schema.model_validate(response.get("content")).model_dump()
                 if response["action"] == "accept"
@@ -2798,9 +2843,7 @@ async def _open_audit_approval(
     if stage not in {"CONSENT", "FIX_SELECTION"} or (
         stage == "FIX_SELECTION" and prepared is None
     ):
-        raise ValueError(
-            "Audit approval needs a known stage and the prepared findings."
-        )
+        raise ValueError(_RAISE_AUDIT_APPROVAL_NEEDS_A_KNOWN_STAGE_AND_THE)
     state = selected.state
     request_id = uuid4().hex
     pending = {
@@ -2824,7 +2867,7 @@ async def _open_audit_approval(
             )
         else:
             if prepared is None:
-                raise ValueError("Audit findings are required for fix selection.")
+                raise ValueError(_RAISE_AUDIT_FINDINGS_ARE_REQUIRED_FOR_FIX_SELECTION)
             schema = _checkbox_model(
                 "SoftwareAuditFixes",
                 prepared["items"],
@@ -2847,7 +2890,7 @@ async def _open_audit_approval(
             selected.state is not state
             or state.software_audit.get("request_id") != request_id
         ):
-            raise ValueError("The audit approval belongs to a replaced run.")
+            raise ValueError(_RAISE_THE_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN)
         task = asyncio.create_task(
             _finish_audit_approval(
                 ctx, selected, request_id, stage, dialog, prepared or {}, schema
@@ -3465,7 +3508,9 @@ async def _ask_software_audit_choice(ctx: Context) -> str | None:
         choice = normalize_choice(selected)
         if choice is None:
             raise ValueError(
-                f"The software-audit window returned an unknown choice: {selected!r}"
+                _RAISE_THE_SOFTWARE_AUDIT_WINDOW_RETURNED_AN_UNKNOWN_CHOICE.format(
+                    selected
+                )
             )
         return choice
     if not _form_supported(ctx):
@@ -3550,9 +3595,7 @@ async def _wait_for_audit_handoff(selected: Engine) -> None:
         for task in done:
             task.result()
         if selected.state is not state:
-            raise RuntimeError(
-                "The audit handoff belonged to a replaced run. No audit action was authorized."
-            )
+            raise RuntimeError(_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN)
         if not done:
             sink = progress_sink.get()
             if sink is not None:

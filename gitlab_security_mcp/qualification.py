@@ -31,6 +31,157 @@ from gitlab_security_mcp.validate import (
 )
 from gitlab_security_mcp.versions import is_major_upgrade, parse_version
 
+_RAISE_PACKAGE_MANAGER_DOES_NOT_SUPPORT_QUALIFICATION_CHECKS = (
+    "Package manager does not support qualification checks"
+)
+_RAISE_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT = "{} exceeds the qualification size limit"
+_RAISE_MUST_BE_A_NONEMPTY_EVIDENCE_STRING = "{} must be a nonempty evidence string"
+_RAISE_REQUIRES_REVIEWED_OFFICIAL_HTTPS_SOURCES = (
+    "{} requires reviewed official HTTPS sources"
+)
+_RAISE_PACKAGE_REVIEW_MUST_BE_AN_OBJECT = "Package review must be an object"
+_RAISE_REVIEW_THE_COMPLETE_OFFICIAL_PACKAGE_DOCUMENTATION_BEFORE_QUALIFICATION = (
+    "Review the complete official package documentation before qualification"
+)
+_RAISE_VALIDATION_MODE_MUST_BE_REVIEWED_OR_BUILD_ONLY = (
+    "validation_mode must be reviewed or build_only"
+)
+_RAISE_UNSUPPORTED_OR_UNCERTAIN_FRAMEWORK_RUNTIME_COMPATIBILITY_REQUIRES_MANUAL = (
+    "Unsupported or uncertain framework/runtime compatibility requires manual review"
+)
+_RAISE_PACKAGE_UPDATE_REQUIRES_EXPLICIT_CONFIRMATION_THAT_NEITHER_PRODUCTION = "Package update requires explicit confirmation that neither production nor unit-test callers need API changes"
+_RAISE_REVIEW_THE_PRODUCT_S_ACTUAL_RUNTIME_FRAMEWORK_AND = (
+    "Review the product's actual runtime, framework, and BOM versions"
+)
+_RAISE_PACKAGE_VERSION_UPDATES_CANNOT_REQUIRE_PRODUCTION_OR_UNIT = "Package version updates cannot require production or unit-test code changes; source_fixes must be []"
+_RAISE_AUTOMATIC_MAJOR_UPDATES_CANNOT_ADJUST_SOURCE_OR_TEST = (
+    "Automatic major updates cannot adjust source or test code"
+)
+_RAISE_MAJOR_UPDATE_REQUIRES_API_COMPARISON_AND_CALLER_REVIEW = (
+    "Major update requires API comparison and caller review evidence"
+)
+_RAISE_CALLER_SCAN_CHANGED_OR_IS_MISSING_REVERIFY_AND = (
+    "Caller scan changed or is missing; reverify and review current callers"
+)
+_RAISE_CALLER_BREAKAGES_OR_UNCERTAIN_API_COMPATIBILITY_REQUIRE_REVIEW = "Caller breakages or uncertain API compatibility require review, not an automatic major update"
+_RAISE_REVIEW_ACTUAL_CALLER_SOURCE_FILES_INCLUDING_DEPENDENCY_CALLERS = "Review actual caller source files, including dependency callers for transitive packages"
+_RAISE_REVIEW_EVERY_SOURCE_REFERENCE_IDENTIFIED_BY_THE_CALLER = (
+    "Review every source reference identified by the caller scan"
+)
+_RAISE_TRANSITIVE_NPM_MAJOR_UPDATES_REQUIRE_INSTALLED_DEPENDENCY_CALLER = (
+    "Transitive npm major updates require installed dependency caller source review"
+)
+_RAISE_NO_CORPORATE_POLICY_IS_CONFIGURED_PROVIDE_REVIEW_LICENSE = "No corporate policy is configured. Provide review.license with expression, official sources, commercial_use_permitted and no_license_fees (true or explicit null when unverified), obligations, and assessment. No corporate approval file is required."
+_RAISE_UNLICENSED_TERMS_CANNOT_QUALIFY_A_PACKAGE_UPDATE = (
+    "Unlicensed terms cannot qualify a package update"
+)
+_RAISE_PACKAGE_APPROVAL_POLICY_REQUIRES_SCHEMA_VERSION_1 = (
+    "Package approval policy requires schema_version 1"
+)
+_RAISE_PACKAGE_APPROVAL_POLICY_REQUIRES_AN_APPROVALS_LIST = (
+    "Package approval policy requires an approvals list"
+)
+_RAISE_EXACTLY_ONE_CORPORATE_APPROVAL_FOR_THIS_PACKAGE_AND = (
+    "Exactly one corporate approval for this package and target version is required"
+)
+_RAISE_CORPORATE_APPROVAL_MUST_PERMIT_COMMERCIAL_DISTRIBUTION_WITHOUT_LICENSE = (
+    "Corporate approval must permit commercial distribution without license fees"
+)
+_RAISE_MISSING_OR_UNLICENSED_TERMS_CANNOT_AUTHORIZE_COMMERCIAL_DISTRIBUTION = (
+    "Missing or unlicensed terms cannot authorize commercial distribution"
+)
+_RAISE_POLICY_MUST_REQUIRE_BUILD_RUNTIME_AND_LICENSE_AUDIT = (
+    "Policy must require build, runtime, and license_audit checks"
+)
+_RAISE_QUALIFICATION_WORKING_DIRECTORY_MUST_STAY_INSIDE_THE_REPOSITORY = (
+    "Qualification working directory must stay inside the repository"
+)
+_RAISE_CHECKOUT_SNAPSHOT_IS_TRUNCATED_MANUAL_QUALIFICATION_IS_REQUIRED = (
+    "Checkout snapshot is truncated; manual qualification is required"
+)
+_RAISE_PACKAGE_VERSION_UPDATES_CANNOT_CHANGE_PACKAGE_BUILD_TEST = "Package version updates cannot change package build/test scripts; requalification is required"
+_RAISE_PACKAGE_VERSION_UPDATES_CANNOT_AUTHORIZE_PRODUCTION_OR_UNIT = "Package version updates cannot authorize production or unit-test code adaptations; requalify without source fixes"
+_RAISE_PACKAGE_VERSION_UPDATE_REJECTED_PRODUCTION_OR_UNIT_TEST = "Package version update rejected: production or unit-test code changed; API adaptations are not permitted for any version increment"
+_RAISE_DEPENDENCY_FILES_CHANGED_BEYOND_THE_APPLIED_VERSION_EDIT = "Dependency files changed beyond the applied version edit; production/test settings cannot be adapted to support an update"
+_RAISE_VERSION_ALIGNMENT_DOCUMENTATION_MUST_STAY_INSIDE_THE_CHECKOUT = (
+    "Version-alignment documentation must stay inside the checkout"
+)
+_RAISE_VERSION_ALIGNMENT_DOCUMENTATION_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT = (
+    "Version-alignment documentation exceeds the qualification size limit"
+)
+_RAISE_AI_DOCUMENTATION_CHANGED_DURING_QUALIFICATION_RETRY_AGAINST_A = (
+    "AI documentation changed during qualification; retry against a stable tree"
+)
+_RAISE_VERSION_ALIGNMENT_DOCUMENT_MOVED_REQUALIFICATION_IS_REQUIRED = (
+    "Version-alignment document moved; requalification is required"
+)
+_RAISE_AI_DOCUMENTATION_CHANGED_DURING_VALIDATION_RETRY_AGAINST_A = (
+    "AI documentation changed during validation; retry against a stable tree"
+)
+_RAISE_REQUIRES_HTTPS_URLS_WITHOUT_CREDENTIALS = (
+    "{} requires HTTPS URLs without credentials"
+)
+_RAISE_A_BUILD_ONLY_TRIAL_REQUIRES_KNOWN_INCOMPATIBILITIES = (
+    "A build-only trial requires known_incompatibilities: []"
+)
+_RAISE_FRAMEWORK_EVIDENCE_MUST_BE_AN_OBJECT = "Framework evidence must be an object"
+_RAISE_BUILD_ONLY_TRIALS_REQUIRE_COMPARABLE_INSTALLED_AND_TARGET = (
+    "Build-only trials require comparable installed and target versions"
+)
+_RAISE_MAJOR_UPGRADES_REQUIRE_CONFIRMED_API_CALLER_COMPATIBILITY_NOT = (
+    "Major upgrades require confirmed API/caller compatibility, not a build-only trial"
+)
+_RAISE_CALLER_EVIDENCE_MUST_NAME_A_SOURCE_PATH_SHA256 = (
+    "Caller evidence must name a source path, SHA256, and assessment"
+)
+_RAISE_REVIEWED_CALLER_MUST_BE_AN_EXISTING_SOURCE_FILE = (
+    "Reviewed caller must be an existing source file inside the checkout"
+)
+_RAISE_REVIEWED_CALLER_SOURCE_CHANGED_OR_ITS_SHA256_IS = (
+    "Reviewed caller source changed or its SHA256 is missing"
+)
+_RAISE_LICENSE_MUST_BE_TRUE_OR_EXPLICITLY_NULL_WHEN = (
+    "License {} must be true or explicitly null when unverified"
+)
+_RAISE_PAID_OR_RESTRICTED_LICENSE_AUTOMATIC_UPGRADE_BLOCKED_USER = "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; user investigation required. Reviewed license terms must permit commercial use without license fees."
+_RAISE_PACKAGE_CHECKS_MUST_STAY_INSIDE_THE_CHECKOUT = (
+    "Package checks must stay inside the checkout"
+)
+_RAISE_PACKAGE_MANIFEST_MUST_STAY_INSIDE_THE_CHECKOUT = (
+    "Package manifest must stay inside the checkout"
+)
+_RAISE_PACKAGE_UPDATES_REQUIRE_AN_EXISTING_BUILD_SCRIPT_MISSING = "Package updates require an existing build script; missing checks cannot count as passing"
+_RAISE_QUALIFICATION_CHECKS_MUST_BE_OBJECTS = "Qualification checks must be objects"
+_RAISE_QUALIFICATION_COMMANDS_MUST_BE_STRING_ARRAYS = (
+    "Qualification commands must be string arrays"
+)
+_RAISE_MUST_USE_THE_PACKAGE_MANAGER_S_DEDICATED_ALLOWLISTED = (
+    "{} must use the package manager's dedicated allowlisted check"
+)
+_RAISE_PACKAGE_ROLLBACK_BACKUPS_MUST_CONTAIN_DEPENDENCY_FILES_INSIDE = "Package rollback backups must contain dependency files inside the repository, not production/unit-test code"
+_RAISE_DEPENDENCY_ROLLBACK_BACKUP_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT = (
+    "Dependency rollback backup exceeds the qualification size limit"
+)
+_RAISE_DEPENDENCY_FILE_MOVED_OUTSIDE_THE_REPOSITORY = (
+    "Dependency file moved outside the repository"
+)
+_RAISE_AI_DOCUMENTATION_MUST_CHANGE_ONLY_EXACT_REVIEWED_PACKAGE = "AI documentation {} must change only exact reviewed package versions; unknown or ambiguous version ownership requires review"
+_RAISE_BUILD_ONLY_REVIEW_MUST_EXPLICITLY_SUPPLY_USING_NULL = (
+    "Build-only review must explicitly supply {}, using null when unknown"
+)
+_RAISE_KNOWN_INCOMPATIBILITY_CANNOT_BE_BYPASSED_WITH_A_BUILD = (
+    "Known incompatibility cannot be bypassed with a build-only trial"
+)
+_RAISE_CALLER_REFERENCE_SCAN_EXCEEDS_ITS_EVIDENCE_LIMIT = (
+    "Caller reference scan exceeds its evidence limit"
+)
+_RAISE_DEPENDENCY_PATH_MOVED_OUTSIDE_THE_REPOSITORY = (
+    "Dependency path moved outside the repository"
+)
+_RAISE_CHECKOUT_SNAPSHOT_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT = (
+    "Checkout snapshot exceeds the qualification size limit"
+)
+
 PACKAGE_ECOSYSTEMS = {"npm", "NuGet", "Maven"}
 CHECK_KINDS = ("build", "unit_tests", "runtime", "license_audit")
 ARTIFACT_DIRS = {
@@ -94,7 +245,7 @@ def capture_version_alignment(root: Path, snapshot: dict[str, str]) -> dict[str,
         path = resolve_inside(root, relative)
         if path is None:
             raise ValueError(
-                "Version-alignment documentation must stay inside the checkout"
+                _RAISE_VERSION_ALIGNMENT_DOCUMENTATION_MUST_STAY_INSIDE_THE_CHECKOUT
             )
         canonical = path.relative_to(root.resolve()).as_posix()
         if canonical in documents or not _alignment_document(canonical):
@@ -103,11 +254,11 @@ def capture_version_alignment(root: Path, snapshot: dict[str, str]) -> dict[str,
         total += len(raw)
         if total > MAX_TREE_BYTES:
             raise ValueError(
-                "Version-alignment documentation exceeds the qualification size limit"
+                _RAISE_VERSION_ALIGNMENT_DOCUMENTATION_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT
             )
         if hashlib.sha256(raw).hexdigest() != snapshot[relative]:
             raise ValueError(
-                "AI documentation changed during qualification; retry against a stable tree"
+                _RAISE_AI_DOCUMENTATION_CHANGED_DURING_QUALIFICATION_RETRY_AGAINST_A
             )
         documents[canonical] = raw.decode("utf-8")
     return documents
@@ -148,12 +299,12 @@ def _version_alignment_changes(
         path = resolve_inside(root, relative)
         if path is None or path.relative_to(root.resolve()).as_posix() != relative:
             raise ValueError(
-                "Version-alignment document moved; requalification is required"
+                _RAISE_VERSION_ALIGNMENT_DOCUMENT_MOVED_REQUALIFICATION_IS_REQUIRED
             )
         current = _read_bounded(path, MAX_SOURCE_BYTES).decode("utf-8")
         if hashlib.sha256(current.encode("utf-8")).hexdigest() != after[relative]:
             raise ValueError(
-                "AI documentation changed during validation; retry against a stable tree"
+                _RAISE_AI_DOCUMENTATION_CHANGED_DURING_VALIDATION_RETRY_AGAINST_A
             )
         before_parts, after_parts = (
             _ALIGNMENT_VERSION.split(original),
@@ -172,8 +323,9 @@ def _version_alignment_changes(
             owners = updates.get((old, target), set())
             if len(owners) != 1:
                 raise ValueError(
-                    f"AI documentation {relative} must change only exact reviewed package versions; "
-                    "unknown or ambiguous version ownership requires review"
+                    _RAISE_AI_DOCUMENTATION_MUST_CHANGE_ONLY_EXACT_REVIEWED_PACKAGE.format(
+                        relative
+                    )
                 )
             manager, package, _target = next(iter(owners))
             replacements.append(
@@ -246,21 +398,21 @@ def _read_bounded(path: Path, limit: int) -> bytes:
     """
     contents = read_bounded(path, limit)
     if contents is None:
-        raise ValueError(f"{path.name} exceeds the qualification size limit")
+        raise ValueError(_RAISE_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT.format(path.name))
     return contents
 
 
 def _text(value: object, label: str) -> str:
     """Require bounded, nonempty evidence rather than truthy placeholders."""
     if not isinstance(value, str) or not value.strip() or len(value) > 32768:
-        raise ValueError(f"{label} must be a nonempty evidence string")
+        raise ValueError(_RAISE_MUST_BE_A_NONEMPTY_EVIDENCE_STRING.format(label))
     return value
 
 
 def _sources(value: object, label: str) -> list[str]:
     """Require reviewed HTTPS references without embedded credentials."""
     if not isinstance(value, list) or not value or len(value) > 50:
-        raise ValueError(f"{label} requires reviewed official HTTPS sources")
+        raise ValueError(_RAISE_REQUIRES_REVIEWED_OFFICIAL_HTTPS_SOURCES.format(label))
     for source in value:
         parsed = urlparse(_text(source, label))
         if (
@@ -269,28 +421,30 @@ def _sources(value: object, label: str) -> list[str]:
             or parsed.username
             or parsed.password
         ):
-            raise ValueError(f"{label} requires HTTPS URLs without credentials")
+            raise ValueError(
+                _RAISE_REQUIRES_HTTPS_URLS_WITHOUT_CREDENTIALS.format(label)
+            )
     return value
 
 
 def review_package(review: dict) -> None:
     """Require reviewed compatibility or an explicitly disclosed build-only trial."""
     if not isinstance(review, dict):
-        raise ValueError("Package review must be an object")
+        raise ValueError(_RAISE_PACKAGE_REVIEW_MUST_BE_AN_OBJECT)
     documentation = review.get("documentation")
     if not isinstance(documentation, dict) or documentation.get("complete") is not True:
         raise ValueError(
-            "Review the complete official package documentation before qualification"
+            _RAISE_REVIEW_THE_COMPLETE_OFFICIAL_PACKAGE_DOCUMENTATION_BEFORE_QUALIFICATION
         )
     _sources(documentation.get("sources"), "Documentation")
     _text(documentation.get("summary"), "Documentation summary")
     mode = review.get("validation_mode", "reviewed")
     if mode not in {"reviewed", "build_only"}:
-        raise ValueError("validation_mode must be reviewed or build_only")
+        raise ValueError(_RAISE_VALIDATION_MODE_MUST_BE_REVIEWED_OR_BUILD_ONLY)
     trial = mode == "build_only"
     if trial:
         if review.get("known_incompatibilities") != []:
-            raise ValueError("A build-only trial requires known_incompatibilities: []")
+            raise ValueError(_RAISE_A_BUILD_ONLY_TRIAL_REQUIRES_KNOWN_INCOMPATIBILITIES)
         _text(
             review.get("compatibility_limitations"),
             "Build-only compatibility limitations",
@@ -298,36 +452,36 @@ def review_package(review: dict) -> None:
         for field in ("compatible", "compatible_without_code_changes"):
             if field not in review:
                 raise ValueError(
-                    f"Build-only review must explicitly supply {field}, using null when unknown"
+                    _RAISE_BUILD_ONLY_REVIEW_MUST_EXPLICITLY_SUPPLY_USING_NULL.format(
+                        field
+                    )
                 )
             if review.get(field) is not None and review[field] is not True:
                 raise ValueError(
-                    "Known incompatibility cannot be bypassed with a build-only trial"
+                    _RAISE_KNOWN_INCOMPATIBILITY_CANNOT_BE_BYPASSED_WITH_A_BUILD
                 )
     if not trial and review.get("compatible") is not True:
         raise ValueError(
-            "Unsupported or uncertain framework/runtime compatibility requires manual review"
+            _RAISE_UNSUPPORTED_OR_UNCERTAIN_FRAMEWORK_RUNTIME_COMPATIBILITY_REQUIRES_MANUAL
         )
     _text(review.get("api_changes"), "API-change analysis")
     if not trial and review.get("compatible_without_code_changes") is not True:
         raise ValueError(
-            "Package update requires explicit confirmation that neither production nor unit-test callers need API changes"
+            _RAISE_PACKAGE_UPDATE_REQUIRES_EXPLICIT_CONFIRMATION_THAT_NEITHER_PRODUCTION
         )
     frameworks = review.get("frameworks")
     if not isinstance(frameworks, list) or not frameworks:
-        raise ValueError(
-            "Review the product's actual runtime, framework, and BOM versions"
-        )
+        raise ValueError(_RAISE_REVIEW_THE_PRODUCT_S_ACTUAL_RUNTIME_FRAMEWORK_AND)
     for framework in frameworks:
         if not isinstance(framework, dict):
-            raise ValueError("Framework evidence must be an object")
+            raise ValueError(_RAISE_FRAMEWORK_EVIDENCE_MUST_BE_AN_OBJECT)
         for key in ("name", "version", "assessment"):
             _text(framework.get(key), f"Framework {key}")
         _sources([framework.get("source_url")], "Framework compatibility")
     fixes = review.get("source_fixes")
     if fixes != []:
         raise ValueError(
-            "Package version updates cannot require production or unit-test code changes; source_fixes must be []"
+            _RAISE_PACKAGE_VERSION_UPDATES_CANNOT_REQUIRE_PRODUCTION_OR_UNIT
         )
 
 
@@ -374,7 +528,9 @@ def scan_package_callers(root: Path, plan: dict) -> dict:
         ]
         if lines:
             if len(references) >= 100 or len(lines) > 100:
-                raise ValueError("Caller reference scan exceeds its evidence limit")
+                raise ValueError(
+                    _RAISE_CALLER_REFERENCE_SCAN_EXCEEDS_ITS_EVIDENCE_LIMIT
+                )
             references.append({"path": relative, "lines": lines})
     fingerprint = {
         "package": package,
@@ -405,34 +561,30 @@ def review_major_upgrade(root: Path, plan: dict, review: dict) -> dict | None:
             or parse_version(plan.get("target")) is None
         ):
             raise ValueError(
-                "Build-only trials require comparable installed and target versions"
+                _RAISE_BUILD_ONLY_TRIALS_REQUIRE_COMPARABLE_INSTALLED_AND_TARGET
             )
         if plan.get("major_upgrade") or is_major_upgrade(
             plan["installed"], plan["target"]
         ):
             raise ValueError(
-                "Major upgrades require confirmed API/caller compatibility, not a build-only trial"
+                _RAISE_MAJOR_UPGRADES_REQUIRE_CONFIRMED_API_CALLER_COMPATIBILITY_NOT
             )
     if not plan.get("major_upgrade"):
         return None
     if review.get("source_fixes") != []:
-        raise ValueError("Automatic major updates cannot adjust source or test code")
+        raise ValueError(_RAISE_AUTOMATIC_MAJOR_UPDATES_CANNOT_ADJUST_SOURCE_OR_TEST)
     evidence = review.get("major_upgrade")
     if not isinstance(evidence, dict):
-        raise ValueError(
-            "Major update requires API comparison and caller review evidence"
-        )
+        raise ValueError(_RAISE_MAJOR_UPDATE_REQUIRES_API_COMPARISON_AND_CALLER_REVIEW)
     scan = scan_package_callers(root, plan)
     if evidence.get("scan_id") != scan["scan_id"] or scan != plan.get("caller_scan"):
-        raise ValueError(
-            "Caller scan changed or is missing; reverify and review current callers"
-        )
+        raise ValueError(_RAISE_CALLER_SCAN_CHANGED_OR_IS_MISSING_REVERIFY_AND)
     if (
         evidence.get("compatible_without_code_changes") is not True
         or evidence.get("caller_breakages_found") is not False
     ):
         raise ValueError(
-            "Caller breakages or uncertain API compatibility require review, not an automatic major update"
+            _RAISE_CALLER_BREAKAGES_OR_UNCERTAIN_API_COMPATIBILITY_REQUIRE_REVIEW
         )
     _sources(
         evidence.get("migration_sources"), "Major-version API/migration references"
@@ -442,15 +594,13 @@ def review_major_upgrade(root: Path, plan: dict, review: dict) -> dict | None:
     reviewed = evidence.get("reviewed_files")
     if not isinstance(reviewed, list) or not reviewed or len(reviewed) > 100:
         raise ValueError(
-            "Review actual caller source files, including dependency callers for transitive packages"
+            _RAISE_REVIEW_ACTUAL_CALLER_SOURCE_FILES_INCLUDING_DEPENDENCY_CALLERS
         )
     reviewed_paths = set()
     dependency_callers = set()
     for item in reviewed:
         if not isinstance(item, dict):
-            raise ValueError(
-                "Caller evidence must name a source path, SHA256, and assessment"
-            )
+            raise ValueError(_RAISE_CALLER_EVIDENCE_MUST_NAME_A_SOURCE_PATH_SHA256)
         relative = _text(item.get("path"), "Reviewed caller path")
         path = resolve_inside(root, relative)
         if (
@@ -458,12 +608,10 @@ def review_major_upgrade(root: Path, plan: dict, review: dict) -> dict | None:
             or path.suffix.lower() not in SOURCE_SUFFIXES
             or not path.is_file()
         ):
-            raise ValueError(
-                "Reviewed caller must be an existing source file inside the checkout"
-            )
+            raise ValueError(_RAISE_REVIEWED_CALLER_MUST_BE_AN_EXISTING_SOURCE_FILE)
         contents = _read_bounded(path, MAX_SOURCE_BYTES)
         if hashlib.sha256(contents).hexdigest() != item.get("sha256"):
-            raise ValueError("Reviewed caller source changed or its SHA256 is missing")
+            raise ValueError(_RAISE_REVIEWED_CALLER_SOURCE_CHANGED_OR_ITS_SHA256_IS)
         _text(item.get("assessment"), "Caller API assessment")
         canonical = path.relative_to(root.resolve()).as_posix()
         reviewed_paths.add(canonical)
@@ -472,14 +620,14 @@ def review_major_upgrade(root: Path, plan: dict, review: dict) -> dict | None:
         ):
             dependency_callers.add(canonical)
     if not {item["path"] for item in scan["references"]}.issubset(reviewed_paths):
-        raise ValueError("Review every source reference identified by the caller scan")
+        raise ValueError(_RAISE_REVIEW_EVERY_SOURCE_REFERENCE_IDENTIFIED_BY_THE_CALLER)
     if (
         plan.get("ecosystem") == "npm"
         and plan.get("strategy") == "override"
         and not dependency_callers
     ):
         raise ValueError(
-            "Transitive npm major updates require installed dependency caller source review"
+            _RAISE_TRANSITIVE_NPM_MAJOR_UPDATES_REQUIRE_INSTALLED_DEPENDENCY_CALLER
         )
     return {"scan": scan, "evidence": evidence}
 
@@ -527,7 +675,7 @@ def _check_args(manager: str, kind: str) -> list[str]:
                 "license_audit": "securityLicenses",
             }[kind],
         ] + (["-x", "test"] if kind == "build" else [])
-    raise ValueError("Package manager does not support qualification checks")
+    raise ValueError(_RAISE_PACKAGE_MANAGER_DOES_NOT_SUPPORT_QUALIFICATION_CHECKS)
 
 
 def _check_variants(manager: str, kind: str) -> list[list[str]]:
@@ -554,17 +702,14 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
     license_review = review.get("license")
     if not isinstance(license_review, dict):
         raise ValueError(
-            "No corporate policy is configured. Provide review.license with expression, "
-            "official sources, commercial_use_permitted and no_license_fees (true or "
-            "explicit null when unverified), "
-            "obligations, and assessment. No corporate approval file is required."
+            _RAISE_NO_CORPORATE_POLICY_IS_CONFIGURED_PROVIDE_REVIEW_LICENSE
         )
     for key in ("expression", "obligations", "assessment"):
         _text(license_review.get(key), f"License {key}")
     if license_review["expression"].strip().upper() in {
         "UNLICENSED",
     }:
-        raise ValueError("Unlicensed terms cannot qualify a package update")
+        raise ValueError(_RAISE_UNLICENSED_TERMS_CANNOT_QUALIFY_A_PACKAGE_UPDATE)
     _sources(license_review.get("sources"), "Official target-version license terms")
     warnings = []
     for field in ("commercial_use_permitted", "no_license_fees"):
@@ -573,12 +718,11 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
             and not isinstance(license_review[field], bool)
         ):
             raise ValueError(
-                f"License {field} must be true or explicitly null when unverified"
+                _RAISE_LICENSE_MUST_BE_TRUE_OR_EXPLICITLY_NULL_WHEN.format(field)
             )
         if license_review[field] is False:
             raise ValueError(
-                "PAID OR RESTRICTED LICENSE: automatic upgrade blocked; user investigation required. "
-                "Reviewed license terms must permit commercial use without license fees."
+                _RAISE_PAID_OR_RESTRICTED_LICENSE_AUTOMATIC_UPGRADE_BLOCKED_USER
             )
         if license_review[field] is None:
             warnings.append(
@@ -605,10 +749,10 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
         )
         resolved = resolve_inside(root, entry)
         if resolved is None:
-            raise ValueError("Package checks must stay inside the checkout")
+            raise ValueError(_RAISE_PACKAGE_CHECKS_MUST_STAY_INSIDE_THE_CHECKOUT)
         manifest = resolve_inside(root, resolved.parent / "package.json")
         if manifest is None:
-            raise ValueError("Package manifest must stay inside the checkout")
+            raise ValueError(_RAISE_PACKAGE_MANIFEST_MUST_STAY_INSIDE_THE_CHECKOUT)
         scripts = json_object(
             _read_bounded(manifest, MAX_SOURCE_BYTES).decode("utf-8")
         ).get("scripts", {})
@@ -617,7 +761,7 @@ def reviewed_license_policy(root: Path, plan: dict, review: dict) -> dict:
             for kind in ("build",)
         ):
             raise ValueError(
-                "Package updates require an existing build script; missing checks cannot count as passing"
+                _RAISE_PACKAGE_UPDATES_REQUIRE_AN_EXISTING_BUILD_SCRIPT_MISSING
             )
     fingerprint = {
         "mode": "documentation_review",
@@ -648,10 +792,10 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     raw = _read_bounded(policy_path, MAX_POLICY_BYTES)
     policy = json_object(raw.decode("utf-8"))
     if type(policy.get("schema_version")) is not int or policy["schema_version"] != 1:
-        raise ValueError("Package approval policy requires schema_version 1")
+        raise ValueError(_RAISE_PACKAGE_APPROVAL_POLICY_REQUIRES_SCHEMA_VERSION_1)
     approvals = policy.get("approvals")
     if not isinstance(approvals, list):
-        raise ValueError("Package approval policy requires an approvals list")
+        raise ValueError(_RAISE_PACKAGE_APPROVAL_POLICY_REQUIRES_AN_APPROVALS_LIST)
     matching = [
         item
         for item in approvals
@@ -661,16 +805,14 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         )
     ]
     if len(matching) != 1:
-        raise ValueError(
-            "Exactly one corporate approval for this package and target version is required"
-        )
+        raise ValueError(_RAISE_EXACTLY_ONE_CORPORATE_APPROVAL_FOR_THIS_PACKAGE_AND)
     approval = matching[0]
     if (
         approval.get("commercial_distribution_approved") is not True
         or approval.get("no_license_fees") is not True
     ):
         raise ValueError(
-            "Corporate approval must permit commercial distribution without license fees"
+            _RAISE_CORPORATE_APPROVAL_MUST_PERMIT_COMMERCIAL_DISTRIBUTION_WITHOUT_LICENSE
         )
     for key in (
         "license_expression",
@@ -686,7 +828,7 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         "NONE",
     }:
         raise ValueError(
-            "Missing or unlicensed terms cannot authorize commercial distribution"
+            _RAISE_MISSING_OR_UNLICENSED_TERMS_CANNOT_AUTHORIZE_COMMERCIAL_DISTRIBUTION
         )
     _sources(approval.get("license_sources"), "License terms")
     all_checks = policy.get("checks")
@@ -694,7 +836,7 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
     if not isinstance(checks, dict) or not (
         {"build", "runtime", "license_audit"} <= set(checks) <= set(CHECK_KINDS)
     ):
-        raise ValueError("Policy must require build, runtime, and license_audit checks")
+        raise ValueError(_RAISE_POLICY_MUST_REQUIRE_BUILD_RUNTIME_AND_LICENSE_AUDIT)
     manager = plan.get("manager")
     tools = {
         "npm": {"npm"},
@@ -708,19 +850,19 @@ def load_policy(root: Path, policy_path: Path, plan: dict) -> dict:
         if kind == "unit_tests":
             continue
         if not isinstance(check, dict):
-            raise ValueError("Qualification checks must be objects")
+            raise ValueError(_RAISE_QUALIFICATION_CHECKS_MUST_BE_OBJECTS)
         argv = check.get("argv")
         if (
             not isinstance(argv, list)
             or not argv
             or any(not isinstance(arg, str) for arg in argv)
         ):
-            raise ValueError("Qualification commands must be string arrays")
+            raise ValueError(_RAISE_QUALIFICATION_COMMANDS_MUST_BE_STRING_ARRAYS)
         if tool_name(argv[0]) not in tools or argv[1:] not in _check_variants(
             manager, kind
         ):
             raise ValueError(
-                f"{kind} must use the package manager's dedicated allowlisted check"
+                _RAISE_MUST_USE_THE_PACKAGE_MANAGER_S_DEDICATED_ALLOWLISTED.format(kind)
             )
         _text(check.get("success_marker"), f"{kind} success marker")
         assert_allowed(argv, root)
@@ -755,7 +897,7 @@ def _check_workdir(root: Path, plan: dict | None) -> Path:
     resolved = resolve_inside(root, entry)
     if resolved is None:
         raise ValueError(
-            "Qualification working directory must stay inside the repository"
+            _RAISE_QUALIFICATION_WORKING_DIRECTORY_MUST_STAY_INSIDE_THE_REPOSITORY
         )
     return resolved.parent
 
@@ -842,7 +984,7 @@ def tree_snapshot(root: Path) -> dict[str, str]:
     files, truncated = iter_files(root)
     if truncated:
         raise ValueError(
-            "Checkout snapshot is truncated; manual qualification is required"
+            _RAISE_CHECKOUT_SNAPSHOT_IS_TRUNCATED_MANUAL_QUALIFICATION_IS_REQUIRED
         )
     hashes = {}
     total = 0
@@ -856,7 +998,7 @@ def tree_snapshot(root: Path) -> dict[str, str]:
                 total += len(block)
                 if total > MAX_TREE_BYTES:
                     raise ValueError(
-                        "Checkout snapshot exceeds the qualification size limit"
+                        _RAISE_CHECKOUT_SNAPSHOT_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT
                     )
                 digest.update(block)
         hashes[relative.as_posix()] = digest.hexdigest()
@@ -895,13 +1037,13 @@ def backup_dependency_files(root: Path, plan: dict) -> dict[str, str | None]:
         path = resolve_inside(root, relative)
         if path is None or path.suffix.lower() in SOURCE_SUFFIXES:
             raise ValueError(
-                "Package rollback backups must contain dependency files inside the repository, not production/unit-test code"
+                _RAISE_PACKAGE_ROLLBACK_BACKUPS_MUST_CONTAIN_DEPENDENCY_FILES_INSIDE
             )
         raw = _read_bounded(path, MAX_TREE_BYTES) if path.exists() else None
         total += len(raw) if raw is not None else 0
         if total > MAX_TREE_BYTES:
             raise ValueError(
-                "Dependency rollback backup exceeds the qualification size limit"
+                _RAISE_DEPENDENCY_ROLLBACK_BACKUP_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT
             )
         originals[relative] = raw.decode("utf-8") if raw is not None else None
     return originals
@@ -913,7 +1055,7 @@ def dependency_file_hashes(root: Path, paths: dict) -> dict[str, str | None]:
     for relative in paths:
         path = resolve_inside(root, relative)
         if path is None:
-            raise ValueError("Dependency file moved outside the repository")
+            raise ValueError(_RAISE_DEPENDENCY_FILE_MOVED_OUTSIDE_THE_REPOSITORY)
         hashes[relative] = (
             hashlib.sha256(_read_bounded(path, MAX_TREE_BYTES)).hexdigest()
             if path.exists()
@@ -947,7 +1089,7 @@ def rollback_dependency_files(root: Path, receipt: dict) -> dict:
                 continue
             path = resolve_inside(root, relative)
             if path is None:
-                raise ValueError("Dependency path moved outside the repository")
+                raise ValueError(_RAISE_DEPENDENCY_PATH_MOVED_OUTSIDE_THE_REPOSITORY)
             if original is None:
                 path.unlink(missing_ok=True)
             else:
@@ -987,11 +1129,11 @@ def validate_edits(
         script_hashes or any(Path(path).name == "package.json" for path in after)
     ):
         raise ValueError(
-            "Package version updates cannot change package build/test scripts; requalification is required"
+            _RAISE_PACKAGE_VERSION_UPDATES_CANNOT_CHANGE_PACKAGE_BUILD_TEST
         )
     if receipt.get("source_before"):
         raise ValueError(
-            "Package version updates cannot authorize production or unit-test code adaptations; requalify without source fixes"
+            _RAISE_PACKAGE_VERSION_UPDATES_CANNOT_AUTHORIZE_PRODUCTION_OR_UNIT
         )
     changed = {
         path
@@ -999,9 +1141,7 @@ def validate_edits(
         if before.get(path) != after.get(path)
     }
     if any(Path(path).suffix.lower() in SOURCE_SUFFIXES for path in changed):
-        raise ValueError(
-            "Package version update rejected: production or unit-test code changed; API adaptations are not permitted for any version increment"
-        )
+        raise ValueError(_RAISE_PACKAGE_VERSION_UPDATE_REJECTED_PRODUCTION_OR_UNIT_TEST)
     expected = (
         receipt.get("applied_dependency_hashes", {})
         if expected_dependencies is None
@@ -1009,7 +1149,7 @@ def validate_edits(
     )
     if expected and dependency_file_hashes(root, expected) != expected:
         raise ValueError(
-            "Dependency files changed beyond the applied version edit; production/test settings cannot be adapted to support an update"
+            _RAISE_DEPENDENCY_FILES_CHANGED_BEYOND_THE_APPLIED_VERSION_EDIT
         )
     allowed = set(allowed_files)
     canonical_allowed = {

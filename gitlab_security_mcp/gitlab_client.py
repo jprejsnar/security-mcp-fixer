@@ -24,6 +24,69 @@ from gitlab_security_mcp.util import (
 )
 from gitlab_security_mcp.versions import parse_fixed_versions
 
+_RAISE_GITLAB_TRACKED_REF_LOOKUP_EXCEEDED_THE_PAGE_LIMIT = (
+    "GitLab tracked-ref lookup exceeded the page limit"
+)
+_RAISE_GITLAB_CONNECTION_IS_NOT_READABLE = "GitLab {} connection is not readable"
+_RAISE_GITLAB_NODES_ARE_MALFORMED = "GitLab {} nodes are malformed"
+_RAISE_GITLAB_PAGINATION_IS_MALFORMED = "GitLab {} pagination is malformed"
+_RAISE_GITLAB_RETURNED_MALFORMED_SCANNER_EVIDENCE = (
+    "GitLab returned malformed scanner evidence"
+)
+_RAISE_GITLAB_RETURNED_MALFORMED_SUPPORTING_MESSAGES = (
+    "GitLab returned malformed supporting messages"
+)
+_RAISE_GITLAB_READ_BACK_RETURNED_NO_VULNERABILITY_OBJECT = (
+    "GitLab read-back returned no vulnerability object"
+)
+_RAISE_GITLAB_READ_BACK_DID_NOT_CONFIRM_THIS_FINDING = "GitLab read-back did not confirm this finding as DISMISSED / FALSE_POSITIVE (state={!r}, reason={!r}). The mutation may have succeeded; no write was retried. Check the project Vulnerability report, tracked ref and vulnerability details."
+_RAISE_CANNOT_PROVE_GITLAB_S_DEFAULT_BRANCH_IS_MAIN = "Cannot prove GitLab's default branch is main at a known commit; branch findings cannot be dismissed"
+_RAISE_ONLY_GITLAB_GRAPHQL_QUERIES_ARE_ALLOWED = (
+    "Only GitLab GraphQL queries are allowed"
+)
+_RAISE_ONLY_GITLAB_READS_AND_THE_FIXED_FALSE_POSITIVE = "Only GitLab reads and the fixed false-positive dismissal mutation are allowed; project attributes and repository writes are forbidden"
+_RAISE_GITLAB_DID_NOT_RETURN_A_JSON_OBJECT = "GitLab {} {} did not return a JSON object"
+_RAISE_GITLAB_CLIENT_IS_CLOSED = "GitLab client is closed"
+_RAISE_GITLAB_PROJECT_LOOKUP_DID_NOT_RETURN_PATH_WITH = (
+    "GitLab project lookup did not return path_with_namespace"
+)
+_RAISE_GITLAB_TOKEN_WITH_API_WRITE_PERMISSION_IS_REQUIRED = (
+    "GITLAB_TOKEN with API write permission is required"
+)
+_RAISE_A_GITLAB_VULNERABILITY_GLOBAL_ID_IS_REQUIRED_NOT = (
+    "A GitLab Vulnerability global ID is required, not a finding UUID"
+)
+_RAISE_FINDING_PROJECT_AND_A_REASON_OF_1_50 = (
+    "Finding, project and a reason of 1-50,000 characters are required"
+)
+_RAISE_GITLAB_TARGET_CHANGED_OR_DOES_NOT_MATCH_THE = (
+    "GitLab target changed or does not match the approved finding/project"
+)
+_RAISE_GITLAB_TARGET_IS_NO_LONGER_ACTIVE = "GitLab target is no longer active"
+_RAISE_GITLAB_DID_NOT_CONFIRM_THE_REQUESTED_DISMISSAL_INSPECT = (
+    "GitLab did not confirm the requested dismissal; inspect GitLab before retrying"
+)
+_RAISE_GITLAB_PROJECT_WAS_NOT_FOUND_OR_IS_NOT = (
+    "GitLab project '{}' was not found or is not readable"
+)
+_RAISE_GITLAB_SECURITY_TRACKED_BRANCH_MAIN_WAS_NOT_FOUND = "GitLab security tracked branch 'main' was not found; refusing to fetch unfiltered findings"
+_RAISE_GITLAB_TRACKED_REF_PAGINATION_DID_NOT_ADVANCE = (
+    "GitLab tracked-ref pagination did not advance"
+)
+_RAISE_GITLAB_VULNERABILITY_REPORT_PAGINATION_DID_NOT_ADVANCE = (
+    "GitLab vulnerability report pagination did not advance"
+)
+_RAISE_GITLAB_RETURNED_MALFORMED_GRAPHQL_ERRORS = (
+    "GitLab returned malformed GraphQL errors"
+)
+_RAISE_GITLAB_RETURNED_MALFORMED_REQUEST_RESPONSE_EVIDENCE = (
+    "GitLab returned malformed request/response evidence"
+)
+_RAISE_MAIN_OR_BRANCH_RESOLUTION_EVIDENCE_CHANGED_AFTER_APPROVAL = "Main or branch-resolution evidence changed after approval; no dismissal was attempted"
+_RAISE_GITLAB_RETURNED_MALFORMED_EVIDENCE_HEADERS = (
+    "GitLab returned malformed evidence headers"
+)
+
 FINDINGS_QUERY = """
 query SecurityFindings($fullPath: ID!, $trackedRefIds: [SecurityProjectTrackedContextID!]!, $after: String, $hasResolution: Boolean! = false) {
   project(fullPath: $fullPath) {
@@ -244,7 +307,7 @@ class GitLabClient:
         """Overlap distinct targets while serializing each target and owned shutdown."""
         with self._idle:
             if self._closed or self._closing:
-                raise RuntimeError("GitLab client is closed")
+                raise RuntimeError(_RAISE_GITLAB_CLIENT_IS_CLOSED)
             lock, users = self._dismissal_locks.get(
                 vulnerability_id, (threading.Lock(), 0)
             )
@@ -334,7 +397,7 @@ class GitLabClient:
             path = payload.get("path_with_namespace")
             if not path:
                 raise RuntimeError(
-                    "GitLab project lookup did not return path_with_namespace"
+                    _RAISE_GITLAB_PROJECT_LOOKUP_DID_NOT_RETURN_PATH_WITH
                 )
             return path
         return unquote(project_id).strip("/")
@@ -356,12 +419,14 @@ class GitLabClient:
         """
         with self._dismissal_access(vulnerability_id):
             if not self.token:
-                raise ValueError("GITLAB_TOKEN with API write permission is required")
+                raise ValueError(
+                    _RAISE_GITLAB_TOKEN_WITH_API_WRITE_PERMISSION_IS_REQUIRED
+                )
             if not re.fullmatch(
                 r"gid://gitlab/Vulnerability/[1-9][0-9]*", vulnerability_id
             ):
                 raise ValueError(
-                    "A GitLab Vulnerability global ID is required, not a finding UUID"
+                    _RAISE_A_GITLAB_VULNERABILITY_GLOBAL_ID_IS_REQUIRED_NOT
                 )
             if (
                 not finding_id
@@ -369,9 +434,7 @@ class GitLabClient:
                 or not reason.strip()
                 or len(reason) > 50000
             ):
-                raise ValueError(
-                    "Finding, project and a reason of 1-50,000 characters are required"
-                )
+                raise ValueError(_RAISE_FINDING_PROJECT_AND_A_REASON_OF_1_50)
             payload = self._graphql(DISMISSAL_TARGET_QUERY, {"id": vulnerability_id})
             target = (payload.get("data") or {}).get("vulnerability") or {}
             if (
@@ -379,9 +442,7 @@ class GitLabClient:
                 or target.get("uuid") != finding_id
                 or (target.get("project") or {}).get("fullPath") != project_path
             ):
-                raise RuntimeError(
-                    "GitLab target changed or does not match the approved finding/project"
-                )
+                raise RuntimeError(_RAISE_GITLAB_TARGET_CHANGED_OR_DOES_NOT_MATCH_THE)
             if target.get("state") == "DISMISSED":
                 return {
                     **self._confirm_dismissal(
@@ -390,7 +451,7 @@ class GitLabClient:
                     "already_dismissed": True,
                 }
             if target.get("state") not in {"DETECTED", "CONFIRMED"}:
-                raise RuntimeError("GitLab target is no longer active")
+                raise RuntimeError(_RAISE_GITLAB_TARGET_IS_NO_LONGER_ACTIVE)
             if main_resolution is not None:
                 branch = self._main_branch_snapshot(project_path)
                 tracked = target.get("trackedRef") or {}
@@ -402,7 +463,7 @@ class GitLabClient:
                     or tracked.get("name") == "main"
                 ):
                     raise RuntimeError(
-                        "Main or branch-resolution evidence changed after approval; no dismissal was attempted"
+                        _RAISE_MAIN_OR_BRANCH_RESOLUTION_EVIDENCE_CHANGED_AFTER_APPROVAL
                     )
             payload = self._request(
                 "POST",
@@ -425,7 +486,7 @@ class GitLabClient:
                 or vulnerability.get("state") != "DISMISSED"
             ):
                 raise RuntimeError(
-                    "GitLab did not confirm the requested dismissal; inspect GitLab before retrying"
+                    _RAISE_GITLAB_DID_NOT_CONFIRM_THE_REQUESTED_DISMISSAL_INSPECT
                 )
             return self._confirm_dismissal(vulnerability_id, finding_id, project_path)
 
@@ -437,7 +498,7 @@ class GitLabClient:
         data = payload.get("data")
         target = data.get("vulnerability") if isinstance(data, dict) else None
         if not isinstance(target, dict):
-            raise RuntimeError("GitLab read-back returned no vulnerability object")
+            raise RuntimeError(_RAISE_GITLAB_READ_BACK_RETURNED_NO_VULNERABILITY_OBJECT)
         reason = target.get("dismissalReason")
         reason_source = "dismissalReason"
         if reason is None:
@@ -460,10 +521,9 @@ class GitLabClient:
             or reason != "FALSE_POSITIVE"
         ):
             raise RuntimeError(
-                "GitLab read-back did not confirm this finding as DISMISSED / "
-                f"FALSE_POSITIVE (state={target.get('state')!r}, reason={reason!r}). "
-                "The mutation may have succeeded; no write was retried. Check the "
-                "project Vulnerability report, tracked ref and vulnerability details."
+                _RAISE_GITLAB_READ_BACK_DID_NOT_CONFIRM_THIS_FINDING.format(
+                    target.get("state"), reason
+                )
             )
         result = {
             "status": "DISMISSED",
@@ -500,7 +560,7 @@ class GitLabClient:
             project = (payload.get("data") or {}).get("project")
             if not project:
                 raise RuntimeError(
-                    f"GitLab project '{full_path}' was not found or is not readable"
+                    _RAISE_GITLAB_PROJECT_WAS_NOT_FOUND_OR_IS_NOT.format(full_path)
                 )
             connection = _connection(project, "securityTrackedRefs")
             for tracked_ref in connection["nodes"]:
@@ -516,12 +576,12 @@ class GitLabClient:
                 if "main" in branches:
                     return branches
                 raise RuntimeError(
-                    "GitLab security tracked branch 'main' was not found; refusing to fetch unfiltered findings"
+                    _RAISE_GITLAB_SECURITY_TRACKED_BRANCH_MAIN_WAS_NOT_FOUND
                 )
             if not page.get("endCursor") or page["endCursor"] == after:
-                raise RuntimeError("GitLab tracked-ref pagination did not advance")
+                raise RuntimeError(_RAISE_GITLAB_TRACKED_REF_PAGINATION_DID_NOT_ADVANCE)
             after = page["endCursor"]
-        raise RuntimeError("GitLab tracked-ref lookup exceeded the page limit")
+        raise RuntimeError(_RAISE_GITLAB_TRACKED_REF_LOOKUP_EXCEEDED_THE_PAGE_LIMIT)
 
     def _findings(self, full_path: str) -> tuple[dict | None, list[dict], bool]:
         """Keep main's active report and add explicitly resolved non-main findings.
@@ -589,9 +649,7 @@ class GitLabClient:
             or not isinstance(sha, str)
             or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha)
         ):
-            raise RuntimeError(
-                "Cannot prove GitLab's default branch is main at a known commit; branch findings cannot be dismissed"
-            )
+            raise RuntimeError(_RAISE_CANNOT_PROVE_GITLAB_S_DEFAULT_BRANCH_IS_MAIN)
         return {"sha": sha}
 
     def _report_findings(
@@ -617,7 +675,7 @@ class GitLabClient:
             project = (payload.get("data") or {}).get("project")
             if not project:
                 raise RuntimeError(
-                    f"GitLab project '{full_path}' was not found or is not readable"
+                    _RAISE_GITLAB_PROJECT_WAS_NOT_FOUND_OR_IS_NOT.format(full_path)
                 )
             connection = _connection(project, "vulnerabilities")
             nodes.extend(connection["nodes"])
@@ -626,7 +684,7 @@ class GitLabClient:
                 return nodes, False
             if not page.get("endCursor") or page["endCursor"] == after:
                 raise RuntimeError(
-                    "GitLab vulnerability report pagination did not advance"
+                    _RAISE_GITLAB_VULNERABILITY_REPORT_PAGINATION_DID_NOT_ADVANCE
                 )
             after = page["endCursor"]
             if len(nodes) >= self.max_findings:
@@ -636,7 +694,7 @@ class GitLabClient:
     def _graphql(self, query: str, variables: dict) -> dict:
         """Send only query operations to the GitLab GraphQL endpoint."""
         if not query.strip().lower().startswith("query"):
-            raise RuntimeError("Only GitLab GraphQL queries are allowed")
+            raise RuntimeError(_RAISE_ONLY_GITLAB_GRAPHQL_QUERIES_ARE_ALLOWED)
         return self._request(
             "POST",
             self._graphql_url(),
@@ -663,10 +721,7 @@ class GitLabClient:
             and url == self._graphql_url()
             and (read_query or query == DISMISS_FALSE_POSITIVE)
         ):
-            raise PermissionError(
-                "Only GitLab reads and the fixed false-positive dismissal mutation "
-                "are allowed; project attributes and repository writes are forbidden"
-            )
+            raise PermissionError(_RAISE_ONLY_GITLAB_READS_AND_THE_FIXED_FALSE_POSITIVE)
         operation = re.match(r"\s*(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)", query)
         with timed_http_stream(
             self.http,
@@ -690,13 +745,15 @@ class GitLabClient:
             response.read()
             payload = response.json()
         if not isinstance(payload, dict):
-            raise RuntimeError(f"GitLab {method} {url} did not return a JSON object")
+            raise RuntimeError(
+                _RAISE_GITLAB_DID_NOT_RETURN_A_JSON_OBJECT.format(method, url)
+            )
         if payload.get("errors"):
             errors = payload["errors"]
             if not isinstance(errors, list) or any(
                 not isinstance(error, dict) for error in errors
             ):
-                raise ValueError("GitLab returned malformed GraphQL errors")
+                raise ValueError(_RAISE_GITLAB_RETURNED_MALFORMED_GRAPHQL_ERRORS)
             message = "; ".join(
                 str(error.get("message") or "unknown GraphQL error") for error in errors
             )
@@ -736,13 +793,13 @@ def _connection(project: dict, name: str) -> dict:
     """Reject unreadable GraphQL nodes or pagination instead of emptying them."""
     connection = project.get(name)
     if not isinstance(connection, dict):
-        raise RuntimeError(f"GitLab {name} connection is not readable")
+        raise RuntimeError(_RAISE_GITLAB_CONNECTION_IS_NOT_READABLE.format(name))
     nodes = connection.get("nodes")
     page = connection.get("pageInfo")
     if not isinstance(nodes, list) or any(not isinstance(node, dict) for node in nodes):
-        raise ValueError(f"GitLab {name} nodes are malformed")
+        raise ValueError(_RAISE_GITLAB_NODES_ARE_MALFORMED.format(name))
     if not isinstance(page, dict) or not isinstance(page.get("hasNextPage"), bool):
-        raise ValueError(f"GitLab {name} pagination is malformed")
+        raise ValueError(_RAISE_GITLAB_PAGINATION_IS_MALFORMED.format(name))
     return connection
 
 
@@ -859,13 +916,13 @@ def _scanner_evidence(evidence: dict | None) -> dict | None:
     if evidence is None:
         return None
     if not isinstance(evidence, dict):
-        raise ValueError("GitLab returned malformed scanner evidence")
+        raise ValueError(_RAISE_GITLAB_RETURNED_MALFORMED_SCANNER_EVIDENCE)
     captured = deepcopy(evidence)
     messages = captured.get("supportingMessages") or []
     if not isinstance(messages, list) or any(
         not isinstance(message, dict) for message in messages
     ):
-        raise ValueError("GitLab returned malformed supporting messages")
+        raise ValueError(_RAISE_GITLAB_RETURNED_MALFORMED_SUPPORTING_MESSAGES)
     sensitive = {
         "authorization",
         "proxy-authorization",
@@ -881,12 +938,14 @@ def _scanner_evidence(evidence: dict | None) -> dict | None:
             if exchange is None:
                 continue
             if not isinstance(exchange, dict):
-                raise ValueError("GitLab returned malformed request/response evidence")
+                raise ValueError(
+                    _RAISE_GITLAB_RETURNED_MALFORMED_REQUEST_RESPONSE_EVIDENCE
+                )
             for header in exchange.get("headers") or []:
                 if not isinstance(header, dict) or not isinstance(
                     header.get("name"), str
                 ):
-                    raise ValueError("GitLab returned malformed evidence headers")
+                    raise ValueError(_RAISE_GITLAB_RETURNED_MALFORMED_EVIDENCE_HEADERS)
                 if header["name"].strip().lower() in sensitive:
                     header["value"] = "[REDACTED]"
     return captured

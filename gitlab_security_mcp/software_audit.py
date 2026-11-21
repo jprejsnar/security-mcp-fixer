@@ -11,6 +11,25 @@ from pathlib import Path
 from gitlab_security_mcp.manifests import SKIP_DIRS, iter_files
 from gitlab_security_mcp.util import atomic_write_text, resolve_inside
 
+_RAISE_THE_SOFTWARE_AUDIT_REPORT_MUST_BE_WRITTEN_IN = (
+    "The software audit report must be written in the home directory."
+)
+_RAISE_UNKNOWN_AUDIT_REVIEW_PHASE = "Unknown audit review phase."
+_RAISE_AUDIT_TIMESTAMP_IS_NOT_USABLE_IN_A_FILE = (
+    "Audit timestamp is not usable in a file name: {}"
+)
+_RAISE_INVALID_GENERATED_EXCLUSION = "Invalid generated exclusion: {}"
+_RAISE_INVALID_GENERATED_EXCLUSION_EVIDENCE = "Invalid generated exclusion evidence: {}"
+_RAISE_GENERATED_EXCLUSION_NEEDS_CURRENT_CONFIGURATION_EVIDENCE = (
+    "Generated exclusion needs current configuration evidence: {}"
+)
+_RAISE_AUDIT_REVIEW_IS_OUTSIDE_THE_INVENTORY = (
+    "Audit review is outside the inventory: {}"
+)
+_RAISE_AUDIT_REVIEW_NEEDS_THE_CURRENT_FILE_HASH_AND = (
+    "Audit review needs the current file hash and an assessment: {}"
+)
+
 _CHOICES = {
     "fix_from_report": (
         "1. Select which findings from the completed audit report to fix."
@@ -126,9 +145,7 @@ def persist_audit_draft(
 ) -> None:
     """Create the home report and append progress without replacing host findings."""
     if report.parent.resolve() != Path.home().resolve():
-        raise ValueError(
-            "The software audit report must be written in the home directory."
-        )
+        raise ValueError(_RAISE_THE_SOFTWARE_AUDIT_REPORT_MUST_BE_WRITTEN_IN)
     reviewed = len(coverage.get("reviews", {}))
     total = len(coverage.get("files", []))
     message = " ".join((progress or {}).get("message", "Audit started.").split())
@@ -196,7 +213,9 @@ def _generated_output_paths(root: Path, exclusions: list[dict]) -> set[Path]:
     for exclusion in exclusions:
         output = resolve_inside(root, exclusion["path"])
         if output is None or output == root.resolve() or not output.exists():
-            raise ValueError(f"Invalid generated exclusion: {exclusion['path']}")
+            raise ValueError(
+                _RAISE_INVALID_GENERATED_EXCLUSION.format(exclusion["path"])
+            )
         outputs.add(output)
     for exclusion in exclusions:
         evidence = exclusion["evidence"]
@@ -207,14 +226,16 @@ def _generated_output_paths(root: Path, exclusions: list[dict]) -> set[Path]:
             or any(config.is_relative_to(output) for output in outputs)
         ):
             raise ValueError(
-                f"Invalid generated exclusion evidence: {evidence['path']}"
+                _RAISE_INVALID_GENERATED_EXCLUSION_EVIDENCE.format(evidence["path"])
             )
         if (
             not evidence["assessment"].strip()
             or hashlib.sha256(config.read_bytes()).hexdigest() != evidence["sha256"]
         ):
             raise ValueError(
-                f"Generated exclusion needs current configuration evidence: {evidence['path']}"
+                _RAISE_GENERATED_EXCLUSION_NEEDS_CURRENT_CONFIGURATION_EVIDENCE.format(
+                    evidence["path"]
+                )
             )
     return outputs
 
@@ -266,7 +287,7 @@ def record_audit_coverage(
 ) -> dict:
     """Validate host attestations against actual files and their current content."""
     if not set(phases) <= REVIEW_PHASES:
-        raise ValueError("Unknown audit review phase.")
+        raise ValueError(_RAISE_UNKNOWN_AUDIT_REVIEW_PHASE)
     exclusions = {
         item["path"]: item for item in coverage.get("generated_exclusions", [])
     }
@@ -286,11 +307,15 @@ def record_audit_coverage(
     for review in reviews:
         path = resolve_inside(root, review["path"])
         if path is None or review["path"] not in updated["files"]:
-            raise ValueError(f"Audit review is outside the inventory: {review['path']}")
+            raise ValueError(
+                _RAISE_AUDIT_REVIEW_IS_OUTSIDE_THE_INVENTORY.format(review["path"])
+            )
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if review["sha256"] != digest or not review["assessment"].strip():
             raise ValueError(
-                f"Audit review needs the current file hash and an assessment: {review['path']}"
+                _RAISE_AUDIT_REVIEW_NEEDS_THE_CURRENT_FILE_HASH_AND.format(
+                    review["path"]
+                )
             )
         updated["reviews"][review["path"]] = dict(review)
     updated["completed_phases"] = sorted(
@@ -366,7 +391,7 @@ def audit_report_path(project_name: str, when: datetime) -> Path:
     """
     stamp = when.astimezone(UTC).strftime("%Y-%m-%dT%H%M%SZ")
     if _STAMP.fullmatch(stamp) is None:
-        raise ValueError(f"Audit timestamp is not usable in a file name: {stamp}")
+        raise ValueError(_RAISE_AUDIT_TIMESTAMP_IS_NOT_USABLE_IN_A_FILE.format(stamp))
     return Path.home() / f"{project_name}_{stamp}_software_audit_report.md"
 
 

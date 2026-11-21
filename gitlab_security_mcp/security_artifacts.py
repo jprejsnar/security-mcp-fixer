@@ -7,6 +7,26 @@ import logging
 import re
 from pathlib import Path
 
+_RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT = (
+    "Security artifacts contain a link/reparse point: {}"
+)
+_RAISE_SECURITY_ARTIFACTS_CHANGED_DURING_LOG_REVIEW_RETRY_WHEN = (
+    "Security artifacts changed during log review; retry when no other run is writing"
+)
+_RAISE_UNSUPPORTED_SECURITY_ARTIFACT_TYPE = "Unsupported security artifact type: {}"
+_RAISE_THE_SECURITY_ARTIFACT_ROOT_IS_NOT_A_DIRECTORY = (
+    "The security artifact root is not a directory"
+)
+_RAISE_A_SECURITY_ARTIFACT_CHANGED_BEFORE_CLEANUP_NO_FURTHER = (
+    "A security artifact changed before cleanup; no further files were removed"
+)
+_RAISE_SECURITY_ARTIFACT_DIRECTORIES_CHANGED_BEFORE_CLEANUP = (
+    "Security artifact directories changed before cleanup"
+)
+_RAISE_RUN_STATE_IS_NOT_AN_OBJECT = "Run state is not an object"
+_RAISE_DISMISSAL_RECORDS_ARE_MALFORMED = "Dismissal records are malformed"
+_RAISE_JSON_LOG_ENTRY_IS_NOT_AN_OBJECT = "JSON log entry is not an object"
+
 logger = logging.getLogger("gitlab_security_mcp")
 
 GENERATED_NAMES = {
@@ -43,16 +63,18 @@ def _snapshot(root: Path) -> dict[Path, tuple[int, int, int]]:
         info = path.lstat()
         if path.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
             raise ValueError(
-                f"Security artifacts contain a link/reparse point: {path.name}"
+                _RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT.format(path.name)
             )
         if path.is_dir():
             paths.extend(path.iterdir())
         elif path.is_file():
             if path == root:
-                raise ValueError("The security artifact root is not a directory")
+                raise ValueError(_RAISE_THE_SECURITY_ARTIFACT_ROOT_IS_NOT_A_DIRECTORY)
             found[path] = (info.st_size, info.st_mtime_ns, info.st_ino)
         else:
-            raise ValueError(f"Unsupported security artifact type: {path.name}")
+            raise ValueError(
+                _RAISE_UNSUPPORTED_SECURITY_ARTIFACT_TYPE.format(path.name)
+            )
     return found
 
 
@@ -136,7 +158,7 @@ def review_security_artifacts(
                 try:
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if not isinstance(state, dict):
-                        raise ValueError("Run state is not an object")
+                        raise ValueError(_RAISE_RUN_STATE_IS_NOT_AN_OBJECT)
                     if any(
                         isinstance(state.get(key), str)
                         and state[key].endswith(("_FAILED", "_INCOMPLETE"))
@@ -151,7 +173,7 @@ def review_security_artifacts(
                     if not isinstance(dismissals, list) or not all(
                         isinstance(item, dict) for item in dismissals
                     ):
-                        raise ValueError("Dismissal records are malformed")
+                        raise ValueError(_RAISE_DISMISSAL_RECORDS_ARE_MALFORMED)
                     if any(item.get("status") != "DISMISSED" for item in dismissals):
                         record(
                             path,
@@ -176,7 +198,7 @@ def review_security_artifacts(
                         if path.suffix.lower() == ".jsonl" and text.strip():
                             entry = json.loads(text)
                             if not isinstance(entry, dict):
-                                raise ValueError("JSON log entry is not an object")
+                                raise ValueError(_RAISE_JSON_LOG_ENTRY_IS_NOT_AN_OBJECT)
                             failure = _record_failure(entry)
                         else:
                             failure = (
@@ -190,7 +212,7 @@ def review_security_artifacts(
                         record(path, number, "Log entry is malformed or unreadable")
         if _snapshot(root) != snapshot:
             raise ValueError(
-                "Security artifacts changed during log review; retry when no other run is writing"
+                _RAISE_SECURITY_ARTIFACTS_CHANGED_DURING_LOG_REVIEW_RETRY_WHEN
             )
         filesystem_safe = True
         if fresh_start and tracked is not None and error_count:
@@ -215,7 +237,7 @@ def review_security_artifacts(
                     or (info.st_size, info.st_mtime_ns, info.st_ino) != snapshot[path]
                 ):
                     raise ValueError(
-                        "A security artifact changed before cleanup; no further files were removed"
+                        _RAISE_A_SECURITY_ARTIFACT_CHANGED_BEFORE_CLEANUP_NO_FURTHER
                     )
                 path.unlink()
                 deleted.append(str(path.relative_to(repo_root)))
@@ -236,7 +258,7 @@ def review_security_artifacts(
                     or not directory.resolve().is_relative_to(root)
                 ):
                     raise ValueError(
-                        "Security artifact directories changed before cleanup"
+                        _RAISE_SECURITY_ARTIFACT_DIRECTORIES_CHANGED_BEFORE_CLEANUP
                     )
                 if not any(directory.iterdir()):
                     directory.rmdir()

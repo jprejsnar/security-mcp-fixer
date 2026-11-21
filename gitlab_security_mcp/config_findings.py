@@ -17,6 +17,20 @@ from gitlab_security_mcp.alpine_packages import AlpineLookupError, ApkPins
 from gitlab_security_mcp.remediate import Plan
 from gitlab_security_mcp.util import atomic_write_text, resolve_inside
 
+_RAISE_THE_CONFIGURATION_PLAN_DOES_NOT_NAME_EXACT_LINES = (
+    "The configuration plan does not name exact lines."
+)
+_RAISE_A_CONFIGURATION_REPLACEMENT_CANNOT_ADD_LINES = (
+    "A configuration replacement cannot add lines."
+)
+_RAISE_A_CONFIGURATION_PLAN_CANNOT_EDIT_THE_SAME_LINE = (
+    "A configuration plan cannot edit the same line twice."
+)
+_RAISE_IS_NOT_A_FILE_INSIDE_THE_REPOSITORY = "{} is not a file inside the repository."
+_RAISE_THE_CITED_LINE_NO_LONGER_MATCHES_THE_PLANNED = (
+    "The cited line no longer matches the planned configuration."
+)
+
 # GitLab documents these as the variables that skip security jobs when "true".
 _SECURITY_DISABLED = frozenset(
     {
@@ -225,17 +239,17 @@ def apply_config_line(root: Path, plan: Plan) -> list[str]:
         or edit.get("replacement") is None
         for edit in edits
     ):
-        raise ValueError("The configuration plan does not name exact lines.")
+        raise ValueError(_RAISE_THE_CONFIGURATION_PLAN_DOES_NOT_NAME_EXACT_LINES)
     if any(
         "\n" in edit["replacement"] or "\r" in edit["replacement"] for edit in edits
     ):
-        raise ValueError("A configuration replacement cannot add lines.")
+        raise ValueError(_RAISE_A_CONFIGURATION_REPLACEMENT_CANNOT_ADD_LINES)
     if len({edit["line"] for edit in edits}) != len(edits):
-        raise ValueError("A configuration plan cannot edit the same line twice.")
+        raise ValueError(_RAISE_A_CONFIGURATION_PLAN_CANNOT_EDIT_THE_SAME_LINE)
     relative = plan.files[0]
     resolved = resolve_inside(root, relative)
     if resolved is None or not resolved.is_file():
-        raise ValueError(f"{relative} is not a file inside the repository.")
+        raise ValueError(_RAISE_IS_NOT_A_FILE_INSIDE_THE_REPOSITORY.format(relative))
     with resolved.open(encoding="utf-8", newline="") as stream:
         text = stream.read()
     ending = "\r\n" if "\r\n" in text else "\n"
@@ -243,9 +257,7 @@ def apply_config_line(root: Path, plan: Plan) -> list[str]:
     for edit in edits:
         index = int(edit["line"]) - 1
         if index < 0 or index >= len(lines) or lines[index] != edit["expected"]:
-            raise ValueError(
-                "The cited line no longer matches the planned configuration."
-            )
+            raise ValueError(_RAISE_THE_CITED_LINE_NO_LONGER_MATCHES_THE_PLANNED)
     for edit in edits:
         lines[int(edit["line"]) - 1] = edit["replacement"]
     updated = ending.join(lines)

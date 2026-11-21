@@ -36,6 +36,52 @@ import httpx
 from gitlab_security_mcp.fanout import map_ordered
 from gitlab_security_mcp.util import timed_http_stream
 
+_RAISE_DATA_COULD_NOT_BE_READ_FROM = "Data could not be read from {}"
+_RAISE_ALPINE_INDEX_EXCEEDS_THE_READ_LIMIT = "Alpine {} {} index exceeds the read limit"
+_RAISE_ALPINE_INDEX_LISTS_NO_PACKAGES = "Alpine {} {} index lists no packages"
+_RAISE_DOES_NOT_IDENTIFY_EXACTLY_ONE_ALPINE_RELEASE_BASE = "{} does not identify exactly one Alpine release (base-layer /etc/apk/repositories: {})."
+_RAISE_RETURNED_AN_UNREADABLE_MANIFEST = "{}/{} returned an unreadable manifest"
+_RAISE_UNSUPPORTED_IMAGE_DIGEST_R = "Unsupported image digest {!r}"
+_RAISE_BLOB_DOES_NOT_MATCH = "{}/{} blob does not match {}"
+_RAISE_THE_REGISTRY_REQUIRES_CREDENTIALS_THE_IMAGE_IS_NOT = (
+    "The registry requires credentials; the image is not public"
+)
+_RAISE_REGISTRY_TOKEN_REALM_R_IS_NOT_ALLOWLISTED = (
+    "Registry token realm {!r} is not allowlisted"
+)
+_RAISE_THE_REGISTRY_DID_NOT_ISSUE_AN_ANONYMOUS_PULL = (
+    "The registry did not issue an anonymous pull token"
+)
+_RAISE_ALPINE_RELEASES_JSON_LISTS_NO_SUPPORTED_BRANCH = (
+    "Alpine releases.json lists no supported branch."
+)
+_RAISE_THE_STAGE_IMAGE_DOES_NOT_NAME_AN_ALPINE = "The stage image does not name an Alpine release and the stage pins no other apk package, so the Alpine branch cannot be identified."
+_RAISE_SUPPORTED_ALPINE_BRANCHES_PUBLISHING_EXACTLY_ONE_IS_REQUIRED = "Supported Alpine branches publishing {}: {}. Exactly one is required to choose versions."
+_RAISE_ALPINE_INDEX_COULD_NOT_BE_READ = "Alpine {} {} index could not be read: {}"
+_RAISE_IS_NOT_PUBLISHED_IN_ALPINE_MAIN_OR_COMMUNITY = (
+    "{} is not published in Alpine {} main or community for {}."
+)
+_RAISE_HAS_AN_UNREADABLE_IMAGE_MANIFEST = "{} has an unreadable image manifest"
+_RAISE_HAS_AN_UNREADABLE_IMAGE_CONFIG = "{} has an unreadable image config"
+_RAISE_BASE_LAYER_COULD_NOT_BE_READ = "{} base layer could not be read: {}"
+_RAISE_THE_REGISTRY_RETURNED_AN_UNREADABLE_TOKEN = (
+    "The registry returned an unreadable token"
+)
+_RAISE_ALPINE_RELEASES_JSON_COULD_NOT_BE_READ = (
+    "Alpine releases.json could not be read: {}"
+)
+_RAISE_ALPINE_PACKAGE_LOOKUP_IS_CLOSED = "Alpine package lookup is closed"
+_RAISE_APKINDEX_IS_NOT_A_REGULAR_ARCHIVE_MEMBER = (
+    "APKINDEX is not a regular archive member"
+)
+_RAISE_ALPINE_PUBLISHES_SEVERAL_VERSIONS_NO_SINGLE_LATEST_VERSION = "Alpine {} {} publishes several {} versions ({}); no single latest version was chosen."
+_RAISE_HAS_NO_LINUX_AMD64_IMAGE = "{} has no linux/amd64 image"
+_RAISE_HTTP = "HTTP {}"
+_RAISE_THE_STAGE_IMAGE_COULD_NOT_BE_INSPECTED = (
+    "The stage image could not be inspected ({}). {}"
+)
+_RAISE_EXCEEDS_THE_BYTE_READ_LIMIT = "{} exceeds the {} byte read limit"
+
 logger = logging.getLogger("gitlab_security_mcp")
 RELEASES_URL = "https://alpinelinux.org/releases.json"
 INDEX_URL = (
@@ -236,7 +282,9 @@ class AlpinePackages:
                 except AlpineLookupError as exc:
                     if inspection_error:
                         raise AlpineLookupError(
-                            f"The stage image could not be inspected ({inspection_error}). {exc}"
+                            _RAISE_THE_STAGE_IMAGE_COULD_NOT_BE_INSPECTED.format(
+                                inspection_error, exc
+                            )
                         ) from exc
                     raise
         versions: dict[str, str] = {}
@@ -251,15 +299,18 @@ class AlpinePackages:
                     continue
                 if len(published) != 1:
                     raise AlpineLookupError(
-                        f"Alpine {branch} {repo} publishes several {name} versions "
-                        f"({', '.join(sorted(published))}); no single latest version was chosen."
+                        _RAISE_ALPINE_PUBLISHES_SEVERAL_VERSIONS_NO_SINGLE_LATEST_VERSION.format(
+                            branch, repo, name, ", ".join(sorted(published))
+                        )
                     )
                 versions[name] = next(iter(published))
                 repositories[name] = repo
                 break
             else:
                 raise AlpineLookupError(
-                    f"{name} is not published in Alpine {branch} main or community for {ARCH}."
+                    _RAISE_IS_NOT_PUBLISHED_IN_ALPINE_MAIN_OR_COMMUNITY.format(
+                        name, branch, ARCH
+                    )
                 )
         if RELEASES_URL not in sources:
             try:
@@ -296,7 +347,9 @@ class AlpinePackages:
                     None,
                 )
                 if platform is None:
-                    raise AlpineLookupError(f"{image} has no linux/amd64 image")
+                    raise AlpineLookupError(
+                        _RAISE_HAS_NO_LINUX_AMD64_IMAGE.format(image)
+                    )
                 manifest = self._registry_json(
                     host, repository, f"manifests/{platform['digest']}", sources
                 )
@@ -304,7 +357,7 @@ class AlpinePackages:
             base_digest = manifest["layers"][0]["digest"]
         except (KeyError, IndexError, TypeError) as exc:
             raise AlpineLookupError(
-                f"{image} has an unreadable image manifest"
+                _RAISE_HAS_AN_UNREADABLE_IMAGE_MANIFEST.format(image)
             ) from exc
         try:
             config = json.loads(
@@ -314,7 +367,9 @@ class AlpinePackages:
             )
             history = config.get("history") or []
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
-            raise AlpineLookupError(f"{image} has an unreadable image config") from exc
+            raise AlpineLookupError(
+                _RAISE_HAS_AN_UNREADABLE_IMAGE_CONFIG.format(image)
+            ) from exc
         for entry in history if isinstance(history, list) else []:
             matched = _MINIROOTFS.search(
                 str((entry if isinstance(entry, dict) else {}).get("created_by") or "")
@@ -339,13 +394,14 @@ class AlpinePackages:
             text = ""
         except (tarfile.TarError, EOFError, OSError) as exc:
             raise AlpineLookupError(
-                f"{image} base layer could not be read: {type(exc).__name__}"
+                _RAISE_BASE_LAYER_COULD_NOT_BE_READ.format(image, type(exc).__name__)
             ) from exc
         branches = {f"v{a}.{b}" for a, b in _REPOSITORY_LINE.findall(text)}
         if len(branches) != 1:
             raise AlpineLookupError(
-                f"{image} does not identify exactly one Alpine release "
-                f"(base-layer /etc/apk/repositories: {', '.join(sorted(branches)) or 'none'})."
+                _RAISE_DOES_NOT_IDENTIFY_EXACTLY_ONE_ALPINE_RELEASE_BASE.format(
+                    image, ", ".join(sorted(branches)) or "none"
+                )
             )
         branch = branches.pop()
         return (
@@ -365,11 +421,11 @@ class AlpinePackages:
             data = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AlpineLookupError(
-                f"{host}/{repository} returned an unreadable manifest"
+                _RAISE_RETURNED_AN_UNREADABLE_MANIFEST.format(host, repository)
             ) from exc
         if not isinstance(data, dict):
             raise AlpineLookupError(
-                f"{host}/{repository} returned an unreadable manifest"
+                _RAISE_RETURNED_AN_UNREADABLE_MANIFEST.format(host, repository)
             )
         return data
 
@@ -378,12 +434,14 @@ class AlpinePackages:
     ) -> bytes:
         """Read one content-addressed blob and reject bytes that do not match its digest."""
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)):
-            raise AlpineLookupError(f"Unsupported image digest {digest!r}")
+            raise AlpineLookupError(_RAISE_UNSUPPORTED_IMAGE_DIGEST_R.format(digest))
         body = self._registry_get(
             host, repository, f"blobs/{digest}", limit, {}, sources
         )
         if "sha256:" + hashlib.sha256(body).hexdigest() != digest:
-            raise AlpineLookupError(f"{host}/{repository} blob does not match {digest}")
+            raise AlpineLookupError(
+                _RAISE_BLOB_DOES_NOT_MATCH.format(host, repository, digest)
+            )
         return body
 
     def _registry_get(
@@ -431,7 +489,7 @@ class AlpinePackages:
         """Request a pull-only anonymous token from an allowlisted realm."""
         if not challenge.lower().startswith("bearer "):
             raise AlpineLookupError(
-                "The registry requires credentials; the image is not public"
+                _RAISE_THE_REGISTRY_REQUIRES_CREDENTIALS_THE_IMAGE_IS_NOT
             )
         fields = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
         realm = httpx.URL(fields.get("realm", ""))
@@ -440,7 +498,7 @@ class AlpinePackages:
             or realm.host not in _TOKEN_HOSTS | PUBLIC_REGISTRIES
         ):
             raise AlpineLookupError(
-                f"Registry token realm {realm.host!r} is not allowlisted"
+                _RAISE_REGISTRY_TOKEN_REALM_R_IS_NOT_ALLOWLISTED.format(realm.host)
             )
         query = {"scope": f"repository:{repository}:pull"}
         if fields.get("service"):
@@ -453,12 +511,10 @@ class AlpinePackages:
             token = data.get("token") or data.get("access_token")
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
             raise AlpineLookupError(
-                "The registry returned an unreadable token"
+                _RAISE_THE_REGISTRY_RETURNED_AN_UNREADABLE_TOKEN
             ) from exc
         if not isinstance(token, str) or not token:
-            raise AlpineLookupError(
-                "The registry did not issue an anonymous pull token"
-            )
+            raise AlpineLookupError(_RAISE_THE_REGISTRY_DID_NOT_ISSUE_AN_ANONYMOUS_PULL)
         return token
 
     def supported_branches(self) -> list[str]:
@@ -495,7 +551,7 @@ class AlpinePackages:
             ]
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise AlpineLookupError(
-                f"Alpine releases.json could not be read: {type(exc).__name__}"
+                _RAISE_ALPINE_RELEASES_JSON_COULD_NOT_BE_READ.format(type(exc).__name__)
             ) from exc
         branches.sort(
             key=lambda value: tuple(
@@ -504,7 +560,9 @@ class AlpinePackages:
             reverse=True,
         )
         if not branches:
-            raise AlpineLookupError("Alpine releases.json lists no supported branch.")
+            raise AlpineLookupError(
+                _RAISE_ALPINE_RELEASES_JSON_LISTS_NO_SUPPORTED_BRANCH
+            )
         return branches
 
     def _branch_from_pins(
@@ -512,10 +570,7 @@ class AlpinePackages:
     ) -> tuple[str, str]:
         """Choose the one supported branch that publishes every existing pin."""
         if not pinned:
-            raise AlpineLookupError(
-                "The stage image does not name an Alpine release and the stage pins no "
-                "other apk package, so the Alpine branch cannot be identified."
-            )
+            raise AlpineLookupError(_RAISE_THE_STAGE_IMAGE_DOES_NOT_NAME_AN_ALPINE)
 
         def matches(branch: str) -> bool:
             """Check every pin against main, then community only when needed."""
@@ -543,8 +598,9 @@ class AlpinePackages:
         )
         if len(found) != 1:
             raise AlpineLookupError(
-                f"Supported Alpine branches publishing {evidence}: "
-                f"{', '.join(found) or 'none'}. Exactly one is required to choose versions."
+                _RAISE_SUPPORTED_ALPINE_BRANCHES_PUBLISHING_EXACTLY_ONE_IS_REQUIRED.format(
+                    evidence, ", ".join(found) or "none"
+                )
             )
         return (
             found[0],
@@ -559,7 +615,7 @@ class AlpinePackages:
             if key in self._indexes:
                 return self._indexes[key]
             if self._closed:
-                raise AlpineLookupError("Alpine package lookup is closed")
+                raise AlpineLookupError(_RAISE_ALPINE_PACKAGE_LOOKUP_IS_CLOSED)
             self._pending.add(key)
         try:
             parsed = _parse_index(
@@ -598,7 +654,7 @@ class AlpinePackages:
         """
         for attempt in range(_ATTEMPTS):
             if self._closed:
-                raise AlpineLookupError("Alpine package lookup is closed")
+                raise AlpineLookupError(_RAISE_ALPINE_PACKAGE_LOOKUP_IS_CLOSED)
             try:
                 with timed_http_stream(
                     self.http,
@@ -610,7 +666,7 @@ class AlpinePackages:
                 ) as response:
                     if response.status_code in _TRANSIENT_STATUS:
                         raise httpx.HTTPStatusError(
-                            f"HTTP {response.status_code}",
+                            _RAISE_HTTP.format(response.status_code),
                             request=response.request,
                             response=response,
                         )
@@ -622,7 +678,7 @@ class AlpinePackages:
                         size += len(chunk)
                         if size > limit:
                             raise AlpineLookupError(
-                                f"{url} exceeds the {limit} byte read limit"
+                                _RAISE_EXCEEDS_THE_BYTE_READ_LIMIT.format(url, limit)
                             )
                         chunks.append(chunk)
                     return response.status_code, response.headers, b"".join(chunks)
@@ -647,7 +703,7 @@ class AlpinePackages:
                     _ATTEMPTS,
                 )
                 sleep(_BACKOFF_SECONDS * 2**attempt)
-        raise AlpineLookupError(f"Data could not be read from {url}")
+        raise AlpineLookupError(_RAISE_DATA_COULD_NOT_BE_READ_FROM.format(url))
 
 
 def _index_url(branch: str, repo: str) -> str:
@@ -661,14 +717,18 @@ def _parse_index(raw: bytes, branch: str, repo: str) -> dict[str, set[str]]:
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
             member = archive.extractfile("APKINDEX")
             if member is None:
-                raise AlpineLookupError("APKINDEX is not a regular archive member")
+                raise AlpineLookupError(_RAISE_APKINDEX_IS_NOT_A_REGULAR_ARCHIVE_MEMBER)
             text = member.read(_MAX_INDEX + 1)
     except (tarfile.TarError, KeyError, EOFError, OSError) as exc:
         raise AlpineLookupError(
-            f"Alpine {branch} {repo} index could not be read: {type(exc).__name__}"
+            _RAISE_ALPINE_INDEX_COULD_NOT_BE_READ.format(
+                branch, repo, type(exc).__name__
+            )
         ) from exc
     if len(text) > _MAX_INDEX:
-        raise AlpineLookupError(f"Alpine {branch} {repo} index exceeds the read limit")
+        raise AlpineLookupError(
+            _RAISE_ALPINE_INDEX_EXCEEDS_THE_READ_LIMIT.format(branch, repo)
+        )
     packages: dict[str, set[str]] = {}
     for record in text.decode("utf-8", errors="replace").split("\n\n"):
         fields = {
@@ -679,5 +739,7 @@ def _parse_index(raw: bytes, branch: str, repo: str) -> dict[str, set[str]]:
         if fields.get("P") and fields.get("V"):
             packages.setdefault(fields["P"], set()).add(fields["V"])
     if not packages:
-        raise AlpineLookupError(f"Alpine {branch} {repo} index lists no packages")
+        raise AlpineLookupError(
+            _RAISE_ALPINE_INDEX_LISTS_NO_PACKAGES.format(branch, repo)
+        )
     return packages

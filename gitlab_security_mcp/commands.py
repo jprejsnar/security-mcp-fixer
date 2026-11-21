@@ -20,12 +20,59 @@ from pathlib import Path
 from uuid import uuid4
 
 from gitlab_security_mcp.util import (
+    PROGRESS_PUBLISH_FAILURES,
     atomic_write_text,
     log_concurrency,
     log_task,
     logged_lock,
     safe_token,
     utc_now_iso,
+)
+
+_RAISE_REFUSING_TO_RUN_AN_EMPTY_COMMAND = "Refusing to run an empty command"
+_RAISE_REFUSING_COMMAND_ARGUMENTS_THAT_CONTAIN_SHELL_METACHARACTERS = (
+    "Refusing command arguments that contain shell metacharacters"
+)
+_RAISE_RELATIVE_EXECUTABLE_PATHS_ARE_NOT_ALLOWED = (
+    "Relative executable paths are not allowed: {}"
+)
+_RAISE_COMMAND_IS_NOT_ON_THE_ALLOWLIST = "Command is not on the allowlist: {}"
+_RAISE_CANNOT_VERIFY_TEST_FREE_BUILD_SCRIPTS_PROJECT_DISCOVERY = (
+    "Cannot verify test-free build scripts: project discovery was truncated"
+)
+_RAISE_ONLY_THE_OWNED_GRADLE_NO_TESTS_INITIALIZATION_SCRIPT = (
+    "Only the owned Gradle no-tests initialization script is allowed"
+)
+_RAISE_WRAPPER_MUST_LIVE_IN_THE_REPOSITORY = "Wrapper must live in the repository: {}"
+_RAISE_UNEXPECTED_EXECUTABLE = "Unexpected executable: {}"
+_RAISE_CANNOT_VERIFY_OVERSIZED_PACKAGE_JSON_BUILD_SCRIPTS = (
+    "Cannot verify oversized package.json build scripts"
+)
+_RAISE_SCRIPTS_MUST_BE_AN_OBJECT = "{}: scripts must be an object"
+_RAISE_MAX_OUTPUT_MUST_BE_NON_NEGATIVE = "max_output must be non-negative"
+_RAISE_COMMAND_OUTPUT_READERS_DID_NOT_STOP = "Command output readers did not stop"
+_RAISE_COULD_NOT_READ_COMMAND_OUTPUT = "Could not read command output"
+_RAISE_FAILED = "{} failed ({}): {}"
+_RAISE_COMMAND_PIPES_WERE_NOT_OPENED = "Command pipes were not opened"
+_RAISE_COULD_NOT_FIND_SUSPENDED_COMMAND_THREAD = (
+    "Could not find suspended command thread"
+)
+_RAISE_COMMAND_PROCESS_WAS_NOT_REAPED_AFTER_TERMINATION_CLEANUP = (
+    "Command process {} was not reaped after termination; cleanup is incomplete"
+)
+_RAISE_THE_OWNED_GRADLE_NO_TESTS_INITIALIZATION_SCRIPT_WAS = (
+    "The owned Gradle no-tests initialization script was changed"
+)
+_RAISE_MUST_BE_A_COMMAND_STRING = "{}: {} must be a command string"
+_RAISE_TESTS_ARE_DISABLED_SCRIPT_R_INVOKES_A_TEST = "Tests are disabled: {} script {!r} invokes a test runner. Provide a test-free build/check; scripts were not changed."
+_RAISE_REFUSING_TO_RUN_OUTSIDE_THE_REPOSITORY = (
+    "Refusing to run outside the repository: {}"
+)
+_RAISE_GRADLE_NO_TESTS_INITIALIZATION_MUST_STAY_INSIDE_THE = (
+    "Gradle no-tests initialization must stay inside the checkout"
+)
+_RAISE_COMMAND_DESCENDANTS_CONTINUED_WRITING_AFTER_SHUTDOWN_OUTPUT_CAPTURE = (
+    "Command descendants continued writing after shutdown; output capture is incomplete"
 )
 
 FORBIDDEN_GIT = {
@@ -356,18 +403,20 @@ _CHECKERS = {
 def assert_allowed(argv: list[str], repo_root: Path) -> None:
     """Raise PermissionError when argv is not an allowlisted command."""
     if len(argv) < 2:
-        raise PermissionError("Refusing to run an empty command")
+        raise PermissionError(_RAISE_REFUSING_TO_RUN_AN_EMPTY_COMMAND)
     batch = Path(argv[0]).suffix.lower() in {".cmd", ".bat"}
     if any(_bad_argument(arg) for arg in argv[:1]) or any(
         _bad_argument(arg, batch=batch) for arg in argv[1:]
     ):
         raise PermissionError(
-            "Refusing command arguments that contain shell metacharacters"
+            _RAISE_REFUSING_COMMAND_ARGUMENTS_THAT_CONTAIN_SHELL_METACHARACTERS
         )
     name = tool_name(argv[0])
     path = Path(argv[0])
     if not path.is_absolute() and name not in REPO_WRAPPERS and len(path.parts) > 1:
-        raise PermissionError(f"Relative executable paths are not allowed: {argv[0]}")
+        raise PermissionError(
+            _RAISE_RELATIVE_EXECUTABLE_PATHS_ARE_NOT_ALLOWED.format(argv[0])
+        )
     checked = argv[1:]
     if name in {"gradle", "gradlew"} and checked[:2] == [
         "--no-daemon",
@@ -380,27 +429,29 @@ def assert_allowed(argv: list[str], repo_root: Path) -> None:
             or not _inside_repo(str(script), repo_root)
         ):
             raise PermissionError(
-                "Only the owned Gradle no-tests initialization script is allowed"
+                _RAISE_ONLY_THE_OWNED_GRADLE_NO_TESTS_INITIALIZATION_SCRIPT
             )
         with script.open(encoding="utf-8") as stream:
             if stream.read(len(GRADLE_NO_TESTS_INIT) + 1) != GRADLE_NO_TESTS_INIT:
                 raise PermissionError(
-                    "The owned Gradle no-tests initialization script was changed"
+                    _RAISE_THE_OWNED_GRADLE_NO_TESTS_INITIALIZATION_SCRIPT_WAS
                 )
         checked = [checked[0], *checked[3:]]
     checker = _CHECKERS.get(name)
     if checker is None or not checker(checked, repo_root):
         shown = " ".join(argv)
-        raise PermissionError(f"Command is not on the allowlist: {shown}")
+        raise PermissionError(_RAISE_COMMAND_IS_NOT_ON_THE_ALLOWLIST.format(shown))
     if path.is_absolute() or name in REPO_WRAPPERS:
         if name in REPO_WRAPPERS and not _inside_repo(argv[0], repo_root):
-            raise PermissionError(f"Wrapper must live in the repository: {argv[0]}")
+            raise PermissionError(
+                _RAISE_WRAPPER_MUST_LIVE_IN_THE_REPOSITORY.format(argv[0])
+            )
         if name in PATH_TOOLS and path.is_absolute():
             return
         if name in REPO_WRAPPERS:
             return
         if name not in PATH_TOOLS and name not in REPO_WRAPPERS:
-            raise PermissionError(f"Unexpected executable: {argv[0]}")
+            raise PermissionError(_RAISE_UNEXPECTED_EXECUTABLE.format(argv[0]))
 
 
 @dataclass
@@ -461,7 +512,7 @@ class CommandProgress:
             self._last_emitted = now
             try:
                 self.callback(text)
-            except Exception:
+            except PROGRESS_PUBLISH_FAILURES:
                 logging.getLogger("gitlab_security_mcp").warning(
                     "Could not publish command progress", exc_info=True
                 )
@@ -556,7 +607,7 @@ def assert_test_free_scripts(argv: list[str], workdir: Path) -> None:
     files, truncated = iter_files(workdir)
     if truncated:
         raise PermissionError(
-            "Cannot verify test-free build scripts: project discovery was truncated"
+            _RAISE_CANNOT_VERIFY_TEST_FREE_BUILD_SCRIPTS_PROJECT_DISCOVERY
         )
     prohibited = re.compile(
         r"\b(?:jest|vitest|mocha|jasmine|karma|cypress|playwright|pytest|vstest)\b"
@@ -571,11 +622,13 @@ def assert_test_free_scripts(argv: list[str], workdir: Path) -> None:
         with path.open(encoding="utf-8") as stream:
             text = stream.read(512 * 1024 + 1)
         if len(text) > 512 * 1024:
-            raise PermissionError("Cannot verify oversized package.json build scripts")
+            raise PermissionError(
+                _RAISE_CANNOT_VERIFY_OVERSIZED_PACKAGE_JSON_BUILD_SCRIPTS
+            )
         data = json.loads(text)
         scripts = data.get("scripts", {})
         if not isinstance(scripts, dict):
-            raise ValueError(f"{path}: scripts must be an object")
+            raise ValueError(_RAISE_SCRIPTS_MUST_BE_AN_OBJECT.format(path))
         visited: set[str] = set()
 
         def inspect(name: str, declarations=scripts, seen=visited, source=path) -> None:
@@ -585,10 +638,12 @@ def assert_test_free_scripts(argv: list[str], workdir: Path) -> None:
             seen.add(name)
             body = declarations[name]
             if not isinstance(body, str):
-                raise ValueError(f"{source}: {name} must be a command string")
+                raise ValueError(_RAISE_MUST_BE_A_COMMAND_STRING.format(source, name))
             if prohibited.search(body):
                 raise PermissionError(
-                    f"Tests are disabled: {source} script {name!r} invokes a test runner. Provide a test-free build/check; scripts were not changed."
+                    _RAISE_TESTS_ARE_DISABLED_SCRIPT_R_INVOKES_A_TEST.format(
+                        source, name
+                    )
                 )
             for nested in re.findall(
                 r"\b(?:npm|pnpm|yarn)\s+(?:run(?:-script)?\s+)?([\w:.-]+)", body
@@ -623,7 +678,7 @@ class CommandRunner:
         permit bounded reader shutdown.
         """
         if max_output < 0:
-            raise ValueError("max_output must be non-negative")
+            raise ValueError(_RAISE_MAX_OUTPUT_MUST_BE_NON_NEGATIVE)
         self.repo_root = repo_root
         self.max_output = max_output
         self.audit_path = audit_path or (repo_root / ".security-mcp" / "audit.jsonl")
@@ -651,7 +706,7 @@ class CommandRunner:
             workdir.relative_to(self.repo_root.resolve())
         except ValueError as exc:
             raise PermissionError(
-                f"Refusing to run outside the repository: {workdir}"
+                _RAISE_REFUSING_TO_RUN_OUTSIDE_THE_REPOSITORY.format(workdir)
             ) from exc
         assert_allowed(argv, self.repo_root)
         assert_test_free_scripts(argv, workdir)
@@ -665,7 +720,7 @@ class CommandRunner:
                 script = self.repo_root / ".security-mcp" / "no-tests-v1.init.gradle"
                 if not _inside_repo(str(script), self.repo_root):
                     raise PermissionError(
-                        "Gradle no-tests initialization must stay inside the checkout"
+                        _RAISE_GRADLE_NO_TESTS_INITIALIZATION_MUST_STAY_INSIDE_THE
                     )
                 script.parent.mkdir(parents=True, exist_ok=True)
                 if not script.exists():
@@ -759,7 +814,7 @@ class CommandRunner:
                     with output_lock:
                         if errors:
                             raise RuntimeError(
-                                "Could not read command output"
+                                _RAISE_COULD_NOT_READ_COMMAND_OUTPUT
                             ) from errors[0]
                     if time.monotonic() >= deadline:
                         raise
@@ -792,9 +847,9 @@ class CommandRunner:
                 ):
                     _close_pipes(process)
         if any(thread.is_alive() for thread in threads):
-            raise RuntimeError("Command output readers did not stop")
+            raise RuntimeError(_RAISE_COMMAND_OUTPUT_READERS_DID_NOT_STOP)
         if errors:
-            raise RuntimeError("Could not read command output") from errors[0]
+            raise RuntimeError(_RAISE_COULD_NOT_READ_COMMAND_OUTPUT) from errors[0]
         stdout, stdout_truncated = captured.get("stdout", ("", False))
         stderr, stderr_truncated = captured.get("stderr", ("", False))
         if timed_out:
@@ -814,7 +869,7 @@ class CommandRunner:
         if check and result.exit_code != 0:
             detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(
-                f"{result.display()} failed ({result.exit_code}): {detail[:500]}"
+                _RAISE_FAILED.format(result.display(), result.exit_code, detail[:500])
             )
         return result
 
@@ -834,7 +889,7 @@ class CommandRunner:
         still happens-before the caller reads the captured output.
         """
         if process.stdout is None or process.stderr is None:
-            raise RuntimeError("Command pipes were not opened")
+            raise RuntimeError(_RAISE_COMMAND_PIPES_WERE_NOT_OPENED)
         log_paths = self._command_log_paths
         progress = self._command_progress
 
@@ -850,7 +905,7 @@ class CommandRunner:
                     if progress is not None
                     else None,
                 )
-            except BaseException as exc:
+            except (Exception, KeyboardInterrupt, SystemExit) as exc:
                 log_concurrency(
                     "worker_error",
                     f"command-reader:{name}",
@@ -980,7 +1035,7 @@ def _read_capped(
                 shutdown_bytes += len(raw)
                 if shutdown_bytes > 1024 * 1024:
                     raise RuntimeError(
-                        "Command descendants continued writing after shutdown; output capture is incomplete"
+                        _RAISE_COMMAND_DESCENDANTS_CONTINUED_WRITING_AFTER_SHUTDOWN_OUTPUT_CAPTURE
                     )
             if kept >= limit:
                 truncated = True
@@ -1234,7 +1289,7 @@ class _WindowsJob:
                         kernel.CloseHandle(thread)
                     return
                 found = kernel.Thread32Next(snapshot, ctypes.byref(entry))
-            raise RuntimeError("Could not find suspended command thread")
+            raise RuntimeError(_RAISE_COULD_NOT_FIND_SUSPENDED_COMMAND_THREAD)
         finally:
             kernel.CloseHandle(snapshot)
 
@@ -1245,6 +1300,13 @@ class _WindowsJob:
             self._handle = None
 
 
+def _taskkill_executable() -> Path:
+    """Return Windows taskkill by absolute path, not a PATH lookup."""
+    return (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+    )
+
+
 def _kill_tree(process: subprocess.Popen[str]) -> None:
     """Stop the child and everything it started, then reap the child."""
     if os.name != "nt" or process.poll() is None:
@@ -1253,12 +1315,19 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
             # direct child would leave node or java running.
             try:
                 subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    [
+                        str(_taskkill_executable()),
+                        "/F",
+                        "/T",
+                        "/PID",
+                        str(process.pid),
+                    ],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=15,
                     check=False,
+                    shell=False,
                 )
             except (OSError, subprocess.TimeoutExpired):
                 logging.getLogger("gitlab_security_mcp").warning(
@@ -1285,7 +1354,9 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
             "Command process was not reaped after termination pid=%s", process.pid
         )
         raise RuntimeError(
-            f"Command process {process.pid} was not reaped after termination; cleanup is incomplete"
+            _RAISE_COMMAND_PROCESS_WAS_NOT_REAPED_AFTER_TERMINATION_CLEANUP.format(
+                process.pid
+            )
         ) from exc
 
 

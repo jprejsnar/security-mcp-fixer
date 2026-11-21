@@ -20,7 +20,7 @@ import httpx
 
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import timed_http_stream
+from gitlab_security_mcp.util import PROGRESS_PUBLISH_FAILURES, timed_http_stream
 
 # Publishers named by the remediation contract. Each marker must appear in
 # the live page, which rejects an empty or unrelated response.
@@ -380,7 +380,7 @@ class OfficialDocs:
                 if sink is not None:
                     try:
                         sink(message)
-                    except Exception:
+                    except PROGRESS_PUBLISH_FAILURES:
                         logger.warning(
                             "Could not publish documentation progress", exc_info=True
                         )

@@ -18,3 +18,4 @@ These rules load at startup for Cursor and Copilot. Change them only in `ai/guar
 - stdout is the MCP protocol. Logs go to stderr.
 - Do not commit, push, or dismiss a GitLab finding unless the user asks. Human checkboxes start unchecked.
 - Before changing a Python API, read its current page on https://docs.python.org.
+- Do not leave magic numbers or magic strings in code. Name a constant for a limit, timeout, status, path fragment, or message. A literal that is only its own value, such as `0`, `1`, or `""`, can stay inline.

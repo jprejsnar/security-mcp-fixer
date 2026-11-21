@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gitlab_security_mcp.audit_host import handle_event, install_hooks
+from gitlab_security_mcp.audit_host import handle_event, install_hooks, main
 
 
 @pytest.fixture
@@ -203,6 +203,23 @@ def test_hook_install_preserves_existing_entries_and_is_idempotent(tmp_path):
         "UserPromptSubmit",
         "Stop",
     }
+
+
+def test_install_command_prints_written_hook_paths(tmp_path, monkeypatch, capsys):
+    """Successful installation lists each written hook file on stdout."""
+    # Arrange
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(sys, "argv", ["audit_host", "--install"])
+
+    # Act
+    main()
+    captured = capsys.readouterr()
+
+    # Assert
+    lines = captured.out.splitlines()
+    assert lines
+    assert captured.err == ""
+    assert [Path(line) for line in lines] == install_hooks(tmp_path, Path(sys.executable))
 
 
 def test_malformed_hook_input_is_reported_instead_of_claiming_success():
