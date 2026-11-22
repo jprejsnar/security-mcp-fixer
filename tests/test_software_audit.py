@@ -1128,7 +1128,9 @@ def test_fix_choice_keeps_only_checked_items(tmp_path, monkeypatch):
     assert "Leave every unchecked audit item unchanged." in result["message"]
     assert "Never guess or invent a cause" in result["message"]
     assert "what the change corrects and why" in result["message"]
-    assert "Do not call submit_false_positive_approvals from this job" in result["message"]
+    assert (
+        "Do not call submit_false_positive_approvals from this job" in result["message"]
+    )
     assert "unchecked boxes for those false positives" in result["message"]
     assert "Do not commit, push, or open a merge request." in result["message"]
 

@@ -12,15 +12,18 @@ dependencies = [
     "mcp[cli]>=2.3.0,<3",
     "httpx>=0.28.1",
     "packaging>=26.3",
-    "pydantic>=2.14.3,<3",
+    "pydantic>=2.14.4,<3",
     "ruamel.yaml>=0.19.1,<0.20",
 ]
 
 [project.optional-dependencies]
-dev = ["anyio>=4.16.0,<5", "pytest>=9.2.0", "ruff>=0.17.5,<1"]
+dev = ["anyio>=4.16.0,<5", "pytest>=9.2.0", "ruff>=0.17.6,<1"]
 
 [project.scripts]
 gitlab-security-mcp = "gitlab_security_mcp.server:main"
+
+[tool.setuptools]
+packages = ["gitlab_security_mcp"]
 
 [tool.setuptools.package-data]
 gitlab_security_mcp = ["software_audit_prompt.md"]

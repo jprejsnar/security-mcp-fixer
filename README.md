@@ -1742,8 +1742,8 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   [winget commands](#install-windows-prerequisites-with-winget). macOS and
   Linux wheel installs do not use this script and do not require PowerShell.
 - Runtime floors: `mcp[cli]>=2.3.0,<3`, `httpx>=0.28.1`, `packaging>=26.3`,
-  `pydantic>=2.14.3,<3`, and `ruamel.yaml>=0.19.1,<0.20`. Development floors are
-  `anyio>=4.16.0,<5`, `pytest>=9.2.0` and `ruff>=0.17.5,<1`.
+  `pydantic>=2.14.4,<3`, and `ruamel.yaml>=0.19.1,<0.20`. Development floors are
+  `anyio>=4.16.0,<5`, `pytest>=9.2.0` and `ruff>=0.17.6,<1`.
   Isolated wheel builds use `setuptools>=84.2.1` through the declared PEP 517
   backend. Pydantic and AnyIO are explicit dependencies because production and
   test code import them directly, respectively. These lines are minimums.

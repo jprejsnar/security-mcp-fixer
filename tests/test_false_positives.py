@@ -21,6 +21,7 @@ from mcp.types import ClientCapabilities
 from gitlab_security_mcp import __version__, server
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.gitlab_client import (
+    _GITLAB_READ_ATTEMPTS,
     DISMISS_FALSE_POSITIVE,
     DISMISSAL_CONFIRMATION_QUERY,
     DISMISSAL_TARGET_QUERY,
@@ -2044,11 +2045,14 @@ def test_gitlab_mutation_checks_identity_reason_and_confirmed_outcome(
         "graphql_error",
     ],
 )
-def test_dismissal_requires_independent_persisted_state_and_reason(tmp_path, mode):
+def test_dismissal_requires_independent_persisted_state_and_reason(
+    tmp_path, monkeypatch, mode
+):
     """A successful mutation response alone must never count as a dismissal."""
     # Arrange
     queries = []
     path = tmp_path / "http-timings.jsonl"
+    monkeypatch.setattr("gitlab_security_mcp.gitlab_client.sleep", lambda _delay: None)
 
     def handler(request):
         """Acknowledge the write, then provide independently controlled evidence."""
@@ -2111,10 +2115,11 @@ def test_dismissal_requires_independent_persisted_state_and_reason(tmp_path, mod
                 client.dismiss_false_positive(GID, "finding-1", "group/app", "Reviewed")
 
     # Assert
+    confirmation_attempts = _GITLAB_READ_ATTEMPTS if mode == "timeout" else 1
     assert queries == [
         DISMISSAL_TARGET_QUERY,
         DISMISS_FALSE_POSITIVE,
-        DISMISSAL_CONFIRMATION_QUERY,
+        *([DISMISSAL_CONFIRMATION_QUERY] * confirmation_attempts),
     ]
     events = [
         json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
@@ -2122,7 +2127,7 @@ def test_dismissal_requires_independent_persisted_state_and_reason(tmp_path, mod
     assert [row["operation"] for row in events] == [
         "DismissalTarget",
         "DismissFalsePositive",
-        "ConfirmFalsePositiveDismissal",
+        *(["ConfirmFalsePositiveDismissal"] * confirmation_attempts),
     ]
     assert "test-token" not in path.read_text(encoding="utf-8")
     assert "Reviewed" not in path.read_text(encoding="utf-8")
