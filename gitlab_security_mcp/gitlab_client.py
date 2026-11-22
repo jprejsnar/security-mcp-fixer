@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import logging
 import re
 import threading
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import sleep
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
@@ -79,6 +81,7 @@ _RAISE_GITLAB_VULNERABILITY_REPORT_PAGINATION_DID_NOT_ADVANCE = (
 _RAISE_GITLAB_RETURNED_MALFORMED_GRAPHQL_ERRORS = (
     "GitLab returned malformed GraphQL errors"
 )
+_RAISE_GITLAB_RESPONSE_EXCEEDS_THE_SIZE_LIMIT = "GitLab response exceeds the size limit"
 _RAISE_GITLAB_RETURNED_MALFORMED_REQUEST_RESPONSE_EVIDENCE = (
     "GitLab returned malformed request/response evidence"
 )
@@ -238,6 +241,11 @@ KEEP_STATES = {"detected", "confirmed"}
 
 
 MAX_PAGES = 20
+MAX_GITLAB_RESPONSE_BYTES = 8 * 1024 * 1024
+_GITLAB_READ_ATTEMPTS = 4
+_GITLAB_BACKOFF_SECONDS = 1.0
+_MAX_GITLAB_RETRY_WAIT = 4.0
+_GITLAB_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
 @dataclass
@@ -723,27 +731,41 @@ class GitLabClient:
         ):
             raise PermissionError(_RAISE_ONLY_GITLAB_READS_AND_THE_FIXED_FALSE_POSITIVE)
         operation = re.match(r"\s*(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)", query)
-        with timed_http_stream(
-            self.http,
-            method,
-            url,
-            source="gitlab",
-            log_path=self.http_log_path,
-            operation=operation.group(1) if operation else None,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-            },
-            json=json_body,
-        ) as response:
-            if response.status_code >= 400:
-                detail = self._clean(
-                    f"GitLab {method} {url} returned {response.status_code}: "
-                    f"{_response_excerpt(response)}"
+        read = method == "GET" or read_query
+        attempts = _GITLAB_READ_ATTEMPTS if read else 1
+        for attempt in range(attempts):
+            try:
+                payload, delay = self._exchange(
+                    method,
+                    url,
+                    json_body,
+                    operation.group(1) if operation else None,
+                    read=read,
+                    attempt=attempt,
+                    attempts=attempts,
                 )
-                raise RuntimeError(detail)
-            response.read()
-            payload = response.json()
+            except httpx.TransportError:
+                if not read or attempt + 1 == attempts:
+                    raise
+                delay = _GITLAB_BACKOFF_SECONDS * 2**attempt
+                logger.warning(
+                    "Transient GitLab transport failure; retrying read %s of %s",
+                    attempt + 2,
+                    attempts,
+                )
+                if delay > 0:
+                    sleep(delay)
+                continue
+            if delay is not None:
+                logger.warning(
+                    "Transient GitLab status; retrying read %s of %s",
+                    attempt + 2,
+                    attempts,
+                )
+                if delay > 0:
+                    sleep(delay)
+                continue
+            break
         if not isinstance(payload, dict):
             raise RuntimeError(
                 _RAISE_GITLAB_DID_NOT_RETURN_A_JSON_OBJECT.format(method, url)
@@ -760,9 +782,78 @@ class GitLabClient:
             raise RuntimeError(self._clean(message))
         return payload
 
+    def _exchange(
+        self,
+        method: str,
+        url: str,
+        json_body: dict | None,
+        operation: str | None,
+        *,
+        read: bool,
+        attempt: int,
+        attempts: int,
+    ) -> tuple[dict | None, float | None]:
+        """Read one bounded response. Reads may ask for a short retry delay."""
+        with timed_http_stream(
+            self.http,
+            method,
+            url,
+            source="gitlab",
+            log_path=self.http_log_path,
+            operation=operation,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+            },
+            json=json_body,
+        ) as response:
+            if response.status_code >= 400:
+                detail = self._clean(
+                    f"GitLab {method} {url} returned {response.status_code}: "
+                    f"{_response_excerpt(response)}"
+                )
+                if (
+                    read
+                    and response.status_code in _GITLAB_TRANSIENT_STATUS
+                    and attempt + 1 < attempts
+                ):
+                    delay = _retry_wait(response, attempt)
+                    if delay is not None:
+                        return None, delay
+                raise RuntimeError(detail)
+            payload = json.loads(_bounded_body(response))
+        return payload, None
+
     def _clean(self, text: str) -> str:
         """Remove the GitLab token from returned or logged request details."""
         return redact(text, [self.token])
+
+
+def _retry_wait(response: httpx.Response, attempt: int) -> float | None:
+    """Return a short read delay, or None when Retry-After is too long to wait."""
+    header = response.headers.get("Retry-After")
+    if header:
+        try:
+            delay = float(int(header))
+        except ValueError:
+            delay = None
+        if delay is not None:
+            if delay > _MAX_GITLAB_RETRY_WAIT:
+                return None
+            return delay
+    return _GITLAB_BACKOFF_SECONDS * 2**attempt
+
+
+def _bounded_body(response: httpx.Response) -> bytes:
+    """Read a GitLab body without retaining more than the response cap."""
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in response.iter_bytes():
+        size += len(chunk)
+        if size > MAX_GITLAB_RESPONSE_BYTES:
+            raise ValueError(_RAISE_GITLAB_RESPONSE_EXCEEDS_THE_SIZE_LIMIT)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _response_excerpt(response: httpx.Response, limit: int = 500) -> str:

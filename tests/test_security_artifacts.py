@@ -129,3 +129,53 @@ def test_fresh_cleanup_removes_empty_generated_directories(tmp_path):
     assert result["previous_run_error_count"] == 1
     assert not root.exists()
     assert len(result["deleted_directories"]) == 3
+
+
+def test_run_logs_are_archived_then_removed_from_the_checkout(tmp_path, monkeypatch):
+    """Zip checkout logs into the home folder and leave reports in place."""
+    # Arrange
+    import zipfile
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from gitlab_security_mcp.security_artifacts import archive_run_logs
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(
+        "gitlab_security_mcp.security_artifacts.Path.home", lambda: home
+    )
+    root = tmp_path / "checkout"
+    metadata = root / ".security-mcp"
+    (metadata / "command-logs").mkdir(parents=True)
+    (metadata / "reports").mkdir()
+    (metadata / "audit.jsonl").write_text("audit\n", encoding="utf-8")
+    (metadata / "http-timings.jsonl").write_text("http\n", encoding="utf-8")
+    (metadata / "command-logs" / "abc.stdout.log").write_text("out\n", encoding="utf-8")
+    (metadata / "reports" / "unresolved-remediation.md").write_text(
+        "keep\n", encoding="utf-8"
+    )
+    (metadata / "run-state.json").write_text("{}\n", encoding="utf-8")
+    when = datetime(2026, 11, 21, 21, 26, tzinfo=UTC)
+
+    # Act
+    result = archive_run_logs(root, "sample-project", when)
+
+    # Assert
+    archive = Path(result["path"])
+    assert result["status"] == "ARCHIVED"
+    assert archive == (
+        home / "softwareSecurityAuditReports" / "sample-project_2026-11-21T212600Z.zip"
+    )
+    with zipfile.ZipFile(result["path"]) as zipped:
+        assert zipped.namelist() == [
+            "audit.jsonl",
+            "http-timings.jsonl",
+            "command-logs/abc.stdout.log",
+        ]
+    assert not (metadata / "audit.jsonl").exists()
+    assert not (metadata / "http-timings.jsonl").exists()
+    assert not (metadata / "command-logs").exists()
+    assert (metadata / "reports" / "unresolved-remediation.md").is_file()
+    assert (metadata / "run-state.json").is_file()
+    assert archive.is_file()

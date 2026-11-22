@@ -49,6 +49,7 @@ from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.progress import publish as publish_editor_progress
 from gitlab_security_mcp.report import write_unresolved_report
+from gitlab_security_mcp.security_artifacts import archive_run_logs
 from gitlab_security_mcp.software_audit import (
     REVIEW_PHASES,
     audit_coverage_gaps,
@@ -2621,6 +2622,16 @@ async def _continue_workflow(
         result = await asyncio.to_thread(
             write_unresolved_report, selected.repo_root, state
         )
+        try:
+            result["log_archive"] = await asyncio.to_thread(
+                archive_run_logs,
+                selected.repo_root,
+                project_file_name(state.gitlab_project_path, selected.repo_root.name),
+                datetime.now(UTC),
+            )
+        except (OSError, ValueError) as exc:
+            logger.exception("Could not archive run logs")
+            result["log_archive"] = {"status": "ERROR", "path": None, "error": str(exc)}
         state.workflow["final_report"] = True
         state.workflow["final_result"] = result
         workflow.advance(
@@ -3372,11 +3383,28 @@ def _audit_fix_from_report(
         "selected_items": selected,
         "message": (
             "Fix only selected_items. Leave every unchecked audit item unchanged. "
-            "Use the smallest change and prefer an annotation when that is a real fix. "
-            "Do not rewrite a file, invent an issue, or change a false positive. "
-            "Before editing, read the current public guidance for this repository's "
-            "languages and frameworks. Every fix needs its own AAA unit test. "
-            "The code and tests must compile with no errors and no warnings. "
+            "Investigate each selected item before editing. Apply a change only for a "
+            "reproduced root cause, with an Arrange-Act-Assert test that fails before "
+            "the change and passes after it. Follow the repo's declared language "
+            "version and its current official docs. Do not retarget Java, .NET, "
+            "TypeScript, or JavaScript. The change adds no compiler errors and no "
+            "new warnings. On every changed code, Dockerfile, nginx.conf, or "
+            "build/script line, add a comment in that file's normal syntax that "
+            "states what the change corrects and why. Leave the code unchanged "
+            "when the reproduction, the test, or that comment is missing, or when "
+            "the change would make the code less correct or less stable. Never "
+            "guess or invent a cause, a line, or a test result. "
+            "When investigation shows the reported defect is absent, leave the code "
+            "unchanged and record the item as a false positive with the evidence. "
+            "Unknown reachability is not a false positive. After the selected work, "
+            "show unchecked boxes for those false positives. Record each box the "
+            "human checks in that item's failed result. Do not call "
+            "submit_false_positive_approvals from this job; it is accepted only "
+            "in job 4, and only for the same downloaded GitLab vulnerability. "
+            "Report each "
+            "unfixed false positive as failed, with the evidence in reason and the "
+            "investigation in validation. Before editing, read the current public "
+            "guidance for this repository's languages and frameworks. "
             "Do not commit, push, or open a merge request. "
             "The human reviews the diff and decides whether it is committed."
         ),

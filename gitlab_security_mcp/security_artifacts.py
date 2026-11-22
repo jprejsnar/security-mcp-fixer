@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
+import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 _RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT = (
@@ -26,8 +30,16 @@ _RAISE_SECURITY_ARTIFACT_DIRECTORIES_CHANGED_BEFORE_CLEANUP = (
 _RAISE_RUN_STATE_IS_NOT_AN_OBJECT = "Run state is not an object"
 _RAISE_DISMISSAL_RECORDS_ARE_MALFORMED = "Dismissal records are malformed"
 _RAISE_JSON_LOG_ENTRY_IS_NOT_AN_OBJECT = "JSON log entry is not an object"
+_RAISE_ARCHIVE_TIMESTAMP_IS_NOT_ISO_8601 = (
+    "Archive timestamp is not ISO 8601 basic time: {}"
+)
 
 logger = logging.getLogger("gitlab_security_mcp")
+LOG_ARCHIVE_DIRECTORY = "softwareSecurityAuditReports"
+_RUN_LOG_NAMES = ("audit.jsonl", "http-timings.jsonl")
+_COMMAND_LOG_SUFFIXES = (".stdout.log", ".stderr.log")
+_ARCHIVE_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z$")
+_REPARSE_POINT = 0x400
 
 GENERATED_NAMES = {
     "audit.jsonl",
@@ -278,3 +290,80 @@ def review_security_artifacts(
         "previous_run_errors": prior_errors,
         "cleanup_performed": tracked is not None and not error_count,
     }
+
+
+def _ordinary_file(path: Path) -> bool:
+    """Return whether a path is a regular file, not a link or reparse point."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        path.is_file()
+        and not path.is_symlink()
+        and not (getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+    )
+
+
+def run_log_files(repo_root: Path) -> list[Path]:
+    """Return this run's command and HTTP logs inside the checkout."""
+    root = repo_root / ".security-mcp"
+    found = [path for name in _RUN_LOG_NAMES if _ordinary_file(path := root / name)]
+    command_logs = root / "command-logs"
+    try:
+        info = command_logs.lstat()
+    except OSError:
+        info = None
+    if (
+        info is not None
+        and command_logs.is_dir()
+        and not command_logs.is_symlink()
+        and not (getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+    ):
+        found.extend(
+            path
+            for path in command_logs.iterdir()
+            if path.name.endswith(_COMMAND_LOG_SUFFIXES) and _ordinary_file(path)
+        )
+    return found
+
+
+def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict:
+    """Zip checkout logs into the home archive folder, then delete those files.
+
+    Reports, run state, policies, and lint evidence stay in the checkout. The
+    archive name uses an ISO 8601 basic timestamp because a colon is not a
+    legal Windows file name.
+    """
+    files = run_log_files(repo_root)
+    if not files:
+        return {"status": "NO_LOGS", "path": None, "removed": []}
+    destination = Path.home() / LOG_ARCHIVE_DIRECTORY
+    destination.mkdir(parents=True, exist_ok=True)
+    stamp = when.astimezone(UTC).strftime("%Y-%m-%dT%H%M%SZ")
+    if _ARCHIVE_STAMP.fullmatch(stamp) is None:
+        raise ValueError(_RAISE_ARCHIVE_TIMESTAMP_IS_NOT_ISO_8601.format(stamp))
+    target = destination / f"{project_name}_{stamp}.zip"
+    descriptor, temporary = tempfile.mkstemp(dir=destination, suffix=".zip.tmp")
+    os.close(descriptor)
+    try:
+        with zipfile.ZipFile(
+            temporary, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for path in files:
+                archive.write(
+                    path,
+                    arcname=path.relative_to(repo_root / ".security-mcp").as_posix(),
+                )
+        os.replace(temporary, target)
+    except (OSError, ValueError):
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    removed = []
+    for path in files:
+        path.unlink()
+        removed.append(path.relative_to(repo_root).as_posix())
+    command_logs = repo_root / ".security-mcp" / "command-logs"
+    if command_logs.is_dir() and not any(command_logs.iterdir()):
+        command_logs.rmdir()
+    return {"status": "ARCHIVED", "path": str(target), "removed": removed}

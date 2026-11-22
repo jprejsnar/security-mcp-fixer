@@ -34,10 +34,14 @@ This is one chat request, not a terminal command. The workflow runs these
 5. **GitLab source fixes:** a new unchecked source/config-only GUI. The host AI
    fixes only selected findings and records successful or unsuccessful outcomes.
 6. **Optional deep-dive audit:** ask **Yes / No** first. Yes generates the
-   coverage-checked report before showing unchecked audit-fix choices.
+   coverage-checked report before showing unchecked audit-fix choices. A checked
+   fix needs a reproduced root cause and a test that fails before the change and
+   passes after it. A selected item that is not a defect is left unchanged.
 7. **Final unresolved report:** write and display
    `.security-mcp/reports/unresolved-remediation.md`, with package current/target
    versions and blockers, plus unsuccessful code attempts and their reasons.
+   Checkout logs are then zipped under `~/softwareSecurityAuditReports/` and
+   removed from the repo. Reports and run state stay.
 
 Canceling a selection authorizes nothing and continues to the next job.
 Declining the audit still generates the final report. Jobs cannot be started
@@ -639,7 +643,7 @@ flowchart TD
   j3 --> j4["4 Review and upload false positives"]
   j4 --> j5["5 Select and fix GitLab source findings"]
   j5 --> j6{"6 Optional deep-dive software audit and selected fixes"}
-  j6 -->|Yes| audit["Prompt, file coverage, unchecked finding choices, checked fixes only"]
+  j6 -->|Yes| audit["Prompt, coverage, unchecked choices. Checked fixes need a reproduced root cause. A false positive is not patched."]
   j6 -->|No or cancel| j7["7 Display unresolved remediation report"]
   audit --> j7
   j7 --> human["Human reviews reports and the diff, then commits and pushes manually"]
@@ -657,7 +661,12 @@ What each job still does:
   `FAILED`, marks jobs 2–6 `SKIPPED`, and writes the job 7 report.
 - **Job 2.** `list_security_findings` loads tracked `main` findings in Needs
   triage or Confirmed that are still detected, plus non-main findings GitLab
-  reports resolved on `main`. A successful list advances to job 3. `ERROR` or a
+  reports resolved on `main`. Each GraphQL page asks for 100 records and stops
+  after 20 pages or 1,000 kept findings, which sets `truncated`. A success body
+  larger than 8 MiB is rejected. Read requests retry transport failures and HTTP
+  429, 500, 502, 503, and 504 up to four times, waiting 1, 2, then 4 seconds.
+  A `Retry-After` longer than 4 seconds fails on that first response. Dismissal
+  writes are not retried. A successful list advances to job 3. `ERROR` or a
   status ending in `_FAILED` blocks the run the same way as job 1. Verification
   starts in job 3, not in this job.
 - **Job 3.** Package findings are assessed here. `verify_security_finding` may
@@ -712,12 +721,29 @@ What each job still does:
   `AUDIT_REPORT_GENERATED`. `NO_FINDINGS` means section 7 says there is nothing
   to select. Otherwise `SELECTION_REQUIRED` shows one unchecked box per
   finding. `NONE_SELECTED` fixes nothing. Checked items are
-  `FIX_FROM_AUDIT_REPORT`. The host applies only those items. Every fix needs its
-  own AAA unit test. `CODE_FIX_RESULTS_REQUIRED` waits for each outcome.
+  `FIX_FROM_AUDIT_REPORT`. The host applies only those items. A change needs a
+  reproduced root cause and an Arrange-Act-Assert test that fails before the
+  change and passes after it. Each changed code, Dockerfile, nginx, or
+  build/script line carries a comment that states what the change corrects
+  and why. A selected item that investigation shows is a
+  false positive is left unchanged and reported as `failed`, with the evidence
+  in `reason` and the investigation in `validation`. The host then shows those
+  items as unchecked choices. A box the human checks is recorded on that failed result. It can update
+  GitLab only when it is the same downloaded vulnerability and only through
+  `submit_false_positive_approvals` in job 4. Job 6 does not call that tool
+  and does not open a second dismissal form. Language findings follow the
+  version the repo declares, including Java 17 or newer and .NET 10 when
+  those are the declared targets. A selected fix does not retarget the
+  language and does not add compiler warnings. `CODE_FIX_RESULTS_REQUIRED`
+  waits for each outcome.
   A Yes path finishes the job as `FINISHED` because the report path exists.
   See [Software audit states (job 6)](#software-audit-states-job-6).
 - **Job 7.** Writes and opens `.security-mcp/reports/unresolved-remediation.md`
-  plus the Markdown and JSON reports. The human reviews the reports and
+  plus the Markdown and JSON reports. It then zips this run's `audit.jsonl`,
+  `http-timings.jsonl`, and `command-logs` to
+  `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ.zip` and
+  deletes those files from the checkout. The home rolling log, reports, run
+  state, policies, and lint files stay. The human reviews the reports and
   `git diff`, then commits and pushes manually. A repeated
   `complete_security_run` returns the saved report.
 
@@ -734,7 +760,9 @@ Running alongside every job:
 - **Evidence logs:** command output goes to `.security-mcp/command-logs/`,
   hashes and exit codes to `audit.jsonl`, HTTP timings to `http-timings.jsonl`,
   and an inspection snapshot to `run-state.json`. Snapshots are never reloaded
-  as permission.
+  as permission. Job 7 moves the checkout logs into the home zip named above
+  and deletes those checkout files. INFO and higher server logs also append to
+  `~/gitlab-security-mcp/gitlab-security-mcp.log` for the life of the process.
 - **Audit continuation hooks (opt-in):** Cursor and Copilot stop hooks continue
   an unfinished approved audit for the same session, up to 24 turns (8 for
   Copilot), and stop when no new progress is recorded.
@@ -843,6 +871,11 @@ stateDiagram-v2
   NONE_SELECTED --> [*]
 ```
 
+False positives found while fixing a checked item stay inside
+`FIX_FROM_AUDIT_REPORT`. They are not a separate server state. The host reports
+each one `failed` and shows an unchecked list. GitLab dismissal remains the job
+4 tool.
+
 The first `GENERATE_AUDIT_REPORT` response delivers the full prompt and file
 inventory once. Later responses are compact (counts, next files, remaining
 phases) to keep AI token use low. The full prompt, inventory and receipts stay
@@ -884,7 +917,7 @@ flowchart TB
     securityPages["Named CVE records and CWE definitions"]
   end
 
-  server -->|"Tracked main and active findings, pages in cursor order"| gitlab
+  server -->|"Tracked main pages, 8 MiB cap, bounded read retries; dismissal writes once"| gitlab
   server -->|"Try OSV, then GitHub, then NVD"| osv
   server -->|"Same source order; earliest GitHub id still wins"| github
   server -->|"Only when OSV and GitHub have no record"| nvd
@@ -953,7 +986,7 @@ flowchart TB
   registry --> engine["engine.py: phase gates and finding decisions"]
 
   subgraph evidenceLayer["Evidence collection"]
-    gitlabClient["gitlab_client.py: GraphQL filtering and cursor pagination"]
+    gitlabClient["gitlab_client.py: GraphQL pages, 8 MiB cap, read retries, one-shot dismissal"]
     advisoryClient["advisory.py: ordered sources, parallel identifiers, 256-record cache"]
     officialDocs["official_docs.py: required publishers and optional security references"]
     fanout["fanout.py: bounded submissions, at most 8 workers, copied request context"]
@@ -1251,9 +1284,14 @@ The remediation report matches Status = Needs triage or Confirmed, Tracked ref
 branch ID, requests `DETECTED` and `CONFIRMED`, and sets `hasResolution: false`.
 If tracked
 `main` cannot be resolved, it fails rather than fetching unfiltered findings.
-Pagination and per-finding pipeline provenance are retained. Inspect `truncated`
-before treating a retrieval as complete; do not claim omitted findings were
-verified or resolved.
+Each page requests 100 records. Lookup stops after 20 pages or 1,000 kept
+findings and sets `truncated`. A success body over 8 MiB is rejected. Read
+requests retry transport failures and HTTP 429, 500, 502, 503, and 504 at most
+four times, waiting 1, 2, then 4 seconds. A `Retry-After` longer than 4 seconds
+fails on the first response. The false-positive dismissal is one request and is
+not retried. Pagination and per-finding pipeline provenance are retained.
+Inspect `truncated` before treating a retrieval as complete; omitted findings
+were not verified or resolved.
 
 The client also retrieves `hasResolution: true` findings on other tracked
 **branches**, not tags, for already-resolved-on-main review. Mere absence from
@@ -1666,9 +1704,13 @@ needs, are copied. Logged and returned text also redacts those secrets after
 percent-encoding.
 
 Advisory responses larger than 2 MB are refused. The cache holds at most 256
-records and is cleared on shutdown. GitLab error text keeps the first 500
-characters and discards the rest of the body. Documentation hashes cover the
-full page. Phrase checks use only the retained 1 MB prefix.
+records and is cleared on shutdown. A GitLab success body larger than 8 MiB is
+refused while it is read. GitLab error text keeps the first 500 characters and
+discards the rest of the body. Read requests retry transport failures and HTTP
+429, 500, 502, 503, and 504 at most four times, with 1, 2, and 4 second waits.
+A `Retry-After` longer than 4 seconds fails immediately. The dismissal mutation
+is not retried. Documentation hashes cover the full page. Phrase checks use
+only the retained 1 MB prefix.
 
 Malformed advisory responses fail that identifier's lookup. Malformed local
 evidence requires manual review instead of being treated as package absence.
@@ -2273,7 +2315,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.48-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.49-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -2289,7 +2331,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.48-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.49-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -2349,7 +2391,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.48-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.49-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
@@ -2365,7 +2407,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.48-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.49-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -2386,7 +2428,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.48-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.49-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -2395,7 +2437,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.48-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.49-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -2698,7 +2740,7 @@ VS Code/Cursor windows, including Agents/background windows, and use
 **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.48-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.49-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2772,7 +2814,7 @@ installation.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.48**
+3. Apply the deployment-specific update and verify installed version **1.0.49**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2977,6 +3019,13 @@ process ID and traceback. Approval-window start, visibility, close and PowerShel
 diagnostics are logged with the dialog process ID. A logging failure does not
 fail the task. Child-process CPU is not included.
 Stderr lines use `YYYY-MM-DDTHH:MM:SSZ LEVEL logger [thread]: message` in UTC.
+The same lines at INFO and above also go to
+`~/gitlab-security-mcp/gitlab-security-mcp.log`, which rolls by UTC day and at
+1 MB into zip archives kept for 21 days and at most 21 MB.
+When the final report is written, checkout logs (`audit.jsonl`,
+`http-timings.jsonl`, and `command-logs`) are zipped to
+`~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ.zip` and
+then deleted from the checkout. Reports and run state stay in the repo.
 Values of `GITLAB_TOKEN`, `GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`,
 `GH_TOKEN` and `NVD_API_KEY`, including URL-encoded forms and tracebacks, are
 replaced with `[REDACTED]`; other secrets in application output are not scrubbed.
@@ -3212,7 +3261,10 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
-| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. |
+| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output while the run is open. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files with the two JSONL logs and deletes them from the checkout. |
+| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table. Stays in the checkout after the log zip. |
+| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ.zip` | Checkout logs from the finished run. Created only when those log files exist. |
+| `~/gitlab-security-mcp/gitlab-security-mcp.log` | Process log at INFO and above. Rolls by UTC day or 1 MB, keeps 21 days and at most 21 MB of zip archives, and is not part of the run zip. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
 | `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |
 | `.security-mcp/reports/security-remediation-report-*.md` | Human-readable findings, changes, validation and review evidence. |

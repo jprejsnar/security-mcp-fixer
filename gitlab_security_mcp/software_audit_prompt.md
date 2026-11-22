@@ -1,6 +1,6 @@
 # Codebase Issues Meta Audit Prompt
 
-**Purpose:** Perform a thorough static meta-audit of a GitLab repository and produce a findings report with proposed surgical fixes only. No code, dependency, test, CI, or configuration changes are applied.
+**Purpose:** Perform a thorough static meta-audit of a GitLab repository and produce a findings report with proposed surgical fixes only. Writing the report changes no code, dependency, test, CI, or configuration. Edits happen only after a human checks a section 7 item, and only under "Fixing human-selected items".
 
 **Date:** {{CURRENT_DATE}}  
 **Audited revision:** {{GIT_COMMIT_SHA_OR_BRANCH}}  
@@ -13,8 +13,9 @@
 Review the first-party application code, shared libraries, tests, scripts, Git hooks (if present), configuration, CI, container/deployment files, and package/build manifests relevant to the repository.
 
 **Tech-stack awareness (use what is present):**
-- Frontend: Node.js / TypeScript / pnpm / Angular / Crystal / other JS/TS tooling
-- Backend: .NET 10 C#, Java 17 OpenJDK (Quarkus), Gradle, RabbitMQ, MongoDB, AWS S3
+- Detect the languages, frameworks, and versions from the repo's manifests. The names below are examples, not a required retarget.
+- Frontend examples: Node.js, JavaScript, TypeScript, pnpm, Angular, Crystal, other JS/TS tooling
+- Backend examples: C# on the declared .NET target (including .NET 10), Java on the declared release (including Java 17), Quarkus, Gradle, RabbitMQ, MongoDB, AWS S3
 - Mixed front-end + back-end repositories
 - Any other languages or frameworks found in the repo
 
@@ -51,7 +52,7 @@ Report a confirmed finding only when all of these are true:
 1. The code is on a path a user, job, or startup sequence can reach.
 2. You opened the writer and at least one caller or template that uses it.
 3. You can name the input and what happens on that path today.
-4. A smaller change would correct that behavior.
+4. The smallest change that corrects the root cause would fix that behavior. A smaller edit that only hides the symptom is not enough.
 
 For each finding, add:
 - Reachability: entry point, caller, and the input that triggers it.
@@ -90,6 +91,19 @@ finding still needs every item in "Evidence required before a finding". Do not
 report an outdated or vulnerable version alone; dependency upgrades are handled
 by the separate GitLab package job.
 
+## Language contracts
+
+Apply these only to the version the repo declares. Do not retarget Java, .NET, TypeScript, JavaScript, or any other language as an audit finding or a selected fix. Read the publisher page for that declared version before a language-quality finding or a fix. A style preference, a missing type by itself, or a newer-language feature is not a finding. A deprecated or removed API is a finding only when the call is on a reachable path and the publisher page for the declared version says it is deprecated or removed. The recommended replacement is the current API from that page, not a removed one.
+
+- **Java (declared 17 or newer, including Java 17):** Follow the Java SE documentation for that release. Close `AutoCloseable` resources with try-with-resources. Do not recommend `sun.*` or the deprecated `SecurityManager` as a fix. Quarkus and Jakarta libraries use `jakarta.*` when the project's imports already do. Do not rewrite `javax` to `jakarta`, or the reverse, as a style pass.
+- **JavaScript:** Follow the current MDN reference for the syntax the repo's `engines` or toolchain accepts. On a line you are already changing for a proven defect, use `const` or `let` rather than `var`. `===` is the fix only when the reachable bug is a coerced comparison. An unhandled rejection is a finding only on a reachable path. Optional chaining does not validate input.
+- **TypeScript:** Types are erased at compile time and are not a security control. Before a TypeScript verdict, apply this utility-type limit: `Pick` and `Omit` drop fields, `Partial` makes every property optional, `Required` is the opposite, `Readonly` does not freeze nested objects, `Record` does not prove an allowlist, `NonNullable` only removes `null` and `undefined`, `Awaited` unwraps Promises but does not catch rejection, and `Parameters`, `ReturnType`, `ConstructorParameters`, `InstanceType`, `Extract`, `Exclude`, `Uppercase`, `Lowercase`, `Capitalize`, and `Uncapitalize` do not sanitize runtime values. A type assertion is not a runtime check.
+- **C# and .NET:** Follow the project's `TargetFramework` and the current Microsoft Learn pages for that target. For `net10.0`, use the .NET 10 APIs. Dispose with `using` or `await using`. A finalizer is not a substitute. Do not recommend `BinaryFormatter`. Nullable annotations and the null-forgiving operator are compile-time and are not a null check.
+- **Dockerfile and nginx:** Follow the current Dockerfile reference and the current nginx documentation. A comment uses `#`.
+- **Other languages, including Python and Crystal:** Follow that language's official documentation for the version the repo declares.
+
+The audit's Arrange-Act-Assert test uses the test style the repo already uses. This MCP server's Python 3.11 floor applies to this server, not to the audited repository.
+
 ## Review order
 
 Review in this order and record each entry point you opened:
@@ -100,7 +114,7 @@ Review in this order and record each entry point you opened:
 4. Resource lifetime: subscriptions, transactions, HTTP clients, and timers. A subscription that is tied to destroy, or an HTTP observable that completes, is not a leak.
 5. UI behavior that already has a sibling implementation. Read that sibling before calling the other one wrong.
 
-Stop after implemented paths. Do not code-review generated files, generated coverage, lockfiles, or vendored packages for these findings.
+Review every remaining inventoried file. Stop tracing a path when it is unimplemented, and list that path under Unfinished work. Do not stop the audit after the first implemented path. Do not code-review generated files, generated coverage, lockfiles, or vendored packages for these findings.
 
 ## Required coverage and completion
 
@@ -111,7 +125,8 @@ properties/items, npm scripts, OpenAPI/GraphQL/Protobuf configuration, Git
 generated-file attributes, and generator output manifests as applicable. Follow
 variables and copy destinations; generated outputs can be checked in and can
 have arbitrary names. Do not execute generators or build scripts to discover
-their outputs. Exclude every identified generated file and output folder before
+their outputs. Running the Arrange-Act-Assert test for a human-selected fix is
+a later step and is not discovery. Exclude every identified generated file and output folder before
 reviewing application implementations. Keep handwritten siblings, generator
 inputs/templates, and generator configuration in scope.
 
@@ -204,10 +219,10 @@ phases, then save the complete report at the exact requested output path.
 it must not open the fix-selection UI. Changed files need fresh receipts.
 Record any genuine review blocker rather than declaring completion.
 
-Ask the developer Yes/No before starting this optional audit, after the separate
-GitLab package, false-positive, and source-fix jobs. If accepted, generate the
-complete report before opening unchecked audit-fix checkboxes. Cancel or an
-empty selection approves no fixes and proceeds to the final unresolved report.
+This prompt is delivered only after the human has already accepted the audit.
+Do not ask for that Yes/No consent again. Generate the complete report before
+opening unchecked audit-fix checkboxes. Cancel or an empty selection approves
+no fixes and proceeds to the final unresolved report.
 Zero or one finding is valid after complete review; do not invent findings,
 lower the evidence bar, or inflate severity to satisfy an expected count.
 
@@ -256,7 +271,7 @@ For each finding include:
 - Proposed surgical fix
 - Reachability, evidence with linked code lines (including the test or template showing intended behavior), and why the proposed change is enough; use an ID-keyed explanation below the table if needed
 - Suggested test(s) if relevant
-- Do **not** apply the fix
+- Do **not** apply the fix while writing this report
 
 ### 3. Security findings and conditional hardening items
 
@@ -274,7 +289,7 @@ Note what was not covered (private packages, full transitive CVE review, runtime
 
 ### 7. Selectable findings
 
-List only rows from sections 2 and 3, including conditional security items. Unfinished work and rejected leads stay out of this list. One item per line and no other text in this section, except that a report with no selectable findings must contain exactly `No selectable findings.`:
+List only rows from sections 2 and 3, including conditional security items. Unfinished work and rejected leads stay out of this list. A checked conditional item still needs the reproduction bar in "Fixing human-selected items"; a missing caller stays `failed` and is not invented. One item per line and no other text in this section, except that a report with no selectable findings must contain exactly `No selectable findings.`:
 
 `- R01 | High | [src/File.cs:12](./source/My%20Project/src/File.cs#L12) | One-sentence problem`
 
@@ -290,12 +305,33 @@ Add one short line per lead you opened and did not report, with the reason. Incl
 
 ---
 
+## Fixing human-selected items
+
+The report changes no code. After the human checks items in section 7, investigate each checked item in the current code before editing it.
+
+Apply a change only when all of these are true:
+
+1. You reproduced the defect, or you can show the exact path, input, and wrong result in the current code.
+2. You identified the root cause on that path.
+3. The change corrects that cause and leaves every other behavior intact.
+4. An Arrange-Act-Assert test fails before the change and passes after it. Record the command and the result.
+5. The change adds no compiler errors and no new warnings. Pre-existing warnings outside the change stay as they are.
+6. The edit includes a comment, in that file's normal comment syntax, at the changed code, Dockerfile instruction, nginx directive, or build/script line. The comment states what defect the change corrects and why this change corrects it. A team lead must be able to read that comment without the audit report. Use the evidence from this investigation. Leave the file unchanged when you cannot write that comment from observed behavior.
+
+Leave the code unchanged when any item above is missing. Report that selected item as `failed` and name the blocker. A guessed cause, an invented line, an invented test result, or a change that makes the code less correct or less stable is not a fix. Keep the change to the root cause.
+
+### A selected item that is a false positive
+
+Leave the code unchanged when investigation shows the reported defect is not present. Record the id, location, and the evidence that shows why the warning does not apply. Unknown reachability does not establish a false positive.
+
+Keep every such item. After the selected work, show the human one unchecked box per false positive. The human chooses. Record each checked id in that item's `failed` result. Do not call `submit_false_positive_approvals` from this audit job: that tool is accepted only while job 4 is current, and this job does not dismiss a GitLab finding. A checked id is the human's selection for a later job 4 dismissal, and only when it is the same vulnerability downloaded for this run. An audit item with no GitLab vulnerability stays on the list and is not a GitLab update. Report each unfixed false positive as `failed`, with the evidence in `reason` and the investigation in `validation`, so it is not recorded as repaired.
+
 ## Guidelines for the auditor
 
 - Prefer surgical, minimal fixes. Do not propose large refactors, new frameworks, or dependency upgrades unless they are the smallest correct fix for a confirmed defect.
 - Preserve public contracts and existing behavior unless the current behavior is clearly defective.
 - For mixed-stack repos, audit each major part (frontend, backend, infrastructure) appropriately for its language and tooling.
-- When project AI rules/skills exist, follow them. When they do not, fall back to language- and framework-specific best practices (Angular/TypeScript quality, .NET resource lifetime, Java/Quarkus concurrency and resource handling, Crystal idioms, etc.).
+- When project AI rules/skills exist, follow them unless they contradict this prompt's evidence bar, human-selection boundary, or the declared-version language contract. Otherwise use "Language contracts".
 - Be explicit about what was and was not verified.
 - Group related symptoms rather than inflating the count of defects.
 - Do not claim security clearance or that a full dependency audit was performed unless it was.
@@ -304,7 +340,7 @@ Add one short line per lead you opened and did not report, with the reason. Incl
 
 ## Usage notes
 
-When invoked through MCP, the host AI performs the scan; the server does not run an autonomous AI review. Follow the file/phase receipt protocol above. After writing the exact requested `output_path`, call `choose_software_audit_action(repo_root=..., report_ready=True)`. Coverage is checked before unchecked findings are shown. Fix only human-selected items; report progress with `complete_security_run(progress={id,message})` and finish with `complete_security_run(code_results=[{id,status:"fixed" or "failed",reason,validation}])`. Record an honest failure reason when a selected fix cannot be completed. Fixed outcomes require actual validation evidence. This finishes with the displayed unresolved Markdown report. Do not stop after writing the audit report without making the report-ready call.
+When invoked through MCP, the host AI performs the scan; the server does not run an autonomous AI review. Follow the file/phase receipt protocol above. After writing the exact requested `output_path`, call `choose_software_audit_action(repo_root=..., report_ready=True)`. Coverage is checked before unchecked findings are shown. Fix only human-selected items, using "Fixing human-selected items" above. Report progress with `complete_security_run(progress={id,message})` and finish with `complete_security_run(code_results=[{id,status:"fixed" or "failed",reason,validation}])`. A `fixed` result needs the reproduced root cause, the test command that failed before the change and passed after it, and the why-comment on each changed code, Dockerfile, nginx, or build/script line. A selected item that is a false positive stays unfixed: report it as `failed` with the evidence, then let the human check which of those items to record for a later job 4 GitLab dismissal. Do not dismiss during this audit job. Record an honest failure reason when a selected fix cannot be completed. This finishes with the displayed unresolved Markdown report. Do not stop after writing the audit report without making the report-ready call.
 
 Paste this prompt into an AI coding assistant (Copilot, Cursor, Claude, Grok, etc.) while pointed at the target GitLab repository.  
 Replace the placeholders (`{{CURRENT_DATE}}`, `{{GIT_COMMIT_SHA_OR_BRANCH}}`) as needed.  

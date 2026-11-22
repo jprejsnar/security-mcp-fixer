@@ -945,6 +945,73 @@ def test_report_findings_limit_marks_results_truncated():
     assert fetched.truncated is True
 
 
+def test_gitlab_read_retries_a_transient_status_without_a_long_wait(monkeypatch):
+    """A short GitLab 429 is retried; a long Retry-After fails with one request."""
+    # Arrange
+    from gitlab_security_mcp.gitlab_client import DISMISS_FALSE_POSITIVE
+
+    delays = []
+    monkeypatch.setattr("gitlab_security_mcp.gitlab_client.sleep", delays.append)
+    finding_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail the first report read, then return one finding."""
+        finding_calls.append(request)
+        if len(finding_calls) == 1:
+            return httpx.Response(429, text="slow")
+        return httpx.Response(
+            200, json=_vulnerability_page("gid://gitlab/Ci::Pipeline/1", False)
+        )
+
+    def blocked(request: httpx.Request) -> httpx.Response:
+        """Refuse to be called again after a long cooldown."""
+        finding_calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "120"}, text="later")
+
+    # Act
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+    with httpx.Client(transport=_gitlab_transport(blocked)) as http:
+        client = GitLabClient("glpat-test", http=http)
+        cooled = client.fetch("group/project")
+        try:
+            client._request(
+                "POST",
+                client._graphql_url(),
+                json_body={"query": DISMISS_FALSE_POSITIVE, "variables": {}},
+            )
+        except RuntimeError as exc:
+            dismissal_error = str(exc)
+
+    # Assert
+    assert fetched.ok is True
+    assert len(fetched.findings) == 1
+    assert delays == [1.0]
+    assert cooled.ok is False
+    assert "429" in cooled.error
+    assert "429" in dismissal_error
+    assert len(finding_calls) == 4
+
+
+def test_gitlab_response_over_the_size_limit_is_rejected():
+    """A success body larger than the cap is discarded instead of parsed."""
+    # Arrange
+    from gitlab_security_mcp.gitlab_client import MAX_GITLAB_RESPONSE_BYTES
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a report body one byte past the retained limit."""
+        return httpx.Response(200, content=b"{" + b"x" * MAX_GITLAB_RESPONSE_BYTES)
+
+    # Act
+    with httpx.Client(transport=_gitlab_transport(handler)) as http:
+        fetched = GitLabClient("glpat-test", http=http).fetch("group/project")
+
+    # Assert
+    assert fetched.ok is False
+    assert fetched.findings == []
+    assert "size limit" in fetched.error
+
+
 @pytest.mark.parametrize(
     "connection",
     [

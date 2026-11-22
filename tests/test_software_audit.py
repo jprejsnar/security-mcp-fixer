@@ -413,6 +413,12 @@ def test_render_audit_prompt_fills_the_date_and_revision():
     assert "2026-11-18" in text
     assert "abc123" in text
     assert "Do **not** apply the fix" in text
+    assert "Fixing human-selected items" in text
+    assert "show the human one unchecked box per false positive" in text
+    assert "what defect the change corrects and why" in text
+    assert "## Language contracts" in text
+    assert "Do not ask for that Yes/No consent again" in text
+    assert "Do not call `submit_false_positive_approvals` from this audit job" in text
     assert "## File and line links" in text
     assert "#L12" in text
     assert "## Evidence required before a finding" in text
@@ -1120,6 +1126,10 @@ def test_fix_choice_keeps_only_checked_items(tmp_path, monkeypatch):
     assert result["report_path"] == str(report)
     assert [item["id"] for item in result["selected_items"]] == ["R01"]
     assert "Leave every unchecked audit item unchanged." in result["message"]
+    assert "Never guess or invent a cause" in result["message"]
+    assert "what the change corrects and why" in result["message"]
+    assert "Do not call submit_false_positive_approvals from this job" in result["message"]
+    assert "unchecked boxes for those false positives" in result["message"]
     assert "Do not commit, push, or open a merge request." in result["message"]
 
 
