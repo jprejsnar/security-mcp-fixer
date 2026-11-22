@@ -47,12 +47,15 @@ Canceling a selection authorizes nothing and continues to the next job.
 Declining the audit still generates the final report. Jobs cannot be started
 out of order. An interrupted or unavailable approval never implies consent.
 
-**In-editor progress requires both release files:** install the Python wheel,
-then install `gitlab-security-progress-1.0.51.vsix` in **each** editor using
-**Extensions: Install from VSIX**. The wheel alone cannot force an editor status
-bar or persistent notification. See [the progress extension](editor-progress/README.md).
-The server also mirrors progress to `~/.cache/gitlab-security-mcp/progress/`, so
-the graphical bar appears even when the audited checkout is not an open folder.
+**In-editor progress requires both release files:** install the Python wheel.
+Reloading the MCP server on Windows, macOS, or Linux installs the progress
+extension into that VS Code or Cursor window. The wheel alone cannot force an
+editor status bar or persistent notification. See [the progress extension](editor-progress/README.md).
+The server also mirrors progress to `~/.cache/gitlab-security-mcp/progress/`.
+A window with open folders shows a run only when that checkout is one of those
+folders, or a directory inside one of them. A window with no open folder still
+shows the newest mirror for each checkout. Another VS Code or Cursor window can
+run a different repository at the same time.
 
 Release 1.0.48 adds a persistent editor tab with a real graphical progress bar,
 counts, percentage, current activity and seven-job checklist. **Show Task
@@ -85,8 +88,9 @@ Release 1.0.46 replaces the earlier automatic audit with explicit human consent.
 Per-file hash/assessment receipts and all five audit review phases are
 required; partial reviews cannot silently finish. A genuinely complete audit
 may still find zero or one defect. Package and source permissions are separate.
-The companion extension displays the current **Job N/7**, real finished-job
-counts, current finding/activity, and the full job checklist. Unknown command
+The companion extension displays the current **Job N/7** when the finished-job
+count is known, plus that count, the current finding or activity, and the full
+job checklist. Without a finished-job count it shows the task label. Unknown command
 durations remain indeterminate; job progress is not elapsed-time estimation.
 
 Release 1.0.23 makes the earlier **fix selection** precise: each package option
@@ -712,7 +716,7 @@ What each job still does:
   `SKIPPED`, and starts job 7.
   `CONSENT_UNAVAILABLE` authorizes no scan. **Yes** records
   `GENERATE_AUDIT_REPORT`, prints the prompt, and creates an `INCOMPLETE` draft
-  at `~/Project_YYYY-MM-DDTHHMMSSZ_software_audit_report.md`. That stamp is UTC
+  at `~/Project_YYYY-MM-DDTHHMMSSZ_<checkout>_software_audit_report.md`. That stamp is UTC
   ISO 8601 basic time, without colons, so it is a legal Windows file name. The host reads build dependencies and
   their official docs, then reviews inventoried files in batches.
   `AUDIT_IN_PROGRESS` accepts more receipts. `AUDIT_INCOMPLETE` means gaps
@@ -741,9 +745,10 @@ What each job still does:
 - **Job 7.** Writes and opens `.security-mcp/reports/unresolved-remediation.md`
   plus the Markdown and JSON reports. It then zips this run's `audit.jsonl`,
   `http-timings.jsonl`, and `command-logs` to
-  `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ.zip` and
-  deletes those files from the checkout. The home rolling log, reports, run
-  state, policies, and lint files stay. The human reviews the reports and
+  `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` and
+  deletes those files from the checkout. Reports, run state, policies, and
+  lint files stay. Server messages stay on stderr and are not copied into a
+  home log file. The human reviews the reports and
   `git diff`, then commits and pushes manually. A repeated
   `complete_security_run` returns the saved report.
 
@@ -761,8 +766,8 @@ Running alongside every job:
   hashes and exit codes to `audit.jsonl`, HTTP timings to `http-timings.jsonl`,
   and an inspection snapshot to `run-state.json`. Snapshots are never reloaded
   as permission. Job 7 moves the checkout logs into the home zip named above
-  and deletes those checkout files. INFO and higher server logs also append to
-  `~/gitlab-security-mcp/gitlab-security-mcp.log` for the life of the process.
+  and deletes those checkout files. INFO and higher server logs go to stderr
+  only, in the same process, and are not written to a file.
 - **Audit continuation hooks (opt-in):** Cursor and Copilot stop hooks continue
   an unfinished approved audit for the same session, up to 24 turns (8 for
   Copilot), and stop when no new progress is recorded.
@@ -1755,8 +1760,10 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   Optional false-positive dismissal requires `api` write scope and a GitLab role
   permitted to dismiss the finding; a read-only token does not enable writes.
 - A local checkout with tracked `main` and an origin matching the configured
-  trusted GitLab API host. The server discovers the project path from Git;
-  an explicit project path or numeric ID is an optional override, not a prerequisite.
+  trusted GitLab API host. The server discovers the project path from that
+  checkout's Git origin. A `project_id` on `list_security_findings` overrides
+  that origin for the call. `GITLAB_PROJECT_ID` is used only when origin
+  cannot name a project.
 - The package managers and toolchains required by the target application.
 - Meaningful production builds, dependency checks and documented license review; independently
   approved corporate policy only when required/configured for your organization.
@@ -2639,11 +2646,14 @@ Cursor environment reference instead, use `"GITLAB_TOKEN": "${env:GITLAB_TOKEN}"
 not Copilot's `${GITLAB_TOKEN}` syntax. See the official
 [Cursor MCP documentation](https://cursor.com/docs/mcp).
 
-Use a literal absolute `REPO_ROOT` in user-level Cursor configuration. Do not
-assume `${workspaceFolder}` is expanded: a server launched outside the active
-project cannot infer that project's directory. For example, study-service uses
+Use a literal absolute `REPO_ROOT` when this process is not started inside a
+Git checkout. `${workspaceFolder}` is not expanded. A process whose working
+directory is inside a checkout uses that checkout, so a shared `REPO_ROOT`
+does not send every VS Code or Cursor window to one repository. A checkout
+opened on a component subdirectory still resolves to the Git root that
+contains it. For example, study-service uses
 `C:\Users\James.Prejsnar\source\repos\study-service`, not its `backend` or
-`frontend` subdirectory.
+`frontend` subdirectory, when you set `REPO_ROOT` yourself.
 
 Alternatively, have the agent call
 `run_prechecks(repo_root="C:\\Users\\James.Prejsnar\\source\\repos\\study-service")`.
@@ -2678,23 +2688,28 @@ requirements into the configured virtual environment before restarting.
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `GITLAB_TOKEN` | yes for retrieval | Personal access token with report access and `read_api`; optional approved dismissals require `api` and sufficient GitLab permissions. `GITLAB_PERSONAL_ACCESS_TOKEN` is also accepted. |
-| `GITLAB_PROJECT_ID` | no | Optional fixed project override: `group/project` or a numeric ID. Leave unset to select the project from each checkout's Git origin. |
-| `REPO_ROOT` | set explicitly in the host | Absolute path of the git repo to remediate. Defaults to the process working directory. |
+| `GITLAB_PROJECT_ID` | no | Used only when that window's checkout origin cannot name a project. A readable origin always selects that checkout's own GitLab project, including when several VS Code or Cursor windows run at once. |
+| `REPO_ROOT` | set explicitly in the host | Fallback checkout when this process was not started inside a Git repository. A VS Code or Cursor window opened on a repository uses that repository, so several windows can remediate different checkouts at the same time. |
 | `GITLAB_API_URL` | no | REST base URL. Defaults to `https://gitlab.com/api/v4`. GraphQL is derived from it. |
 | `GITHUB_TOKEN` or `GH_TOKEN` | no | Raises the GitHub Advisory rate limit. |
 | `NVD_API_KEY` | no | Raises the NVD rate limit. OSV is tried first and does not need a key. |
 | `VALIDATION_TIMEOUT_SEC` | no | Per validation command. Defaults to 600. |
 | `PACKAGE_UPDATE_POLICY` | optional | Enforce corporate exact-version approvals and checks at this absolute path. Existing default `.security-mcp/package-update-policy.json` also enables enforcement. If neither exists, use documented license review, informational lint and production-build checks. Test-requiring policy blocks remediation. |
-| `PROGRESS_CONSOLE` | no | Windows live progress: `auto` by default, `on` to force a console, or `off` for CI/headless runs. Restart the connection after changes. |
+| `PROGRESS_CONSOLE` | no | Windows live progress: `auto` by default, `on` to force a console, or `off` for CI/headless runs. Ignored on macOS and Linux. Restart the connection after changes. |
+| `PROGRESS_EXTENSION_INSTALL` | no | Set to `0`, `off`, or `false` to skip installing the progress extension when the server starts. Any other value installs it into the VS Code or Cursor process that launched the server. |
+| `GITLAB_SECURITY_PROGRESS_DIR` | no | Override for the progress mirror directory. The default is `~/.cache/gitlab-security-mcp/progress/`. |
 
 For a self-hosted GitLab instance, set `GITLAB_API_URL` to `https://gitlab.example.com/api/v4`.
 
 ### Automatic per-repository project selection
 
-- Remove any old `GITLAB_PROJECT_ID` setting once, then restart the MCP server.
+- Leave `GITLAB_PROJECT_ID` unset unless a checkout's origin cannot name a
+  project. When it is set, it is used only for that failure. It does not
+  replace a readable origin in another window.
 - Have the agent pass the active checkout's absolute `repo_root` on tool calls.
-  This overrides a fixed `REPO_ROOT`; no configuration edits are needed when
-  switching checkouts.
+  That argument selects the checkout. A process started inside a Git checkout
+  also uses that checkout when the argument is omitted. No configuration edit
+  is required to switch windows between repositories.
 - The server uses `git remote get-url --all origin`, not direct `.git/config`
   parsing. Linked worktrees, submodules, config includes and Git URL rewrites
   are supported. HTTPS and SSH origins can include nested subgroups.
@@ -2709,10 +2724,11 @@ For a self-hosted GitLab instance, set `GITLAB_API_URL` to `https://gitlab.examp
 - Missing, local-file, unsupported, mismatched or multiple origin URLs return an
   actionable error rather than selecting a different repository. No credentials
   are inferred from Git URLs or credential stores.
-- Selection precedence is the tool's explicit `project_id`, then
-  `GITLAB_PROJECT_ID`, then the selected checkout's origin. Explicit overrides
-  intentionally bypass origin discovery; do not retain a fixed project setting
-  if you want automatic selection across repositories.
+- Selection precedence is the tool's explicit `project_id`, then that
+  checkout's Git origin, then `GITLAB_PROJECT_ID` when origin cannot name a
+  project. A project setting in shared user configuration does not redirect
+  another window's repository. An explicit `project_id` on the tool call
+  still bypasses origin discovery.
 
 Use the server's actual process environment, not only a terminal opened after
 the host started. GitLab credentials are required for retrieval; startup alone
@@ -2977,11 +2993,14 @@ than relying only on a short natural-language success message.
 
 ### Live progress and HTTP timings
 
-For progress **inside** Cursor or VS Code, install the companion
-`gitlab-security-progress-1.0.51.vsix` using **Extensions: Install from VSIX**
-in both editors. The audited checkout does not need to be an open workspace
-folder: the extension also reads the per-user mirror in
-`~/.cache/gitlab-security-mcp/progress/` (mirrors older than 12 hours are ignored).
+For progress **inside** Cursor or VS Code on Windows, macOS, or Linux, reloading
+this MCP server installs the progress extension into that editor. A manual
+`gitlab-security-progress-1.0.51.vsix` install is only needed when the server
+is not launched by the editor. The extension reads the checkout progress file
+and the per-user mirror in `~/.cache/gitlab-security-mcp/progress/`
+(mirrors older than 12 hours are ignored). A window with open folders shows
+only checkouts inside those folders. A window with no open folder shows the
+newest mirror for each checkout.
 It watches inspection-only `.security-mcp/progress.json` files and displays a
 status-bar spinner, progress notification, and **GitLab Security Progress**
 output channel. Click the status item or run **GitLab Security: Show Task
@@ -2990,7 +3009,8 @@ edits. Install the wheel separately and restart its MCP connection.
 
 Each active tool and background owner has a separate receipt. Silent server
 work refreshes every five seconds; a returned request cannot complete its worker.
-The persistent workflow bar shows **Job N/7**, the actual finished-job fraction,
+The persistent workflow bar shows **Job N/7** when the finished-job count is
+known, the actual finished-job fraction,
 and the current item/activity. Its tooltip/output includes all seven jobs and
 their states. This job fraction is not a prediction of runtime or fix success.
 After job seven the extension opens the final Markdown preview once in a
@@ -3019,12 +3039,10 @@ process ID and traceback. Approval-window start, visibility, close and PowerShel
 diagnostics are logged with the dialog process ID. A logging failure does not
 fail the task. Child-process CPU is not included.
 Stderr lines use `YYYY-MM-DDTHH:MM:SSZ LEVEL logger [thread]: message` in UTC.
-The same lines at INFO and above also go to
-`~/gitlab-security-mcp/gitlab-security-mcp.log`, which rolls by UTC day and at
-1 MB into zip archives kept for 21 days and at most 21 MB.
+Those lines are not written to a home log file.
 When the final report is written, checkout logs (`audit.jsonl`,
 `http-timings.jsonl`, and `command-logs`) are zipped to
-`~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ.zip` and
+`~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` and
 then deleted from the checkout. Reports and run state stay in the repo.
 Values of `GITLAB_TOKEN`, `GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`,
 `GH_TOKEN` and `NVD_API_KEY`, including URL-encoded forms and tracebacks, are
@@ -3263,8 +3281,8 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
 | `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output while the run is open. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files with the two JSONL logs and deletes them from the checkout. |
 | `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table. Stays in the checkout after the log zip. |
-| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ.zip` | Checkout logs from the finished run. Created only when those log files exist. |
-| `~/gitlab-security-mcp/gitlab-security-mcp.log` | Process log at INFO and above. Rolls by UTC day or 1 MB, keeps 21 days and at most 21 MB of zip archives, and is not part of the run zip. |
+| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | Checkout logs from the finished run. Created only when those log files exist. The checkout token keeps another repository with the same project name from replacing the archive. |
+| Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr. Not written to a home file and not part of the run zip. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
 | `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |
 | `.security-mcp/reports/security-remediation-report-*.md` | Human-readable findings, changes, validation and review evidence. |

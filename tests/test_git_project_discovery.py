@@ -175,9 +175,12 @@ def test_explicit_project_overrides_do_not_require_origin(repo, override):
         ["https://gitlab.com/team/app.git", "https://gitlab.com/team/other.git"],
     ],
 )
-def test_discovery_errors_never_fetch_another_project(repo, remotes, caplog):
+def test_discovery_errors_never_fetch_another_project(
+    repo, remotes, caplog, monkeypatch
+):
     """Stop before API access when origin is missing, untrusted or ambiguous."""
     # Arrange
+    monkeypatch.delenv("GITLAB_PROJECT_ID", raising=False)
     for remote in remotes:
         git(repo, "config", "--add", "remote.origin.url", remote)
     client = _client()
@@ -231,6 +234,48 @@ def test_from_env_uses_trusted_self_hosted_endpoint_without_project_setting(
         engine.gitlab.fetch.assert_called_once_with("team/app")
     # Assert
     assert result["status"] == "OK"
+
+
+def test_shared_project_setting_does_not_replace_another_checkout_origin(
+    repo, monkeypatch
+):
+    """A user-level project id must not redirect a window opened on another repo."""
+    # Arrange
+    other_project = "other/project"
+    origin_project = "team/app"
+    monkeypatch.setenv("GITLAB_PROJECT_ID", other_project)
+    git(repo, "remote", "add", "origin", f"git@gitlab.com:{origin_project}.git")
+    with closing(Engine.from_env(repo_root=str(repo))) as engine:
+        engine.gitlab.fetch = Mock(
+            return_value=FetchResult(ok=True, findings=[], project_path=origin_project)
+        )
+        engine.state.status = "BRANCH_CREATED"
+        # Act
+        result = engine.list_security_findings()
+        engine.gitlab.fetch.assert_called_once_with(origin_project)
+    # Assert
+    assert result["project_source"] == "git_origin"
+    assert result["project_path"] == origin_project
+
+
+def test_project_setting_applies_only_when_origin_cannot_name_a_project(
+    repo, monkeypatch
+):
+    """Keep the environment project only as a fallback for an unreadable origin."""
+    # Arrange
+    pinned = "other/project"
+    monkeypatch.setenv("GITLAB_PROJECT_ID", pinned)
+    with closing(Engine.from_env(repo_root=str(repo))) as engine:
+        engine.gitlab.fetch = Mock(
+            return_value=FetchResult(ok=True, findings=[], project_path=pinned)
+        )
+        engine.state.status = "BRANCH_CREATED"
+        # Act
+        result = engine.list_security_findings()
+        engine.gitlab.fetch.assert_called_once_with(pinned)
+    # Assert
+    assert result["project_source"] == "GITLAB_PROJECT_ID"
+    assert result["project_path"] == pinned
 
 
 def test_only_reading_origin_url_is_allowlisted(repo):

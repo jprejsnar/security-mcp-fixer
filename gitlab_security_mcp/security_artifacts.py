@@ -11,6 +11,8 @@ import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gitlab_security_mcp.util import checkout_file_id
+
 _RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT = (
     "Security artifacts contain a link/reparse point: {}"
 )
@@ -333,7 +335,8 @@ def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict
 
     Reports, run state, policies, and lint evidence stay in the checkout. The
     archive name uses an ISO 8601 basic timestamp because a colon is not a
-    legal Windows file name.
+    legal Windows file name. A checkout token keeps another repository with
+    the same project name from replacing this archive.
     """
     files = run_log_files(repo_root)
     if not files:
@@ -343,7 +346,8 @@ def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict
     stamp = when.astimezone(UTC).strftime("%Y-%m-%dT%H%M%SZ")
     if _ARCHIVE_STAMP.fullmatch(stamp) is None:
         raise ValueError(_RAISE_ARCHIVE_TIMESTAMP_IS_NOT_ISO_8601.format(stamp))
-    target = destination / f"{project_name}_{stamp}.zip"
+    identity = checkout_file_id(repo_root)
+    target = destination / f"{project_name}_{stamp}_{identity}.zip"
     descriptor, temporary = tempfile.mkstemp(dir=destination, suffix=".zip.tmp")
     os.close(descriptor)
     try:

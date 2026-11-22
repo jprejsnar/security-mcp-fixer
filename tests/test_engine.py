@@ -92,11 +92,34 @@ def test_dns_loss_blocks_pulls_or_pnpm_preparation(
     assert engine.create_security_branch()["status"] == "BRANCH_CREATION_FAILED"
 
 
+def test_open_checkout_wins_over_a_shared_repo_root(tmp_path, monkeypatch):
+    """Each editor window uses the checkout it opened, not one shared path."""
+    # Arrange
+    shared = tmp_path / "shared"
+    opened = tmp_path / "opened"
+    shared.mkdir()
+    opened.mkdir()
+    (opened / ".git").mkdir()
+    monkeypatch.setenv("REPO_ROOT", str(shared))
+    monkeypatch.chdir(opened)
+
+    # Act
+    engine = Engine.from_env()
+    try:
+        selected = engine.repo_root
+    finally:
+        engine.close()
+
+    # Assert
+    assert selected == opened.resolve()
+
+
 def test_repository_override_recovers_unresolved_host_placeholder(
-    cloned_repo, monkeypatch
+    cloned_repo, monkeypatch, tmp_path
 ):
     """Repository override recovers unresolved host placeholder."""
     # Arrange
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
 
     # Act
@@ -116,6 +139,7 @@ def test_repository_override_recovers_unresolved_host_placeholder(
 def test_missing_repository_has_actionable_error(tmp_path, monkeypatch):
     """Missing repository has actionable error."""
     # Arrange
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("REPO_ROOT", str(tmp_path / "missing"))
 
     # Act
@@ -128,12 +152,13 @@ def test_missing_repository_has_actionable_error(tmp_path, monkeypatch):
     assert "Repository directory does not exist" in str(raised.value)
 
 
-def test_server_recovers_configuration_error(cloned_repo, monkeypatch):
+def test_server_recovers_configuration_error(cloned_repo, monkeypatch, tmp_path):
     """Server recovers configuration error."""
     # Arrange
     from gitlab_security_mcp import server
 
     server._close_engine()
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
 
     # Act

@@ -1,12 +1,15 @@
 # GitLab Security Progress
 
-Install the supplied VSIX in **each** editor (VS Code and Cursor) using
-**Extensions: Install from VSIX**. Use MCP server 1.0.47 or newer.
+Reloading the MCP server on Windows, macOS, or Linux installs this extension
+into the VS Code or Cursor process that launched it. A manual
+**Extensions: Install from VSIX** is needed only when the server is not
+launched by the editor. Use MCP server 1.0.47 or newer.
 
 The server writes `.security-mcp/progress.json` in the audited checkout and a
 mirror under `~/.cache/gitlab-security-mcp/progress/` (override with
-`GITLAB_SECURITY_PROGRESS_DIR`). The extension reads both, so the graphical bar
-appears even when the audited repository is not an open workspace folder.
+`GITLAB_SECURITY_PROGRESS_DIR`). A window with open folders shows a run only
+when that checkout is one of those folders, or a directory inside one of them.
+A window with no open folder shows the newest mirror for each checkout.
 Mirrors older than 12 hours are ignored.
 
 Version 1.0.48 displays a persistent **GitLab Security Progress** editor tab
@@ -20,8 +23,10 @@ The status bar also contains a compact meter and percentage. The separate
 **GitLab Security: Show Progress Log** command opens the diagnostic output
 channel; that text is a log, not the graphical progress bar.
 
-The persistent bar shows the current **Job N/7**, finished-job counts, and
-current finding/activity. The tooltip/output lists all seven sequential jobs.
+The persistent bar shows the current **Job N/7** when the finished-job count
+is known. Without that count it shows the task label, not job 1. It also shows
+finished-job counts and the current finding or activity. The tooltip and output
+list all seven sequential jobs.
 During report generation, **Software audit** takes priority with real
 reviewed-file counts and a progress notification. The server keeps this owner
 alive between host tool calls. **Waiting for AI**, **Waiting for you**, and

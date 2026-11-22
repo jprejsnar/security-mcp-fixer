@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -44,6 +45,19 @@ ADVISORY_READ_FAILURES = (
     *CONVERTED_DEFECTS,
 )
 PROGRESS_PUBLISH_FAILURES = (OSError, RuntimeError, ValueError, TypeError)
+
+
+CHECKOUT_FILE_ID_LENGTH = 12
+
+
+def checkout_file_id(root: Path) -> str:
+    """Return a stable file-name token for one checkout, not its folder name.
+
+    Two repositories can share a folder name. Home reports and log archives
+    include this token so those checkouts do not write the same file.
+    """
+    text = os.path.normcase(str(root.resolve()))
+    return hashlib.sha256(text.encode()).hexdigest()[:CHECKOUT_FILE_ID_LENGTH]
 
 
 def utc_now_iso() -> str:

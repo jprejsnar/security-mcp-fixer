@@ -26,7 +26,10 @@ gitlab-security-mcp = "gitlab_security_mcp.server:main"
 packages = ["gitlab_security_mcp"]
 
 [tool.setuptools.package-data]
-gitlab_security_mcp = ["software_audit_prompt.md"]
+gitlab_security_mcp = [
+    "software_audit_prompt.md",
+    "editor_progress/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

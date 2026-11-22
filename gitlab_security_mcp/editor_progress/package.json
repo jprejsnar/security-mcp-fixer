@@ -1,0 +1,25 @@
+{
+  "name": "gitlab-security-progress",
+  "displayName": "GitLab Security Progress",
+  "description": "Visible local MCP task status and audit coverage in VS Code and Cursor.",
+  "publisher": "local-security-tools",
+  "version": "1.0.51",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["workspace"],
+  "main": "./extension.js",
+  "files": ["extension.js", "progress-model.js", "README.md"],
+  "scripts": { "test": "node --test test/*.test.js" },
+  "contributes": {
+    "commands": [{
+      "command": "gitlabSecurity.showProgress",
+      "title": "GitLab Security: Show Task Progress"
+    }, {
+      "command": "gitlabSecurity.showProgressLog",
+      "title": "GitLab Security: Show Progress Log"
+    }]
+  }
+}

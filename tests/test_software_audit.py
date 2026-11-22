@@ -23,6 +23,7 @@ from gitlab_security_mcp.software_audit import (
     record_audit_coverage,
     render_audit_prompt,
 )
+from gitlab_security_mcp.util import checkout_file_id
 
 
 @pytest.fixture(autouse=True)
@@ -359,10 +360,15 @@ def test_report_path_uses_the_project_and_a_windows_safe_utc_stamp(
     moment = datetime(2026, 11, 18, 19, 56, 7, tzinfo=UTC)
 
     # Act
-    path = audit_report_path(project_file_name("group/patient-web", "fallback"), moment)
+    path = audit_report_path(
+        project_file_name("group/patient-web", "fallback"), moment, tmp_path
+    )
 
     # Assert
-    assert path == tmp_path / "patient-web_2026-11-18T195607Z_software_audit_report.md"
+    assert path == tmp_path / (
+        "patient-web_2026-11-18T195607Z_"
+        f"{checkout_file_id(tmp_path)}_software_audit_report.md"
+    )
     assert ":" not in path.name
 
 

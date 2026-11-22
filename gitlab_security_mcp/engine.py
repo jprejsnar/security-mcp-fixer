@@ -222,6 +222,17 @@ PROGRESS_SEVERITIES = {
 }
 
 
+def _workspace_checkout() -> Path | None:
+    """Return the Git checkout that contains this process, if one is open."""
+    current = Path.cwd()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+        if candidate.parent == candidate:
+            return None
+    return None
+
+
 def _progress_severity(finding: dict) -> str:
     """Group display counts without changing the scanner's severity."""
     severity = str(finding.get("severity") or "unknown").strip().lower()
@@ -472,14 +483,25 @@ class Engine:
     def from_env(cls, repo_root: str | None = None) -> Engine:
         """Build an engine from repository, API, and credential settings.
 
-        An explicit repository overrides REPO_ROOT, which defaults to cwd.
+        An explicit repository wins. Otherwise the Git checkout that contains
+        this process is used, so each VS Code or Cursor window keeps its own
+        repository even when user settings pin ``REPO_ROOT``. That setting is
+        the fallback when the process was not started inside a checkout.
+        ``GITLAB_PROJECT_ID`` is not applied here; each checkout selects its
+        own project from Git origin.
         Unexpanded host placeholders and missing directories are rejected.
         GitLab and advisory
         credentials are optional until their services are needed.
         VALIDATION_TIMEOUT_SEC defaults to 600 and must parse as an integer.
         """
-        configured = repo_root if repo_root is not None else os.environ.get("REPO_ROOT")
-        configured = configured or os.getcwd()
+        if repo_root is not None:
+            configured = repo_root
+        else:
+            workspace = _workspace_checkout()
+            configured = (
+                str(workspace) if workspace is not None else os.environ.get("REPO_ROOT")
+            )
+            configured = configured or os.getcwd()
         if "${" in configured:
             raise ValueError(
                 _RAISE_REPO_ROOT_CONTAINS_AN_UNRESOLVED_HOST_PLACEHOLDER_SET
@@ -492,7 +514,6 @@ class Engine:
         timeout = int(os.environ.get("VALIDATION_TIMEOUT_SEC", "600"))
         return cls(
             root,
-            project_id=os.environ.get("GITLAB_PROJECT_ID"),
             gitlab_token=os.environ.get("GITLAB_TOKEN")
             or os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN"),
             gitlab_api_url=os.environ.get(
@@ -911,19 +932,28 @@ class Engine:
                 "status": "ERROR",
                 "reason": "Findings were already verified or changed. Listing again would discard those decisions.",
             }
-        pid = project_id or self.project_id
-        project_source = "explicit" if pid else "git_origin"
-        if not pid:
+        if project_id or self.project_id:
+            pid = project_id or self.project_id
+            project_source = "explicit"
+        else:
             try:
                 pid = self.git.gitlab_project_path(self.gitlab.api_url)
+                project_source = "git_origin"
             except (OSError, RuntimeError, ValueError) as exc:
-                logger.warning("GitLab project discovery failed: %s", exc)
-                return {
-                    "status": "ERROR",
-                    "stage": "project_discovery",
-                    "reason": str(exc),
-                    "action": "Check the selected repo_root and Git origin. For automatic per-repository selection, leave GITLAB_PROJECT_ID unset and configure only the trusted GitLab API host and your own token.",
-                }
+                pinned = os.environ.get("GITLAB_PROJECT_ID")
+                if not pinned:
+                    logger.warning("GitLab project discovery failed: %s", exc)
+                    return {
+                        "status": "ERROR",
+                        "stage": "project_discovery",
+                        "reason": str(exc),
+                        "action": "Check the selected repo_root and Git origin. For automatic per-repository selection, leave GITLAB_PROJECT_ID unset and configure only the trusted GitLab API host and your own token.",
+                    }
+                logger.info(
+                    "Git origin did not name a project; using GITLAB_PROJECT_ID"
+                )
+                pid = pinned
+                project_source = "GITLAB_PROJECT_ID"
         fetched = self.gitlab.fetch(pid)
         if not fetched.ok:
             return {"status": "ERROR", "reason": fetched.error}

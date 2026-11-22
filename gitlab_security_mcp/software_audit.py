@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from gitlab_security_mcp.manifests import SKIP_DIRS, iter_files
-from gitlab_security_mcp.util import atomic_write_text, resolve_inside
+from gitlab_security_mcp.util import atomic_write_text, checkout_file_id, resolve_inside
 
 _RAISE_THE_SOFTWARE_AUDIT_REPORT_MUST_BE_WRITTEN_IN = (
     "The software audit report must be written in the home directory."
@@ -383,16 +383,18 @@ def project_file_name(project_path: str | None, fallback: str) -> str:
     return cleaned or "gitlab-project"
 
 
-def audit_report_path(project_name: str, when: datetime) -> Path:
-    """Return the home-directory report path for one project and UTC moment.
+def audit_report_path(project_name: str, when: datetime, root: Path) -> Path:
+    """Return the home-directory report path for one checkout and UTC moment.
 
     The clock portion uses ``YYYY-MM-DDTHHMMSSZ``. That is ISO 8601 basic time,
-    and it is a legal Windows file name because it contains no colons.
+    and it is a legal Windows file name because it contains no colons. The
+    checkout token keeps two repositories that share a project name apart.
     """
     stamp = when.astimezone(UTC).strftime("%Y-%m-%dT%H%M%SZ")
     if _STAMP.fullmatch(stamp) is None:
         raise ValueError(_RAISE_AUDIT_TIMESTAMP_IS_NOT_USABLE_IN_A_FILE.format(stamp))
-    return Path.home() / f"{project_name}_{stamp}_software_audit_report.md"
+    identity = checkout_file_id(root)
+    return Path.home() / f"{project_name}_{stamp}_{identity}_software_audit_report.md"
 
 
 def audit_items(text: str) -> list[dict[str, str]]:

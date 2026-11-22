@@ -139,6 +139,7 @@ def test_run_logs_are_archived_then_removed_from_the_checkout(tmp_path, monkeypa
     from pathlib import Path
 
     from gitlab_security_mcp.security_artifacts import archive_run_logs
+    from gitlab_security_mcp.util import checkout_file_id
 
     home = tmp_path / "home"
     home.mkdir()
@@ -165,7 +166,9 @@ def test_run_logs_are_archived_then_removed_from_the_checkout(tmp_path, monkeypa
     archive = Path(result["path"])
     assert result["status"] == "ARCHIVED"
     assert archive == (
-        home / "softwareSecurityAuditReports" / "sample-project_2026-11-21T212600Z.zip"
+        home
+        / "softwareSecurityAuditReports"
+        / f"sample-project_2026-11-21T212600Z_{checkout_file_id(root)}.zip"
     )
     with zipfile.ZipFile(result["path"]) as zipped:
         assert zipped.namelist() == [

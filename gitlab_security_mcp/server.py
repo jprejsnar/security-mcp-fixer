@@ -48,6 +48,7 @@ from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.progress import publish as publish_editor_progress
+from gitlab_security_mcp.progress_extension import install_progress_extension
 from gitlab_security_mcp.report import write_unresolved_report
 from gitlab_security_mcp.security_artifacts import archive_run_logs
 from gitlab_security_mcp.software_audit import (
@@ -3253,7 +3254,7 @@ def _software_audit_result(
     when = datetime.now(UTC)
     project_name = _audit_project_name(engine)
     if choice == "generate_report" or select_after_report:
-        destination = audit_report_path(project_name, when)
+        destination = audit_report_path(project_name, when, engine.repo_root)
         coverage = audit_inventory(engine.repo_root)
         result = {
             "status": "GENERATE_AUDIT_REPORT",
@@ -4030,6 +4031,7 @@ def main() -> None:
     global _progress_console
     _install_host_logging()
     logger.info("gitlab-security-mcp %s serving stdio", __version__)
+    install_progress_extension()
     try:
         mcp.run(transport="stdio")
     finally:

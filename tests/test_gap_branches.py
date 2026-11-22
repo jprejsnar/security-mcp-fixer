@@ -300,7 +300,7 @@ def test_audit_inventory_skips_locks_and_records_only_current_hashes(tmp_path):
     items = audit_items(text)
     empty = audit_has_no_findings(text.split(NEXT_SECTION, 1)[1])
     with pytest.raises(ValueError):
-        audit_report_path("project", _Clock(SHORT_STAMP))
+        audit_report_path("project", _Clock(SHORT_STAMP), tmp_path)
 
     # Assert
     assert UNKNOWN_PHASE not in REVIEW_PHASES

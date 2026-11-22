@@ -12,6 +12,26 @@ function mirrorDirectory() {
     path.join(os.homedir(), ".cache", "gitlab-security-mcp", "progress");
 }
 
+function inWorkspace(repoRoot, folders) {
+  if (!repoRoot) return false;
+  return (folders || []).some(folder => {
+    const folderPath = folder.uri?.fsPath || folder.fsPath || "";
+    if (!folderPath) return false;
+    const root = path.normalize(repoRoot);
+    const folderName = path.normalize(folderPath);
+    const prefix = folderName.endsWith(path.sep) ? folderName : folderName + path.sep;
+    return root.toLowerCase() === folderName.toLowerCase() ||
+      root.toLowerCase().startsWith(prefix.toLowerCase());
+  });
+}
+
+function snapshotsForWindow(snapshots, folders, now = Date.now()) {
+  // An open workspace follows only its own checkouts, including before its run starts.
+  const newest = newestPerRepository(snapshots, now);
+  if (!folders?.length) return newest;
+  return newest.filter(snapshot => inWorkspace(snapshot.repo_root, folders));
+}
+
 function newestPerRepository(snapshots, now = Date.now()) {
   const newest = new Map();
   for (const { snapshot, mirror } of snapshots) {
@@ -129,7 +149,9 @@ function createPresenter(vscode) {
     const percent = current.total > 0 ? Math.floor(100 * current.completed / current.total) : null;
     const filled = percent == null ? 0 : Math.floor(percent / 10);
     const meter = percent == null ? "" : ` [${"#".repeat(filled)}${"-".repeat(10 - filled)}] ${percent}%`;
-    const label = current.id === "software-audit" ? current.label : workflow ? `Job ${current.completed + 1}/7` : current.label;
+    const jobNumber = Number.isInteger(current.completed) ? current.completed + 1 : null;
+    const label = current.id === "software-audit" ? current.label :
+      workflow && jobNumber != null ? `Job ${jobNumber}/7` : current.label;
     bar.text = active.length ? `${stale || current.status !== "RUNNING" ? "$(clock)" : "$(sync~spin)"} Security: ${label}${meter}${counts} | ${state}` : `$(list-unordered) Security: ${current.status}`;
     bar.tooltip = tasks.map(task => taskText(task)).join("\n");
     bar.show();
@@ -194,8 +216,9 @@ async function activate(context, vscode = require("vscode")) {
   const mirrors = new Set();
   const failures = new Set();
   const displayedReports = new Set();
-  const render = () => presenter.update(newestPerRepository(
-    [...snapshots].map(([key, snapshot]) => ({ snapshot, mirror: mirrors.has(key) }))
+  const render = () => presenter.update(snapshotsForWindow(
+    [...snapshots].map(([key, snapshot]) => ({ snapshot, mirror: mirrors.has(key) })),
+    vscode.workspace?.workspaceFolders || []
   ));
 
   async function refresh(uri) {
@@ -290,4 +313,4 @@ async function activate(context, vscode = require("vscode")) {
   await poll();
 }
 
-module.exports = { activate, createPresenter, newestPerRepository };
+module.exports = { activate, createPresenter, newestPerRepository, snapshotsForWindow };

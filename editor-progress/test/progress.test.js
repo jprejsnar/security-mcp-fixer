@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { parseSnapshot, taskText } = require("../progress-model");
-const { activate, createPresenter, newestPerRepository } = require("../extension");
+const { activate, createPresenter, newestPerRepository, snapshotsForWindow } = require("../extension");
 
 function snapshot(overrides = {}) {
   return {
@@ -95,7 +95,7 @@ test("ignored progress files are discovered even without search or watcher event
   ui.vscode.Uri = { joinPath: () => uri };
   ui.vscode.commands = { registerCommand: () => disposable };
   ui.vscode.workspace = {
-    workspaceFolders: [{ uri: {} }],
+    workspaceFolders: [{ uri: { fsPath: "C:\\repo" } }],
     getWorkspaceFolder: () => ({}),
     findFiles: async () => [],
     createFileSystemWatcher: () => ({
@@ -134,6 +134,21 @@ test("the seven-job bar stays visible while command and worker receipts change",
   assert.match(ui.reports[0].message, /2\/7 jobs finished/);
   assert.match(ui.reports[0].message, /backend library/);
   assert.match(ui.bars[0].tooltip, /False positives: PENDING/);
+  ui.presenter.dispose();
+});
+
+test("a workflow without counts does not claim job 1", () => {
+  const ui = harness();
+  ui.presenter.update([{
+    repo_root: "C:\\repo",
+    tasks: [{
+      id: "workflow", label: "Workflow", status: "RUNNING",
+      message: "Waiting for the first job count.",
+      completed: null, total: null, updated_at: new Date().toISOString()
+    }]
+  }]);
+  assert.doesNotMatch(ui.bars[0].text, /Job 1\/7/);
+  assert.match(ui.bars[0].text, /Workflow/);
   ui.presenter.dispose();
 });
 
@@ -296,6 +311,26 @@ test("workspace and mirror copies of one run are shown once, and old mirrors are
 
   // Assert
   assert.deepEqual(shown, [newer]);
+});
+
+test("an open workspace does not display another repository's run", () => {
+  // Arrange
+  const local = { repo_root: "C:\\Repo", updated_at: "2026-11-20T11:00:00Z", tasks: [] };
+  const other = { repo_root: "C:\\Other", updated_at: "2026-11-20T11:59:00Z", tasks: [] };
+  const folders = [{ uri: { fsPath: "C:\\Repo" } }];
+
+  // Act
+  const shown = snapshotsForWindow([
+    { snapshot: local, mirror: false },
+    { snapshot: other, mirror: true }
+  ], folders, Date.parse("2026-11-20T12:00:00Z"));
+
+  // Assert
+  assert.deepEqual(shown, [local]);
+  const idle = snapshotsForWindow(
+    [{ snapshot: other, mirror: true }], folders, Date.parse("2026-11-20T12:00:00Z")
+  );
+  assert.deepEqual(idle, []);
 });
 
 test("stale mirror files are not reread on every poll", async () => {
