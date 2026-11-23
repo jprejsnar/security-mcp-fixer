@@ -186,7 +186,7 @@ def plan_remediation(
                 )
             package_plan.files = [manifest]
             package_plan.description = (
-                f"Add a scoped Gradle resolutionStrategy.force security override for "
+                f"Add scoped Gradle force and coordinate-specific eachDependency security rules for "
                 f"{hit.name} from {installed} to {fixed} in {manifest}; "
                 f"configurations: {', '.join(scopes)}. Preserve the existing dependency graph "
                 "and require the exact target in every observed configuration after a production build; no tests."
@@ -213,8 +213,9 @@ def plan_remediation(
                 package_plan.gradle_configurations = scopes
                 package_plan.files = [manifest]
                 package_plan.description = (
-                    f"Force only {hit.name} from {installed} to {fixed} across configurations "
-                    f"in {manifest}, which declares enforcedPlatform. Preserve the BOM and "
+                    f"Force only {hit.name} from {installed} to {fixed} with a final "
+                    f"coordinate-specific resolution rule across configurations in {manifest}, "
+                    "which declares enforcedPlatform. Preserve existing shared version properties, the BOM and "
                     "other coordinates; require exact resolved-version proof and a production "
                     "build. Runtime compatibility with the platform remains unverified; no tests."
                 )

@@ -1024,7 +1024,7 @@ def test_combined_completion_does_not_prompt_without_eligible_false_positives(
     assert result.structured_content["status"] == "REPORT_GENERATED"
     assert (
         result.structured_content["false_positive_review"]["status"]
-        == "ASSESSMENT_REQUIRED"
+        == "NO_FALSE_POSITIVES"
     )
     ctx.elicit.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
@@ -1121,7 +1121,10 @@ def test_repeat_review_explains_previously_confirmed_dismissals(tmp_path, monkey
     engine.gitlab.dismiss_false_positive.assert_not_called()
 
 
-@pytest.mark.parametrize("blocker", ["assessment", "global_id", "reason", "empty"])
+@pytest.mark.parametrize(
+    "blocker",
+    ["assessment", "global_id", "reason", "empty", "change_required", "manual_review"],
+)
 def test_empty_approval_reports_blockers_without_writing(
     tmp_path, monkeypatch, blocker
 ):
@@ -1139,6 +1142,9 @@ def test_empty_approval_reports_blockers_without_writing(
     elif blocker == "reason":
         engine.state.decisions["finding-1"]["reason"] = " "
         expected = "INVALID_REASON"
+    elif blocker in {"change_required", "manual_review"}:
+        engine.state.decisions["finding-1"]["decision"] = blocker.upper()
+        expected = "NOT_FALSE_POSITIVE"
     else:
         engine.state.findings.clear()
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
@@ -1148,7 +1154,11 @@ def test_empty_approval_reports_blockers_without_writing(
     result = asyncio.run(server.review_false_positives(ctx, str(tmp_path)))
 
     # Assert
-    assert result["status"] == "ASSESSMENT_REQUIRED"
+    assert result["status"] == (
+        "NO_FALSE_POSITIVES"
+        if expected == "NOT_FALSE_POSITIVE"
+        else "ASSESSMENT_REQUIRED"
+    )
     assert result["repo_root"] == str(tmp_path)
     if expected:
         assert result["excluded"][0]["reason"] == expected
@@ -1156,6 +1166,31 @@ def test_empty_approval_reports_blockers_without_writing(
     else:
         assert result["excluded"] == []
         assert "No findings are loaded" in result["message"]
+    ctx.elicit.assert_not_called()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_non_false_positive_does_not_hide_an_unassessed_finding(tmp_path, monkeypatch):
+    """Keep the real assessment blocker when another finding already needs remediation."""
+    # Arrange
+    engine = _engine(tmp_path)
+    engine.state.decisions.clear()
+    engine.state.decisions["finding-1"] = {
+        "decision": "CHANGE_REQUIRED",
+        "reason": "The package still requires its reviewed update.",
+    }
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    ctx = _context()
+
+    # Act
+    result = asyncio.run(server.review_false_positives(ctx, str(tmp_path)))
+
+    # Assert
+    assert result["status"] == "ASSESSMENT_REQUIRED"
+    assert {row["reason"] for row in result["excluded"]} == {
+        "NOT_FALSE_POSITIVE",
+        "ASSESSMENT_REQUIRED",
+    }
     ctx.elicit.assert_not_called()
     engine.gitlab.dismiss_false_positive.assert_not_called()
 

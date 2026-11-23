@@ -3,11 +3,14 @@
 import asyncio
 import json
 import os
+import subprocess
 from subprocess import CompletedProcess
 
 import pytest
 
 from gitlab_security_mcp.desktop_approval import (
+    _CHOICE_SCRIPT,
+    SCRIPT,
     DesktopApproval,
     _close_stream,
     ask_checkboxes,
@@ -227,6 +230,7 @@ def test_open_dialog_returns_after_ready_and_closes_when_pipes_fail(monkeypatch)
     # Assert
     assert dialog.process is shown
     assert CHOICE_KEY.encode() in sent
+    assert json.loads(sent)["host_process_id"] == os.getpid()
 
 
 def test_open_choice_returns_after_ready(monkeypatch):
@@ -250,6 +254,111 @@ def test_open_choice_returns_after_ready(monkeypatch):
 
     # Assert
     assert CHOICE_ID in dialog.choice_ids
+    assert json.loads(shown.stdin.written)["host_process_id"] == os.getpid()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires Windows PowerShell")
+@pytest.mark.parametrize("window_script", [SCRIPT, _CHOICE_SCRIPT])
+@pytest.mark.parametrize("allowed", [False, True])
+def test_all_window_handlers_request_foreground_before_ready(window_script, allowed):
+    """Execute real Shown handlers with fake windows, including Windows focus denial."""
+    # Arrange
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$data = [Console]::In.ReadToEnd() | ConvertFrom-Json
+Add-Type @'
+using System;
+public static class ApprovalWindowHost {
+    public static bool Allowed;
+    public static IntPtr LastWindow;
+    public static bool SetForegroundWindow(IntPtr window) {
+        LastWindow = window;
+        return Allowed;
+    }
+    public static IntPtr GetForegroundWindow() {
+        return Allowed ? LastWindow : IntPtr.Zero;
+    }
+}
+'@
+[ApprovalWindowHost]::Allowed = $data.allowed
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($data.script, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$focus = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Show-ApprovalForeground'
+}, $true)
+. ([scriptblock]::Create($focus.Extent.Text))
+$shown = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Member.Value -eq 'Add_Shown'
+}, $true)
+$script:events = New-Object 'System.Collections.Generic.List[string]'
+$form = [pscustomobject]@{ TopMost = $false; Handle = [IntPtr]4040 }
+$form | Add-Member ScriptMethod BringToFront {
+    if (-not $this.TopMost) { throw 'Window must already be topmost' }
+    $script:events.Add('front')
+}
+$form | Add-Member ScriptMethod Activate { $script:events.Add('activate') }
+$inputData = [pscustomobject]@{ notify_ready = $true }
+$body = $shown.Arguments[0].ScriptBlock.Extent.Text
+. ([scriptblock]::Create($body.Substring(1, $body.Length - 2)))
+if ([ApprovalWindowHost]::LastWindow -ne $form.Handle) { throw 'Wrong foreground handle' }
+@{ events = @($script:events); topmost = $form.TopMost } | ConvertTo-Json -Compress
+"""
+
+    # Act
+    result = subprocess.run(
+        [str(powershell()), "-NoProfile", "-Command", script],
+        input=json.dumps({"script": window_script, "allowed": allowed}),
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=20,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    ready, payload = result.stdout.strip().splitlines()
+    assert ready == READY.decode()
+    assert json.loads(payload) == {
+        "events": ["front", "activate"],
+        "topmost": True,
+    }
+    assert ("Windows denied" in result.stderr) is not allowed
+
+
+@pytest.mark.parametrize("checkboxes", [False, True])
+def test_successful_sync_windows_log_foreground_diagnostics(
+    monkeypatch, caplog, checkboxes
+):
+    """A valid human answer must not discard a failed foreground/placement warning."""
+    # Arrange
+    payloads = []
+    response = {"action": ACCEPT, "content": {}} if checkboxes else {"choice": DONE}
+
+    def run(*_args, **kwargs):
+        """Return a successful answer accompanied by a native-window diagnostic."""
+        payloads.append(json.loads(kwargs["input"]))
+        return _completed(SUCCESS_CODE, json.dumps(response), DIAGNOSTIC)
+
+    monkeypatch.setattr("gitlab_security_mcp.desktop_approval.subprocess.run", run)
+
+    # Act
+    if checkboxes:
+        ask_checkboxes(
+            MESSAGE, {}, title=TITLE, detail_header=DETAIL, submit_label=SUBMIT
+        )
+    else:
+        ask_choice(TITLE, MESSAGE, [{"id": DONE, "label": DONE}])
+
+    # Assert
+    assert payloads[0]["host_process_id"] == os.getpid()
+    assert DIAGNOSTIC in caplog.text
 
 
 def test_choice_and_checkbox_helpers_require_a_readable_response(monkeypatch):

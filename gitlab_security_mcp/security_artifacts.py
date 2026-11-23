@@ -6,12 +6,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gitlab_security_mcp.util import checkout_file_id, read_server_log
+from gitlab_security_mcp.util import checkout_file_id, server_log_snapshot
 
 _RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT = (
     "Security artifacts contain a link/reparse point: {}"
@@ -39,9 +40,21 @@ _RAISE_ARCHIVE_TIMESTAMP_IS_NOT_ISO_8601 = (
 logger = logging.getLogger("gitlab_security_mcp")
 _LOG_ARTIFACT_CLEANUP = "Security log review/cleanup could not complete: %s"
 _SERVER_LOG_MEMBER = "server.log"
+_SERVER_LOG_COPY_BYTES = 64 * 1024
+_RAISE_SERVER_LOG_TRUNCATED = "Server diagnostic spool was truncated during archival; checkout logs were preserved"
 LOG_ARCHIVE_DIRECTORY = "softwareSecurityAuditReports"
-_RUN_LOG_NAMES = ("audit.jsonl", "http-timings.jsonl")
-_COMMAND_LOG_SUFFIXES = (".stdout.log", ".stderr.log")
+_LOG_SUFFIXES = {".log", ".jsonl"}
+_RAISE_LOGS_CHANGED_DURING_ARCHIVE = (
+    "Run logs changed during archival; checkout copies were preserved"
+)
+_RAISE_UNSAFE_LOG_ARCHIVE = "The existing log archive is not an ordinary file"
+_ARCHIVE_GENERATED_NAMES = {
+    "progress.json",
+    "no-tests-v1.init.gradle",
+}
+_UNRESOLVED_REPORT = "reports/unresolved-remediation.md"
+_AUDIT_REPORT_DIRECTORY = "software-audit"
+_RAISE_UNSAFE_AUDIT_REPORT = "The software audit report is not an ordinary file"
 _ARCHIVE_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z$")
 _REPARSE_POINT = 0x400
 
@@ -140,6 +153,7 @@ def review_security_artifacts(
     With no tracked-file inventory, this performs an inspection only. Cleanup
     deletes individual owned files and empty directories, never recursively.
     A fresh start may discard prior execution errors, but not unsafe filesystem state.
+    Keep logs until final archival: startup commands already appended to those files.
     """
     root = repo_root / ".security-mcp"
     errors = []
@@ -244,6 +258,7 @@ def review_security_artifacts(
                 for path in sorted(snapshot)
                 if _generated(str(path.relative_to(root)))
                 and path.relative_to(repo_root).as_posix() not in tracked
+                and (not fresh_start or path.suffix.lower() not in _LOG_SUFFIXES)
             ]
             for path in candidates:
                 info = path.lstat()
@@ -310,41 +325,62 @@ def _ordinary_file(path: Path) -> bool:
     )
 
 
-def run_log_files(repo_root: Path) -> list[Path]:
-    """Return this run's command and HTTP logs inside the checkout."""
+def _run_log_snapshot(repo_root: Path) -> dict[Path, tuple[int, int, int]]:
+    """Capture stable log identities without following artifact-directory links."""
     root = repo_root / ".security-mcp"
-    found = [path for name in _RUN_LOG_NAMES if _ordinary_file(path := root / name)]
-    command_logs = root / "command-logs"
-    try:
-        info = command_logs.lstat()
-    except OSError:
-        info = None
-    if (
-        info is not None
-        and command_logs.is_dir()
-        and not command_logs.is_symlink()
-        and not (getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
-    ):
-        found.extend(
-            path
-            for path in command_logs.iterdir()
-            if path.name.endswith(_COMMAND_LOG_SUFFIXES) and _ordinary_file(path)
-        )
-    return found
+    return {
+        path: info
+        for path, info in sorted(_snapshot(root).items())
+        if path.suffix.lower() in _LOG_SUFFIXES
+    }
 
 
-def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict:
-    """Zip checkout logs and the server diagnostic log, then delete the checkout copies.
+def run_log_files(repo_root: Path) -> list[Path]:
+    """Return every log beneath the artifact root without following links."""
+    return list(_run_log_snapshot(repo_root))
 
-    Reports, run state, policies, and lint evidence stay in the checkout. The
+
+def _archive_snapshot(repo_root: Path) -> dict[Path, tuple[int, int, int]]:
+    """Include generated evidence and all logs, but not user policies or unknown files."""
+    root = repo_root / ".security-mcp"
+    return {
+        path: info
+        for path, info in sorted(_snapshot(root).items())
+        if _generated(path.relative_to(root).as_posix())
+        or path.suffix.lower() in _LOG_SUFFIXES
+        or path.relative_to(root).as_posix() == _UNRESOLVED_REPORT
+        or path.relative_to(root).as_posix() in _ARCHIVE_GENERATED_NAMES
+    }
+
+
+def archive_run_logs(
+    repo_root: Path,
+    project_name: str,
+    when: datetime,
+    *,
+    audit_report: Path | None = None,
+) -> dict:
+    """Zip generated evidence and server diagnostics, then remove checkout logs only.
+
+    Reports, run state, progress, the no-tests helper, and lint evidence are
+    archived and stay in the checkout. User policies are not generated evidence. The
     server log is the redacted stderr text for this process. The archive name
     uses an ISO 8601 basic timestamp because a colon is not a legal Windows
     file name. A checkout token keeps another repository with the same project
-    name from replacing this archive.
+    name from replacing this archive. Retry with the same timestamp to merge
+    late logs into the same ZIP without losing already archived members.
     """
-    files = run_log_files(repo_root)
-    server_log = read_server_log()
-    if not files and not server_log:
+    root = repo_root / ".security-mcp"
+    snapshot = _archive_snapshot(repo_root)
+    audit_info = None
+    if audit_report is not None:
+        if not _ordinary_file(audit_report):
+            raise ValueError(_RAISE_UNSAFE_AUDIT_REPORT)
+        info = audit_report.stat()
+        audit_info = (info.st_size, info.st_mtime_ns, info.st_ino)
+    server_log = server_log_snapshot()
+    has_server_log = server_log is not None and server_log[1] > 0
+    if not snapshot and not has_server_log and audit_report is None:
         return {"status": "NO_LOGS", "path": None, "removed": []}
     destination = Path.home() / LOG_ARCHIVE_DIRECTORY
     destination.mkdir(parents=True, exist_ok=True)
@@ -353,28 +389,86 @@ def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict
         raise ValueError(_RAISE_ARCHIVE_TIMESTAMP_IS_NOT_ISO_8601.format(stamp))
     identity = checkout_file_id(repo_root)
     target = destination / f"{project_name}_{stamp}_{identity}.zip"
+    if target.exists() and not _ordinary_file(target):
+        raise ValueError(_RAISE_UNSAFE_LOG_ARCHIVE)
     descriptor, temporary = tempfile.mkstemp(dir=destination, suffix=".zip.tmp")
     os.close(descriptor)
     try:
         with zipfile.ZipFile(
             temporary, "w", compression=zipfile.ZIP_DEFLATED
         ) as archive:
-            for path in files:
+            replaced = {path.relative_to(root).as_posix() for path in snapshot}
+            audit_member = (
+                f"{_AUDIT_REPORT_DIRECTORY}/{audit_report.name}"
+                if audit_report is not None
+                else None
+            )
+            if audit_member is not None:
+                replaced.add(audit_member)
+            if has_server_log:
+                replaced.add(_SERVER_LOG_MEMBER)
+            if target.exists():
+                with zipfile.ZipFile(target) as previous:
+                    for member in previous.infolist():
+                        if member.filename not in replaced:
+                            with (
+                                previous.open(member) as source,
+                                archive.open(member, "w") as output,
+                            ):
+                                shutil.copyfileobj(source, output)
+            for path in snapshot:
                 archive.write(
                     path,
-                    arcname=path.relative_to(repo_root / ".security-mcp").as_posix(),
+                    arcname=path.relative_to(root).as_posix(),
                 )
-            if server_log:
-                archive.writestr(_SERVER_LOG_MEMBER, server_log)
+            if server_log is not None and has_server_log:
+                path, remaining = server_log
+                with (
+                    path.open("rb") as source,
+                    archive.open(_SERVER_LOG_MEMBER, "w", force_zip64=True) as output,
+                ):
+                    while remaining:
+                        chunk = source.read(min(remaining, _SERVER_LOG_COPY_BYTES))
+                        if not chunk:
+                            raise OSError(_RAISE_SERVER_LOG_TRUNCATED)
+                        output.write(chunk)
+                        remaining -= len(chunk)
+            if audit_report is not None:
+                archive.write(audit_report, arcname=audit_member)
+        if _archive_snapshot(repo_root) != snapshot:
+            raise ValueError(_RAISE_LOGS_CHANGED_DURING_ARCHIVE)
+        if audit_report is not None:
+            info = audit_report.lstat()
+            if (
+                not _ordinary_file(audit_report)
+                or (info.st_size, info.st_mtime_ns, info.st_ino) != audit_info
+            ):
+                raise ValueError(_RAISE_LOGS_CHANGED_DURING_ARCHIVE)
         os.replace(temporary, target)
-    except (OSError, ValueError):
+    except (OSError, ValueError, zipfile.BadZipFile):
         Path(temporary).unlink(missing_ok=True)
         raise
     removed = []
-    for path in files:
+    for path, info in snapshot.items():
+        if path.suffix.lower() not in _LOG_SUFFIXES:
+            continue
+        current = path.lstat()
+        if (
+            not _ordinary_file(path)
+            or (current.st_size, current.st_mtime_ns, current.st_ino) != info
+        ):
+            raise ValueError(_RAISE_LOGS_CHANGED_DURING_ARCHIVE)
         path.unlink()
         removed.append(path.relative_to(repo_root).as_posix())
-    command_logs = repo_root / ".security-mcp" / "command-logs"
-    if command_logs.is_dir() and not any(command_logs.iterdir()):
-        command_logs.rmdir()
+    directories = {
+        parent
+        for path in snapshot
+        for parent in path.parents
+        if parent != root and parent.is_relative_to(root)
+    }
+    for directory in sorted(
+        directories, key=lambda path: len(path.parts), reverse=True
+    ):
+        if not any(directory.iterdir()):
+            directory.rmdir()
     return {"status": "ARCHIVED", "path": str(target), "removed": removed}

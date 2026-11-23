@@ -159,6 +159,12 @@ def _unresolved_issues(state: RunState) -> list[dict]:
         decision = assessment.get("decision") or finding.get("remediationDecision")
         outcome = outcomes.get(finding_id) or {}
         qualification = finding.get("packageQualification") or {}
+        release = (finding.get("proposedFix") or {}).get("release_selection") or {}
+        advisory_warning = (
+            release.get("advisory_warning")
+            if outcome.get("status") == "APPLIED"
+            else None
+        )
         pending = (
             outcome.get("package_update")
             and outcome.get("qualification_status") != "VALIDATED"
@@ -168,7 +174,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
         ) != "APPLIED"
         unapplied = decision == "CHANGE_REQUIRED" and outcome.get("status") != "APPLIED"
         if decision == "FALSE_POSITIVE" or (
-            outcome.get("status") == "APPLIED" and not pending
+            outcome.get("status") == "APPLIED" and not pending and not advisory_warning
         ):
             continue
         failed = (
@@ -218,6 +224,7 @@ def _unresolved_issues(state: RunState) -> list[dict]:
                 "decision": outcome.get("status") if failed else decision,
                 "reason": host_result.get("reason")
                 or (outcome.get("detail") if failed or pending else None)
+                or advisory_warning
                 or (
                     "No remediation edit was authorized for this finding. "
                     + (
@@ -256,8 +263,8 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
         "",
         "Local results only. Nothing was committed or pushed. Host code-fix outcomes are attestations, not independent MCP validation or GitLab resolution.",
         "",
-        "## Package versions not updated",
-        "| Finding / package | Current | Proposed target | Why not updated |",
+        "## Unresolved package updates",
+        "| Finding / package | Current | Proposed target | Blocker or verification limitation |",
         "|---|---|---|---|",
     ]
     package_ids = set()
@@ -550,6 +557,7 @@ def render(
                     "policy_sha256",
                     "baseline_results",
                     "post_results",
+                    "rejection_diagnostics",
                     "check_contract",
                     "rollback",
                     "version_alignment_files",
@@ -776,6 +784,8 @@ def render(
         lines.append(
             f"- {finding_id}: selected {selection.get('target') or 'no eligible release'}; {selection['source']}."
         )
+        if selection.get("advisory_warning"):
+            lines.append(f"  WARNING: {selection['advisory_warning']}")
         for paid in selection.get("paid_releases", []):
             lines.append(
                 f"  PAID VERSION {paid['version']}: blocked; user investigation required. "
@@ -800,6 +810,9 @@ def render(
             )
             for warning in qualification.get("warnings") or []:
                 lines.append(f"  WARNING: {warning}")
+            rejection = qualification.get("rejection_diagnostics")
+            if rejection:
+                lines.append(f"  Rejected update: {rejection['summary']}")
             documentation = (qualification.get("review") or {}).get(
                 "documentation"
             ) or {}
@@ -842,6 +855,19 @@ def render(
         for trial in state.batch_isolation:
             selected = ", ".join(trial["finding_ids"]) or "original baseline"
             lines.append(f"- {trial['status']}: {selected}")
+            validation = trial.get("validation") or {}
+            if validation:
+                lines.append(
+                    f"  Production build: {validation['build_status']}. "
+                    + validation["unit_tests"]["reason"]
+                )
+                for check in validation["build_checks"]:
+                    lines.append(
+                        f"  Build: {check.get('command')}; {check['status']}; exit {check.get('exit_code')}."
+                    )
+                    for key in ("stdout_log_path", "stderr_log_path"):
+                        if check.get(key):
+                            lines.append(f"  {key}: {check[key]}")
             for failure in trial["failures"]:
                 lines.append(
                     f"  Failure: {failure.get('detail') or failure.get('command')}"

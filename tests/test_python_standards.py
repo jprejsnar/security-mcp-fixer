@@ -18,6 +18,15 @@ SUBPROCESS_CALLS = {"call", "check_call", "check_output", "Popen", "run"}
 def implicit_text_encodings(tree: ast.AST) -> list[ast.Call]:
     """Return text I/O and text-mode subprocess calls that omit ``encoding``."""
     found = []
+    binary_open_owners = {"os", "tarfile"}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.withitem)
+            and isinstance(node.optional_vars, ast.Name)
+            and isinstance(node.context_expr, ast.Call)
+            and ast.unparse(node.context_expr.func) == "zipfile.ZipFile"
+        ):
+            binary_open_owners.add(node.optional_vars.id)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or any(
             keyword.arg == "encoding" for keyword in node.keywords
@@ -31,7 +40,7 @@ def implicit_text_encodings(tree: ast.AST) -> list[ast.Call]:
         elif name == "open" and not (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
-            and func.value.id == "tarfile"
+            and func.value.id in binary_open_owners
         ):
             position = 1 if isinstance(func, ast.Name) else 0
             mode = keywords.get("mode")

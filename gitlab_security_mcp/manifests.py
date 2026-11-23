@@ -1258,13 +1258,25 @@ def add_java_override(
             '            because("Reviewed security remediation; preserve the existing dependency graph.")\n'
             f"        }}\n    }}\n}}\n{end}"
         )
-        if force:
-            block = (
-                f"{start}\nconfigurations.configureEach {{\n"
-                f'    resolutionStrategy.force("{package}:" + project.providers.gradleProperty("{key}").get())\n'
-                f"}}\n{end}"
-            )
-        elif configurations:
+        # Gradle evaluates eachDependency rules after force, in declaration order.
+        if force or configurations:
+            group, artifact = package.split(":")
+            if path.name.endswith(".kts"):
+                rule = (
+                    "    resolutionStrategy.eachDependency {\n"
+                    f'        if (requested.group == "{group}" && requested.name == "{artifact}") {{\n'
+                    f'            useVersion(project.providers.gradleProperty("{key}").get())\n'
+                    "        }\n"
+                    "    }\n"
+                )
+            else:
+                rule = (
+                    "    resolutionStrategy.eachDependency { details ->\n"
+                    f'        if (details.requested.group == "{group}" && details.requested.name == "{artifact}") {{\n'
+                    f'            details.useVersion(project.providers.gradleProperty("{key}").get())\n'
+                    "        }\n"
+                    "    }\n"
+                )
             names = sorted({scope.rsplit(":", 1)[-1] for scope in configurations})
             if any(
                 re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,100}", name) is None
@@ -1273,11 +1285,17 @@ def add_java_override(
                 raise ValueError(
                     _RAISE_A_GRADLE_RESOLUTION_OVERRIDE_REQUIRES_EXACT_CONFIGURATION_NAMES
                 )
+            selectors = (
+                ["configurations.configureEach"]
+                if force
+                else [f'configurations.named("{name}")' for name in names]
+            )
             rules = "\n".join(
-                f'configurations.named("{name}") {{\n'
+                f"{selector} {{\n"
                 f'    resolutionStrategy.force("{package}:" + project.providers.gradleProperty("{key}").get())\n'
-                "}"
-                for name in names
+                + rule
+                + "}"
+                for selector in selectors
             )
             block = f"{start}\n{rules}\n{end}"
         newline = "\r\n" if "\r\n" in text else "\n"

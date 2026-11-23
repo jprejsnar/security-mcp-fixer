@@ -54,6 +54,51 @@ def test_corporate_dns_failure_blocks_prechecks_without_work(tmp_path, corporate
     assert engine.state.stop_stage is None
 
 
+@pytest.mark.parametrize("background", [False, True])
+def test_default_status_omits_repeated_workflow_evidence(
+    tmp_path, monkeypatch, background
+):
+    """Keep live jobs and blockers while saved evidence is returned only on recovery."""
+    # Arrange
+    from copy import deepcopy
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import server
+
+    engine = Engine(tmp_path, gitlab=Mock(), advisory=Mock())
+    engine.state.workflow = {
+        "current": 3,
+        "jobs": [{"number": 3, "status": "RUNNING"}],
+        "package_reviews": {"one": {"documentation": "Reviewed source. " * 3000}},
+        "final_result": {
+            "status": "WORKFLOW_COMPLETE",
+            "report_path": str(tmp_path / "report.md"),
+            "final_summary_markdown": "Report evidence. " * 3000,
+            "log_archive": {"status": "ERROR", "error": "disk full"},
+        },
+    }
+    original = deepcopy(engine.state.workflow)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(
+        server,
+        "_background_for",
+        lambda selected: [{"status": "RUNNING"}] if background else [],
+    )
+
+    # Act
+    compact = server.get_run_status(str(tmp_path))
+    recovered = server.get_run_status(str(tmp_path), include_audit_details=True)
+
+    # Assert
+    assert compact["workflow"]["current"] == 3
+    assert compact["workflow"]["package_review_count"] == 1
+    assert compact["workflow"]["jobs"] == original["jobs"]
+    assert compact["workflow"]["final_result"]["log_archive"]["error"] == "disk full"
+    assert len(json.dumps(compact)) < len(json.dumps(recovered)) * 0.1
+    assert recovered["workflow"] == original
+    assert engine.state.workflow == original
+
+
 @pytest.mark.parametrize("failed_check", [1, 2, 3])
 def test_dns_loss_blocks_pulls_or_pnpm_preparation(
     tmp_path, corporate_dns, failed_check, caplog
@@ -3142,6 +3187,8 @@ def test_existing_branch_name_is_reused_after_log_review(cloned_repo):
     from tests.conftest import git
 
     git(cloned_repo, "branch", branch_name_for(date(2026, 11, 1)))
+    audit_path = cloned_repo / ".security-mcp" / "audit.jsonl"
+    startup_commands = audit_path.read_bytes()
 
     # Act
     reused = engine.create_security_branch()
@@ -3150,6 +3197,7 @@ def test_existing_branch_name_is_reused_after_log_review(cloned_repo):
     assert reused["status"] == "BRANCH_CREATED"
     assert reused["reused"]
     assert reused["security_artifacts"]["cleanup_performed"]
+    assert audit_path.read_bytes().startswith(startup_commands)
     assert engine.git.current_branch() == branch_name_for(date(2026, 11, 1))
 
 
@@ -3234,8 +3282,8 @@ def test_current_today_branch_reuses_its_own_dependencies_and_preserves_policies
 
 
 @pytest.mark.parametrize("stage", ["prechecks", "branch"])
-def test_clean_branch_reuse_discards_prior_generated_failure_logs(cloned_repo, stage):
-    """A clean existing branch can start fresh without stale runtime failures blocking it."""
+def test_clean_branch_reuse_retains_failure_logs_for_final_archive(cloned_repo, stage):
+    """Keep earlier diagnostics without letting stale failures block a fresh run."""
     # Arrange
     from tests.conftest import git
 
@@ -3270,7 +3318,9 @@ def test_clean_branch_reuse_discards_prior_generated_failure_logs(cloned_repo, s
     assert result["status"] == "BRANCH_CREATED"
     assert result["security_artifacts"]["previous_run_error_count"] > 0
     assert not old_report.exists()
-    assert not log.exists()
+    assert log.read_text(encoding="utf-8") == (
+        "Traceback (most recent call last):\nRuntimeError: failed\n"
+    )
     assert json.loads(state.read_text(encoding="utf-8"))["status"] == "BRANCH_CREATED"
 
 
@@ -3636,15 +3686,24 @@ def test_report_says_unknown_when_the_index_cannot_be_read(tmp_path):
 
 
 @pytest.mark.parametrize("receipt_key", ["packageQualification", "localFixAttempt"])
-def test_inspection_snapshot_keeps_hashes_not_raw_rollback_text(tmp_path, receipt_key):
-    """Keep rollback bytes in memory without repeatedly publishing large lockfiles."""
+@pytest.mark.parametrize(
+    "backup_key,manifest_key",
+    [
+        ("dependency_before", "dependency_backup_manifest"),
+        ("version_alignment_before", "version_alignment_backup_manifest"),
+    ],
+)
+def test_inspection_snapshot_keeps_hashes_not_raw_rollback_text(
+    tmp_path, receipt_key, backup_key, manifest_key
+):
+    """Keep original dependency/AI text in memory, not repeated inspection snapshots."""
     # Arrange
     import hashlib
 
     from gitlab_security_mcp.state import RunState
 
     original = "lockfile-private-content\u00e9\r\n" * 10000
-    receipt = {"dependency_before": {"pnpm-lock.yaml": original, "new-file": None}}
+    receipt = {backup_key: {"original.md": original, "new-file": None}}
     state = RunState(findings=[{"id": "a", receipt_key: receipt}])
 
     # Act
@@ -3655,13 +3714,13 @@ def test_inspection_snapshot_keeps_hashes_not_raw_rollback_text(tmp_path, receip
     # Assert
     assert len(raw) < len(original) // 20
     assert "lockfile-private-content" not in raw
-    assert "dependency_before" not in snapshot
-    assert snapshot["dependency_backup_manifest"]["pnpm-lock.yaml"] == {
+    assert backup_key not in snapshot
+    assert snapshot[manifest_key]["original.md"] == {
         "sha256": hashlib.sha256(original.encode()).hexdigest(),
         "bytes": len(original.encode()),
     }
-    assert snapshot["dependency_backup_manifest"]["new-file"] is None
-    assert receipt["dependency_before"]["pnpm-lock.yaml"] == original
+    assert snapshot[manifest_key]["new-file"] is None
+    assert receipt[backup_key]["original.md"] == original
 
 
 def test_final_summary_exposes_baseline_and_optional_validation_gaps():

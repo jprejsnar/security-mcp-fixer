@@ -744,22 +744,7 @@ class CommandRunner:
         started = time.monotonic()
         total_suites = None
         self._command_log_paths = {}
-        if tool_name(argv[0]) != "git" and any(
-            arg
-            in ALLOWED_SCRIPTS
-            | {
-                "clean",
-                "install",
-                "audit",
-                "dependencies",
-                "verify",
-                "format",
-                "checkstyle:check",
-                "checkstyleMain",
-                "checkstyleTest",
-            }
-            for arg in argv[1:]
-        ):
+        if tool_name(argv[0]) != "git":
             directory = self.repo_root / ".security-mcp" / "command-logs"
             directory.mkdir(parents=True, exist_ok=True)
             identifier = uuid4().hex

@@ -56,6 +56,7 @@ from gitlab_security_mcp.official_docs import (
     DocReview,
     OfficialDocs,
     cited_security_pages_ok,
+    manager_documentation,
 )
 from gitlab_security_mcp.package_releases import release_catalog, reviewed_selection
 from gitlab_security_mcp.progress import drop_checkout
@@ -126,7 +127,13 @@ _RAISE_SERVER_SHUTDOWN_INTERRUPTED_THE_APPROVED_PACKAGE_BATCH = (
     "Server shutdown interrupted the approved package batch."
 )
 _RAISE_THE_LATEST_ELIGIBLE_TARGET_IS_R_BUT_THE = "The latest eligible target is {!r}, but the release review does not identify that exact target. Review the current catalog and resubmit; a newly published release cannot inherit an older target's support or fee review."
-_RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED_OR_COULD_NOT = "Latest eligible target {} is affected or could not be verified against public advisories; manual investigation required"
+_RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED = "Latest eligible target {} is affected by public advisory evidence; manual investigation required"
+_RAISE_TARGET_ADVISORY_PACKAGE_MISMATCH = "Target advisory evidence does not match the requested package; manual investigation required"
+_UNVERIFIED_TARGET_WARNING = (
+    "Public advisory bounds could not verify target {target} as unaffected. "
+    "Human-approved compatibility validation may retain this update, but passing "
+    "builds do not prove vulnerability resolution. Unit/integration tests are not run."
+)
 _RAISE_LATEST_ELIGIBLE_RELEASE_CANNOT_BE_PLANNED = (
     "Latest eligible release cannot be planned: {}"
 )
@@ -211,6 +218,31 @@ _LOG_BRANCH_PREPARATION_FAILED = "Security branch preparation failed for %s: %s"
 _LOG_PROJECT_DISCOVERY_FAILED = "GitLab project discovery failed: %s"
 _LOG_MAVEN_INSPECTION_FAILED = "Maven dependency inspection unavailable: %s"
 _LOG_GRADLE_INSPECTION_FAILED = "Gradle dependency inspection unavailable: %s"
+_DEPENDENCY_RESOLUTION_CHECK = "dependency_resolution"
+NOT_FALSE_POSITIVE = "NOT_FALSE_POSITIVE"
+_CHECK_NOT_RUN = "NOT_RUN"
+_TESTS_DISABLED_REASON = (
+    "Unit/integration tests are disabled during package remediation."
+)
+_BUILD_SKIPPED_RESOLUTION = (
+    "Production builds were not run because required dependency resolution failed."
+)
+_LOG_GRADLE_TARGET_REJECTED = "Gradle target verification rejected an update: %s"
+_CHECK_DIAGNOSTIC_FIELDS = (
+    "kind",
+    "status",
+    "command",
+    "cwd",
+    "exit_code",
+    "detail",
+    "stdout_log_path",
+    "stderr_log_path",
+    "finding_id",
+    "package",
+    "expected_version",
+    "required_configurations",
+    "observed_configuration_versions",
+)
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -306,6 +338,47 @@ class _ValidationRunner:
         if key not in self.results:
             self.results[key] = self.runner.run(argv, **kwargs)
         return self.results[key]
+
+
+def _validation_diagnostics(result: dict) -> dict:
+    """Keep actual build outcomes and compact failure evidence across rollback."""
+    builds = [
+        {key: row[key] for key in _CHECK_DIAGNOSTIC_FIELDS if key in row}
+        for row in result.get("results", [])
+        if row.get("kind") == "build"
+    ]
+    build_status = (
+        _CHECK_NOT_RUN
+        if not builds
+        else "FAILED"
+        if any(row["status"] == "FAILED" for row in builds)
+        else "PASSED"
+        if all(row["status"] == "PASSED" for row in builds)
+        else "INCOMPLETE"
+    )
+    failures = [
+        {key: row[key] for key in _CHECK_DIAGNOSTIC_FIELDS if key in row}
+        for row in result.get("results", [])
+        if row.get("required") and row["status"] != "PASSED"
+    ]
+    return {
+        "build_status": build_status,
+        "build_checks": builds,
+        "unit_tests": {"status": _CHECK_NOT_RUN, "reason": _TESTS_DISABLED_REASON},
+        "failed_checks": failures,
+        "summary": (
+            f"Production build: {build_status}. {_TESTS_DISABLED_REASON} "
+            + (
+                result.get("build_skipped", "") + " "
+                if result.get("build_skipped")
+                else ""
+            )
+            + "; ".join(
+                f"{row.get('kind') or 'validation'}: {row.get('detail') or row.get('command') or row['status']}"
+                for row in failures
+            )
+        ),
+    }
 
 
 class Engine:
@@ -1545,6 +1618,7 @@ class Engine:
                         "finding_id": item["id"],
                         "plan": deepcopy(plan),
                         "reason": str(exc),
+                        "manager_documentation": manager_documentation(plan),
                     }
                 )
             else:
@@ -1791,6 +1865,7 @@ class Engine:
                         "omitted_below_floor": len(catalog["versions"]) - len(eligible),
                     },
                     "advisory_floor": floor,
+                    "manager_documentation": manager_documentation(plan),
                     "requirements": (
                         "Review publisher support, actual project runtime compatibility, and target-version "
                         "fees. Supply target=<exact reviewed eligible version>,"
@@ -1841,11 +1916,16 @@ class Engine:
                 finding, plan["ecosystem"], plan["package"], target
             )
             self._record_validation_sites(finding, target_advisory.validation_sites)
-            if target_advisory.affected is not False:
+            if target_advisory.affected is True:
                 raise ValueError(
-                    _RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED_OR_COULD_NOT.format(
-                        target
-                    )
+                    _RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED.format(target)
+                )
+            if target_advisory.outcome == PACKAGE_MISMATCH:
+                raise ValueError(_RAISE_TARGET_ADVISORY_PACKAGE_MISMATCH)
+            selection["advisory_verified"] = target_advisory.affected is False
+            if not selection["advisory_verified"]:
+                selection["advisory_warning"] = _UNVERIFIED_TARGET_WARNING.format(
+                    target=target
                 )
             decision, reason, evidence, proposed, _prompt = self._decide(
                 finding, package_target=target
@@ -1867,6 +1947,8 @@ class Engine:
             evidence.append(
                 f"Latest supported runtime-compatible stable target: {target}; {catalog['source']}."
             )
+            if selection.get("advisory_warning"):
+                evidence.append(selection["advisory_warning"])
             finding["evidence"] = evidence
             finding["assessment"] = {
                 "decision": decision,
@@ -1880,7 +1962,11 @@ class Engine:
                 "status": "VERSION_SELECTED",
                 "finding_id": finding_id,
                 "proposed_fix": deepcopy(proposed),
+                "manager_documentation": manager_documentation(proposed),
                 "paid_releases": selection["paid_releases"],
+                "warnings": [selection["advisory_warning"]]
+                if selection.get("advisory_warning")
+                else [],
                 "next_tool": "select_security_fixes",
                 "message": "Review this exact target and obtain fresh human approval; previous target qualification is invalid.",
             }
@@ -2476,6 +2562,7 @@ class Engine:
         trials = []
         self.state.batch_isolation = trials
         rejected = {}
+        rejection_diagnostics = {}
 
         def record(selected: tuple[str, ...], result: dict) -> None:
             """Retain failed commands and log paths without losing final green evidence."""
@@ -2483,6 +2570,7 @@ class Engine:
                 {
                     "finding_ids": list(selected),
                     "status": result["status"],
+                    "validation": _validation_diagnostics(result),
                     "failures": [
                         deepcopy(row)
                         for row in result.get("results", [])
@@ -2622,18 +2710,11 @@ class Engine:
                 retain(group[:middle])
                 retain(group[middle:])
             else:
-                reason = (
-                    "Rejected after production build, resolution or policy failure with retained updates "
-                    + repr(accepted)
-                    + ": "
-                    + "; ".join(
-                        str(row.get("detail") or row.get("command"))
-                        for row in result.get("results", [])
-                        if row.get("required") and row["status"] != "PASSED"
-                    )
-                )
+                diagnostics = _validation_diagnostics(result)
+                reason = diagnostics["summary"] + " Retained updates: " + repr(accepted)
                 for finding_id in group[0]:
                     rejected[finding_id] = reason
+                    rejection_diagnostics[finding_id] = deepcopy(diagnostics)
 
         retain(groups)
         accepted = [finding_id for finding_id in identifiers if finding_id in accepted]
@@ -2650,19 +2731,25 @@ class Engine:
                 qualification_status="REJECTED",
                 validation_pending=False,
                 detail="Package update rejected: " + reason,
+                rejection_diagnostics=rejection_diagnostics[finding_id],
             )
             receipt = self._finding(finding_id)["packageQualification"]
             receipt.update(
                 status="REJECTED",
                 reason=reason,
                 rollback=deepcopy(change.get("rollback")),
+                rejection_diagnostics=deepcopy(rejection_diagnostics[finding_id]),
             )
         self.state.batch_isolation = trials
         final.update(
             isolation_trials=trials,
             retained_updates=accepted,
             rejected_updates=[
-                {"finding_id": finding_id, "reason": reason}
+                {
+                    "finding_id": finding_id,
+                    "reason": reason,
+                    "validation": rejection_diagnostics[finding_id],
+                }
                 for finding_id, reason in rejected.items()
             ],
             rollbacks=[
@@ -2692,6 +2779,60 @@ class Engine:
             self.state.manual_cleanup_required = True
         self._remember()
         return final
+
+    def _gradle_target_check(self, finding: dict, plan: dict) -> dict:
+        """Reject an ineffective Gradle edit before spending time on a production build."""
+        finding["packageQualification"].pop("resolved_dependency", None)
+        required = set(plan.get("gradle_configurations") or ())
+        resolved = self._resolve_gradle_package(
+            finding, self._snapshot()[0], configurations=tuple(sorted(required))
+        )
+        observed = (resolved.configuration_versions or {}) if resolved else {}
+        versions = {version for values in observed.values() for version in values}
+        inspection = finding.get("dependencyResolution") or {}
+        passed = (
+            resolved is not None
+            and resolved.version == plan["target"]
+            and versions == {plan["target"]}
+            and required.issubset(observed)
+        )
+        row = {
+            "kind": _DEPENDENCY_RESOLUTION_CHECK,
+            "status": "PASSED" if passed else "FAILED",
+            "required": True,
+            "finding_id": finding["id"],
+            "package": plan["package"],
+            "expected_version": plan["target"],
+            "required_configurations": sorted(required),
+            "observed_configuration_versions": observed,
+            **{
+                key: inspection[key]
+                for key in (
+                    "command",
+                    "exit_code",
+                    "stdout_log_path",
+                    "stderr_log_path",
+                )
+                if key in inspection
+            },
+        }
+        if passed:
+            finding["packageQualification"]["resolved_dependency"] = {
+                "package": plan["package"],
+                "expected": plan["target"],
+                "configuration_versions": observed,
+                "verified": True,
+                "inspection": deepcopy(inspection),
+            }
+        else:
+            row["detail"] = (
+                f"{plan['package']}: expected {plan['target']} in "
+                f"{', '.join(sorted(required)) or 'all observed configurations'}; "
+                f"observed {json.dumps(observed, sort_keys=True)}. "
+                + _RAISE_GRADLE_DID_NOT_RESOLVE_THE_EXACT_FIXED_VERSION
+            )
+            logger.warning(_LOG_GRADLE_TARGET_REJECTED, row["detail"])
+        return row
 
     def _validate_current_batch(
         self,
@@ -2729,17 +2870,33 @@ class Engine:
         for change in package_changes:
             self._progress(
                 change["finding_id"],
-                "Running production builds and resolved-dependency checks; tests are disabled",
+                "Checking resolved dependencies before production builds; tests are disabled",
             )
         validation_runner = _ValidationRunner(self.runner, self.repo_root)
-        outcome = run_validation(
-            self.repo_root,
-            validation_runner,
-            self.which,
-            timeout=self.validation_timeout,
-            package_checks=bool(package_changes) or require_package_checks,
-            skip_lint=True,
-        )
+        resolution_checks = []
+        for change in package_changes:
+            finding = self._finding(change["finding_id"]) or {}
+            plan = (finding.get("packageQualification") or {}).get("plan") or {}
+            if plan.get("manager") == "gradle" and ":" in plan.get("package", ""):
+                resolution_checks.append(self._gradle_target_check(finding, plan))
+        resolution_failed = any(row["status"] != "PASSED" for row in resolution_checks)
+        if resolution_failed:
+            outcome = {
+                "status": "VALIDATION_FAILED",
+                "results": resolution_checks,
+                "build_skipped": _BUILD_SKIPPED_RESOLUTION,
+                "test_execution": _TESTS_DISABLED_REASON,
+            }
+        else:
+            outcome = run_validation(
+                self.repo_root,
+                validation_runner,
+                self.which,
+                timeout=self.validation_timeout,
+                package_checks=bool(package_changes) or require_package_checks,
+                skip_lint=True,
+            )
+            outcome["results"].extend(resolution_checks)
         allowed_files = [
             path for change in self.state.changes for path in change.get("files") or []
         ]
@@ -2761,7 +2918,7 @@ class Engine:
             .get("applied_dependency_hashes", {})
             .items()
         }
-        for receipt in baseline_policies or []:
+        for receipt in () if resolution_failed else baseline_policies or []:
             checks = run_checks(
                 self.repo_root,
                 receipt["checks"],
@@ -2776,6 +2933,8 @@ class Engine:
                 for row in checks
             ):
                 outcome["status"] = "VALIDATION_FAILED"
+        product_validation_status = outcome["status"]
+        product_validation_results = deepcopy(outcome["results"])
         for change in package_changes:
             finding = self._finding(change["finding_id"])
             receipt = (finding or {}).get("packageQualification") or {}
@@ -2789,7 +2948,7 @@ class Engine:
                     raise ValueError(
                         _RAISE_PACKAGE_QUALIFICATION_PREDATES_BUILD_ONLY_NO_CODE_CHECKS
                     )
-                receipt["post_results"] = deepcopy(outcome["results"])
+                receipt["post_results"] = deepcopy(product_validation_results)
                 policy = self._package_policy(receipt["plan"], receipt["review"])
                 if policy["policy_sha256"] != receipt["policy_sha256"]:
                     raise ValueError(
@@ -2802,49 +2961,19 @@ class Engine:
                     expected_dependencies=expected_dependencies,
                     version_updates=version_updates,
                 )
-                if outcome["status"] != "VALIDATION_COMPLETE":
+                if resolution_failed:
+                    continue
+                if product_validation_status != "VALIDATION_COMPLETE":
                     raise ValueError(
                         _RAISE_PRODUCTION_BUILD_VALIDATION_FAILED_OR_IS_INCOMPLETE_CANDIDATE
                     )
                 plan = receipt["plan"]
                 if plan.get("manager") == "gradle" and ":" in plan.get("package", ""):
-                    required_configurations = set(
-                        plan.get("gradle_configurations") or ()
-                    )
-                    resolved = self._resolve_gradle_package(
-                        finding,
-                        self._snapshot()[0],
-                        configurations=tuple(sorted(required_configurations)),
-                    )
-                    versions = (
-                        {
-                            version
-                            for values in (
-                                resolved.configuration_versions or {}
-                            ).values()
-                            for version in values
-                        }
-                        if resolved
-                        else set()
-                    )
-                    if (
-                        not resolved
-                        or resolved.version != plan["target"]
-                        or versions != {plan["target"]}
-                        or not required_configurations.issubset(
-                            resolved.configuration_versions or {}
-                        )
-                    ):
-                        raise ValueError(
-                            _RAISE_GRADLE_DID_NOT_RESOLVE_THE_EXACT_FIXED_VERSION
-                        )
-                    receipt["resolved_dependency"] = {
-                        "package": plan["package"],
-                        "expected": plan["target"],
-                        "configuration_versions": resolved.configuration_versions,
-                        "verified": True,
-                        "inspection": deepcopy(finding["dependencyResolution"]),
-                    }
+                    check = self._gradle_target_check(finding, plan)
+                    if check["status"] != "PASSED":
+                        outcome["results"].append(check)
+                        outcome["status"] = "VALIDATION_FAILED"
+                        continue
                 if (
                     plan.get("strategy") == "override"
                     and plan.get("manager") == "maven"
@@ -3036,11 +3165,18 @@ class Engine:
             elif assessment.get("decision") == "SOURCE_REVIEW_REQUIRED":
                 exclusion = "SOURCE_REVIEW_REQUIRED"
                 action = "The host AI must complete the local code review and submit source_review through verify_security_finding; reading an excerpt alone is not an assessment."
-            elif assessment.get("decision") != "FALSE_POSITIVE":
+            elif not assessment.get("decision"):
                 exclusion = "ASSESSMENT_REQUIRED"
                 action = (
                     "Call verify_security_finding for this finding in this process. "
                     "Only an evidenced FALSE_POSITIVE assessment is eligible."
+                )
+            elif assessment["decision"] != "FALSE_POSITIVE":
+                exclusion = NOT_FALSE_POSITIVE
+                action = (
+                    f"The recorded assessment is {assessment['decision']}, not FALSE_POSITIVE. "
+                    "Follow its remediation or manual-review blocker. Do not repeat verification "
+                    "solely to request dismissal; no false-positive approval is appropriate."
                 )
             elif (
                 not isinstance(reason, str) or not reason.strip() or len(reason) > 50000
@@ -3480,8 +3616,13 @@ class Engine:
                 _RAISE_PAID_OR_RESTRICTED_LICENSE_AUTOMATIC_UPGRADE_BLOCKED_FLAG
             )
         if self._package_policy_required or self.package_policy_path.exists():
-            return load_policy(self.repo_root, self.package_policy_path, plan)
-        return reviewed_license_policy(self.repo_root, plan, review)
+            policy = load_policy(self.repo_root, self.package_policy_path, plan)
+        else:
+            policy = reviewed_license_policy(self.repo_root, plan, review)
+        warning = (plan.get("release_selection") or {}).get("advisory_warning")
+        if warning:
+            policy.setdefault("warnings", []).append(warning)
+        return policy
 
     def _refresh_package_validation(self) -> None:
         """Invalidate green evidence when the checkout or approval policy moves."""
@@ -3704,6 +3845,7 @@ class Engine:
             )
             row.update(
                 command=result.display(),
+                exit_code=result.exit_code,
                 stdout_log_path=result.stdout_log_path,
                 stderr_log_path=result.stderr_log_path,
             )
@@ -3819,7 +3961,14 @@ class Engine:
                     _RAISE_GRADLE_WRAPPER_AND_GRADLE_ARE_UNAVAILABLE_DEPENDENCY_TREE
                 )
             scoped_inspection = None
-            for scope in (None,) if configurations else (configuration, None):
+            inspections = (configuration, None)
+            if configurations:
+                inspections = (
+                    (configurations[0], None)
+                    if len(configurations) == 1 and ":" not in configurations[0]
+                    else (None,)
+                )
+            for scope in inspections:
                 if scope is None and not configurations:
                     scoped_inspection = deepcopy(row)
                     self._progress(

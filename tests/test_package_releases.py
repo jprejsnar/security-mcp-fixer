@@ -327,8 +327,13 @@ def test_paid_releases_are_reported_without_selecting_them(release_engine):
     assert payload["package_version_selections"]["one"]["paid_releases"] == [paid]
 
 
-def test_unverified_or_affected_latest_target_blocks_automatic_fix(release_engine):
-    """Invalidate a prior selection when the latest target cannot be proven unaffected."""
+@pytest.mark.parametrize(
+    "affected,outcome", [(True, "resolved"), (None, "package_mismatch")]
+)
+def test_affected_or_mismatched_target_blocks_automatic_fix(
+    release_engine, affected, outcome
+):
+    """Known affected targets and evidence for another package cannot authorize edits."""
     # Arrange
     engine = release_engine
     assert (
@@ -336,7 +341,7 @@ def test_unverified_or_affected_latest_target_blocks_automatic_fix(release_engin
     )
     engine.advisory.lookup.side_effect = None
     engine.advisory.lookup.return_value = AdvisoryLookup(
-        outcome="lookup_failed", affected=None
+        outcome=outcome, affected=affected
     )
 
     # Act
@@ -344,9 +349,105 @@ def test_unverified_or_affected_latest_target_blocks_automatic_fix(release_engin
 
     # Assert
     assert blocked["status"] == "RELEASE_REVIEW_REQUIRED"
-    assert "could not be verified" in blocked["reason"]
     with pytest.raises(ValueError, match="select_package_version"):
         engine._require_package_version(engine.state.findings[0]["proposedFix"])
+
+
+@pytest.mark.parametrize("release_engine", ["npm", "NuGet", "Maven"], indirect=True)
+@pytest.mark.parametrize("target_outcome", ["lookup_failed", "no_fix_published"])
+def test_unknown_target_advisory_allows_reviewed_update_but_stays_unresolved(
+    release_engine, target_outcome
+):
+    """Advisory gaps do not block build validation or become a claim of remediation."""
+    # Arrange
+    engine = release_engine
+    original_lookup = engine.advisory.lookup.side_effect
+    engine.advisory.lookup.side_effect = lambda finding, ecosystem, package, version: (
+        AdvisoryLookup(outcome=target_outcome, affected=None)
+        if version == "3.0.0"
+        else original_lookup(finding, ecosystem, package, version)
+    )
+    finding = engine.state.findings[0]
+    original_bytes = (engine.repo_root / finding["location"]["file"]).read_bytes()
+
+    # Act
+    selected = engine.select_package_version("one", _support())
+
+    # Assert
+    assert selected["status"] == "VERSION_SELECTED", selected
+    plan = selected["proposed_fix"]
+    assert plan["release_selection"]["advisory_verified"] is False
+    assert "do not prove vulnerability resolution" in selected["warnings"][0]
+    engine._require_package_version(plan)
+    assert (
+        engine.repo_root / finding["location"]["file"]
+    ).read_bytes() == original_bytes
+    assert (
+        engine.run_approved_fix("apply_minimal_fix", "one")["status"]
+        == "FIX_APPROVAL_REQUIRED"
+    )
+    engine.state.changes = [
+        {
+            "finding_id": "one",
+            "status": "APPLIED",
+            "package_update": True,
+            "qualification_status": "VALIDATED",
+            "validation_pending": False,
+        }
+    ]
+    payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+    assert payload["unresolved_issues"][0]["id"] == "one"
+    assert (
+        "do not prove vulnerability resolution"
+        in payload["unresolved_issues"][0]["reason"]
+    )
+    assert selected["warnings"][0] in markdown
+
+
+@pytest.mark.parametrize("release_engine", ["Maven"], indirect=True)
+def test_mongodb_gitlab_fix_remains_selectable_without_public_bounds(
+    release_engine, monkeypatch
+):
+    """Reproduce the reported MongoDB 5.14.0 to 5.15.0 advisory-metadata gap."""
+    # Arrange
+    engine = release_engine
+    (engine.repo_root / "pom.xml").write_text(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>app</groupId>"
+        "<artifactId>app</artifactId><version>1.0.0</version><dependencies>"
+        "<dependency><groupId>org.mongodb</groupId><artifactId>mongodb-driver-sync</artifactId>"
+        "<version>5.14.0</version></dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+    finding = engine.state.findings[0]
+    finding.update(
+        component="org.mongodb:mongodb-driver-sync",
+        installedVersion="5.14.0",
+        fixedVersions=["5.15.0"],
+    )
+    engine.advisory.lookup.side_effect = None
+    engine.advisory.lookup.return_value = AdvisoryLookup(
+        outcome="no_fix_published",
+        affected=None,
+        summary="Public affected-version bounds are missing.",
+    )
+    monkeypatch.setattr(
+        "gitlab_security_mcp.engine.release_catalog",
+        lambda *args, **kwargs: {
+            "source": "https://repo.maven.apache.org/maven2/org/mongodb/mongodb-driver-sync/maven-metadata.xml",
+            "versions": ["5.15.0", "5.14.0"],
+        },
+    )
+
+    # Act
+    verified = engine.verify_security_finding("one")
+    selected = engine.select_package_version("one", _support(target="5.15.0"))
+
+    # Assert
+    assert verified["decision"] == "CHANGE_REQUIRED"
+    assert selected["status"] == "VERSION_SELECTED", selected
+    assert selected["proposed_fix"]["target"] == "5.15.0"
+    assert selected["proposed_fix"]["release_selection"]["advisory_verified"] is False
+    assert "5.15.0" in selected["warnings"][0]
 
 
 def test_no_free_supported_release_blocks_a_previously_selected_plan(release_engine):

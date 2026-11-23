@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.49** (progress extension 1.0.51). In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.50** (progress extension 1.0.51). In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -40,9 +40,9 @@ This is one chat request, not a terminal command. The workflow runs these
 7. **Final unresolved report:** write and display
    `.security-mcp/reports/unresolved-remediation.md`, with package current/target
    versions and blockers, plus unsuccessful code attempts and their reasons.
-   Checkout logs and the redacted server log are then zipped under
-   `~/softwareSecurityAuditReports/` and the checkout copies are removed.
-   Reports and run state stay. The server log is not a home log file.
+   All generated evidence and the redacted server log are then zipped under
+   `~/softwareSecurityAuditReports/`. Only checkout log copies are removed.
+   Reports and inspection state stay available and are also in the ZIP.
 
 Canceling a selection authorizes nothing and continues to the next job.
 Declining the audit still generates the final report. Jobs cannot be started
@@ -651,7 +651,7 @@ flowchart TD
   j6 -->|Yes| audit["Prompt, coverage, unchecked choices. Checked fixes need a reproduced root cause. A false positive is not patched."]
   j6 -->|No or cancel| j7["7 Display unresolved remediation report"]
   audit --> j7
-  j7 --> zip["Zip checkout logs and redacted server.log"]
+  j7 --> zip["Zip generated evidence and redacted server.log"]
   zip --> human["Human reviews reports and the diff, then commits and pushes manually"]
 ```
 
@@ -745,17 +745,45 @@ What each job still does:
   A Yes path finishes the job as `FINISHED` because the report path exists.
   See [Software audit states (job 6)](#software-audit-states-job-6).
 - **Job 7.** Writes and opens `.security-mcp/reports/unresolved-remediation.md`
-  plus the Markdown and JSON reports. It then zips this run's `audit.jsonl`,
-  `http-timings.jsonl`, and `command-logs`, plus the redacted server diagnostic
-  log as `server.log`, to
+  plus the Markdown and JSON reports. It then zips every `.log` and `.jsonl`
+  beneath `.security-mcp/`, including nested tool logs, along with generated
+  reports, run state, progress, lint evidence, the Gradle no-tests helper,
+  any optional software-audit report, and redacted server diagnostics as `server.log`, to
   `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip`
-  and deletes the checkout copies. Reports, run state, policies, and
-  lint files stay. The same server lines still go to stderr. A process temp
+  and deletes only the checkout log copies. Reports, run state, progress, helper, and
+  lint files stay available and are also archived. User policies and unknown
+  user files are not included. The same server lines still go to stderr. A process temp
   spool holds them until the process exits; it is not a home log file. The
-  zip is written when either the checkout logs or that spool has text. The
+  zip is written when there is generated evidence or spool text. The
   human reviews the reports and
   `git diff`, then commits and pushes manually. A repeated
-  `complete_security_run` returns the saved report.
+  `complete_security_run` returns the saved report. If archival failed, completion
+  retries the same archive name, retaining previously archived members rather than
+  creating another ZIP. Checkout logs are removed only after a stable snapshot is
+  archived; failed writes or changing artifacts preserve the checkout evidence.
+  The same ZIP is refreshed after saving its completion receipt, so archived
+  run state includes the final archive result.
+  Reverted package updates name the actual failed check, expected and resolved
+  dependency versions/configurations, production-build outcome and log paths.
+  They explicitly say unit/integration tests were not run. Successful checks
+  on the restored baseline do not replace failed-update trial evidence.
+  Gradle targets are checked before production builds: ineffective overrides
+  fail immediately without building each doomed trial. A restored baseline
+  still receives its required build, and passing candidates still require a
+  production build and current resolved-version evidence.
+  A single known root configuration uses `--configuration` instead of dumping
+  every configuration; missing, multiple, or subproject scopes retain the
+  all-configuration fallback. Scoped/forced Gradle overrides register an exact
+  coordinate `eachDependency` rule after existing rules, because Gradle applies
+  those rules after `force`. Shared family pins, sibling coordinates and the
+  enclosing framework BOM are not rewritten.
+  Ordered background package completion reports its actual execution outcome
+  and names `complete_security_run` as the next handoff, rather than a generic
+  instruction to inspect status. Human and host idle time is not command execution.
+  Findings already assessed as requiring changes or manual review are not
+  mislabeled as missing assessments during false-positive approval. With no
+  eligible dismissals, `NO_FALSE_POSITIVES` continues remediation rather than
+  asking the host to repeat verification; genuinely unassessed findings still block.
 
 A tool called out of order returns `JOB_ORDER_REQUIRED` with
 `next_tool=complete_security_run`. It does not create edit or dismissal
@@ -766,7 +794,8 @@ Running alongside every job:
 - **Progress:** each update is written to `.security-mcp/progress.json` and a
   per-user mirror. The editor extension shows a status-bar meter, notification,
   and a **GitLab Security Progress** tab. On Windows, a separate console window
-  shows text progress.
+  shows text progress. Atomic writes retry temporary Windows reader locks for a
+  bounded interval, log the retry, and surface persistent failures.
 - **Evidence logs:** command output goes to `.security-mcp/command-logs/`,
   hashes and exit codes to `audit.jsonl`, HTTP timings to `http-timings.jsonl`,
   and an inspection snapshot to `run-state.json`. Snapshots are never reloaded
@@ -944,7 +973,7 @@ flowchart TB
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
   server -->|"After approval outcome: final reports, snapshots and audit"| artifacts["Target checkout: .security-mcp"]
-  server -->|"Final report: zip checkout logs and redacted server.log"| logZip["~/softwareSecurityAuditReports"]
+  server -->|"Final report: zip generated evidence and redacted server.log"| logZip["~/softwareSecurityAuditReports"]
   artifacts --> reviewer
   logZip --> reviewer
   checkout -->|"Review diff and publish manually"| reviewer
@@ -1063,9 +1092,12 @@ The snapshot is not a resume database. A restarted process creates a new
 job scheduler, general-purpose rollback, or multi-file transaction. Failed fix
 candidates have guarded restoration of unchanged updater-owned files; later user
 edits are preserved rather than overwritten.
-Raw dependency rollback text stays in memory. Inspection snapshots instead expose
+Raw dependency rollback text and original AI version-alignment documents stay in
+memory. Inspection snapshots instead expose
 `dependency_backup_manifest` with UTF-8 byte counts and SHA-256 hashes, or `null`
-for a previously absent file. They cannot restore files after a restart.
+for a previously absent file, and `version_alignment_backup_manifest` for the
+original AI documents. They do not repeatedly serialize document contents and
+cannot restore files after a restart.
 
 ## Workflow
 
@@ -1104,7 +1136,7 @@ checkout is active.
 | `complete_security_run(repo_root=None, code_results=None, progress=None)` | Advance the seven sequential jobs. Report each selected host code outcome as `{id,status:"fixed" or "failed",reason,validation}`; a fixed outcome requires actual validation evidence. Send `{id,message}` in `progress` while fixing a selected item. Ask audit consent after source work; finish with displayed unresolved Markdown, including failed audit fixes. Host outcomes are attestations, not independent MCP validation. |
 | `generate_local_report(repo_root=None)` | Legacy alias for `complete_security_run`; follows the same ordered job gates. It is not a report-only or approval-order bypass. |
 | `choose_software_audit_action(repo_root=None, choice=None, selected_ids=None, report_ready=False, progress=None)` | Await owned work and collect the next sequential job handoff. In job 6 obtain Yes/No consent, then submit file/phase coverage and write the reserved audit report. `report_ready=True` checks coverage before opening unchecked findings. Cancel/empty selection proceeds to the final report. |
-| `get_run_status(repo_root=None, include_audit_details=False)` | Return phase, counts, package-validation status, and a compact software-audit summary. Pass `include_audit_details=True` only after context loss to recover the full audit prompt, inventory and receipts. During owned background work, return a nonblocking activity snapshot and finished execution steps instead of waiting behind a build's engine lock. Completed steps do not imply successful validation. |
+| `get_run_status(repo_root=None, include_audit_details=False)` | Return phase, counts, package-validation status, and compact audit/workflow summaries without resending saved package reviews or final-report Markdown. Pass `include_audit_details=True` only after context loss to recover the full audit prompt, inventory and receipts, including workflow evidence. During owned background work, return a nonblocking activity snapshot and finished execution steps instead of waiting behind a build's engine lock. Completed steps do not imply successful validation. |
 
 Software audit reports use clickable filename-and-line links (`#L12`) for VS Code
 and Cursor. The host resolves links from the saved report's home-directory
@@ -1335,7 +1367,7 @@ A finding is auto-fixed only when all of these are true:
 - Node.js, .NET 10/NuGet, and Java/Maven/Gradle fixes must select the latest supported stable release compatible with the project's existing runtime, including major upgrades. An advisory's first fixed version is only a minimum, not the final upgrade target. Known paid/restricted targets are blocked; unverified licensing is allowed with an explicit warning unless corporate policy is stricter.
 - Every package update requires no production/unit-test API adaptations and passing post-update production builds, dependency checks and applicable test-free corporate checks. Unit/integration tests are disabled and test compatibility is not verified. Same-major does not prove compatibility.
 
-An advisory that names the identifier but not the package found in the repo does not by itself block establishing a GitLab-recommended fix floor. The finding's package and installed version must match locally. Failed lookups can still establish that preliminary floor when GitLab provides a concrete newer fix; they do not prove the final latest target safe. Release selection requires public advisory evidence that its exact target is unaffected. Production builds, dependency checks and test-free policy checks determine acceptance; failures isolate offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
+An advisory that names the identifier but not the package found in the repo does not by itself block establishing a GitLab-recommended fix floor. The finding's package and installed version must match locally. Failed lookups can still establish that preliminary floor when GitLab provides a concrete newer fix; they do not prove the final latest target safe. Release selection blocks known-affected targets and package-mismatched evidence. Inconclusive public bounds permit a human-approved, compatibility-validated update with an explicit unresolved-advisory warning, not a claim that the vulnerability is fixed. Production builds, dependency checks and test-free policy checks determine acceptance; failures isolate offending updates. Without a concrete target, the server does not guess a version. Missing external data is not evidence of a false positive.
 
 Named CVE record pages and CWE definitions are read when GitLab names those
 identifiers. NSA catalog homes are not requested. A failed named record blocks
@@ -1406,6 +1438,16 @@ without waiting for a human response. There is **no selection deadline**. Report
 refresh asynchronously after submission or cancellation. Do not poll, restart the
 server, or repeatedly request completion while reviewing. A late response cannot
 authorize a new run or different finding snapshots.
+
+Native package and false-positive callbacks consume the next-job handoff immediately:
+job 5 opens its own fresh, unchecked source-fix window, or skips an empty source
+list and offers audit consent without waiting for another host request. Selected
+host-led source changes still wait for AI implementation and reported validation;
+earlier package consent never authorizes source edits or an audit.
+All Windows human-selection windows, including audit Yes/No buttons, use the
+editor's monitor, stay topmost, and request foreground activation before reporting
+ready. Windows can deny keyboard activation; this is logged explicitly while the
+window remains above non-topmost applications. No focus-lock bypass is used.
 
 The window has two columns: **Issue** (including its unchecked approval box) and
 **Why this is a false positive**. GitLab already names the file and line. The
@@ -1828,7 +1870,17 @@ call the same tool with this review:
 ```
 
 The server chooses the newest remaining stable release at or above the advisory
-floor, checks that public advisories mark it unaffected, and replans the edit.
+floor, checks public advisory evidence, and replans the edit. A known affected
+target or an advisory/package mismatch blocks selection. Missing public bounds
+do not block an otherwise evidenced update: the checkbox, qualification warnings,
+and reports disclose that the target is not verified unaffected. Human approval,
+framework/API and licensing review, production builds, and exact dependency
+resolution are still required. Passing builds do not prove vulnerability resolution;
+these findings remain in the unresolved report even when the update passes
+compatibility validation. Unit/integration tests remain disabled for package-only
+updates, so their compatibility is not claimed. Manager-documentation URLs are
+returned with release selection and review requests to avoid repeated missing-citation
+round trips; fetching a page alone is not a review.
 Newer releases may be excluded only for documented `unsupported`,
 `runtime_incompatible`, or `paid` reasons, never simply because they cross a major
 version. The review must identify the exact eligible `target` (or `null` when
@@ -2331,7 +2383,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 Live GitLab tests remain opt-in. The current version produces
-`dist/gitlab_security_mcp-1.0.49-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.50-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -2347,7 +2399,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.49-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.50-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -2407,7 +2459,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.49-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.50-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
@@ -2423,7 +2475,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.49-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.50-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -2444,7 +2496,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.49-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.50-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -2453,7 +2505,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.49-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.50-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -2766,7 +2818,7 @@ VS Code/Cursor windows, including Agents/background windows, and use
 **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.49-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.50-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -2840,7 +2892,7 @@ installation.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.49**
+3. Apply the deployment-specific update and verify installed version **1.0.50**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -2849,7 +2901,7 @@ installation.
    `review_false_positives` among the seventeen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.49`
+   edits before requesting a new run. Its `server_version` must be `1.0.50`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -3049,18 +3101,37 @@ name; commands that fail before producing a result log the tool, checkout, child
 process ID and traceback. Approval-window start, visibility, close and PowerShell
 diagnostics are logged with the dialog process ID. A logging failure does not
 fail the task. Child-process CPU is not included.
+CPU, memory, and GC samples describe the process over each task's interval;
+overlapping or nested task deltas must not be summed as independent resource usage.
 Stderr lines use `YYYY-MM-DDTHH:MM:SSZ LEVEL logger [thread]: message` in UTC.
 The same redacted lines are appended to a process spool under the system temp
 directory, `gitlab-security-mcp/<pid>.log`. That spool is not a home log file
 and is removed when the process exits.
-When the final report is written, checkout logs (`audit.jsonl`,
-`http-timings.jsonl`, and `command-logs`) and the spool text (`server.log`)
+When the final report is written, all checkout `.log` and `.jsonl` files beneath
+`.security-mcp/`, generated reports/state/progress/lint/helper files, the optional
+software-audit report, and spool text (`server.log`)
 are zipped to
 `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip`.
-The checkout copies are then deleted. The spool stays until process exit so a
+Only checkout log copies are then deleted. The spool stays until process exit so a
 later checkout archived by the same process still receives the process log.
-Reports and run state stay in the repo. No zip is written when both the
-checkout logs and the spool are empty.
+The spool is copied in at most 64 KiB chunks up to a flushed byte boundary,
+without loading the complete process history into memory or chasing concurrent
+appends. An unreadable or truncated spool fails archival and preserves checkout
+logs instead of silently publishing an incomplete archive.
+Fresh reused-branch cleanup retains logs until this final archive, including
+commands already run during prechecks, pulls, and branch preparation.
+Reports, run state, progress, the no-tests helper, and lint evidence stay in the repo
+and are included in the ZIP. The optional report is included under `software-audit/`
+and its original is retained. User policies and unknown files are excluded.
+Archive retries reuse the same name and preserve earlier
+members. Automated tests write archives only into disposable test directories,
+never the developer's real reports folder. Existing archives are not deleted or
+combined. No zip is written when there is no generated evidence or spool text.
+MCP JSON text compaction remains always enabled; default status calls also omit
+repeated package-review evidence and final-report Markdown in both idle and
+background-worker paths. Full evidence remains on disk and is available through
+explicit context-loss recovery. These settings do not control the editor's own
+conversation-compaction feature.
 Values of `GITLAB_TOKEN`, `GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`,
 `GH_TOKEN` and `NVD_API_KEY`, including URL-encoded forms and tracebacks, are
 replaced with `[REDACTED]`; other secrets in application output are not scrubbed.
@@ -3302,9 +3373,9 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
-| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output while the run is open. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files with the two JSONL logs and `server.log`, then deletes the checkout copies. |
-| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table. Stays in the checkout after the log zip. |
-| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | Checkout logs from the finished run, plus `server.log` (the redacted stderr text for this process). Created when either those checkout files or the server spool has text. Checkout copies are deleted; the temp spool stays until the process exits. The checkout token keeps another repository with the same project name from replacing the archive. |
+| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full output for every allowed non-Git command, including Gradle `assemble` and runtime-version checks. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files and deletes checkout log copies. |
+| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status. Archived and retained in the checkout. |
+| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | One ZIP per finished run containing every checkout `.log`/`.jsonl`, generated reports/state/progress/lint/helper files, any optional software-audit report, and redacted `server.log`. User policies and unknown files are excluded. Retries merge into the same ZIP, preserving earlier members. Stable checkout log copies are deleted only after archival succeeds; non-log copies remain. The temp spool stays until process exit. Tests use disposable destinations. The checkout token separates repositories with the same project name. |
 | Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr, and the same redacted text in a process temp spool. Job 7 copies the spool into the run zip as `server.log`. The spool is not a home file and is removed when the process exits. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
 | `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |

@@ -82,6 +82,40 @@ def test_package_job_cannot_finish_before_selected_update_attempt(
     assert engine.state.workflow["current"] == 3
 
 
+def test_ordered_background_completion_names_failure_and_next_tool(
+    tmp_path, monkeypatch, caplog
+):
+    """Use the ordered package receipt instead of an unrelated legacy selection."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    engine.state.workflow["package_selection"] = {
+        "request_id": "ordered",
+        "status": "APPROVED",
+        "package_execution": {"status": "PARTIAL_FAILURE"},
+    }
+    engine.state.fix_selection = {"request_id": "legacy", "status": "APPROVED"}
+    monkeypatch.setattr(server, "_background_status", {})
+    monkeypatch.setattr(server, "_progress_calls", 0)
+    monkeypatch.setattr(server, "_progress_console_enabled", False)
+    monkeypatch.setattr(server, "_console_for_progress", lambda: None)
+    monkeypatch.setattr(server, "_finish_progress_call", Mock(return_value=None))
+
+    @server._with_background_progress("Security fix selection and execution")
+    async def worker(ctx, selected, request_id):
+        """Complete a fixture batch whose unresolved updates are already recorded."""
+        return {"status": "PARTIAL_FAILURE"}
+
+    # Act
+    asyncio.run(worker(_context(), engine, "ordered"))
+
+    # Assert
+    receipt = server._background_for(engine)[0]
+    assert receipt["status"] == receipt["outcome"] == "PARTIAL_FAILURE"
+    assert receipt["next_tool"] == "complete_security_run"
+    assert "Next: complete_security_run" in caplog.text
+    assert "see run status" not in receipt["current_step"]
+
+
 def test_precheck_branch_and_download_tools_start_jobs_in_order(tmp_path, monkeypatch):
     """Verify real MCP entry points initialize and advance the sequential run."""
     # Arrange
@@ -216,6 +250,110 @@ def test_package_completion_then_false_positives_then_new_source_form(
     assert calls == ["false positives", "source checkboxes"]
 
 
+@pytest.mark.parametrize("source_selected", [None, False, True])
+@pytest.mark.parametrize(
+    "protocol,request_state",
+    [("2025-11-25", None), ("2026-07-28", "ended-package-request")],
+)
+def test_native_completion_consumes_next_selection_without_another_host_call(
+    tmp_path,
+    monkeypatch,
+    isolate_closing_audit,
+    source_selected,
+    protocol,
+    request_state,
+):
+    """Continue package consent through fresh source consent or directly to audit."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    engine.state.findings = [
+        item
+        for item in engine.state.findings
+        if item["id"] != "fp"
+        and (source_selected is not None or item["id"] != "source")
+    ]
+    _native_lifecycle(monkeypatch, engine)
+    ctx = _context(supported=False)
+    ctx.protocol_version = protocol
+    ctx.request_state = request_state
+    package_dialog = Mock(close=AsyncMock())
+    source_dialog = Mock(
+        close=AsyncMock(),
+        wait=AsyncMock(
+            return_value={
+                "action": "accept",
+                "content": {"finding_0": bool(source_selected)},
+            }
+        ),
+    )
+    opened = AsyncMock(side_effect=[package_dialog, source_dialog])
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+    progress = Mock()
+    monkeypatch.setattr(server, "_editor_progress", progress)
+    workflow_progress = Mock()
+    monkeypatch.setattr(workflow, "publish", workflow_progress)
+
+    async def exercise():
+        """Release package consent and await the automatically opened next window."""
+        ready = asyncio.Event()
+
+        async def answer():
+            """Submit an empty package selection only after the tool returns."""
+            await ready.wait()
+            return {"action": "accept", "content": {}}
+
+        package_dialog.wait = answer
+        pending = await server.select_security_fixes(ctx, str(tmp_path))
+        task = server._desktop_fix_selection_tasks[pending["request_id"]]
+        ready.set()
+        await task
+        await asyncio.gather(*tuple(server._desktop_fix_selection_tasks.values()))
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    assert engine.state.workflow["package_selection"]["selected_ids"] == []
+    assert opened.await_count == (1 if source_selected is None else 2)
+    if source_selected is not None:
+        properties = opened.call_args_list[1].args[1]
+        assert len(properties) == 1
+        assert "Reachable source issue" in properties["finding_0"]["title"]
+        assert properties["finding_0"]["default"] is False
+        source_dialog.close.assert_awaited_once()
+    if source_selected:
+        assert engine.state.workflow["current"] == server.JOB_SOURCE
+        assert engine.state.fix_selection["selected_ids"] == ["source"]
+        assert any(
+            call.kwargs.get("status") == "WAITING_FOR_AI"
+            for call in progress.call_args_list
+        )
+        assert workflow_progress.call_args.kwargs["status"] == "WAITING_FOR_AI"
+        isolate_closing_audit.assert_not_awaited()
+    else:
+        assert engine.state.workflow["current"] == server.JOB_AUDIT
+        isolate_closing_audit.assert_awaited_once()
+    ctx.elicit.assert_not_called()
+    engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
+def test_native_continuation_rejects_a_replaced_run(tmp_path, monkeypatch):
+    """A late window must not open another dialog in a replacement run."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch)
+    owner_state = engine.state
+    engine.state = deepcopy(owner_state)
+    complete = AsyncMock()
+    monkeypatch.setattr(server, "complete_security_run", complete)
+
+    # Act
+    with pytest.raises(RuntimeError, match="replaced run"):
+        asyncio.run(server._resume_desktop_workflow(_context(), engine, owner_state))
+
+    # Assert
+    complete.assert_not_awaited()
+
+
 def test_failed_source_outcome_and_declined_audit_still_display_final_report(
     tmp_path, monkeypatch
 ):
@@ -300,6 +438,68 @@ def test_source_fixed_outcome_requires_actual_validation(tmp_path, monkeypatch):
     assert result.is_error
     assert "validation" in result.structured_content["reason"]
     assert engine.state.workflow["current"] == 5
+
+
+@pytest.mark.parametrize("interruption", [1, 2])
+def test_final_archive_retry_and_late_logs_reuse_one_zip(
+    tmp_path, monkeypatch, isolated_log_archives, interruption
+):
+    """Retry a partial finalization without losing archived logs or leaking late logs."""
+    # Arrange
+    import zipfile
+
+    engine = _ordered_engine(tmp_path, monkeypatch, job=7)
+    monkeypatch.setattr(engine, "generate_local_report", Mock(return_value={}))
+    first_log = tmp_path / ".security-mcp" / "first.log"
+    first_log.write_bytes(b"first")
+    archive = server.archive_run_logs
+    timestamps = []
+
+    def interrupted_cleanup(root, project, when):
+        """Simulate a cleanup failure after the first ZIP was safely published."""
+        timestamps.append(when)
+        result = archive(root, project, when)
+        if len(timestamps) == interruption:
+            raise OSError("cleanup interrupted")
+        return result
+
+    monkeypatch.setattr(server, "archive_run_logs", interrupted_cleanup)
+    ctx = _context()
+
+    # Act
+    first = asyncio.run(
+        server.complete_security_run(ctx, str(tmp_path))
+    ).structured_content
+    late_log = tmp_path / ".security-mcp" / "late.log"
+    late_log.write_bytes(b"late")
+    second = asyncio.run(
+        server.complete_security_run(ctx, str(tmp_path))
+    ).structured_content
+    late_log.write_bytes(b"later")
+    third = asyncio.run(
+        server.complete_security_run(ctx, str(tmp_path))
+    ).structured_content
+
+    # Assert
+    assert first["log_archive"]["status"] == "ERROR"
+    assert (
+        second["log_archive"]["status"] == third["log_archive"]["status"] == "ARCHIVED"
+    )
+    assert len(set(timestamps)) == 1
+    assert len(list(isolated_log_archives.glob("*.zip"))) == 1
+    with zipfile.ZipFile(third["log_archive"]["path"]) as zipped:
+        assert zipped.read("first.log") == b"first"
+        assert zipped.read("late.log") == b"later"
+        assert zipped.testzip() is None
+        archived_state = json.loads(zipped.read("run-state.json"))
+        assert (
+            archived_state["workflow"]["final_result"]
+            == engine.state.workflow["final_result"]
+        )
+        assert "reports/unresolved-remediation.md" in zipped.namelist()
+    assert not first_log.exists()
+    assert not late_log.exists()
+    assert engine.state.workflow["final_result"]["log_archive"] == third["log_archive"]
 
 
 _REAL_AUDIT_OFFER = server._offer_software_audit

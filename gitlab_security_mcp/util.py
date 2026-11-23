@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from subprocess import SubprocessError
-from time import perf_counter, process_time
+from time import perf_counter, process_time, sleep
 from urllib.parse import quote
 
 import httpx
@@ -41,6 +41,12 @@ _LOG_CONVERTED_FAILURE = (
 )
 _LOG_RESOLVE_INSIDE = "Could not resolve %s inside %s: %s"
 _SERVER_LOG_DIRECTORY = "gitlab-security-mcp"
+_ATOMIC_REPLACE_ATTEMPTS = 6
+_ATOMIC_REPLACE_RETRY_SECONDS = 0.02
+_WINDOWS_TRANSIENT_FILE_ERRORS = {5, 32, 33}
+_LOG_ATOMIC_REPLACE_RETRY = (
+    "Retrying atomic replacement of %s after a Windows file lock: %s"
+)
 _server_log_handler: logging.Handler | None = None
 _WINDOWS_MEMORY_QUERY_FAILED = "Windows process memory query failed"
 _memory_log_lock = threading.Lock()
@@ -121,6 +127,19 @@ def attach_server_log(formatter: logging.Formatter) -> None:
             target.addHandler(handler)
 
 
+def server_log_snapshot() -> tuple[Path, int] | None:
+    """Capture a flushed byte boundary without loading the process spool into memory."""
+    handler = _server_log_handler
+    if not isinstance(handler, _ServerLogHandler):
+        return None
+    handler.acquire()
+    try:
+        handler._stream.flush()
+        return handler.path, handler.path.stat().st_size
+    finally:
+        handler.release()
+
+
 def read_server_log() -> str:
     """Return the redacted server log captured so far, or an empty string."""
     handler = _server_log_handler
@@ -129,8 +148,9 @@ def read_server_log() -> str:
     handler.flush()
     try:
         return handler.path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+    except OSError as exc:
+        log_unexpected(exc, "reading server diagnostic spool")
+        raise
 
 
 def _close_server_log() -> None:
@@ -448,7 +468,20 @@ def atomic_write_text(path: Path, text: str, *, exclusive: bool = False) -> None
         if exclusive:
             os.link(temporary, path)
         else:
-            os.replace(temporary, path)
+            for attempt in range(_ATOMIC_REPLACE_ATTEMPTS):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError as exc:
+                    if (
+                        getattr(exc, "winerror", None)
+                        not in _WINDOWS_TRANSIENT_FILE_ERRORS
+                        or attempt == _ATOMIC_REPLACE_ATTEMPTS - 1
+                    ):
+                        raise
+                    if attempt == 0:
+                        logger.warning(_LOG_ATOMIC_REPLACE_RETRY, path, exc)
+                    sleep(_ATOMIC_REPLACE_RETRY_SECONDS * 2**attempt)
     finally:
         Path(temporary).unlink(missing_ok=True)
 

@@ -10,6 +10,11 @@ from pathlib import Path
 from gitlab_security_mcp import __version__
 from gitlab_security_mcp.util import atomic_write_text
 
+_BACKUP_MANIFESTS = {
+    "dependency_before": "dependency_backup_manifest",
+    "version_alignment_before": "version_alignment_backup_manifest",
+}
+
 
 @dataclass
 class RunState:
@@ -57,21 +62,26 @@ class RunState:
             inspection = dict(finding)
             for key in ("packageQualification", "localFixAttempt"):
                 receipt = finding.get(key)
-                if receipt and "dependency_before" in receipt:
+                if receipt:
                     inspection[key] = {
                         name: value
                         for name, value in receipt.items()
-                        if name != "dependency_before"
+                        if name not in _BACKUP_MANIFESTS
                     }
-                    inspection[key]["dependency_backup_manifest"] = {
-                        name: {
-                            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                            "bytes": len(text.encode("utf-8")),
-                        }
-                        if text is not None
-                        else None
-                        for name, text in receipt["dependency_before"].items()
-                    }
+                    for backup, manifest_key in _BACKUP_MANIFESTS.items():
+                        if backup not in receipt:
+                            continue
+                        manifest = {}
+                        for name, original in receipt[backup].items():
+                            if original is None:
+                                manifest[name] = None
+                            else:
+                                raw = original.encode("utf-8")
+                                manifest[name] = {
+                                    "sha256": hashlib.sha256(raw).hexdigest(),
+                                    "bytes": len(raw),
+                                }
+                        inspection[key][manifest_key] = manifest
             snapshot["findings"].append(inspection)
         text = json.dumps(snapshot, indent=2, ensure_ascii=False)
         atomic_write_text(path, text)

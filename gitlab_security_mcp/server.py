@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+import zipfile
 from collections import deque
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -46,11 +47,11 @@ from pydantic import BaseModel, Field, create_model
 from gitlab_security_mcp import __version__, desktop_approval, workflow
 from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
-from gitlab_security_mcp.engine import Engine
+from gitlab_security_mcp.engine import NOT_FALSE_POSITIVE, Engine
 from gitlab_security_mcp.progress import publish as publish_editor_progress
 from gitlab_security_mcp.progress_extension import install_progress_extension
 from gitlab_security_mcp.report import write_unresolved_report
-from gitlab_security_mcp.security_artifacts import archive_run_logs
+from gitlab_security_mcp.security_artifacts import archive_run_logs, run_log_files
 from gitlab_security_mcp.software_audit import (
     REVIEW_PHASES,
     audit_coverage_gaps,
@@ -66,6 +67,7 @@ from gitlab_security_mcp.software_audit import (
     record_audit_coverage,
     render_audit_prompt,
 )
+from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import (
     PROGRESS_PUBLISH_FAILURES,
     attach_server_log,
@@ -697,7 +699,7 @@ def _with_background_progress(label: str):
                     _progress_console_enabled = True
             ended = threading.Event()
 
-            def publish(text: str) -> None:
+            def publish(text: str, *, update_workflow: bool = True) -> None:
                 """Never reuse the original request's progress token from a worker."""
                 if ended.is_set():
                     return
@@ -723,7 +725,8 @@ def _with_background_progress(label: str):
                     selected.repo_root, request_id, label, text, status=status
                 )
                 if (
-                    selected.state is owner_state
+                    update_workflow
+                    and selected.state is owner_state
                     and owner_state.workflow.get("current") == owner_job
                 ):
                     if not _publish_audit_activity(selected):
@@ -786,8 +789,13 @@ def _with_background_progress(label: str):
                 ticker.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await ticker
-                execution = selected.state.fix_selection.get("package_execution") or {}
                 selection = selected.state.fix_selection
+                ordered_selection = (
+                    selected.state.workflow.get("package_selection") or {}
+                )
+                if ordered_selection.get("request_id") == request_id:
+                    selection = ordered_selection
+                execution = selection.get("package_execution") or {}
                 approval = selected.state.false_positive_approval_form
                 detail = (
                     selected.state.software_audit.get("status")
@@ -808,14 +816,23 @@ def _with_background_progress(label: str):
                     "INTERRUPTED",
                 }:
                     outcome = detail
-                publish(
-                    f"{outcome} | callback outcome: {detail or 'see run status'}; this is not an overall run-success claim."
+                next_tool = (
+                    "complete_security_run"
+                    if selection is ordered_selection
+                    and selected.state is owner_state
+                    and outcome not in {"FAILED", "CANCELLED"}
+                    else None
                 )
+                completion = f"{outcome} | callback outcome: {detail or 'see run status'}; this is not an overall run-success claim."
+                if next_tool:
+                    completion += f" Next: {next_tool} for this checkout; do not reopen selection or poll."
+                publish(completion, update_workflow=False)
                 ended.set()
                 with _background_status_lock:
                     _background_status[key].update(
                         status=outcome,
                         outcome=detail,
+                        next_tool=next_tool,
                         elapsed_seconds=round(monotonic() - started, 1),
                     )
                 progress_sink.reset(token)
@@ -1487,6 +1504,9 @@ def _fix_choice_text(item: dict) -> tuple[str, str]:
                 "Isolate and revert offending updates; retain passing updates. Do not adapt source or tests to force acceptance.",
             ]
         )
+        warning = (plan.get("release_selection") or {}).get("advisory_warning")
+        if warning:
+            facts.append(warning)
     else:
         facts.extend(
             [
@@ -1527,6 +1547,30 @@ def _desktop_task_done(
         )
 
 
+async def _resume_desktop_workflow(
+    ctx: Context, selected: Engine, owner_state: RunState
+) -> None:
+    """Consume native completion handoffs without waiting for another host request."""
+    if selected.state is not owner_state:
+        raise RuntimeError(_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN)
+    completion = await complete_security_run(ctx, str(selected.repo_root))
+    if selected.state is not owner_state:
+        raise RuntimeError(_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN)
+    if (
+        completion.structured_content
+        and completion.structured_content.get("status") == "SOURCE_SELECTION_REQUIRED"
+    ):
+        selection = await select_security_fixes(ctx, str(selected.repo_root))
+        if selected.state is not owner_state:
+            raise RuntimeError(_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN)
+        if (
+            isinstance(selection, dict)
+            and selection.get("status") == "SKIPPED"
+            and owner_state.workflow.get("current") == JOB_SOURCE
+        ):
+            await complete_security_run(ctx, str(selected.repo_root))
+
+
 @_with_background_progress("Security fix selection and execution")
 async def _finish_desktop_fix_selection(
     ctx: Context,
@@ -1541,6 +1585,7 @@ async def _finish_desktop_fix_selection(
     """Execute reviewed package and configuration choices after physical approval."""
     closed = False
     work = None
+    owner_state = selected.state
     cancelled = threading.Event()
     try:
         started.set()
@@ -1574,7 +1619,7 @@ async def _finish_desktop_fix_selection(
             len(result.get("selected_ids", [])),
         )
         if result["status"] == "SKIPPED":
-            await complete_security_run(ctx, str(selected.repo_root))
+            await _resume_desktop_workflow(ctx, selected, owner_state)
         if result["status"] == "APPROVED" and result.get("server_execution_queued"):
             work = asyncio.create_task(
                 asyncio.to_thread(
@@ -1587,8 +1632,14 @@ async def _finish_desktop_fix_selection(
             )
             execution = await asyncio.shield(work)
             logger.info("Approved package execution finished: %s", execution["status"])
-            if execution.get("finish_run") is True:
-                await complete_security_run(ctx, str(selected.repo_root))
+            if (
+                selected.state is owner_state
+                and selected.state.fix_selection.get("request_id") == request_id
+                and (execution.get("finish_run") is True or owner_state.workflow)
+            ):
+                await _resume_desktop_workflow(ctx, selected, owner_state)
+        elif result["status"] == "APPROVED" and owner_state.workflow:
+            await _resume_desktop_workflow(ctx, selected, owner_state)
     except asyncio.CancelledError:
         if work is not None:
             cancelled.set()
@@ -1816,9 +1867,11 @@ async def select_security_fixes(
                 "finding_ids": missing,
                 "next_tool": "verify_security_finding",
             }
+    native = desktop_approval.available()
     protocol = ctx.protocol_version
     if (
-        isinstance(protocol, str)
+        not native
+        and isinstance(protocol, str)
         and protocol >= "2026-07-28"
         and ctx.request_state is not None
     ):
@@ -1830,7 +1883,6 @@ async def select_security_fixes(
     if snapshot["status"] not in {"OK", "REQUESTED"}:
         return snapshot
     candidates = snapshot["candidates"]
-    native = desktop_approval.available()
     if not candidates or (not native and not _form_supported(ctx)):
         return await asyncio.to_thread(
             selected.record_fix_selection,
@@ -1967,6 +2019,7 @@ async def _finish_desktop_approval(
     dialog: desktop_approval.DesktopApproval,
 ) -> None:
     """Wait outside the tool request; only physical checkbox selections authorize writes."""
+    owner_state = selected.state
     try:
         response = await dialog.wait()
         approved = None
@@ -2008,9 +2061,11 @@ async def _finish_desktop_approval(
         )
     finally:
         await dialog.close()
+    if selected.state is not owner_state:
+        return
     if selected.state.workflow:
         if selected.state.false_positive_approval_form.get("request_id") == request_id:
-            await complete_security_run(ctx, str(selected.repo_root))
+            await _resume_desktop_workflow(ctx, selected, owner_state)
     elif (
         selected.state.false_positive_approval_form.get("request_id") == request_id
         and _software_audit_blocked(selected) is None
@@ -2057,6 +2112,16 @@ async def review_false_positives(
                 "Some findings are unverified or still need a completed source review. "
                 "No false-positive conclusion can be inferred. Follow source_review_queue, record evidence, "
                 "then request approval again. No GitLab changes were made by this call."
+            )
+        elif excluded and all(
+            item["reason"] in {"ALREADY_DISMISSED", NOT_FALSE_POSITIVE}
+            for item in excluded
+        ):
+            status = "NO_FALSE_POSITIVES"
+            message = (
+                "The remaining findings already have non-false-positive assessments. "
+                "Continue their remediation or manual review; do not repeat verification "
+                "solely to request dismissal. No GitLab changes were made by this call."
             )
         else:
             status = "ASSESSMENT_REQUIRED"
@@ -2652,28 +2717,52 @@ async def _continue_workflow(
         )
     if state.workflow["current"] == JOB_REPORT:
         if state.workflow.get("final_report"):
-            return deepcopy(state.workflow["final_result"])
-        await asyncio.to_thread(selected.generate_local_report)
-        result = await asyncio.to_thread(
-            write_unresolved_report, selected.repo_root, state
+            result = deepcopy(state.workflow["final_result"])
+            if (result.get("log_archive") or {}).get("status") in {
+                "ARCHIVED",
+                "NO_LOGS",
+            } and not await asyncio.to_thread(run_log_files, selected.repo_root):
+                return result
+        else:
+            await asyncio.to_thread(selected.generate_local_report)
+            result = await asyncio.to_thread(
+                write_unresolved_report, selected.repo_root, state
+            )
+            state.workflow["final_report"] = True
+            state.workflow["final_result"] = result
+            workflow.advance(
+                selected,
+                message="Final unresolved report is ready; opening Markdown preview.",
+            )
+            workflow.activity(selected, result["message"], status="FINISHED")
+        archive_at = state.workflow.setdefault(
+            "log_archive_at", datetime.now(UTC).isoformat()
         )
+        selected._remember()
+        archive_args = (
+            selected.repo_root,
+            project_file_name(state.gitlab_project_path, selected.repo_root.name),
+            datetime.fromisoformat(archive_at),
+        )
+        audit_report = state.software_audit.get("output_path")
+        archive_kwargs = {"audit_report": Path(audit_report)} if audit_report else {}
         try:
             result["log_archive"] = await asyncio.to_thread(
-                archive_run_logs,
-                selected.repo_root,
-                project_file_name(state.gitlab_project_path, selected.repo_root.name),
-                datetime.now(UTC),
+                archive_run_logs, *archive_args, **archive_kwargs
             )
-        except (OSError, ValueError) as exc:
+            state.workflow["final_result"] = result
+            selected._remember()
+            if result["log_archive"]["status"] == "ARCHIVED":
+                # Include the persisted completion receipt without losing earlier logs.
+                await asyncio.to_thread(
+                    archive_run_logs, *archive_args, **archive_kwargs
+                )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
             logger.exception("Could not archive run logs")
             result["log_archive"] = {"status": "ERROR", "path": None, "error": str(exc)}
-        state.workflow["final_report"] = True
+            state.workflow["final_result"] = result
+            selected._remember()
         state.workflow["final_result"] = result
-        workflow.advance(
-            selected,
-            message="Final unresolved report is ready; opening Markdown preview.",
-        )
-        workflow.activity(selected, result["message"], status="FINISHED")
         return result
     raise RuntimeError(_RAISE_UNEXPECTED_WORKFLOW_JOB)
 
@@ -4017,6 +4106,24 @@ def _publish_audit_progress(result: dict[str, Any]) -> None:
         sink(text)
 
 
+def _compact_workflow(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Keep live jobs and outcomes without resending saved package-review evidence."""
+    compact = {
+        key: deepcopy(value)
+        for key, value in receipt.items()
+        if key not in {"package_reviews", "final_result"}
+    }
+    if "package_reviews" in receipt:
+        compact["package_review_count"] = len(receipt["package_reviews"])
+    if "final_result" in receipt:
+        compact["final_result"] = {
+            key: deepcopy(value)
+            for key, value in receipt["final_result"].items()
+            if key != "final_summary_markdown"
+        }
+    return compact
+
+
 def _live_run_status(
     selected: Engine, *, include_audit_details: bool = False
 ) -> dict[str, Any]:
@@ -4039,15 +4146,20 @@ def _live_run_status(
             "repo_root": str(selected.repo_root),
             "background_tasks": background,
             "software_audit": audit,
-            "workflow": deepcopy(state.workflow),
+            "workflow": deepcopy(state.workflow)
+            if include_audit_details
+            else _compact_workflow(state.workflow),
             "package_execution": {
                 "status": execution.get("status"),
                 "results": list(execution.get("results") or []),
             },
             "message": "Live activity snapshot; the engine is still working or waiting. Completed steps are not a successful-validation claim.",
         }
+    result = selected.get_run_status()
+    if not include_audit_details:
+        result["workflow"] = _compact_workflow(selected.state.workflow)
     return {
-        **selected.get_run_status(),
+        **result,
         "software_audit": audit,
         "background_tasks": background,
     }

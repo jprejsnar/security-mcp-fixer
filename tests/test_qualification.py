@@ -2276,13 +2276,40 @@ def test_engine_applies_only_fresh_qualified_plan(
 
 
 @pytest.mark.parametrize("failed_kind", [None, "build", "runtime", "license_audit"])
+@pytest.mark.parametrize("advisory_verified", [True, False])
 def test_post_update_checks_control_resolution(
-    package_engine, package_review, failed_kind
+    package_engine, package_review, failed_kind, advisory_verified, monkeypatch
 ):
     """Require product behavior and graph licensing, not just a package edit."""
     # Arrange
     from gitlab_security_mcp.report import render
 
+    if not advisory_verified:
+        monkeypatch.setattr(
+            "gitlab_security_mcp.engine.release_catalog",
+            lambda *args, **kwargs: {
+                "source": "https://registry.npmjs.org/example",
+                "versions": ["1.0.1"],
+            },
+        )
+        package_engine.advisory.lookup.side_effect = (
+            lambda finding, ecosystem, package, version: AdvisoryLookup(
+                outcome="lookup_failed" if version == "1.0.1" else "resolved",
+                affected=None if version == "1.0.1" else True,
+                lowest_fixed_version="1.0.1" if version != "1.0.1" else None,
+            )
+        )
+        selected = package_engine.select_package_version(
+            "package",
+            {
+                "target": "1.0.1",
+                "supported": True,
+                "runtime_compatible": True,
+                "sources": ["https://example.test/support"],
+                "assessment": "Supported by the project's current framework.",
+            },
+        )
+        assert selected["status"] == "VERSION_SELECTED"
     assert (
         package_engine.qualify_package_update("package", package_review)["status"]
         == "QUALIFIED"
@@ -2321,6 +2348,11 @@ def test_post_update_checks_control_resolution(
     )
     if failed_kind is not None:
         assert payload["unresolved_issues"][0]["id"] == "package"
+    elif not advisory_verified:
+        assert (
+            "do not prove vulnerability resolution"
+            in payload["unresolved_issues"][0]["reason"]
+        )
 
 
 @pytest.mark.parametrize(

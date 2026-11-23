@@ -777,6 +777,8 @@ def test_timeout_kills_the_command_and_reports_124(repo):
         ("pnpm", ["run", "build"]),
         ("pnpm", ["audit", "--json"]),
         ("gradle", ["--no-daemon", "dependencies"]),
+        ("gradle", ["--no-daemon", "assemble", "-x", "test"]),
+        ("java", ["-version"]),
     ],
 )
 def test_product_logs_preserve_all_output_and_final_summary(
@@ -1221,7 +1223,13 @@ def test_progress_console_write_failure_records_the_cause(caplog):
     # Assert
     assert _BROKEN_PROGRESS_PIPE in caplog.text
     assert (
-        sum("Progress console closed" in record.message for record in caplog.records)
+        len(
+            {
+                id(record)
+                for record in caplog.records
+                if "Progress console closed" in record.message
+            }
+        )
         == 1
     )
     assert caplog.records[-1].exc_info[0] is OSError

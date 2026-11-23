@@ -52,7 +52,7 @@ _RAISE_APPROVAL_WINDOW_PID_RETURNED_AN_INVALID_CHOICE = (
 logger = logging.getLogger("gitlab_security_mcp")
 _MAX_DIAGNOSTIC_CHARS = 2000
 
-SCRIPT = r"""
+_WINDOW_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
@@ -65,6 +65,9 @@ public static class ApprovalWindowHost {
     public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetForegroundWindow(IntPtr window);
 }
 '@
 function Get-ApprovalHostWindow {
@@ -112,27 +115,46 @@ function Get-ApprovalBounds {
     $top = $WorkingArea.Top + [int][Math]::Floor(($WorkingArea.Height - $height) / 2)
     return New-Object System.Drawing.Rectangle($left, $top, $width, $height)
 }
+function Set-ApprovalPlacement {
+    param([object]$Window, [int]$HostProcessId)
+    $foreground = [ApprovalWindowHost]::GetForegroundWindow()
+    [uint32]$foregroundProcessId = 0
+    [void][ApprovalWindowHost]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId)
+    try {
+        $processTree = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop)
+        $hostWindow = Get-ApprovalHostWindow -HostProcessId $HostProcessId `
+            -ProcessTree $processTree -ForegroundWindow $foreground -ForegroundProcessId $foregroundProcessId
+        if ($hostWindow -eq [IntPtr]::Zero) { throw 'No visible window belongs to the MCP host process ancestry.' }
+        $screen = [System.Windows.Forms.Screen]::FromHandle($hostWindow)
+    } catch {
+        [Console]::Error.WriteLine("Could not locate the MCP host monitor; using the active monitor: $($_.Exception.Message)")
+        $screen = [System.Windows.Forms.Screen]::FromHandle($foreground)
+    }
+    $Window.StartPosition = 'Manual'
+    $Window.Bounds = Get-ApprovalBounds -WorkingArea $screen.WorkingArea -RequestedSize $Window.Size
+    $Window.TopMost = $true
+}
+function Show-ApprovalForeground {
+    param([object]$Window)
+    $Window.TopMost = $true
+    $Window.BringToFront()
+    $Window.Activate()
+    if (-not [ApprovalWindowHost]::SetForegroundWindow($Window.Handle) -and
+            [ApprovalWindowHost]::GetForegroundWindow() -ne $Window.Handle) {
+        [Console]::Error.WriteLine('Windows denied approval-window keyboard activation; the selection remains visible above non-topmost windows.')
+    }
+}
+"""
+
+SCRIPT = (
+    _WINDOW_SCRIPT
+    + r"""
 if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
 $inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $form = New-Object System.Windows.Forms.Form
 $form.Text = [string]$inputData.title
 $form.Size = New-Object System.Drawing.Size(1200, 760)
-$foreground = [ApprovalWindowHost]::GetForegroundWindow()
-[uint32]$foregroundProcessId = 0
-[void][ApprovalWindowHost]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId)
-try {
-    $processTree = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop)
-    $hostWindow = Get-ApprovalHostWindow -HostProcessId $inputData.host_process_id `
-        -ProcessTree $processTree -ForegroundWindow $foreground -ForegroundProcessId $foregroundProcessId
-    if ($hostWindow -eq [IntPtr]::Zero) { throw 'No visible window belongs to the MCP host process ancestry.' }
-    $screen = [System.Windows.Forms.Screen]::FromHandle($hostWindow)
-} catch {
-    [Console]::Error.WriteLine("Could not locate the MCP host monitor; using the active monitor: $($_.Exception.Message)")
-    $screen = [System.Windows.Forms.Screen]::FromHandle($foreground)
-}
-$form.StartPosition = 'Manual'
-$form.Bounds = Get-ApprovalBounds -WorkingArea $screen.WorkingArea -RequestedSize $form.Size
-$form.TopMost = $true
+Set-ApprovalPlacement -Window $form -HostProcessId $inputData.host_process_id
 $message = New-Object System.Windows.Forms.TextBox
 $message.Multiline = $true
 $message.ReadOnly = $true
@@ -236,7 +258,11 @@ $form.CancelButton = $cancel
 $form.Controls.Add($viewport)
 $form.Controls.Add($message)
 $form.Controls.Add($buttons)
-$form.Add_Shown({ $form.Activate(); [Console]::Out.WriteLine('READY'); [Console]::Out.Flush() })
+$form.Add_Shown({
+    Show-ApprovalForeground -Window $form
+    [Console]::Out.WriteLine('READY')
+    [Console]::Out.Flush()
+})
 $result = $form.ShowDialog()
 $response = @{ action = 'cancel' }
 if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -249,6 +275,7 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
 $form.Dispose()
 [Console]::Out.WriteLine(($response | ConvertTo-Json -Depth 5 -Compress))
 """
+)
 
 
 def available() -> bool:
@@ -427,20 +454,18 @@ async def open_dialog(
         raise
 
 
-_CHOICE_SCRIPT = r"""
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+_CHOICE_SCRIPT = (
+    _WINDOW_SCRIPT
+    + r"""
 if (-not [Environment]::UserInteractive) { throw 'No interactive Windows desktop is available.' }
 $inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $form = New-Object System.Windows.Forms.Form
 $form.Text = [string]$inputData.title
-$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
 $form.ClientSize = New-Object System.Drawing.Size(760, 280)
+Set-ApprovalPlacement -Window $form -HostProcessId $inputData.host_process_id
 $label = New-Object System.Windows.Forms.Label
 $label.Text = [string]$inputData.message
 $label.AutoSize = $false
@@ -462,13 +487,18 @@ foreach ($item in @($inputData.choices)) {
     $top += 44
 }
 $form.CancelButton = $form.Controls[$form.Controls.Count - 1]
-if ($inputData.notify_ready) {
-    $form.Add_Shown({ [Console]::Out.WriteLine('READY'); [Console]::Out.Flush() })
-}
+$form.Add_Shown({
+    Show-ApprovalForeground -Window $form
+    if ($inputData.notify_ready) {
+        [Console]::Out.WriteLine('READY')
+        [Console]::Out.Flush()
+    }
+})
 [void]$form.ShowDialog()
 $form.Dispose()
 [Console]::Out.WriteLine((@{ choice = $script:selected } | ConvertTo-Json -Compress))
 """
+)
 
 
 async def open_choice(
@@ -491,6 +521,7 @@ async def open_choice(
         if process.stdin is None or process.stdout is None:
             raise RuntimeError(_RAISE_CHOICE_WINDOW_PIPES_WERE_NOT_CREATED)
         payload = {
+            "host_process_id": os.getpid(),
             "title": title,
             "message": message,
             "choices": choices,
@@ -523,7 +554,12 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
     completed = subprocess.run(
         [str(powershell()), "-NoProfile", "-STA", "-Command", _CHOICE_SCRIPT],
         input=json.dumps(
-            {"title": title, "message": message, "choices": choices},
+            {
+                "host_process_id": os.getpid(),
+                "title": title,
+                "message": message,
+                "choices": choices,
+            },
             ensure_ascii=True,
         ),
         capture_output=True,
@@ -540,6 +576,11 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
             _RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_EXITED_WITH_CODE.format(
                 completed.returncode, detail
             )
+        )
+    if completed.stderr.strip():
+        logger.warning(
+            "Software-audit choice window reported diagnostics: %s",
+            completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:],
         )
     try:
         response = json.loads(completed.stdout.strip().splitlines()[-1])
@@ -600,6 +641,11 @@ def ask_checkboxes(
             _RAISE_THE_AUDIT_ITEM_WINDOW_EXITED_WITH_CODE.format(
                 completed.returncode, detail
             )
+        )
+    if completed.stderr.strip():
+        logger.warning(
+            "Audit-item window reported diagnostics: %s",
+            completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:],
         )
     try:
         response = json.loads(completed.stdout.strip().splitlines()[-1])

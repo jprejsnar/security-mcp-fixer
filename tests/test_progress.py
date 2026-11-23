@@ -7,6 +7,49 @@ from pathlib import Path
 import pytest
 
 from gitlab_security_mcp import progress
+from gitlab_security_mcp.util import atomic_write_text
+
+
+@pytest.mark.parametrize("failure", ["transient", "persistent", "unrelated"])
+def test_atomic_progress_write_handles_windows_reader_locks(
+    tmp_path, monkeypatch, failure
+):
+    """Retry transient Windows locks without losing old data or hiding persistent errors."""
+    # Arrange
+    from gitlab_security_mcp import util
+
+    path = tmp_path / "progress.json"
+    path.write_text("before", encoding="utf-8")
+    replace = os.replace
+    attempts = []
+    waits = []
+
+    def locked_replace(source, target):
+        """Model an editor briefly opening the progress file without delete sharing."""
+        attempts.append(target)
+        if failure != "transient" or len(attempts) == 1:
+            error = PermissionError("reader holds the file")
+            if failure != "unrelated":
+                error.winerror = 5
+            raise error
+        replace(source, target)
+
+    monkeypatch.setattr(util.os, "replace", locked_replace)
+    monkeypatch.setattr(util, "sleep", waits.append)
+
+    # Act
+    if failure == "transient":
+        atomic_write_text(path, "after")
+        assert path.read_text(encoding="utf-8") == "after"
+        assert len(attempts) == 2
+        assert waits
+    else:
+        with pytest.raises(PermissionError, match="reader holds"):
+            atomic_write_text(path, "after")
+        assert path.read_text(encoding="utf-8") == "before"
+        assert bool(waits) is (failure == "persistent")
+    # Assert
+    assert sorted(tmp_path.iterdir()) == [path]
 
 
 def test_background_activity_is_persisted_after_the_initiating_tool_finishes(tmp_path):

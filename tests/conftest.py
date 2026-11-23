@@ -23,6 +23,16 @@ def isolated_progress_mirror(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_log_archives(tmp_path_factory, monkeypatch):
+    """Never put regression-test archives in the developer's audit reports folder."""
+    directory = tmp_path_factory.mktemp("log-archives")
+    monkeypatch.setattr(
+        "gitlab_security_mcp.security_artifacts.LOG_ARCHIVE_DIRECTORY", str(directory)
+    )
+    return directory
+
+
+@pytest.fixture(autouse=True)
 def corporate_dns(monkeypatch):
     """Keep corporate DNS deterministic and offline unless a test overrides it."""
     from unittest.mock import Mock

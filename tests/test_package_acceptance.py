@@ -1,6 +1,8 @@
 """Verify build-only acceptance and configuration-proven Java remediation."""
 
 import asyncio
+import shutil
+import subprocess
 from copy import deepcopy
 from functools import partial
 from unittest.mock import AsyncMock, Mock
@@ -14,7 +16,12 @@ from gitlab_security_mcp import server
 from gitlab_security_mcp.advisory import AdvisoryLookup
 from gitlab_security_mcp.commands import CommandResult, CommandRunner, assert_allowed
 from gitlab_security_mcp.engine import Engine, _ValidationRunner
-from gitlab_security_mcp.manifests import PackageHit
+from gitlab_security_mcp.manifests import (
+    PackageHit,
+    add_java_override,
+    gradle_report_package,
+    parse_gradle_report,
+)
 from gitlab_security_mcp.qualification import run_checks
 from gitlab_security_mcp.remediate import apply_plan, plan_remediation
 from gitlab_security_mcp.validate import _product_result, run_validation
@@ -487,6 +494,87 @@ def test_duplicate_gradle_override_preserves_owned_block_and_line_endings(
 
 
 @pytest.mark.parametrize(
+    "filename,force", [("build.gradle", True), ("build.gradle.kts", False)]
+)
+def test_gradle_override_resolves_after_existing_family_rule(tmp_path, filename, force):
+    """Prove real Groovy/Kotlin resolution changes only the approved coordinate."""
+    # Arrange
+    gradle = shutil.which("gradle")
+    if gradle is None:
+        pytest.skip("Gradle is unavailable for the offline resolver regression")
+    for artifact, version in (
+        ("library", "1.0.0"),
+        ("library", "1.0.1"),
+        ("sibling", "1.0.0"),
+    ):
+        directory = tmp_path / "repository" / "example" / artifact / version
+        directory.mkdir(parents=True)
+        (directory / f"{artifact}-{version}.pom").write_text(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>example</groupId>"
+            f"<artifactId>{artifact}</artifactId><version>{version}</version></project>",
+            encoding="utf-8",
+        )
+    kotlin = filename.endswith(".kts")
+    original = (
+        'plugins { java }\nrepositories { maven { url = uri("repository") } }\n'
+        'val familyVersion = "1.0.0"\n'
+        "configurations.configureEach { resolutionStrategy.eachDependency {\n"
+        '    if (requested.group == "example") { useVersion(familyVersion) }\n'
+        "} }\n"
+        'dependencies { implementation("example:library:1.0.0"); implementation("example:sibling:1.0.0") }\n'
+        if kotlin
+        else "plugins { id 'java' }\nrepositories { maven { url = uri('repository') } }\n"
+        "def familyVersion = '1.0.0'\n"
+        "configurations.configureEach { resolutionStrategy.eachDependency { details ->\n"
+        "    if (details.requested.group == 'example') { details.useVersion(familyVersion) }\n"
+        "} }\n"
+        "dependencies { implementation 'example:library:1.0.0'; implementation 'example:sibling:1.0.0' }\n"
+    )
+    manifest = tmp_path / filename
+    manifest.write_text(original, encoding="utf-8")
+    (tmp_path / "settings.gradle").write_text(
+        "rootProject.name = 'offline-override-regression'\n", encoding="utf-8"
+    )
+
+    # Act
+    add_java_override(
+        tmp_path,
+        filename,
+        "example:library",
+        "1.0.1",
+        force=force,
+        configurations=("runtimeClasspath",),
+    )
+    result = subprocess.run(
+        [
+            gradle,
+            "--no-daemon",
+            "--offline",
+            "--console=plain",
+            "dependencies",
+            "--configuration",
+            "runtimeClasspath",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=120,
+        check=True,
+    )
+
+    # Assert
+    report = parse_gradle_report(result.stdout)
+    for package, version in (
+        ("example:library", "1.0.1"),
+        ("example:sibling", "1.0.0"),
+    ):
+        hit = gradle_report_package(tmp_path, manifest, package, report)
+        assert hit is not None, result.stdout
+        assert hit.version == version, result.stdout
+    assert manifest.read_text(encoding="utf-8").startswith(original)
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "// implementation enforcedPlatform('bom:app:1')\n",
@@ -924,6 +1012,11 @@ def test_native_approval_automatically_updates_selected_gradle_packages(
         assert "configurations.configureEach" in text
         assert "resolutionStrategy.force" in text
         assert "strictly(" not in text
+        assert all(
+            "--configuration" in call.args[0]
+            for call in runner.run.call_args_list
+            if "dependencies" in call.args[0]
+        )
     if outcome in {"success", "mcp", "build_only", "enforced_platform"}:
         calls = [call.args[0] for call in runner.run.call_args_list]
         assert sum("assemble" in argv for argv in calls) == 1
@@ -1169,6 +1262,10 @@ def test_java_override_requires_actual_resolved_fixed_version(
         == "QUALIFIED"
     )
     assert engine.apply_minimal_fix("transitive")["status"] == "APPLIED"
+    if manager == "gradle":
+        engine.state.findings[0]["packageQualification"]["resolved_dependency"] = {
+            "verified": True
+        }
     if configuration not in {None, "runtimeClasspath"}:
         assert f'configurations.named("{configuration}")' in manifest.read_text(
             encoding="utf-8"
@@ -1192,6 +1289,11 @@ def test_java_override_requires_actual_resolved_fixed_version(
     assert (marker in manifest.read_text(encoding="utf-8")) == (
         resolved_version == "1.0.1"
     )
+    if manager == "gradle" and resolved_version != "1.0.1":
+        assert (
+            "resolved_dependency"
+            not in engine.state.findings[0]["packageQualification"]
+        )
 
 
 def test_non_runtime_catalog_dependency_overrides_the_owning_build(tmp_path):
@@ -1233,7 +1335,7 @@ def test_non_runtime_catalog_dependency_overrides_the_owning_build(tmp_path):
     assert catalog.read_text(encoding="utf-8") == original
 
 
-@pytest.mark.parametrize("failure", ["none", "first", "all"])
+@pytest.mark.parametrize("failure", ["none", "first", "all", "resolution"])
 def test_version_alignment_follows_selective_package_rollback(tmp_path, failure):
     """Keep AI documentation aligned to retained versions when another update fails."""
     # Arrange
@@ -1265,7 +1367,7 @@ def test_version_alignment_follows_selective_package_rollback(tmp_path, failure)
         output = (
             "runtimeClasspath - runtime\n"
             + "".join(
-                f"\\--- {package}:{target if package + ':' + target in text else old}\n"
+                f"\\--- {package}:{target if failure != 'resolution' and package + ':' + target in text else old}\n"
                 for package, old, target in updates
             )
             if "dependencies" in argv
@@ -1333,15 +1435,16 @@ def test_version_alignment_follows_selective_package_rollback(tmp_path, failure)
     result = engine.run_validation_matrix()
 
     # Assert
+    all_rejected = failure in {"all", "resolution"}
     assert result["status"] == (
-        "FIX_REJECTED" if failure == "all" else "VALIDATION_COMPLETE"
+        "FIX_REJECTED" if all_rejected else "VALIDATION_COMPLETE"
     ), result
     assert document.read_text(encoding="utf-8") == (
         f"bad:library {'1.0.1' if failure == 'none' else '1.0.0'}\n"
-        f"good:library {'2.0.0' if failure == 'all' else '2.0.1'}\n"
+        f"good:library {'2.0.0' if all_rejected else '2.0.1'}\n"
     )
     assert ("good:library:2.0.1" in manifest.read_text(encoding="utf-8")) == (
-        failure != "all"
+        not all_rejected
     )
     assert ("bad:library:1.0.0" in manifest.read_text(encoding="utf-8")) == (
         failure != "none"
@@ -1349,7 +1452,39 @@ def test_version_alignment_follows_selective_package_rollback(tmp_path, failure)
     assert not engine.state.manual_cleanup_required
     if failure == "first":
         assert result["retained_updates"] == ["1"]
-    if failure != "all":
+    if failure in {"first", "all"}:
+        for item in result["rejected_updates"]:
+            assert item["validation"]["build_status"] == "FAILED"
+            assert "Production build: FAILED" in item["reason"]
+            assert item["validation"]["unit_tests"]["status"] == "NOT_RUN"
+    if failure == "resolution":
+        first_trial = engine.state.batch_isolation[0]["validation"]
+        assert first_trial["build_status"] == "NOT_RUN"
+        assert len(first_trial["failed_checks"]) == 2
+        assert all(
+            check["kind"] == "dependency_resolution"
+            for check in first_trial["failed_checks"]
+        )
+        assert len(result["rejected_updates"]) == len(updates)
+        for index, item in enumerate(result["rejected_updates"]):
+            package, old, target = updates[index]
+            assert item["validation"]["build_status"] == "NOT_RUN"
+            assert item["validation"]["unit_tests"]["status"] == "NOT_RUN"
+            assert f"{package}: expected {target}" in item["reason"]
+            assert old in item["reason"]
+            assert "Production build validation failed" not in item["reason"]
+        payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
+        assert "Production build: NOT_RUN" in markdown
+        assert "Unit/integration tests are disabled" in markdown
+        assert (
+            payload["package_qualifications"]["1"]["rejection_diagnostics"][
+                "build_status"
+            ]
+            == "NOT_RUN"
+        )
+        commands = [call.args[0] for call in runner.run.call_args_list]
+        assert sum("assemble" in argv for argv in commands) == 1
+    if not all_rejected:
         payload, markdown = render(engine.state, staged=[], diff_stat="", diff_files="")
         assert payload["package_qualifications"]["1"]["version_alignment_files"] == [
             ".github/instructions/versions.instructions.md"
