@@ -1374,8 +1374,13 @@ def test_progress_cleanup_does_not_hang_on_an_unresponsive_host(cancelled, caplo
         return result
 
     # Act
-    result = asyncio.run(exercise())
-    publishers[0]("A cancelled worker finished after its event loop closed")
+    previous = server.logger.propagate
+    server.logger.propagate = True
+    try:
+        result = asyncio.run(exercise())
+        publishers[0]("A cancelled worker finished after its event loop closed")
+    finally:
+        server.logger.propagate = previous
 
     # Assert
     assert "progress delivery timed out" in caplog.text

@@ -1,6 +1,7 @@
 """Cover previously untested branches in the smaller library modules."""
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -570,7 +571,9 @@ def test_reports_include_dismissal_details_and_unresolved_blockers(tmp_path):
     assert written["status"] == "WORKFLOW_COMPLETE"
 
 
-def test_documentation_progress_and_page_failures_stay_informational(monkeypatch):
+def test_documentation_progress_and_page_failures_stay_informational(
+    monkeypatch, caplog
+):
     """A progress-sink failure does not hide a page that could not be read."""
     # Arrange
     http = httpx.Client()
@@ -607,9 +610,16 @@ def test_documentation_progress_and_page_failures_stay_informational(monkeypatch
         monkeypatch.setattr(
             "gitlab_security_mcp.official_docs.timed_http_stream", fail_stream
         )
-        offline = OfficialDocs(http=offline_http)._read_page(
-            {"name": PAGE_NAME, "url": PAGE_URL, "markers": (PAGE_MARKER,)}
-        )
+        doc_logger = logging.getLogger("gitlab_security_mcp")
+        previous = doc_logger.propagate
+        doc_logger.propagate = True
+        try:
+            with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+                offline = OfficialDocs(http=offline_http)._read_page(
+                    {"name": PAGE_NAME, "url": PAGE_URL, "markers": (PAGE_MARKER,)}
+                )
+        finally:
+            doc_logger.propagate = previous
         redirected = _redirected_page()
         repeated = _unique(["cve-1", "CVE-1"])
     finally:
@@ -622,6 +632,9 @@ def test_documentation_progress_and_page_failures_stay_informational(monkeypatch
     assert review.sources[0].reused is True
     assert empty.ok is False
     assert offline.ok is False
+    assert offline.error == "ConnectError"
+    assert "offline" in caplog.text
+    assert any(record.exc_info for record in caplog.records)
     assert redirected.ok is False
     assert repeated == ["cve-1"]
 

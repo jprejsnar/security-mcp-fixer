@@ -9,6 +9,7 @@ const { activate, createPresenter, newestPerRepository, snapshotsForWindow } = r
 function snapshot(overrides = {}) {
   return {
     repo_root: "C:\\repo",
+    updated_at: new Date().toISOString(),
     tasks: [{
       id: "audit", label: "Software audit", status: "WAITING_FOR_AI",
       message: "Reading controllers", completed: 2, total: 4,
@@ -420,6 +421,30 @@ test("workspace and mirror copies of one run are shown once, and old mirrors are
 
   // Assert
   assert.deepEqual(shown, [newer]);
+});
+
+test("a progress file without an ISO timestamp is rejected", () => {
+  // Arrange
+  const body = snapshot();
+  delete body.updated_at;
+
+  // Act
+  const read = () => parseSnapshot(JSON.stringify(body));
+
+  // Assert
+  assert.throws(read, /timestamp/);
+});
+
+test("a mirror without an ISO timestamp is not shown", () => {
+  // Arrange
+  const now = Date.parse("2026-11-20T12:00:00Z");
+  const broken = { repo_root: "C:\\Repo", updated_at: "not-a-time", tasks: [] };
+
+  // Act
+  const shown = newestPerRepository([{ snapshot: broken, mirror: true }], now);
+
+  // Assert
+  assert.deepEqual(shown, []);
 });
 
 test("an extended Windows path still matches the open checkout", () => {

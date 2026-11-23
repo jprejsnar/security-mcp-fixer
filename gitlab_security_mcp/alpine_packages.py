@@ -270,7 +270,9 @@ class AlpinePackages:
                 inspected = self.image_branch(image, sources)
             except AlpineLookupError as exc:
                 inspection_error = str(exc)
-                logger.warning("Image inspection for %s failed: %s", image, exc)
+                logger.warning(
+                    "Image inspection for %s failed: %s", image, exc, exc_info=True
+                )
             if inspected is not None:
                 branch, method = inspected
             else:
@@ -318,7 +320,9 @@ class AlpinePackages:
                     method += "; this branch is past its end-of-life date and receives no updates"
                 sources.insert(0, RELEASES_URL)
             except AlpineLookupError as exc:
-                logger.warning("Alpine end-of-life status unavailable: %s", exc)
+                logger.warning(
+                    "Alpine end-of-life status unavailable: %s", exc, exc_info=True
+                )
         return ApkPins(branch, method, versions, repositories, tuple(sources))
 
     def image_branch(
@@ -701,6 +705,7 @@ class AlpinePackages:
                     detail,
                     attempt + 2,
                     _ATTEMPTS,
+                    exc_info=True,
                 )
                 sleep(_BACKOFF_SECONDS * 2**attempt)
         raise AlpineLookupError(_RAISE_DATA_COULD_NOT_BE_READ_FROM.format(url))

@@ -505,6 +505,7 @@ class AdvisoryClient:
                         type(exc).__name__,
                         attempt + 2,
                         _NVD_ATTEMPTS,
+                        exc_info=True,
                     )
         except ADVISORY_READ_FAILURES as exc:
             log_unexpected(exc, f"NVD advisory read {cve}")

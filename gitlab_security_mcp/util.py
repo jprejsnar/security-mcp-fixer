@@ -35,6 +35,7 @@ _RAISE_UNSAFE = "Unsafe {}"
 
 _HTTP_LOG_LOCK = threading.Lock()
 _LOG_PROCESS_MEMORY_UNAVAILABLE = "Could not read process memory: %s"
+_LOG_HTTP_TIMING_WRITE = "Could not write HTTP timing log %s: %s"
 _LOG_CONVERTED_FAILURE = (
     "Converted %s into a failed result during %s: %s; traceback follows"
 )
@@ -167,7 +168,7 @@ def _log_memory_unavailable(exc: BaseException) -> None:
         if _memory_unavailable_logged:
             return
         _memory_unavailable_logged = True
-    logger.warning(_LOG_PROCESS_MEMORY_UNAVAILABLE, exc)
+    logger.warning(_LOG_PROCESS_MEMORY_UNAVAILABLE, exc, exc_info=exc)
 
 
 def _memory_bytes() -> int | None:
@@ -411,7 +412,7 @@ def timed_http_stream(
                     with log_path.open("a", encoding="utf-8") as handle:
                         handle.write(text + "\n")
             except OSError as exc:
-                logger.warning("Could not write HTTP timing log %s: %s", log_path, exc)
+                logger.warning(_LOG_HTTP_TIMING_WRITE, log_path, exc, exc_info=True)
 
 
 def json_object(text: str) -> dict:

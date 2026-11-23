@@ -1,6 +1,8 @@
 """Check corporate approval, compatibility attestations, and bounded edits."""
 
+import hashlib
 import json
+import logging
 from copy import deepcopy
 from subprocess import TimeoutExpired
 
@@ -14,6 +16,7 @@ from gitlab_security_mcp.qualification import (
     load_policy,
     review_major_upgrade,
     review_package,
+    rollback_dependency_files,
     run_checks,
     scan_package_callers,
     tree_snapshot,
@@ -2789,3 +2792,41 @@ def test_other_ecosystems_require_all_allowlisted_checks(
     assert len(qualified["checks"]) == 3
     for check in qualified["checks"].values():
         assert_allowed(check["argv"], tmp_path)
+
+
+_ROLLBACK_FILE = "pnpm-lock.yaml"
+_ROLLBACK_CHANGED = "changed\n"
+_ROLLBACK_ORIGINAL = "original\n"
+_ROLLBACK_DISK = "disk full"
+
+
+def test_failed_dependency_restore_is_logged_and_preserved(
+    tmp_path, caplog, monkeypatch
+):
+    """Keep a file that cannot be restored and record the cause."""
+    # Arrange
+    target = tmp_path / _ROLLBACK_FILE
+    target.write_text(_ROLLBACK_CHANGED, encoding="utf-8", newline="")
+    current = hashlib.sha256(_ROLLBACK_CHANGED.encode("utf-8")).hexdigest()
+    receipt = {
+        "dependency_before": {_ROLLBACK_FILE: _ROLLBACK_ORIGINAL},
+        "applied_dependency_hashes": {_ROLLBACK_FILE: current},
+    }
+
+    def fail(_path, _text):
+        """Fail the restore after the hash check has selected this file."""
+        raise OSError(_ROLLBACK_DISK)
+
+    monkeypatch.setattr("gitlab_security_mcp.qualification.atomic_write_text", fail)
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        result = rollback_dependency_files(tmp_path, receipt)
+
+    # Assert
+    assert result["status"] == "MANUAL_REVIEW_REQUIRED"
+    assert result["preserved_files"] == [_ROLLBACK_FILE]
+    assert result["restored_files"] == []
+    assert target.read_text(encoding="utf-8") == _ROLLBACK_CHANGED
+    assert _ROLLBACK_DISK in caplog.text
+    assert any(record.exc_info for record in caplog.records)

@@ -3008,7 +3008,8 @@ this MCP server installs the progress extension into that editor. A manual
 `gitlab-security-progress-1.0.51.vsix` install is only needed when the server
 is not launched by the editor. The extension reads the checkout progress file
 and the per-user mirror in `~/.cache/gitlab-security-mcp/progress/`
-(mirrors older than 12 hours are ignored). A window with open folders shows
+(mirrors older than 12 hours are ignored, and a file without a finite
+ISO 8601 `updated_at` is rejected). A window with open folders shows
 only checkouts inside those folders. A window with no open folder shows the
 newest mirror for each checkout.
 It watches inspection-only `.security-mcp/progress.json` files and displays a
@@ -3067,7 +3068,12 @@ Unexpected exceptions produce a failure message with a traceback. A handler
 that converts any exception into a failed result logs a WARNING with the
 operation, the exception text, and the traceback. That includes I/O,
 validation, command, and HTTP failures. The returned result still carries the
-message.
+message. Git, DNS, pnpm, Maven, Gradle, project-discovery, report-diff,
+approval, audit, GitLab read-retry, Alpine lookup, official-documentation
+read, and the first memory-probe warnings include that same traceback. A progress-console open, write, or
+reap failure includes the exception and traceback, and stderr plus the tool
+transcript stay available. A dependency restore that cannot write
+the file is logged, and that file stays for manual cleanup.
 The host AI's own reasoning
 and browsing between tool calls are not visible to this server.
 
@@ -3473,7 +3479,9 @@ On failure only, grouped subset testing identifies offending updates and
 interactions without exhaustively enumerating combinations. The retained subset
 must pass final production builds and dependency checks. If none pass, verify the restored
 baseline too; an already-broken baseline remains a failed run. Later edits are
-preserved and unsafe recovery requires manual cleanup. Diagnostic trials retain
+preserved and unsafe recovery requires manual cleanup. A restore that cannot
+write a dependency file is logged with its traceback, and that file is left
+unchanged. Diagnostic trials retain
 failed commands, details and log paths in the JSON report's `batch_isolation`
 and the Markdown **Batch Isolation** section. This is a build/resolution-validated subset,
 not a claim to have found the globally largest passing combination.

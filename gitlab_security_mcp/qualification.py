@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from itertools import pairwise
 from pathlib import Path
@@ -30,6 +31,9 @@ from gitlab_security_mcp.validate import (
     java_wrapper,
 )
 from gitlab_security_mcp.versions import is_major_upgrade, parse_version
+
+logger = logging.getLogger("gitlab_security_mcp")
+_LOG_DEPENDENCY_ROLLBACK_FAILED = "Could not restore dependency file %s: %s"
 
 _RAISE_PACKAGE_MANAGER_DOES_NOT_SUPPORT_QUALIFICATION_CHECKS = (
     "Package manager does not support qualification checks"
@@ -1095,7 +1099,10 @@ def rollback_dependency_files(root: Path, receipt: dict) -> dict:
             else:
                 atomic_write_text(path, original)
             restored.append(relative)
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(
+                _LOG_DEPENDENCY_ROLLBACK_FAILED, relative, exc, exc_info=True
+            )
             preserved.append(relative)
     return {
         "status": "MANUAL_REVIEW_REQUIRED" if preserved else "ROLLED_BACK",

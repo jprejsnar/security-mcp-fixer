@@ -87,10 +87,12 @@ function snapshotsForWindow(snapshots, folders, now = Date.now()) {
 function newestPerRepository(snapshots, now = Date.now()) {
   const newest = new Map();
   for (const { snapshot, mirror } of snapshots) {
-    if (mirror && now - Date.parse(snapshot.updated_at) > MIRROR_MAX_AGE_MS) continue;
+    const updated = Date.parse(snapshot.updated_at);
+    if (!Number.isFinite(updated)) continue;
+    if (mirror && now - updated > MIRROR_MAX_AGE_MS) continue;
     const key = pathKey(snapshot.repo_root || "");
     const previous = newest.get(key);
-    if (!previous || Date.parse(snapshot.updated_at) > Date.parse(previous.updated_at)) {
+    if (!previous || updated > Date.parse(previous.updated_at)) {
       newest.set(key, snapshot);
     }
   }

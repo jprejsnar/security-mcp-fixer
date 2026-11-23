@@ -301,6 +301,15 @@ def _thread_exception(args: threading.ExceptHookArgs) -> None:
 
 
 _STDERR_PREPARE_FAILED = "Could not make stderr UTF-8 and line-buffered: %s"
+_LOG_PROGRESS_CONSOLE_CLOSED = (
+    "Progress console closed; stderr and tool transcripts remain available: %s"
+)
+_LOG_PROGRESS_CONSOLE_NOT_REAPED = (
+    "Progress console could not be reaped after kill; pid=%s"
+)
+_LOG_PROGRESS_CONSOLE_OPEN_FAILED = (
+    "Could not open progress console; stderr and tool transcripts remain available: %s"
+)
 _LOG_FORMAT = "%(asctime)sZ %(levelname)s %(name)s [%(threadName)s]: %(message)s"
 _LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
 
@@ -367,7 +376,7 @@ def _install_host_logging() -> None:
     failure = _prepare_stderr()
     _configure_logging()
     if isinstance(failure, (OSError, ValueError)):
-        logger.warning(_STDERR_PREPARE_FAILED, failure)
+        logger.warning(_STDERR_PREPARE_FAILED, failure, exc_info=failure)
 
 
 _install_host_logging()
@@ -406,10 +415,8 @@ class _ProgressConsole:
             try:
                 self.process.stdin.write(text + "\n")
                 self.process.stdin.flush()
-            except (OSError, ValueError):
-                logger.warning(
-                    "Progress console closed; stderr and tool transcripts remain available."
-                )
+            except (OSError, ValueError) as exc:
+                logger.warning(_LOG_PROGRESS_CONSOLE_CLOSED, exc, exc_info=True)
                 self._closed = True
 
     def close(self) -> None:
@@ -429,8 +436,7 @@ class _ProgressConsole:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 logger.warning(
-                    "Progress console could not be reaped after kill; pid=%s",
-                    process.pid,
+                    _LOG_PROGRESS_CONSOLE_NOT_REAPED, process.pid, exc_info=True
                 )
         for pipe in (process.stdout, process.stderr):
             if pipe is not None and not pipe.closed:
@@ -457,10 +463,8 @@ def _open_progress_console() -> _ProgressConsole | None:
             shell=False,
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10),
         )
-    except OSError:
-        logger.warning(
-            "Could not open progress console; stderr and tool transcripts remain available."
-        )
+    except OSError as exc:
+        logger.warning(_LOG_PROGRESS_CONSOLE_OPEN_FAILED, exc, exc_info=True)
         return None
     console = _ProgressConsole(process)
     console.write("GitLab Security Progress: waiting for tool calls.")
@@ -937,8 +941,12 @@ async def _progress_middleware(
             console.write(text)
         try:
             loop.call_soon_threadsafe(enqueue, text)
-        except RuntimeError:
-            logger.warning("Could not queue progress: the MCP event loop has closed.")
+        except RuntimeError as exc:
+            logger.warning(
+                "Could not queue progress: the MCP event loop has closed: %s",
+                exc,
+                exc_info=True,
+            )
 
     async def deliver() -> None:
         """Send monotonic notification sequence numbers with count-based text bars."""
@@ -1022,7 +1030,8 @@ async def _progress_middleware(
                 await messages.join()
         except TimeoutError:
             logger.warning(
-                "MCP progress delivery timed out; the bounded tool transcript remains available."
+                "MCP progress delivery timed out; the bounded tool transcript remains available.",
+                exc_info=True,
             )
         finally:
             finished.set()
@@ -1751,7 +1760,9 @@ async def _open_fix_selection(
         )
         raise
     except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning("Could not display Windows fix-selection window: %s", exc)
+        logger.warning(
+            "Could not display Windows fix-selection window: %s", exc, exc_info=True
+        )
         return await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -1890,7 +1901,9 @@ async def select_security_fixes(
         if isinstance(response, InputRequiredResult):
             return response
     except (ValueError, MCPError) as exc:
-        logger.warning("Security fix selection unavailable or invalid: %s", exc)
+        logger.warning(
+            "Security fix selection unavailable or invalid: %s", exc, exc_info=True
+        )
         return await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -2177,7 +2190,9 @@ async def submit_false_positive_approvals(
             await asyncio.shield(_interrupt_desktop_startup(selected, receipt))
             raise
         except (OSError, RuntimeError, ValueError) as exc:
-            logger.warning("Could not display Windows approval window: %s", exc)
+            logger.warning(
+                "Could not display Windows approval window: %s", exc, exc_info=True
+            )
             return await _approval_result(
                 selected,
                 receipt,
@@ -2254,7 +2269,9 @@ async def submit_false_positive_approvals(
         await asyncio.shield(asyncio.to_thread(selected.generate_local_report))
         raise
     except ValueError as exc:
-        logger.warning("Invalid false-positive approval response: %s", exc)
+        logger.warning(
+            "Invalid false-positive approval response: %s", exc, exc_info=True
+        )
         return await _approval_result(
             selected,
             receipt,
@@ -2265,7 +2282,9 @@ async def submit_false_positive_approvals(
             },
         )
     except MCPError as exc:
-        logger.warning("False-positive approval form unavailable: %s", exc)
+        logger.warning(
+            "False-positive approval form unavailable: %s", exc, exc_info=True
+        )
         return await _approval_result(
             selected,
             receipt,
@@ -2431,7 +2450,7 @@ def _record_code_results(selected: Engine, results: list[dict] | None) -> dict |
                     )
                 )
     except ValueError as exc:
-        logger.warning("Code outcome rejected: %s", exc)
+        logger.warning("Code outcome rejected: %s", exc, exc_info=True)
         return {"status": "ERROR", "reason": str(exc)}
     for item in parsed:
         stored[f"{prefix}:{item.id}"] = {
@@ -3040,7 +3059,7 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
                 )
             raise
         except (OSError, RuntimeError, ValueError, MCPError) as exc:
-            logger.warning("Audit consent unavailable: %s", exc)
+            logger.warning("Audit consent unavailable: %s", exc, exc_info=True)
             return _record_audit_result(
                 selected,
                 {
@@ -3093,7 +3112,9 @@ async def _offer_audit_choices(ctx: Context, selected: Engine) -> dict[str, Any]
             )
         raise
     except (OSError, RuntimeError, ValueError, MCPError) as exc:
-        logger.warning("Software-audit choice was not collected: %s", exc)
+        logger.warning(
+            "Software-audit choice was not collected: %s", exc, exc_info=True
+        )
         result = {
             "status": "CHOICE_UNAVAILABLE",
             "choices": choice_labels(),
@@ -3111,7 +3132,11 @@ def _audit_revision(engine: Engine) -> str:
     try:
         return f"{engine.git.current_branch()} {engine.git.head()}"
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-        logger.warning("Could not read the Git revision for the audit prompt: %s", exc)
+        logger.warning(
+            "Could not read the Git revision for the audit prompt: %s",
+            exc,
+            exc_info=True,
+        )
         return "unverified"
 
 
@@ -3945,7 +3970,9 @@ async def choose_software_audit_action(
     try:
         checked = await _ask_audit_items(ctx, prepared["items"])
     except (OSError, RuntimeError, ValueError, MCPError) as exc:
-        logger.warning("Audit-item checkboxes were not collected: %s", exc)
+        logger.warning(
+            "Audit-item checkboxes were not collected: %s", exc, exc_info=True
+        )
         return prepared
     if checked is None:
         return prepared

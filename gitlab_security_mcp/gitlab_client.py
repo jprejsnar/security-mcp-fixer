@@ -744,24 +744,21 @@ class GitLabClient:
                     attempt=attempt,
                     attempts=attempts,
                 )
-            except httpx.TransportError:
+            except httpx.TransportError as exc:
                 if not read or attempt + 1 == attempts:
                     raise
                 delay = _GITLAB_BACKOFF_SECONDS * 2**attempt
                 logger.warning(
-                    "Transient GitLab transport failure; retrying read %s of %s",
+                    "Transient GitLab transport failure; retrying read %s of %s: %s",
                     attempt + 2,
                     attempts,
+                    exc,
+                    exc_info=True,
                 )
                 if delay > 0:
                     sleep(delay)
                 continue
             if delay is not None:
-                logger.warning(
-                    "Transient GitLab status; retrying read %s of %s",
-                    attempt + 2,
-                    attempts,
-                )
                 if delay > 0:
                     sleep(delay)
                 continue
@@ -819,6 +816,12 @@ class GitLabClient:
                 ):
                     delay = _retry_wait(response, attempt)
                     if delay is not None:
+                        logger.warning(
+                            "Transient GitLab status %s; retrying read %s of %s",
+                            response.status_code,
+                            attempt + 2,
+                            attempts,
+                        )
                         return None, delay
                 raise RuntimeError(detail)
             payload = json.loads(_bounded_body(response))

@@ -1196,6 +1196,37 @@ def test_progress_console_close_survives_a_child_that_ignores_kill():
     assert child.stdout.closed
 
 
+_BROKEN_PROGRESS_PIPE = "broken pipe"
+
+
+def test_progress_console_write_failure_records_the_cause(caplog):
+    """Keep the pipe error when the Windows progress console stops accepting text."""
+    # Arrange
+    from gitlab_security_mcp.server import _ProgressConsole, logger
+
+    process = Mock()
+    process.stdin.write.side_effect = OSError(_BROKEN_PROGRESS_PIPE)
+    console = _ProgressConsole(process)
+    previous = logger.propagate
+    logger.propagate = True
+
+    # Act
+    try:
+        with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+            console.write("hello")
+            console.write("again")
+    finally:
+        logger.propagate = previous
+
+    # Assert
+    assert _BROKEN_PROGRESS_PIPE in caplog.text
+    assert (
+        sum("Progress console closed" in record.message for record in caplog.records)
+        == 1
+    )
+    assert caplog.records[-1].exc_info[0] is OSError
+
+
 def test_unreaped_command_is_an_explicit_cleanup_failure(monkeypatch, caplog):
     """Do not publish successful cleanup while the owned command is still alive."""
     # Arrange

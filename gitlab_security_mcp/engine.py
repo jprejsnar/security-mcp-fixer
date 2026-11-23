@@ -208,6 +208,9 @@ _LOG_PNPM_PREPARATION_FAILED = "pnpm preparation failed: %s"
 _LOG_GIT_DIFF_FAILED = "Could not read the git diff for the local report: %s"
 _LOG_WORK_TREE_FAILED = "Git work-tree verification failed: %s"
 _LOG_BRANCH_PREPARATION_FAILED = "Security branch preparation failed for %s: %s"
+_LOG_PROJECT_DISCOVERY_FAILED = "GitLab project discovery failed: %s"
+_LOG_MAVEN_INSPECTION_FAILED = "Maven dependency inspection unavailable: %s"
+_LOG_GRADLE_INSPECTION_FAILED = "Gradle dependency inspection unavailable: %s"
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -558,7 +561,7 @@ class Engine:
             if not getaddrinfo("nexus.ert.com", 443, type=SOCK_STREAM):
                 raise gaierror(_RAISE_NO_DNS_ADDRESSES_RETURNED)
         except OSError as exc:
-            logger.warning(_LOG_CORPORATE_DNS_FAILED, exc)
+            logger.warning(_LOG_CORPORATE_DNS_FAILED, exc, exc_info=True)
             reason = (
                 "Cannot resolve nexus.ert.com. Connect to corporate VPN first, "
                 "then rerun run_prechecks."
@@ -593,7 +596,7 @@ class Engine:
         try:
             self.git.ensure_work_tree()
         except GIT_OPERATION_FAILURES as exc:
-            logger.warning(_LOG_WORK_TREE_FAILED, exc)
+            logger.warning(_LOG_WORK_TREE_FAILED, exc, exc_info=True)
             self.state.status = "PRECHECK_FAILED"
             self.state.stop_stage = "precheck"
             return {
@@ -711,7 +714,7 @@ class Engine:
             try:
                 self.git.run(["checkout", "main"])
             except (OSError, RuntimeError) as exc:
-                logger.warning(_LOG_PULL_CHECKOUT_FAILED, exc)
+                logger.warning(_LOG_PULL_CHECKOUT_FAILED, exc, exc_info=True)
                 return self._stop(
                     "PULL_FAILED",
                     "pull_main",
@@ -756,7 +759,7 @@ class Engine:
                         },
                     )
             except GIT_OPERATION_FAILURES as exc:
-                logger.warning(_LOG_PULL_FAILED, number, exc)
+                logger.warning(_LOG_PULL_FAILED, number, exc, exc_info=True)
                 return self._stop(
                     "PULL_FAILED",
                     f"pull_{number}",
@@ -787,7 +790,7 @@ class Engine:
         try:
             preparation = [] if self._reuse_branch_name else self._prepare_pnpm()
         except (OSError, ValueError, RuntimeError) as exc:
-            logger.warning(_LOG_PNPM_PREPARATION_FAILED, exc)
+            logger.warning(_LOG_PNPM_PREPARATION_FAILED, exc, exc_info=True)
             self._drop_snapshot()
             return self._stop(
                 "PREPARATION_FAILED",
@@ -920,7 +923,7 @@ class Engine:
                         },
                     )
         except GIT_OPERATION_FAILURES as exc:
-            logger.warning(_LOG_BRANCH_PREPARATION_FAILED, name, exc)
+            logger.warning(_LOG_BRANCH_PREPARATION_FAILED, name, exc, exc_info=True)
             return self._stop(
                 "BRANCH_CREATION_FAILED",
                 "branch",
@@ -959,7 +962,7 @@ class Engine:
             except (OSError, RuntimeError, ValueError) as exc:
                 pinned = os.environ.get("GITLAB_PROJECT_ID", "").strip()
                 if not pinned:
-                    logger.warning("GitLab project discovery failed: %s", exc)
+                    logger.warning(_LOG_PROJECT_DISCOVERY_FAILED, exc, exc_info=True)
                     return {
                         "status": "ERROR",
                         "stage": "project_discovery",
@@ -1713,7 +1716,7 @@ class Engine:
             status = "PARTIAL_FAILURE" if failed else "COMPLETED"
         except InterruptedError as exc:
             status, reason = "INTERRUPTED", str(exc)
-            logger.warning("%s", reason)
+            logger.warning("%s", reason, exc_info=True)
         except (OSError, ValueError, TypeError, RuntimeError, SubprocessError) as exc:
             status, reason = "BLOCKED", str(exc)
             logger.exception("Approved package execution blocked")
@@ -3182,6 +3185,7 @@ class Engine:
                     "GitLab false-positive dismissal failed for %s: %s",
                     item["id"],
                     outcome["error"],
+                    exc_info=True,
                 )
             return {
                 **outcome,
@@ -3323,7 +3327,7 @@ class Engine:
             diff_stat = summary["stat"]
             diff_files = summary["files"]
         except (OSError, RuntimeError, PermissionError) as exc:
-            logger.warning(_LOG_GIT_DIFF_FAILED, exc)
+            logger.warning(_LOG_GIT_DIFF_FAILED, exc, exc_info=True)
             diff_stat = f"Could not read git diff: {exc}"
         written = write_report(
             self.repo_root,
@@ -3660,7 +3664,7 @@ class Engine:
         except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
             row.update(status="FAILED", detail=str(exc))
             finding["dependencyResolution"] = row
-            logger.warning("Maven dependency inspection unavailable: %s", exc)
+            logger.warning(_LOG_MAVEN_INSPECTION_FAILED, exc, exc_info=True)
             return None
 
     def _gradle_dependency_report(
@@ -3869,7 +3873,7 @@ class Engine:
             return None
         except (OSError, ValueError, RuntimeError, SubprocessError) as exc:
             row.update(status="FAILED", detail=str(exc))
-            logger.warning("Gradle dependency inspection unavailable: %s", exc)
+            logger.warning(_LOG_GRADLE_INSPECTION_FAILED, exc, exc_info=True)
             finding["dependencyResolution"] = row
             return None
 

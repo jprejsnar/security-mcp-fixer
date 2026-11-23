@@ -134,6 +134,7 @@ ALLOWED_HOSTS = frozenset(
 )
 logger = logging.getLogger("gitlab_security_mcp")
 _LOG_DOC_URL_REJECTED = "Official documentation URL was rejected for %s: %s"
+_LOG_DOC_READ_FAILED = "Official documentation page could not be read for %s: %s"
 _CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _CWE = re.compile(r"CWE-(\d{1,5})", re.IGNORECASE)
 _MAX_BODY = 1_000_000
@@ -456,6 +457,7 @@ class OfficialDocs:
                 final_host = response.url.host
                 status_code = response.status_code
         except httpx.HTTPError as exc:
+            logger.warning(_LOG_DOC_READ_FAILED, name, exc, exc_info=True)
             return DocSource(name, url, False, None, None, type(exc).__name__)
         if status_code != 200:
             return DocSource(

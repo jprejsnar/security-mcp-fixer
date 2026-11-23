@@ -8,6 +8,9 @@ function parseSnapshot(text) {
   if (!snapshot || !Array.isArray(snapshot.tasks)) {
     throw new Error("Missing progress task array.");
   }
+  if (!Number.isFinite(Date.parse(snapshot.updated_at))) {
+    throw new Error("Invalid progress timestamp.");
+  }
   for (const task of snapshot.tasks) {
     if (!task || !["id", "label", "status", "message", "updated_at"].every(
       key => typeof task[key] === "string"
