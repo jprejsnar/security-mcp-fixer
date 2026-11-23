@@ -1,12 +1,12 @@
 # Quality sources
 
-Read this once before the first code change. It distills the sites the project requires. Follow the live page when it disagrees with this summary.
+This file lists the public sources behind the startup guardrail. Cursor and VS Code do not load it. Follow the live page when it disagrees with that guardrail.
 
 ## Python
 
 Sites: https://www.python.org/ and https://docs.python.org/
 
-- Prefer the obvious, readable form. Explicit is better than implicit. Simple is better than nested. Errors must not disappear unless the code silences them on purpose. If a fact is ambiguous, look it up instead of guessing. That is PEP 20: https://peps.python.org/pep-0020/
+- Prefer the obvious, readable form. Explicit is better than implicit. Simple is better than nested. An error may stay out of the log only when the startup guardrail already records it in the result or in a warning. If a fact is ambiguous, look it up instead of guessing. That is PEP 20: https://peps.python.org/pep-0020/
 - Match this repository's Ruff settings. Do not restyle unrelated code to satisfy a general style page. PEP 8 is the public baseline: https://peps.python.org/pep-0008/
 - Use the standard library and current language docs for the module you touch. Check the versionchanged notes. Do not adopt syntax or APIs that need a newer interpreter than 3.11.
 - Name exceptions you handle. Close files you open. Pass `encoding` for text. Keep public behavior stable when a cleanup is possible without a rewrite.
@@ -33,7 +33,7 @@ Site: https://docs.gitlab.com/
 
 Sites: https://cursor.com/docs/plugins and https://cursor.com/docs/reference/plugins
 
-- Persistent guidance belongs in an always-apply rule and in `.github/copilot-instructions.md`. Those two copies are generated from `ai/guardrails.md`.
-- Skills and agents carry the same policy, but they are not a second startup copy of a long document. Keep a skill short and point it here.
+- Persistent guidance belongs in `.cursor/rules/ai-guardrails.mdc` (`alwaysApply: true`) and in `.github/copilot-instructions.md`. Both are generated from `ai/guardrails.md`. Do not also put that text in a root `AGENTS.md`; Cursor and VS Code would load the extra copy on top of the file each editor already applies.
+- Skills and custom agents explain how to edit the guardrail. They are not a second startup copy.
 - A plugin may bundle rules, skills, agents, commands, and MCP servers. Do not publish secrets in a plugin manifest. Declare names only, and let the user supply values.
 - Do not install another plugin that repeats this repository's guardrails.

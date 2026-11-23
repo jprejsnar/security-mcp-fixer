@@ -1,14 +1,10 @@
 ---
 name: ai-guardrails
-description: Applies repository compaction and code-quality guardrails. Use at the start of every session and before writing, reviewing, or refactoring code in this repository.
+description: Edit or sync this repository's AI guardrails. Use when changing ai/guardrails.md, the Cursor rule, Copilot instructions, or scripts/sync_ai_guardrails.py.
 ---
 
 # AI guardrails
 
-The startup rule is already loaded. Before the first code change in a session, read `ai/quality-sources.md` and apply it. Do not read that file again, and do not copy it into the chat.
+Cursor and VS Code already load the startup guardrail. Do not paste it into this skill, and do not read `ai/quality-sources.md` during an ordinary task.
 
-Use a named constant instead of a magic number or magic string. Put limits, timeouts, statuses, path fragments, and error messages in constants. Leave a literal inline only when it is the value itself, such as `0`, `1`, or `""`.
-
-Never call a deprecated or scheduled-for-removal MCP, Python, or GitLab API. Use the current replacement from the MCP Python SDK docs, https://docs.python.org, or https://docs.gitlab.com.
-
-Write dates and times as ISO 8601 only. Use `date.isoformat()` or a timezone-aware `datetime.isoformat()`. In a file or branch name, use `YYYY-MM-DD` or basic `YYYY-MM-DDTHHMMSSZ` because a colon is not a legal Windows file name.
+When the guardrail changes, edit `ai/guardrails.md`, then run `python scripts/sync_ai_guardrails.py`. Use `--check` to confirm the generated copies match. Do not hand-edit `.cursor/rules/ai-guardrails.mdc` or `.github/copilot-instructions.md`. Do not add a root `AGENTS.md` that repeats the startup text.

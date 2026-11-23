@@ -146,6 +146,9 @@ def test_run_logs_are_archived_then_removed_from_the_checkout(tmp_path, monkeypa
     monkeypatch.setattr(
         "gitlab_security_mcp.security_artifacts.Path.home", lambda: home
     )
+    monkeypatch.setattr(
+        "gitlab_security_mcp.security_artifacts.read_server_log", lambda: ""
+    )
     root = tmp_path / "checkout"
     metadata = root / ".security-mcp"
     (metadata / "command-logs").mkdir(parents=True)
@@ -182,3 +185,37 @@ def test_run_logs_are_archived_then_removed_from_the_checkout(tmp_path, monkeypa
     assert (metadata / "reports" / "unresolved-remediation.md").is_file()
     assert (metadata / "run-state.json").is_file()
     assert archive.is_file()
+
+
+def test_archive_includes_the_server_diagnostic_log(tmp_path, monkeypatch):
+    """The zip keeps stderr text when the checkout has no command logs."""
+    # Arrange
+    import zipfile
+    from datetime import UTC, datetime
+
+    from gitlab_security_mcp.security_artifacts import archive_run_logs
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(
+        "gitlab_security_mcp.security_artifacts.Path.home", lambda: home
+    )
+    server_log = (
+        "2026-11-22T02:00:00Z WARNING gitlab_security_mcp [MainThread]: disk failed\n"
+    )
+    monkeypatch.setattr(
+        "gitlab_security_mcp.security_artifacts.read_server_log",
+        lambda: server_log,
+    )
+    root = tmp_path / "checkout"
+    root.mkdir()
+    when = datetime(2026, 11, 22, 2, 0, tzinfo=UTC)
+
+    # Act
+    result = archive_run_logs(root, "sample-project", when)
+
+    # Assert
+    assert result["status"] == "ARCHIVED"
+    assert result["removed"] == []
+    with zipfile.ZipFile(result["path"]) as zipped:
+        assert zipped.read("server.log").decode("utf-8") == server_log

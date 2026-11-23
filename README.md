@@ -40,8 +40,9 @@ This is one chat request, not a terminal command. The workflow runs these
 7. **Final unresolved report:** write and display
    `.security-mcp/reports/unresolved-remediation.md`, with package current/target
    versions and blockers, plus unsuccessful code attempts and their reasons.
-   Checkout logs are then zipped under `~/softwareSecurityAuditReports/` and
-   removed from the repo. Reports and run state stay.
+   Checkout logs and the redacted server log are then zipped under
+   `~/softwareSecurityAuditReports/` and the checkout copies are removed.
+   Reports and run state stay. The server log is not a home log file.
 
 Canceling a selection authorizes nothing and continues to the next job.
 Declining the audit still generates the final report. Jobs cannot be started
@@ -650,7 +651,8 @@ flowchart TD
   j6 -->|Yes| audit["Prompt, coverage, unchecked choices. Checked fixes need a reproduced root cause. A false positive is not patched."]
   j6 -->|No or cancel| j7["7 Display unresolved remediation report"]
   audit --> j7
-  j7 --> human["Human reviews reports and the diff, then commits and pushes manually"]
+  j7 --> zip["Zip checkout logs and redacted server.log"]
+  zip --> human["Human reviews reports and the diff, then commits and pushes manually"]
 ```
 
 What each job still does:
@@ -744,11 +746,14 @@ What each job still does:
   See [Software audit states (job 6)](#software-audit-states-job-6).
 - **Job 7.** Writes and opens `.security-mcp/reports/unresolved-remediation.md`
   plus the Markdown and JSON reports. It then zips this run's `audit.jsonl`,
-  `http-timings.jsonl`, and `command-logs` to
-  `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` and
-  deletes those files from the checkout. Reports, run state, policies, and
-  lint files stay. Server messages stay on stderr and are not copied into a
-  home log file. The human reviews the reports and
+  `http-timings.jsonl`, and `command-logs`, plus the redacted server diagnostic
+  log as `server.log`, to
+  `~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip`
+  and deletes the checkout copies. Reports, run state, policies, and
+  lint files stay. The same server lines still go to stderr. A process temp
+  spool holds them until the process exits; it is not a home log file. The
+  zip is written when either the checkout logs or that spool has text. The
+  human reviews the reports and
   `git diff`, then commits and pushes manually. A repeated
   `complete_security_run` returns the saved report.
 
@@ -765,9 +770,10 @@ Running alongside every job:
 - **Evidence logs:** command output goes to `.security-mcp/command-logs/`,
   hashes and exit codes to `audit.jsonl`, HTTP timings to `http-timings.jsonl`,
   and an inspection snapshot to `run-state.json`. Snapshots are never reloaded
-  as permission. Job 7 moves the checkout logs into the home zip named above
-  and deletes those checkout files. INFO and higher server logs go to stderr
-  only, in the same process, and are not written to a file.
+  as permission. INFO and higher server logs go to stderr and to a process
+  temp spool. Job 7 copies the checkout logs and that spool into the home zip
+  named above, as `server.log`, then deletes the checkout files. The spool is
+  removed when the process exits.
 - **Audit continuation hooks (opt-in):** Cursor and Copilot stop hooks continue
   an unfinished approved audit for the same session, up to 24 turns (8 for
   Copilot), and stop when no new progress is recorded.
@@ -938,7 +944,9 @@ flowchart TB
   server -->|"Read exact-version approvals and check definitions"| policy["Corporate-controlled JSON policy"]
   approver["Corporate approvers"] -->|"Provision independently"| policy
   server -->|"After approval outcome: final reports, snapshots and audit"| artifacts["Target checkout: .security-mcp"]
+  server -->|"Final report: zip checkout logs and redacted server.log"| logZip["~/softwareSecurityAuditReports"]
   artifacts --> reviewer
+  logZip --> reviewer
   checkout -->|"Review diff and publish manually"| reviewer
 ```
 
@@ -1577,7 +1585,8 @@ must follow the declared source-edit policy.
 Commands have timeouts, capped output, and audit records with output hashes rather
 than raw stdout/stderr. Tool results can still contain bounded diagnostic output.
 Product checks and dependency audits also retain complete stdout/stderr under
-`.security-mcp/command-logs/`, including failed registry audit responses.
+`.security-mcp/command-logs/`, including failed registry audit responses, until
+job 7 moves those files into the run zip.
 Keep credentials out of source control and avoid secrets in command arguments,
 product logs, or reports. GitLab queries and advisory requests send the relevant
 project or vulnerability/package identifiers to their configured services.
@@ -2666,7 +2675,8 @@ Engine configuration is deferred until a tool is called, so invalid paths or
 settings do not prevent MCP initialization or tool discovery. Tool errors
 include the stage, repository (when available), server working directory, and
 corrective action. Git precheck errors include the attempted checkout and
-recovery instructions. Diagnostic logs go to stderr, never MCP stdout. If the
+recovery instructions. Diagnostic logs go to stderr, never MCP stdout. The
+same redacted lines are copied into the job 7 zip as `server.log`. If the
 Python executable or dependencies prevent startup altogether, consult Cursor's
 MCP server log and verify the configured interpreter and installed requirements.
 
@@ -3039,18 +3049,25 @@ process ID and traceback. Approval-window start, visibility, close and PowerShel
 diagnostics are logged with the dialog process ID. A logging failure does not
 fail the task. Child-process CPU is not included.
 Stderr lines use `YYYY-MM-DDTHH:MM:SSZ LEVEL logger [thread]: message` in UTC.
-Those lines are not written to a home log file.
+The same redacted lines are appended to a process spool under the system temp
+directory, `gitlab-security-mcp/<pid>.log`. That spool is not a home log file
+and is removed when the process exits.
 When the final report is written, checkout logs (`audit.jsonl`,
-`http-timings.jsonl`, and `command-logs`) are zipped to
-`~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` and
-then deleted from the checkout. Reports and run state stay in the repo.
+`http-timings.jsonl`, and `command-logs`) and the spool text (`server.log`)
+are zipped to
+`~/softwareSecurityAuditReports/<GitLab project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip`.
+The checkout copies are then deleted. The spool stays until process exit so a
+later checkout archived by the same process still receives the process log.
+Reports and run state stay in the repo. No zip is written when both the
+checkout logs and the spool are empty.
 Values of `GITLAB_TOKEN`, `GITLAB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`,
 `GH_TOKEN` and `NVD_API_KEY`, including URL-encoded forms and tracebacks, are
 replaced with `[REDACTED]`; other secrets in application output are not scrubbed.
-Unexpected exceptions produce a failure message with a traceback. Handlers that
-convert a `TypeError`, `AttributeError`, `KeyError` or other unexpected type into
-a failed result also log its traceback as a WARNING naming the operation; expected
-I/O, validation, command and HTTP failures appear only in the returned result.
+Unexpected exceptions produce a failure message with a traceback. A handler
+that converts any exception into a failed result logs a WARNING with the
+operation, the exception text, and the traceback. That includes I/O,
+validation, command, and HTTP failures. The returned result still carries the
+message.
 The host AI's own reasoning
 and browsing between tool calls are not visible to this server.
 
@@ -3279,10 +3296,10 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
-| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output while the run is open. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files with the two JSONL logs and deletes them from the checkout. |
+| `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full local preparation and product-check output while the run is open. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files with the two JSONL logs and `server.log`, then deletes the checkout copies. |
 | `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table. Stays in the checkout after the log zip. |
-| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | Checkout logs from the finished run. Created only when those log files exist. The checkout token keeps another repository with the same project name from replacing the archive. |
-| Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr. Not written to a home file and not part of the run zip. |
+| `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | Checkout logs from the finished run, plus `server.log` (the redacted stderr text for this process). Created when either those checkout files or the server spool has text. Checkout copies are deleted; the temp spool stays until the process exits. The checkout token keeps another repository with the same project name from replacing the archive. |
+| Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr, and the same redacted text in a process temp spool. Job 7 copies the spool into the run zip as `server.log`. The spool is not a home file and is removed when the process exits. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
 | `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |
 | `.security-mcp/reports/security-remediation-report-*.md` | Human-readable findings, changes, validation and review evidence. |
@@ -3524,7 +3541,9 @@ file ownership. Only the explicitly selected lint preview rules are enabled;
 formatter output does not use preview style. Background approval owners persist
 failures, and completion callbacks retrieve any exception from final cleanup.
 A handler that converts exceptions into a result calls `util.log_unexpected`
-with the operation name, so defect-type exceptions keep their traceback.
+with the operation name. Every converted failure keeps a WARNING with the
+operation, the exception text, and the traceback, including I/O, validation,
+command, and HTTP errors.
 Bounded file reads use `util.read_bounded`, which closes the file before
 checking the size limit.
 The [logging guidance](https://docs.python.org/3/howto/logging.html),
@@ -3638,7 +3657,7 @@ for deployment and restart differences.
 | `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI opens the file and line GitLab already reported, reads that code in the checkout, and submits `source_review`. The visible reason is at most 2 everyday sentences and 400 characters. This is not a request for the user to analyze code. The file body is not returned. Deprecated sampling is intentionally disabled. |
 | Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval`, `gitlab_dismissal_counts` and saved `gitlab_dismissals` verification. Only an independent read of persisted `DISMISSED` / `FALSE_POSITIVE` establishes confirmation; mutation acknowledgements alone remain unverified. Check the Vulnerability report's Dismissed/False positive filters and tracked ref, not historical scanner artifacts. Inspect unknown outcomes; never automatically retry writes. |
 | NVD returns 429/503 or times out | Review recorded errors and pacing/retry progress. Bounded retries honor shared cooldowns and `Retry-After`; long cooldowns fail explicitly. Do not bypass rate limits or treat an outage as proof of safety. |
-| Approval window opens on an unexpected monitor | Search server stderr for `Approval window pid=... reported diagnostics`. It names why the MCP host window could not be identified; the dialog then uses the active monitor. |
+| Approval window opens on an unexpected monitor | Search server stderr, or `server.log` inside the run zip, for `Approval window pid=... reported diagnostics`. It names why the MCP host window could not be identified; the dialog then uses the active monitor. |
 | `Desktop task failed` or `Approval window pid=... returned unreadable output` | The background approval owner or native dialog failed. The saved form/selection status records the failure and nothing was authorized. Use the logged traceback, process ID and exit code, then reopen the form. |
 | Windows command containment cannot be established | The command fails explicitly before its suspended child resumes; owned resources are cleaned up. Inspect the error and host/job/security-policy restrictions with your administrator rather than disabling containment or launching an uncontained fallback. |
 | Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |

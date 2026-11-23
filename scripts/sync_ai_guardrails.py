@@ -8,17 +8,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BODY = (ROOT / "ai" / "guardrails.md").read_text(encoding="utf-8")
 SKILL = (ROOT / "ai" / "skill.md").read_text(encoding="utf-8")
+AGENT = (ROOT / "ai" / "agent.md").read_text(encoding="utf-8")
 RULE = (
     "---\n"
     "description: Compaction and code-quality guardrails for every session\n"
     "alwaysApply: true\n"
-    "---\n\n"
-    f"{BODY}"
-)
-AGENT = (
-    "---\n"
-    "name: ai-guardrails\n"
-    "description: Repository AI guardrails for compaction and code quality. Apply to every task in this repository.\n"
     "---\n\n"
     f"{BODY}"
 )

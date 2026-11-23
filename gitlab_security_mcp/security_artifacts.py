@@ -11,7 +11,7 @@ import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gitlab_security_mcp.util import checkout_file_id
+from gitlab_security_mcp.util import checkout_file_id, read_server_log
 
 _RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT = (
     "Security artifacts contain a link/reparse point: {}"
@@ -37,6 +37,8 @@ _RAISE_ARCHIVE_TIMESTAMP_IS_NOT_ISO_8601 = (
 )
 
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_ARTIFACT_CLEANUP = "Security log review/cleanup could not complete: %s"
+_SERVER_LOG_MEMBER = "server.log"
 LOG_ARCHIVE_DIRECTORY = "softwareSecurityAuditReports"
 _RUN_LOG_NAMES = ("audit.jsonl", "http-timings.jsonl")
 _COMMAND_LOG_SUFFIXES = (".stdout.log", ".stderr.log")
@@ -278,6 +280,7 @@ def review_security_artifacts(
                     directory.rmdir()
                     deleted_directories.append(str(directory.relative_to(repo_root)))
     except (OSError, ValueError) as exc:
+        logger.warning(_LOG_ARTIFACT_CLEANUP, exc, exc_info=True)
         filesystem_safe = False
         record(root, 0, f"Security log review/cleanup could not complete: {exc}")
     return {
@@ -331,15 +334,17 @@ def run_log_files(repo_root: Path) -> list[Path]:
 
 
 def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict:
-    """Zip checkout logs into the home archive folder, then delete those files.
+    """Zip checkout logs and the server diagnostic log, then delete the checkout copies.
 
     Reports, run state, policies, and lint evidence stay in the checkout. The
-    archive name uses an ISO 8601 basic timestamp because a colon is not a
-    legal Windows file name. A checkout token keeps another repository with
-    the same project name from replacing this archive.
+    server log is the redacted stderr text for this process. The archive name
+    uses an ISO 8601 basic timestamp because a colon is not a legal Windows
+    file name. A checkout token keeps another repository with the same project
+    name from replacing this archive.
     """
     files = run_log_files(repo_root)
-    if not files:
+    server_log = read_server_log()
+    if not files and not server_log:
         return {"status": "NO_LOGS", "path": None, "removed": []}
     destination = Path.home() / LOG_ARCHIVE_DIRECTORY
     destination.mkdir(parents=True, exist_ok=True)
@@ -359,6 +364,8 @@ def archive_run_logs(repo_root: Path, project_name: str, when: datetime) -> dict
                     path,
                     arcname=path.relative_to(repo_root / ".security-mcp").as_posix(),
                 )
+            if server_log:
+                archive.writestr(_SERVER_LOG_MEMBER, server_log)
         os.replace(temporary, target)
     except (OSError, ValueError):
         Path(temporary).unlink(missing_ok=True)

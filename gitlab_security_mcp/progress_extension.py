@@ -30,6 +30,7 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _CLI_JS = Path("resources") / "app" / "out" / "cli.js"
 _MAC_CLI_JS = Path("Resources") / "app" / "out" / "cli.js"
 _MAC_EXECUTABLE_MARKER = "Contents/MacOS/"
+_PS_QUOTES = "\"'"
 _PS_TIMEOUT_SECONDS = 5
 _EDITOR_EXECUTABLES = frozenset(
     {
@@ -38,9 +39,18 @@ _EDITOR_EXECUTABLES = frozenset(
         "code - insiders.exe",
         "cursor",
         "code",
+        "code - insiders",
         "code-insiders",
         "electron",
     }
+)
+# Longest match wins so "code" does not cut "code - insiders".
+_MAC_EDITOR_BASENAMES = (
+    "code - insiders",
+    "code-insiders",
+    "cursor",
+    "electron",
+    "code",
 )
 _EXTENSION_FILES = (
     "package.json",
@@ -162,7 +172,7 @@ def install_progress_extension() -> None:
         else:
             tree = _posix_process_tree()
         command = editor_command(os.getppid(), *tree)
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         logger.warning("Could not identify the editor process", exc_info=True)
         return
     if command is None:
@@ -170,7 +180,10 @@ def install_progress_extension() -> None:
             "Progress extension install skipped; this process is not a VS Code or Cursor child."
         )
         return
-    _install_with_command(command)
+    try:
+        _install_with_command(command)
+    except Exception:
+        logger.warning("Could not install the progress extension", exc_info=True)
 
 
 @contextmanager
@@ -225,6 +238,7 @@ def _editor_cli(image: Path) -> Path | None:
     candidates = (
         image.parent / _CLI_JS,
         image.parent.parent / _MAC_CLI_JS,
+        image.parent.parent / _CLI_JS,
     )
     for cli in candidates:
         if cli.is_file():
@@ -271,7 +285,7 @@ def _posix_process_tree() -> tuple[dict[int, tuple[int, str]], dict[int, Path]]:
     if proc.is_dir():
         return _linux_process_tree(proc)
     completed = subprocess.run(
-        ["ps", "-ax", "-o", "pid=,ppid=,command="],
+        ["ps", "-axww", "-o", "pid=,ppid=,command="],
         check=False,
         shell=False,
         capture_output=True,
@@ -297,7 +311,7 @@ def _linux_process_tree(
         pid = int(entry.name)
         try:
             parsed = _proc_stat((entry / "stat").read_text(encoding="utf-8"))
-        except OSError:
+        except (OSError, ValueError):
             continue
         if parsed is None:
             continue
@@ -355,18 +369,65 @@ def _process_tree_from_ps(
     return parents, images
 
 
+def _unquote_ps_command(command: str) -> str:
+    """Drop one pair of shell quotes around the executable in a ps command."""
+    text = command.strip()
+    if not text or text[0] not in _PS_QUOTES:
+        return text
+    quote = text[0]
+    end = text.find(quote, 1)
+    if end < 0:
+        return text[1:]
+    return text[1:end] + text[end + 1 :]
+
+
 def _image_from_ps_command(command: str) -> Path | None:
     """Keep the executable path, including a macOS path that contains spaces."""
+    command = _unquote_ps_command(command)
     marker = command.find(_MAC_EXECUTABLE_MARKER)
     if marker >= 0:
         start = 0 if command.startswith("/") else command.rfind(" ", 0, marker) + 1
-        end = command.find(" ", marker + len(_MAC_EXECUTABLE_MARKER))
-        text = command[start:] if end < 0 else command[start:end]
-        return Path(text)
+        tail = command[marker + len(_MAC_EXECUTABLE_MARKER) :]
+        name_length = _macos_editor_name_length(tail)
+        if name_length is None:
+            end = command.find(" ", marker + len(_MAC_EXECUTABLE_MARKER))
+            text = command[start:] if end < 0 else command[start:end]
+        else:
+            text = command[start : marker + len(_MAC_EXECUTABLE_MARKER) + name_length]
+        return Path(text) if text else None
     token = command.split(" ", 1)[0]
     if token.startswith("/"):
-        return Path(token)
+        if Path(token).is_file():
+            return Path(token)
+        spaced = _posix_executable_with_spaces(command)
+        return spaced if spaced is not None else Path(token)
     return None
+
+
+def _posix_executable_with_spaces(command: str) -> Path | None:
+    """Return an absolute executable whose path contains spaces, when it exists."""
+    end = 0
+    while True:
+        end = command.find(" ", end + 1)
+        candidate = command if end < 0 else command[:end]
+        if candidate.startswith("/") and Path(candidate).is_file():
+            return Path(candidate)
+        if end < 0:
+            return None
+
+
+def _macos_editor_name_length(tail: str) -> int | None:
+    """Return the editor basename length, keeping spaces that belong to the name."""
+    lowered = tail.lower()
+    matches = [
+        len(base)
+        for base in _MAC_EDITOR_BASENAMES
+        if lowered.startswith(base)
+        and (len(tail) == len(base) or tail[len(base)] == " ")
+    ]
+    if not matches:
+        return None
+    return max(matches)
 
 
 def _windows_process_tree() -> tuple[dict[int, tuple[int, str]], dict[int, Path]]:

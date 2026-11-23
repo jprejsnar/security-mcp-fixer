@@ -68,6 +68,7 @@ from gitlab_security_mcp.software_audit import (
 )
 from gitlab_security_mcp.util import (
     PROGRESS_PUBLISH_FAILURES,
+    attach_server_log,
     environment_secrets,
     logged_lock,
     redact,
@@ -299,14 +300,20 @@ def _thread_exception(args: threading.ExceptHookArgs) -> None:
     )
 
 
-def _prepare_stderr() -> None:
+_STDERR_PREPARE_FAILED = "Could not make stderr UTF-8 and line-buffered: %s"
+_LOG_FORMAT = "%(asctime)sZ %(levelname)s %(name)s [%(threadName)s]: %(message)s"
+_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+def _prepare_stderr() -> Exception | None:
     """Make stderr UTF-8 and line-buffered for IDE pipes."""
     try:
         sys.stderr.reconfigure(
             encoding="utf-8", errors="backslashreplace", line_buffering=True
         )
-    except (AttributeError, OSError, ValueError):
-        return
+    except (AttributeError, OSError, ValueError) as exc:
+        return exc
+    return None
 
 
 class _StderrFormatter(logging.Formatter):
@@ -322,15 +329,15 @@ class _StderrFormatter(logging.Formatter):
         )
 
 
+def _log_formatter() -> _StderrFormatter:
+    """Build one redacting formatter. Handlers must not share an instance."""
+    return _StderrFormatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT)
+
+
 def _stderr_handler() -> logging.Handler:
     """Build one plain-text handler that writes to the current stderr."""
     handler = logging.StreamHandler(_CurrentStderr())
-    handler.setFormatter(
-        _StderrFormatter(
-            "%(asctime)sZ %(levelname)s %(name)s [%(threadName)s]: %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
-    )
+    handler.setFormatter(_log_formatter())
     return handler
 
 
@@ -340,7 +347,8 @@ def _configure_logging() -> None:
     The MCP SDK installs Rich on the root logger when that package is present.
     That call is skipped once a handler exists. Both IDE output panels then
     receive plain text lines. Level and propagate are applied on every call,
-    including when a handler is already attached.
+    including when a handler is already attached. A second handler keeps the
+    same text for the end-of-run zip.
     """
     threading.excepthook = _thread_exception
     root = logging.getLogger()
@@ -351,12 +359,15 @@ def _configure_logging() -> None:
         logger.addHandler(_stderr_handler())
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    attach_server_log(_log_formatter())
 
 
 def _install_host_logging() -> None:
     """Prepare stderr, then attach handlers that write to that stream."""
-    _prepare_stderr()
+    failure = _prepare_stderr()
     _configure_logging()
+    if isinstance(failure, (OSError, ValueError)):
+        logger.warning(_STDERR_PREPARE_FAILED, failure)
 
 
 _install_host_logging()
@@ -614,9 +625,10 @@ def _keep_audit_visible(selected: Engine) -> None:
     active = _publish_audit_activity(selected)
     if previous and (not active or previous[0] is not selected.state):
         previous[1].cancel()
-    if not active or (
-        previous and previous[0] is selected.state and not previous[1].done()
-    ):
+    if not active:
+        _audit_activity_tasks.pop(selected.repo_root, None)
+        return
+    if previous and previous[0] is selected.state and not previous[1].done():
         return
     state = selected.state
 
@@ -1047,6 +1059,9 @@ _registry_lock = threading.Lock()
 
 def _close_engine() -> None:
     """Close every checkout engine. A second call does nothing."""
+    for _state, task in list(_audit_activity_tasks.values()):
+        task.cancel()
+    _audit_activity_tasks.clear()
     with logged_lock(_registry_lock, "registry"):
         engines = list(_engines.values())
         _engines.clear()
@@ -3095,7 +3110,8 @@ def _audit_revision(engine: Engine) -> str:
     """Return the current branch and commit, or an explicit unverified marker."""
     try:
         return f"{engine.git.current_branch()} {engine.git.head()}"
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not read the Git revision for the audit prompt: %s", exc)
         return "unverified"
 
 
@@ -4026,12 +4042,20 @@ def get_run_status(
     )
 
 
+_PROGRESS_INSTALL_THREAD = "progress-extension-install"
+
+
 def main() -> None:
     """Serve MCP tools over stdio until the client disconnects."""
     global _progress_console
     _install_host_logging()
     logger.info("gitlab-security-mcp %s serving stdio", __version__)
-    install_progress_extension()
+    # A second window must speak MCP while another window still holds the install lock.
+    threading.Thread(
+        target=install_progress_extension,
+        name=_PROGRESS_INSTALL_THREAD,
+        daemon=True,
+    ).start()
     try:
         mcp.run(transport="stdio")
     finally:

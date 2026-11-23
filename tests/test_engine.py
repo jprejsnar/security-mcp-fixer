@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import sys
 import threading
 from datetime import date
@@ -55,7 +56,7 @@ def test_corporate_dns_failure_blocks_prechecks_without_work(tmp_path, corporate
 
 @pytest.mark.parametrize("failed_check", [1, 2, 3])
 def test_dns_loss_blocks_pulls_or_pnpm_preparation(
-    tmp_path, corporate_dns, failed_check
+    tmp_path, corporate_dns, failed_check, caplog
 ):
     """Recheck DNS after prechecks and prevent any subsequent preparation."""
     # Arrange
@@ -77,13 +78,15 @@ def test_dns_loss_blocks_pulls_or_pnpm_preparation(
     ]
 
     # Act
-    result = engine.pull_main_twice()
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        result = engine.pull_main_twice()
 
     # Assert
     assert result["status"] == (
         "PREPARATION_FAILED" if failed_check == 3 else "PULL_FAILED"
     )
     assert "Connect to corporate VPN first" in result["reason"]
+    assert "Corporate DNS check failed" in caplog.text
     assert len(result["results"]) == failed_check - 1
     assert engine.git.run.call_count == failed_check - 1
     engine._prepare_pnpm.assert_not_called()
@@ -266,8 +269,12 @@ def test_server_logs_go_to_stderr(capsys):
     server.logger.info("ide-log-marker")
 
     # Assert
-    assert len(server.logger.handlers) == 1
-    assert "ide-log-marker" in capsys.readouterr().err
+    assert len(server.logger.handlers) == 2
+    captured = capsys.readouterr()
+    assert "ide-log-marker" in captured.err
+    from gitlab_security_mcp.util import read_server_log
+
+    assert "ide-log-marker" in read_server_log()
     assert not any(
         type(handler).__name__ == "RichHandler"
         for handler in logging.getLogger().handlers
@@ -296,7 +303,11 @@ def test_configure_logging_sets_level_when_a_handler_exists():
         # Assert
         assert server.logger.propagate is False
         assert server.logger.level == logging.INFO
-        assert len(server.logger.handlers) == 1
+        assert not any(
+            isinstance(handler, logging.StreamHandler)
+            for handler in server.logger.handlers
+        )
+        assert len(server.logger.handlers) == 2
     finally:
         server.logger.handlers.clear()
         for handler in saved_handlers:
@@ -388,16 +399,18 @@ def test_stdio_server_logs_for_cursor_and_copilot(tmp_path):
         assert "\x1b[" not in stderr
 
 
-def test_non_git_precheck_does_not_persist_run_state(tmp_path):
+def test_non_git_precheck_does_not_persist_run_state(tmp_path, caplog):
     """Non git precheck does not persist run state."""
     # Arrange
     engine = Engine(tmp_path, gitlab=FakeGitLab([]), advisory=ScriptedAdvisory())
 
     # Act
-    result = engine.run_prechecks()
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        result = engine.run_prechecks()
 
     # Assert
     assert result["status"] == "PRECHECK_FAILED"
+    assert "Git work-tree verification failed" in caplog.text
     assert result["repo_root"] == str(tmp_path.resolve())
     assert "REPO_ROOT" in result["reason"]
     assert result["no_changes_attempted"]

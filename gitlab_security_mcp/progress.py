@@ -15,6 +15,8 @@ from gitlab_security_mcp.util import atomic_write_text, environment_secrets, red
 _RAISE_PROGRESS_NEEDS_VALID_PAIRED_COMPLETION_COUNTS = (
     "Progress needs valid paired completion counts."
 )
+_WINDOWS_UNC_DEVICE_PREFIX = "\\\\?\\UNC\\"
+_WINDOWS_DEVICE_PREFIX = "\\\\?\\"
 
 _lock = threading.Lock()
 _tasks: dict[Path, dict[str, dict]] = {}
@@ -27,6 +29,28 @@ def mirror_directory() -> Path:
     if override:
         return Path(override)
     return Path.home() / ".cache" / "gitlab-security-mcp" / "progress"
+
+
+def editor_repo_root(root: Path) -> str:
+    """Return a checkout path VS Code and Cursor can match on every supported OS.
+
+    Windows may store a long path with a device prefix. The editors report the
+    same directory without that prefix, including a network share.
+    """
+    text = str(root)
+    if os.name != "nt":
+        return text
+    if text.startswith(_WINDOWS_UNC_DEVICE_PREFIX):
+        return "\\\\" + text[len(_WINDOWS_UNC_DEVICE_PREFIX) :]
+    if text.startswith(_WINDOWS_DEVICE_PREFIX):
+        return text[len(_WINDOWS_DEVICE_PREFIX) :]
+    return text
+
+
+def drop_checkout(root: Path) -> None:
+    """Forget one checkout's in-memory progress after its engine closes."""
+    with _lock:
+        _tasks.pop(root, None)
 
 
 def mirror_path(root: Path) -> Path:
@@ -84,7 +108,7 @@ def publish(
             {
                 "server_version": __version__,
                 "pid": os.getpid(),
-                "repo_root": str(root),
+                "repo_root": editor_repo_root(root),
                 "updated_at": now,
                 "tasks": list(tasks.values()),
             },

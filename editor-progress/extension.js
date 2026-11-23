@@ -1,27 +1,79 @@
 "use strict";
 
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { activeStates, parseSnapshot, taskText } = require("./progress-model");
 
 // Mirrors let the GUI follow a run whose checkout is not an open workspace folder.
 const MIRROR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const WINDOWS_UNC_DEVICE_PREFIX = "\\\\?\\UNC\\";
+const WINDOWS_DEVICE_PREFIX = "\\\\?\\";
 
 function mirrorDirectory() {
   return process.env.GITLAB_SECURITY_PROGRESS_DIR ||
     path.join(os.homedir(), ".cache", "gitlab-security-mcp", "progress");
 }
 
+function withoutWindowsDevicePrefix(value) {
+  if (process.platform !== "win32") return value;
+  if (value.startsWith(WINDOWS_UNC_DEVICE_PREFIX)) {
+    return "\\\\" + value.slice(WINDOWS_UNC_DEVICE_PREFIX.length);
+  }
+  if (value.startsWith(WINDOWS_DEVICE_PREFIX)) {
+    return value.slice(WINDOWS_DEVICE_PREFIX.length);
+  }
+  return value;
+}
+
+function canonical(value) {
+  if (!value) return "";
+  // Progress files name every checkout. realpath on a disconnected mapped
+  // drive blocks the extension host, so only an open workspace folder is resolved.
+  let normalized = withoutWindowsDevicePrefix(path.normalize(value));
+  while (normalized.length > 1 && normalized.endsWith(path.sep) &&
+      !normalized.endsWith(":" + path.sep)) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+const resolvedFolders = new Map();
+
+function resolveOpenFolder(value) {
+  if (resolvedFolders.has(value)) return resolvedFolders.get(value);
+  const normal = canonical(value);
+  let resolved = normal;
+  if (normal && path.isAbsolute(normal) && !isUnc(normal)) {
+    try {
+      resolved = canonical(fs.realpathSync(normal));
+    } catch {
+      resolved = normal;
+    }
+  }
+  resolvedFolders.set(value, resolved);
+  return resolved;
+}
+
+function isUnc(value) {
+  return process.platform === "win32" && value.startsWith("\\\\");
+}
+
+function pathKey(value) {
+  const normal = canonical(value);
+  // Windows and macOS volumes are case-insensitive. Linux paths are not.
+  return process.platform === "linux" ? normal : normal.toLowerCase();
+}
+
 function inWorkspace(repoRoot, folders) {
   if (!repoRoot) return false;
+  const root = pathKey(repoRoot);
   return (folders || []).some(folder => {
     const folderPath = folder.uri?.fsPath || folder.fsPath || "";
     if (!folderPath) return false;
-    const root = path.normalize(repoRoot);
-    const folderName = path.normalize(folderPath);
+    const folderName = pathKey(resolveOpenFolder(folderPath));
     const prefix = folderName.endsWith(path.sep) ? folderName : folderName + path.sep;
-    return root.toLowerCase() === folderName.toLowerCase() ||
-      root.toLowerCase().startsWith(prefix.toLowerCase());
+    return root === folderName || root.startsWith(prefix);
   });
 }
 
@@ -36,7 +88,7 @@ function newestPerRepository(snapshots, now = Date.now()) {
   const newest = new Map();
   for (const { snapshot, mirror } of snapshots) {
     if (mirror && now - Date.parse(snapshot.updated_at) > MIRROR_MAX_AGE_MS) continue;
-    const key = (snapshot.repo_root || "").toLowerCase();
+    const key = pathKey(snapshot.repo_root || "");
     const previous = newest.get(key);
     if (!previous || Date.parse(snapshot.updated_at) > Date.parse(previous.updated_at)) {
       newest.set(key, snapshot);
@@ -149,7 +201,11 @@ function createPresenter(vscode) {
     const percent = current.total > 0 ? Math.floor(100 * current.completed / current.total) : null;
     const filled = percent == null ? 0 : Math.floor(percent / 10);
     const meter = percent == null ? "" : ` [${"#".repeat(filled)}${"-".repeat(10 - filled)}] ${percent}%`;
-    const jobNumber = Number.isInteger(current.completed) ? current.completed + 1 : null;
+    const runningJob = (workflow?.jobs || []).find(job =>
+      job.status === "RUNNING" && Number.isInteger(job.number) && job.number >= 1 && job.number <= 7);
+    const reportedJob = Number.isInteger(current.completed) ? current.completed + 1 : null;
+    const jobNumber = runningJob ? runningJob.number :
+      reportedJob != null && reportedJob <= 7 ? reportedJob : null;
     const label = current.id === "software-audit" ? current.label :
       workflow && jobNumber != null ? `Job ${jobNumber}/7` : current.label;
     bar.text = active.length ? `${stale || current.status !== "RUNNING" ? "$(clock)" : "$(sync~spin)"} Security: ${label}${meter}${counts} | ${state}` : `$(list-unordered) Security: ${current.status}`;
@@ -225,28 +281,34 @@ async function activate(context, vscode = require("vscode")) {
     known.set(uri.toString(), uri);
     try {
       const stat = await vscode.workspace.fs.stat(uri);
-      if (mirrors.has(uri.toString()) && Date.now() - stat.mtime > MIRROR_MAX_AGE_MS) {
+      const staleMirror = mirrors.has(uri.toString()) &&
+        Date.now() - stat.mtime > MIRROR_MAX_AGE_MS;
+      if (staleMirror) {
         snapshots.delete(uri.toString());
-        return;
-      }
-      if (stat.size > 256 * 1024) throw new Error("Progress snapshot exceeds 256 KiB.");
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const next = parseSnapshot(Buffer.from(bytes).toString("utf8"));
-      const previous = snapshots.get(uri.toString());
-      const accepted = !previous || !(Date.parse(previous.updated_at) > Date.parse(next.updated_at));
-      if (accepted) {
-        snapshots.set(uri.toString(), next);
-      }
-      failures.delete(uri.toString());
-      const completed = accepted && next.tasks.find(task => task.id === "workflow" &&
-        task.status === "FINISHED" && task.final_report === true);
-      if (completed && vscode.workspace.isTrusted) {
-        const key = `${uri.toString()}:${completed.started_at}`;
-        if (!displayedReports.has(key)) {
-          displayedReports.add(key);
+      } else {
+        if (stat.size > 256 * 1024) throw new Error("Progress snapshot exceeds 256 KiB.");
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const next = parseSnapshot(Buffer.from(bytes).toString("utf8"));
+        const previous = snapshots.get(uri.toString());
+        const accepted = !previous || !(Date.parse(previous.updated_at) > Date.parse(next.updated_at));
+        if (accepted) {
+          snapshots.set(uri.toString(), next);
+        }
+        failures.delete(uri.toString());
+        const completed = accepted && next.tasks.find(task => task.id === "workflow" &&
+          task.status === "FINISHED" && task.final_report === true);
+        if (completed && vscode.workspace.isTrusted) {
+          const key = `${uri.toString()}:${completed.started_at}`;
           const folder = vscode.workspace.getWorkspaceFolder(uri);
-          if (folder) {
-            const report = vscode.Uri.joinPath(uri, "..", "reports", "unresolved-remediation.md");
+          const report = folder
+            ? vscode.Uri.joinPath(uri, "..", "reports", "unresolved-remediation.md")
+            : next.repo_root
+              ? vscode.Uri.joinPath(
+                  vscode.Uri.file(next.repo_root),
+                  ".security-mcp", "reports", "unresolved-remediation.md")
+              : undefined;
+          if (report && !displayedReports.has(key)) {
+            displayedReports.add(key);
             try {
               await vscode.commands.executeCommand("markdown.showPreview", report);
             } catch (error) {
@@ -257,7 +319,10 @@ async function activate(context, vscode = require("vscode")) {
       }
     } catch (error) {
       snapshots.delete(uri.toString());
-      if (error.code !== "FileNotFound" && error.code !== "ENOENT" && !failures.has(uri.toString())) {
+      if (error.code === "FileNotFound" || error.code === "ENOENT") {
+        known.delete(uri.toString());
+        mirrors.delete(uri.toString());
+      } else if (!failures.has(uri.toString())) {
         failures.add(uri.toString());
         vscode.window.showWarningMessage(`Cannot read GitLab Security progress: ${uri.fsPath}: ${error.message}`);
       }

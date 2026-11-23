@@ -1133,8 +1133,14 @@ def test_uncaught_thread_exception_is_logged(caplog):
     )
 
     # Act
-    with caplog.at_level(logging.ERROR, logger="gitlab_security_mcp"):
-        _thread_exception(args)
+    target = logging.getLogger("gitlab_security_mcp")
+    previous = target.propagate
+    target.propagate = True
+    try:
+        with caplog.at_level(logging.ERROR, logger="gitlab_security_mcp"):
+            _thread_exception(args)
+    finally:
+        target.propagate = previous
 
     # Assert
     assert "RuntimeError" in caplog.records[-1].message
@@ -1211,6 +1217,25 @@ def test_unreaped_command_is_an_explicit_cleanup_failure(monkeypatch, caplog):
     # Assert
     process.kill.assert_called_once()
     assert "not reaped" in caplog.text
+
+
+def test_failed_command_logs_the_exit_and_checkout(tmp_path, caplog):
+    """A non-zero command leaves its tool, exit code and checkout on stderr."""
+    # Arrange
+    runner = CommandRunner(tmp_path)
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        with pytest.raises(RuntimeError, match="rev-parse"):
+            runner.run(["git", "rev-parse", "HEAD"], timeout=30)
+
+    # Assert
+    record = next(
+        row for row in caplog.records if row.message.startswith("Command failed")
+    )
+    assert "tool=git" in record.message
+    assert "exit=128" in record.message
+    assert str(tmp_path) in record.message
 
 
 def test_command_start_failure_has_diagnostic_context(tmp_path, monkeypatch, caplog):
@@ -1347,12 +1372,12 @@ def test_utc_now_iso_is_the_shared_timestamp():
     [
         (KeyError("missing"), True),
         (AttributeError("absent"), True),
-        (OSError("disk"), False),
-        (ValueError("bad value"), False),
+        (OSError("disk"), True),
+        (ValueError("bad value"), True),
     ],
 )
 def test_converted_programming_errors_keep_a_traceback(error, logged, caplog):
-    """Log tracebacks for defect-type errors but not expected recorded failures."""
+    """Keep a traceback for every failure converted into a result."""
     # Arrange
     from gitlab_security_mcp.advisory import AdvisoryClient
 

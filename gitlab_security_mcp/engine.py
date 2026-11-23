@@ -58,6 +58,7 @@ from gitlab_security_mcp.official_docs import (
     cited_security_pages_ok,
 )
 from gitlab_security_mcp.package_releases import release_catalog, reviewed_selection
+from gitlab_security_mcp.progress import drop_checkout
 from gitlab_security_mcp.qualification import (
     PACKAGE_ECOSYSTEMS,
     backup_dependency_files,
@@ -199,6 +200,14 @@ _RAISE_TRUNCATED_MAVEN_DEPENDENCY_OUTPUT_HAS_NO_COMPLETE_LOCAL = (
 _RAISE_MAVEN_DEPENDENCY_LOG_EXCEEDS_THE_8_MIB_INSPECTION = (
     "Maven dependency log exceeds the 8 MiB inspection limit"
 )
+
+_LOG_CORPORATE_DNS_FAILED = "Corporate DNS check failed: %s"
+_LOG_PULL_CHECKOUT_FAILED = "Could not check out main before pull: %s"
+_LOG_PULL_FAILED = "Pull %s of main failed: %s"
+_LOG_PNPM_PREPARATION_FAILED = "pnpm preparation failed: %s"
+_LOG_GIT_DIFF_FAILED = "Could not read the git diff for the local report: %s"
+_LOG_WORK_TREE_FAILED = "Git work-tree verification failed: %s"
+_LOG_BRANCH_PREPARATION_FAILED = "Security branch preparation failed for %s: %s"
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -465,19 +474,22 @@ class Engine:
                 return
             self._closed = True
             try:
-                if self._owns_gitlab:
-                    self.gitlab.close()
-            finally:
                 try:
-                    if self._owns_advisory:
-                        self.advisory.close()
+                    if self._owns_gitlab:
+                        self.gitlab.close()
                 finally:
                     try:
-                        if self._owns_docs and self.docs is not None:
-                            self.docs.close()
+                        if self._owns_advisory:
+                            self.advisory.close()
                     finally:
-                        if self._owns_alpine and self._alpine is not None:
-                            self._alpine.close()
+                        try:
+                            if self._owns_docs and self.docs is not None:
+                                self.docs.close()
+                        finally:
+                            if self._owns_alpine and self._alpine is not None:
+                                self._alpine.close()
+            finally:
+                drop_checkout(self.repo_root)
 
     @classmethod
     def from_env(cls, repo_root: str | None = None) -> Engine:
@@ -546,6 +558,7 @@ class Engine:
             if not getaddrinfo("nexus.ert.com", 443, type=SOCK_STREAM):
                 raise gaierror(_RAISE_NO_DNS_ADDRESSES_RETURNED)
         except OSError as exc:
+            logger.warning(_LOG_CORPORATE_DNS_FAILED, exc)
             reason = (
                 "Cannot resolve nexus.ert.com. Connect to corporate VPN first, "
                 "then rerun run_prechecks."
@@ -580,7 +593,7 @@ class Engine:
         try:
             self.git.ensure_work_tree()
         except GIT_OPERATION_FAILURES as exc:
-            log_unexpected(exc, "Git work-tree verification")
+            logger.warning(_LOG_WORK_TREE_FAILED, exc)
             self.state.status = "PRECHECK_FAILED"
             self.state.stop_stage = "precheck"
             return {
@@ -698,6 +711,7 @@ class Engine:
             try:
                 self.git.run(["checkout", "main"])
             except (OSError, RuntimeError) as exc:
+                logger.warning(_LOG_PULL_CHECKOUT_FAILED, exc)
                 return self._stop(
                     "PULL_FAILED",
                     "pull_main",
@@ -742,7 +756,7 @@ class Engine:
                         },
                     )
             except GIT_OPERATION_FAILURES as exc:
-                log_unexpected(exc, f"pull {number} of main")
+                logger.warning(_LOG_PULL_FAILED, number, exc)
                 return self._stop(
                     "PULL_FAILED",
                     f"pull_{number}",
@@ -773,6 +787,7 @@ class Engine:
         try:
             preparation = [] if self._reuse_branch_name else self._prepare_pnpm()
         except (OSError, ValueError, RuntimeError) as exc:
+            logger.warning(_LOG_PNPM_PREPARATION_FAILED, exc)
             self._drop_snapshot()
             return self._stop(
                 "PREPARATION_FAILED",
@@ -905,7 +920,7 @@ class Engine:
                         },
                     )
         except GIT_OPERATION_FAILURES as exc:
-            log_unexpected(exc, f"security branch preparation {name}")
+            logger.warning(_LOG_BRANCH_PREPARATION_FAILED, name, exc)
             return self._stop(
                 "BRANCH_CREATION_FAILED",
                 "branch",
@@ -932,15 +947,17 @@ class Engine:
                 "status": "ERROR",
                 "reason": "Findings were already verified or changed. Listing again would discard those decisions.",
             }
-        if project_id or self.project_id:
-            pid = project_id or self.project_id
+        supplied = project_id if project_id is not None else self.project_id
+        explicit = supplied.strip() if isinstance(supplied, str) else ""
+        if explicit:
+            pid = explicit
             project_source = "explicit"
         else:
             try:
                 pid = self.git.gitlab_project_path(self.gitlab.api_url)
                 project_source = "git_origin"
             except (OSError, RuntimeError, ValueError) as exc:
-                pinned = os.environ.get("GITLAB_PROJECT_ID")
+                pinned = os.environ.get("GITLAB_PROJECT_ID", "").strip()
                 if not pinned:
                     logger.warning("GitLab project discovery failed: %s", exc)
                     return {
@@ -3306,6 +3323,7 @@ class Engine:
             diff_stat = summary["stat"]
             diff_files = summary["files"]
         except (OSError, RuntimeError, PermissionError) as exc:
+            logger.warning(_LOG_GIT_DIFF_FAILED, exc)
             diff_stat = f"Could not read git diff: {exc}"
         written = write_report(
             self.repo_root,

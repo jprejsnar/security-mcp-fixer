@@ -258,6 +258,22 @@ def test_shared_project_setting_does_not_replace_another_checkout_origin(
     assert result["project_path"] == origin_project
 
 
+def test_blank_project_setting_does_not_select_a_project(repo, monkeypatch):
+    """Whitespace is not a GitLab project id."""
+    # Arrange
+    monkeypatch.setenv("GITLAB_PROJECT_ID", "  ")
+    client = _client()
+    with closing(Engine.from_env(repo_root=str(repo))) as engine:
+        engine.gitlab.fetch = client.fetch
+        engine.state.status = "BRANCH_CREATED"
+        # Act
+        result = engine.list_security_findings(" \t")
+    # Assert
+    assert result["status"] == "ERROR"
+    assert result["stage"] == "project_discovery"
+    client.fetch.assert_not_called()
+
+
 def test_project_setting_applies_only_when_origin_cannot_name_a_project(
     repo, monkeypatch
 ):

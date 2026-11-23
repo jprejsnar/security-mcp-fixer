@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tomllib
@@ -21,6 +22,9 @@ from gitlab_security_mcp.util import (
     resolve_inside,
 )
 from gitlab_security_mcp.versions import bump_npm_spec, parse_version, range_allows
+
+logger = logging.getLogger("gitlab_security_mcp")
+_LOG_TOML_PLUGIN_CATALOG = "Could not read Gradle plugin catalog %s: %s"
 
 _RAISE_UNRECOGNIZED_GITHUB_VERSIONS_MD_PINS_TABLE_MANUAL_POLICY = (
     "Unrecognized .github/versions.md pins table; manual policy mapping is required"
@@ -1650,7 +1654,8 @@ def _toml_plugin_version(path: Path, plugin_id: str) -> tuple[str, str] | None:
     """Return a catalog plugin version and ``inline`` or its version ref."""
     try:
         data = tomllib.loads(_read(path))
-    except tomllib.TOMLDecodeError:
+    except tomllib.TOMLDecodeError as exc:
+        logger.warning(_LOG_TOML_PLUGIN_CATALOG, path, exc, exc_info=True)
         return None
     for library in (data.get("plugins") or {}).values():
         if not isinstance(library, dict) or library.get("id") != plugin_id:

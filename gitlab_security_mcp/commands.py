@@ -22,9 +22,11 @@ from uuid import uuid4
 from gitlab_security_mcp.util import (
     PROGRESS_PUBLISH_FAILURES,
     atomic_write_text,
+    environment_secrets,
     log_concurrency,
     log_task,
     logged_lock,
+    redact,
     safe_token,
     utc_now_iso,
 )
@@ -53,6 +55,12 @@ _RAISE_MAX_OUTPUT_MUST_BE_NON_NEGATIVE = "max_output must be non-negative"
 _RAISE_COMMAND_OUTPUT_READERS_DID_NOT_STOP = "Command output readers did not stop"
 _RAISE_COULD_NOT_READ_COMMAND_OUTPUT = "Could not read command output"
 _RAISE_FAILED = "{} failed ({}): {}"
+_COMMAND_EXCERPT_LIMIT = 500
+_COMMAND_FAILURE_LOG = (
+    "Command failed tool=%s exit=%s cwd=%s stdout_log=%s stderr_log=%s detail=%s"
+)
+_COMMAND_LOG_LOCATIONS = " stdout_log={} stderr_log={}"
+_COMMAND_READER_FAILURE = "Command output reader failed stream=%s"
 _RAISE_COMMAND_PIPES_WERE_NOT_OPENED = "Command pipes were not opened"
 _RAISE_COULD_NOT_FIND_SUSPENDED_COMMAND_THREAD = (
     "Could not find suspended command thread"
@@ -849,7 +857,10 @@ class CommandRunner:
         if any(thread.is_alive() for thread in threads):
             raise RuntimeError(_RAISE_COMMAND_OUTPUT_READERS_DID_NOT_STOP)
         if errors:
-            raise RuntimeError(_RAISE_COULD_NOT_READ_COMMAND_OUTPUT) from errors[0]
+            cause = errors[0]
+            raise RuntimeError(
+                f"{_RAISE_COULD_NOT_READ_COMMAND_OUTPUT}: {type(cause).__name__}"
+            ) from cause
         stdout, stdout_truncated = captured.get("stdout", ("", False))
         stderr, stderr_truncated = captured.get("stderr", ("", False))
         if timed_out:
@@ -866,10 +877,15 @@ class CommandRunner:
             str(self._command_log_paths["stderr"]) if self._command_log_paths else None
         )
         self._audit(result, workdir)
+        if result.exit_code != 0:
+            _log_failed_command(result, workdir)
         if check and result.exit_code != 0:
-            detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(
-                _RAISE_FAILED.format(result.display(), result.exit_code, detail[:500])
+                _RAISE_FAILED.format(
+                    result.display(),
+                    result.exit_code,
+                    _command_failure_text(result),
+                )
             )
         return result
 
@@ -910,6 +926,9 @@ class CommandRunner:
                     "worker_error",
                     f"command-reader:{name}",
                     error=type(exc).__name__,
+                )
+                logging.getLogger("gitlab_security_mcp").warning(
+                    _COMMAND_READER_FAILURE, name, exc_info=exc
                 )
                 with output_lock:
                     errors.append(exc)
@@ -985,6 +1004,38 @@ class CommandRunner:
         }
         with self.audit_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
+
+
+def _command_excerpt(result: CommandResult) -> str:
+    """Return a redacted tail of the stream that explains a non-zero exit."""
+    return redact(
+        (result.stderr or result.stdout).strip(),
+        environment_secrets(),
+    )[:_COMMAND_EXCERPT_LIMIT]
+
+
+def _command_failure_text(result: CommandResult) -> str:
+    """Include the log files so a truncated excerpt can be followed to the full output."""
+    text = _command_excerpt(result)
+    if result.stdout_log_path or result.stderr_log_path:
+        text += _COMMAND_LOG_LOCATIONS.format(
+            result.stdout_log_path or "",
+            result.stderr_log_path or "",
+        )
+    return text
+
+
+def _log_failed_command(result: CommandResult, cwd: Path) -> None:
+    """Record a failed command without waiting for a later handler to keep the traceback."""
+    logging.getLogger("gitlab_security_mcp").warning(
+        _COMMAND_FAILURE_LOG,
+        tool_name(result.argv[0]) if result.argv else "",
+        result.exit_code,
+        cwd,
+        result.stdout_log_path,
+        result.stderr_log_path,
+        _command_excerpt(result),
+    )
 
 
 def _read_capped(

@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1911,3 +1912,18 @@ def test_audit_age_ignores_an_unreadable_stamp():
 
     # Assert
     assert age is None
+
+
+def test_unreadable_git_revision_is_logged(caplog):
+    """An unread revision stays explicit and records why on stderr."""
+    # Arrange
+    engine = SimpleNamespace(git=SimpleNamespace())
+    engine.git.current_branch = Mock(side_effect=RuntimeError("git dir missing"))
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        revision = server._audit_revision(engine)
+
+    # Assert
+    assert revision == "unverified"
+    assert "git dir missing" in caplog.text

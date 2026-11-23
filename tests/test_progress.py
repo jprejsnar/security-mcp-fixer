@@ -1,6 +1,8 @@
 """Verify editor progress snapshots are truthful inspection data."""
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -106,3 +108,44 @@ def test_progress_is_mirrored_for_editors_that_did_not_open_the_checkout(
     assert json.loads(local)["repo_root"] == str(first)
     assert progress.mirror_path(second) != mirrored
     assert len(list(isolated_progress_mirror.glob("*.json"))) == 2
+
+
+_DEVICE_CHECKOUT = "\\\\?\\C:\\Repo"
+_DEVICE_SHARE = "\\\\?\\UNC\\server\\share\\repo"
+_OPEN_CHECKOUT = "C:\\Repo"
+_OPEN_SHARE = "\\\\server\\share\\repo"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows device prefixes")
+def test_closed_checkout_forgets_in_memory_progress(tmp_path, isolated_progress_mirror):
+    """Closing a checkout must not keep its task receipts in the server process."""
+    # Arrange
+    progress.publish(tmp_path, "audit", "Audit", "Reading", completed=1, total=2)
+
+    # Act
+    progress.drop_checkout(tmp_path)
+    progress.publish(tmp_path, "other", "Other", "Next")
+    snapshot = json.loads(
+        (tmp_path / ".security-mcp" / "progress.json").read_text(encoding="utf-8")
+    )
+
+    # Assert
+    assert {item["id"] for item in snapshot["tasks"]} == {"other"}
+    assert progress.mirror_path(tmp_path).read_text(encoding="utf-8") == (
+        tmp_path / ".security-mcp" / "progress.json"
+    ).read_text(encoding="utf-8")
+
+
+def test_editor_progress_path_drops_the_windows_device_prefix():
+    """Editors open normal paths, not the Windows \\\\?\\ device form."""
+    # Arrange
+    checkout = Path(_DEVICE_CHECKOUT)
+    share = Path(_DEVICE_SHARE)
+
+    # Act
+    checkout_text = progress.editor_repo_root(checkout)
+    share_text = progress.editor_repo_root(share)
+
+    # Assert
+    assert checkout_text == _OPEN_CHECKOUT
+    assert share_text == _OPEN_SHARE

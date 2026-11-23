@@ -151,8 +151,8 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
         ):
             raise ValueError(_RAISE_REMOTE_DOES_NOT_IDENTIFY_A_NAMESPACE_PROJECT_PATH)
         return path
-    except ValueError:
-        raise ValueError(_RAISE_CANNOT_INFER_A_GITLAB_PROJECT_FROM_ORIGIN_ON) from None
+    except ValueError as exc:
+        raise ValueError(_RAISE_CANNOT_INFER_A_GITLAB_PROJECT_FROM_ORIGIN_ON) from exc
 
 
 class GitOps:

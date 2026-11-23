@@ -689,7 +689,7 @@ def test_http_clients_write_timing_records(tmp_path, operation):
     assert "secret" not in path.read_text(encoding="utf-8")
 
 
-def test_http_log_write_failure_preserves_request_result(tmp_path):
+def test_http_log_write_failure_preserves_request_result(tmp_path, caplog):
     """Keep successful HTTP work successful when local timing storage is unavailable."""
     # Arrange
     blocked = tmp_path / "blocked"
@@ -700,16 +700,21 @@ def test_http_log_write_failure_preserves_request_result(tmp_path):
         return httpx.Response(200, text="ok")
 
     # Act
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        with timed_http_stream(
-            client,
-            "GET",
-            "https://example.test/",
-            source="test",
-            log_path=blocked / "timings.jsonl",
-        ) as response:
-            # Assert
-            assert response.read() == b"ok"
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with timed_http_stream(
+                client,
+                "GET",
+                "https://example.test/",
+                source="test",
+                log_path=blocked / "timings.jsonl",
+            ) as response:
+                body = response.read()
+
+    # Assert
+    assert body == b"ok"
+    assert "Could not write HTTP timing log" in caplog.text
+    assert "timings.jsonl" in caplog.text
 
 
 def _overlap_handler(state: dict, lock: threading.Lock, body: str):

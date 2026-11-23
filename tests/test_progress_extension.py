@@ -1,12 +1,17 @@
 """Install the progress extension into the editor that started the server."""
 
 import json
+import logging
+import os
+import subprocess
 import threading
 import zipfile
 from pathlib import Path
 
 from gitlab_security_mcp.progress_extension import (
+    _editor_cli,
     _linux_process_tree,
+    _posix_process_tree,
     _process_tree_from_ps,
     editor_command,
     extension_directory,
@@ -27,6 +32,12 @@ EXTENSION_FILES = (
     "progress-model.js",
     "README.md",
 )
+INSIDERS_EXECUTABLE = (
+    "/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Code - Insiders"
+)
+INSIDERS_NAME = "Code - Insiders"
+_SERVER_START_WAIT_SECONDS = 2
+_INSTALL_BLOCK_SECONDS = 5
 
 
 def test_packaged_extension_matches_the_editor_progress_tree():
@@ -133,6 +144,125 @@ def test_linux_proc_tree_keeps_the_editor_executable(tmp_path, monkeypatch):
     assert images[CURSOR_PID] == binary
 
 
+def test_linux_proc_tree_skips_a_malformed_stat_line(tmp_path, monkeypatch):
+    """One unreadable process record does not hide the editor."""
+    # Arrange
+    proc = tmp_path / "proc"
+    record = proc / str(CURSOR_PID)
+    broken = proc / "41"
+    record.mkdir(parents=True)
+    broken.mkdir()
+    (record / "stat").write_text(
+        f"{CURSOR_PID} (cursor) S {PYTHON_PID} 0\n", encoding="utf-8"
+    )
+    (broken / "stat").write_text("41 (bad) S not-a-pid\n", encoding="utf-8")
+    binary = tmp_path / "cursor"
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension._linked_executable",
+        lambda _entry: binary,
+    )
+
+    # Act
+    parents, images = _linux_process_tree(proc)
+
+    # Assert
+    assert 41 not in parents
+    assert parents[CURSOR_PID] == (PYTHON_PID, "cursor")
+    assert images[CURSOR_PID] == binary
+
+
+def test_a_stuck_process_list_does_not_stop_the_server(monkeypatch, caplog):
+    """A ps timeout is an identification failure and the server still starts."""
+    # Arrange
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension.Path.is_dir", lambda _self: False
+    )
+
+    def run(*_args, **_kwargs):
+        """Stall the process listing."""
+        raise subprocess.TimeoutExpired(["ps"], 5)
+
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.subprocess.run", run)
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        install_progress_extension()
+
+    # Assert
+    assert "Could not identify the editor process" in caplog.text
+    assert "Could not install the progress extension" not in caplog.text
+
+
+def test_ps_output_keeps_a_macos_insiders_executable_that_contains_spaces():
+    """VS Code Insiders on macOS has spaces inside the executable name."""
+    # Arrange
+    text = f"{CURSOR_PID} {PYTHON_PID} {INSIDERS_EXECUTABLE} --reuse-window\n"
+
+    # Act
+    parents, images = _process_tree_from_ps(text)
+
+    # Assert
+    assert parents[CURSOR_PID] == (PYTHON_PID, INSIDERS_NAME)
+    assert images[CURSOR_PID] == Path(INSIDERS_EXECUTABLE)
+
+
+def test_editor_cli_finds_resources_above_a_linux_bin_directory(tmp_path):
+    """A Linux editor binary in bin/ still has cli.js in the install root."""
+    # Arrange
+    image = tmp_path / "bin" / "cursor"
+    image.parent.mkdir()
+    image.write_bytes(b"")
+    cli = tmp_path / "resources" / "app" / "out" / "cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("", encoding="utf-8")
+
+    # Act
+    found = _editor_cli(image)
+
+    # Assert
+    assert found is not None
+    assert os.path.normcase(found) == os.path.normcase(cli)
+
+
+def test_the_server_speaks_mcp_while_the_extension_install_is_still_running(
+    monkeypatch,
+):
+    """One window's install lock must not delay another window's MCP handshake."""
+    # Arrange
+    from gitlab_security_mcp import server
+
+    release = threading.Event()
+    started = threading.Event()
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+
+    def install():
+        """Block the way a locked install does."""
+        release.wait(timeout=_INSTALL_BLOCK_SECONDS)
+
+    def run(*_args, **_kwargs):
+        """Record that the protocol started and release the installer."""
+        started.set()
+        release.set()
+
+    monkeypatch.setattr(server, "install_progress_extension", install)
+    monkeypatch.setattr(server.mcp, "run", run)
+    worker = threading.Thread(target=server.main)
+
+    # Act
+    worker.start()
+    try:
+        ready = started.wait(timeout=_SERVER_START_WAIT_SECONDS)
+    finally:
+        release.set()
+        worker.join(timeout=_INSTALL_BLOCK_SECONDS)
+
+    # Assert
+    assert ready
+    assert not worker.is_alive()
+
+
 def test_ps_output_keeps_a_macos_path_that_contains_spaces():
     """ps command text can name Visual Studio Code.app without dropping it."""
     # Arrange
@@ -145,6 +275,42 @@ def test_ps_output_keeps_a_macos_path_that_contains_spaces():
     # Assert
     assert parents[CURSOR_PID] == (PYTHON_PID, "Electron")
     assert images[CURSOR_PID] == Path(image)
+
+
+def test_ps_output_keeps_a_quoted_macos_editor_path():
+    """A quoted macOS editor path still names the executable inside the app."""
+    # Arrange
+    image = "/Applications/Cursor.app/Contents/MacOS/Cursor"
+    text = f'{CURSOR_PID} {PYTHON_PID} "{image}" --reuse-window\n'
+
+    # Act
+    parents, images = _process_tree_from_ps(text)
+
+    # Assert
+    assert parents[CURSOR_PID] == (PYTHON_PID, "Cursor")
+    assert images[CURSOR_PID] == Path(image)
+
+
+def test_ps_output_keeps_an_editor_path_that_contains_spaces(monkeypatch):
+    """A POSIX editor installed under a directory with spaces stays addressable."""
+    # Arrange
+    reported = "/opt/Visual Studio Code/code"
+    target = Path(reported)
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        """Treat the spaced editor path as present without creating it."""
+        return self == target or real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    text = f"{CURSOR_PID} {PYTHON_PID} {reported} --reuse-window\n"
+
+    # Act
+    parents, images = _process_tree_from_ps(text)
+
+    # Assert
+    assert parents[CURSOR_PID] == (PYTHON_PID, "code")
+    assert images[CURSOR_PID] == target
 
 
 def test_ps_keeps_a_relative_command_between_the_server_and_the_editor(tmp_path):
@@ -169,6 +335,83 @@ def test_ps_keeps_a_relative_command_between_the_server_and_the_editor(tmp_path)
     assert parsed == Path(reported)
     assert PYTHON_PID not in images
     assert command == [str(image), str(cli)]
+
+
+def test_ps_asks_for_the_full_command_so_a_long_path_is_not_cut(monkeypatch):
+    """macOS ps truncates command lines unless wide output is requested."""
+    # Arrange
+    recorded = {}
+
+    def run(argv, **_kwargs):
+        """Capture the process listing command and return no rows."""
+        recorded["argv"] = argv
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.subprocess.run", run)
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension.Path.is_dir", lambda _self: False
+    )
+
+    # Act
+    parents, images = _posix_process_tree()
+
+    # Assert
+    assert recorded["argv"][:2] == ["ps", "-axww"]
+    assert parents == {}
+    assert images == {}
+
+
+def test_an_unreadable_process_tree_is_not_an_install_failure(monkeypatch, caplog):
+    """A missing process list is an identification failure, not an install failure."""
+    # Arrange
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.sys.platform", "win32")
+
+    def broken():
+        """Fail while reading the process list."""
+        raise OSError("process snapshot failed")
+
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension._windows_process_tree", broken
+    )
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        install_progress_extension()
+
+    # Assert
+    assert "Could not identify the editor process" in caplog.text
+    assert "Could not install the progress extension" not in caplog.text
+
+
+def test_an_install_error_does_not_escape_to_the_server(monkeypatch, tmp_path, caplog):
+    """A broken extension package is logged and does not stop MCP startup."""
+    # Arrange
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension.editor_command",
+        lambda *_args: [str(tmp_path / "Cursor.exe"), str(tmp_path / "cli.js")],
+    )
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension._windows_process_tree",
+        lambda: ({}, {}),
+    )
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.sys.platform", "win32")
+
+    def broken(_path):
+        """Fail while building the VSIX."""
+        raise ValueError("package.json is missing")
+
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.write_vsix", broken)
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        install_progress_extension()
+
+    # Assert
+    assert "Could not install the progress extension" in caplog.text
+    assert "package.json is missing" in caplog.text
+    assert "Could not identify the editor process" not in caplog.text
 
 
 def test_editor_command_ignores_an_editor_without_its_cli(tmp_path):

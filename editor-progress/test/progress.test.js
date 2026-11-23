@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
 const { parseSnapshot, taskText } = require("../progress-model");
 const { activate, createPresenter, newestPerRepository, snapshotsForWindow } = require("../extension");
 
@@ -134,6 +135,26 @@ test("the seven-job bar stays visible while command and worker receipts change",
   assert.match(ui.reports[0].message, /2\/7 jobs finished/);
   assert.match(ui.reports[0].message, /backend library/);
   assert.match(ui.bars[0].tooltip, /False positives: PENDING/);
+  ui.presenter.dispose();
+});
+
+test("the status bar uses the running job, not one past the last job", () => {
+  const ui = harness();
+  ui.presenter.update([{
+    repo_root: "C:\\repo",
+    tasks: [{
+      id: "workflow", label: "Job 4/7: Review and upload false positives",
+      status: "RUNNING", message: "The earlier job failed.",
+      completed: 7, total: 7, unit: "jobs finished",
+      updated_at: new Date().toISOString(),
+      jobs: [
+        { number: 3, label: "Package updates", status: "FAILED" },
+        { number: 4, label: "False positives", status: "RUNNING" }
+      ]
+    }]
+  }]);
+  assert.match(ui.bars[0].text, /Job 4\/7/);
+  assert.doesNotMatch(ui.bars[0].text, /Job 8\/7/);
   ui.presenter.dispose();
 });
 
@@ -295,6 +316,94 @@ test("a run in a checkout that is not open still shows the graphical bar", async
   for (const subscription of context.subscriptions) subscription.dispose();
 });
 
+test("a failed final report preview warns once", async () => {
+  const ui = harness();
+  const warnings = [];
+  const disposable = { dispose() {} };
+  let changed;
+  const progressUri = {
+    fsPath: "C:\\repo\\.security-mcp\\progress.json",
+    toString: () => "file:///repo/.security-mcp/progress.json"
+  };
+  ui.vscode.window.showWarningMessage = message => warnings.push(message);
+  ui.vscode.Uri = {
+    joinPath: (_base, ...parts) => parts.includes("unresolved-remediation.md")
+      ? { fsPath: "C:\\repo\\.security-mcp\\reports\\unresolved-remediation.md" }
+      : progressUri
+  };
+  ui.vscode.commands = {
+    registerCommand: () => disposable,
+    executeCommand: async () => { throw new Error("permission denied"); }
+  };
+  ui.vscode.workspace = {
+    isTrusted: true,
+    workspaceFolders: [{ uri: {} }],
+    getWorkspaceFolder: () => ({ uri: {} }),
+    findFiles: async () => [],
+    createFileSystemWatcher: () => ({
+      ...disposable, onDidCreate: () => disposable,
+      onDidChange: callback => { changed = callback; return disposable; },
+      onDidDelete: () => disposable
+    }),
+    fs: {
+      stat: async () => ({ size: 1000 }),
+      readFile: async () => Buffer.from(JSON.stringify(snapshot({
+        id: "workflow", status: "FINISHED", started_at: "2026-11-19T12:00:00Z",
+        completed: 7, total: 7, final_report: true
+      })))
+    }
+  };
+  const context = { subscriptions: [] };
+
+  await activate(context, ui.vscode);
+  await changed(progressUri);
+  await changed(progressUri);
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /permission denied/);
+  for (const subscription of context.subscriptions) subscription.dispose();
+});
+
+test("a mirrored final report opens from the checkout path", async () => {
+  const ui = harness();
+  const disposable = { dispose() {} };
+  const opened = [];
+  const report = { fsPath: "C:\\repo\\.security-mcp\\reports\\unresolved-remediation.md" };
+  ui.vscode.FileType = { File: 1 };
+  ui.vscode.Uri = {
+    file: root => ({ root }),
+    joinPath: (base, ...parts) => parts.at(-1) === "unresolved-remediation.md" ? report : { base, parts }
+  };
+  ui.vscode.commands = {
+    registerCommand: () => disposable,
+    executeCommand: async (...args) => opened.push(args)
+  };
+  ui.vscode.workspace = {
+    isTrusted: true,
+    workspaceFolders: [],
+    getWorkspaceFolder: () => undefined,
+    findFiles: async () => [],
+    createFileSystemWatcher: () => ({
+      ...disposable, onDidCreate: () => disposable,
+      onDidChange: () => disposable, onDidDelete: () => disposable
+    }),
+    fs: {
+      readDirectory: async () => [["run.json", 1]],
+      stat: async () => ({ size: 1000, mtime: Date.now() }),
+      readFile: async () => Buffer.from(JSON.stringify(snapshot({
+        id: "workflow", status: "FINISHED", started_at: "2026-11-19T12:00:00Z",
+        completed: 7, total: 7, final_report: true
+      })))
+    }
+  };
+  const context = { subscriptions: [] };
+
+  await activate(context, ui.vscode);
+
+  assert.deepEqual(opened, [["markdown.showPreview", report]]);
+  for (const subscription of context.subscriptions) subscription.dispose();
+});
+
 test("workspace and mirror copies of one run are shown once, and old mirrors are ignored", () => {
   // Arrange
   const now = Date.parse("2026-11-20T12:00:00Z");
@@ -311,6 +420,105 @@ test("workspace and mirror copies of one run are shown once, and old mirrors are
 
   // Assert
   assert.deepEqual(shown, [newer]);
+});
+
+test("an extended Windows path still matches the open checkout", () => {
+  // Arrange
+  if (process.platform !== "win32") return;
+  const local = { repo_root: "\\\\?\\C:\\Repo", updated_at: "2026-11-20T11:00:00Z", tasks: [] };
+  const folders = [{ uri: { fsPath: "C:\\Repo" } }];
+
+  // Act
+  const shown = snapshotsForWindow(
+    [{ snapshot: local, mirror: false }],
+    folders,
+    Date.parse("2026-11-20T12:00:00Z")
+  );
+
+  // Assert
+  assert.deepEqual(shown, [local]);
+});
+
+test("an extended network path matches the open share", () => {
+  // Arrange
+  if (process.platform !== "win32") return;
+  const local = {
+    repo_root: "\\\\?\\UNC\\server\\share\\repo",
+    updated_at: "2026-11-20T11:00:00Z",
+    tasks: []
+  };
+  const folders = [{ uri: { fsPath: "\\\\server\\share\\repo" } }];
+
+  // Act
+  const shown = snapshotsForWindow(
+    [{ snapshot: local, mirror: false }],
+    folders,
+    Date.parse("2026-11-20T12:00:00Z")
+  );
+
+  // Assert
+  assert.deepEqual(shown, [local]);
+});
+
+test("a network checkout stays visible without resolving the share", () => {
+  // Arrange
+  if (process.platform !== "win32") return;
+  const root = "\\\\server\\share\\repo";
+  const local = { repo_root: root, updated_at: "2026-11-20T11:00:00Z", tasks: [] };
+  const folders = [{ uri: { fsPath: root } }];
+
+  // Act
+  const shown = snapshotsForWindow(
+    [{ snapshot: local, mirror: false }],
+    folders,
+    Date.parse("2026-11-20T12:00:00Z")
+  );
+
+  // Assert
+  assert.deepEqual(shown, [local]);
+});
+
+test("a progress path on another drive is not resolved", () => {
+  // Arrange
+  const offline = "Z:\\offline\\repo";
+  const calls = [];
+  const original = fs.realpathSync;
+  fs.realpathSync = (value, ...args) => {
+    calls.push(String(value));
+    return original.call(fs, value, ...args);
+  };
+  const snapshot = { repo_root: offline, updated_at: "2026-11-20T11:00:00Z", tasks: [] };
+  const folders = [{ uri: { fsPath: "C:\\Repo" } }];
+
+  // Act
+  try {
+    snapshotsForWindow(
+      [{ snapshot, mirror: true }],
+      folders,
+      Date.parse("2026-11-20T12:00:00Z")
+    );
+  } finally {
+    fs.realpathSync = original;
+  }
+
+  // Assert
+  assert.equal(calls.some(call => call.includes("offline")), false);
+});
+
+test("a trailing separator does not hide the open checkout", () => {
+  // Arrange
+  const local = { repo_root: "C:\\Repo\\", updated_at: "2026-11-20T11:00:00Z", tasks: [] };
+  const folders = [{ uri: { fsPath: "C:\\Repo" } }];
+
+  // Act
+  const shown = snapshotsForWindow(
+    [{ snapshot: local, mirror: false }],
+    folders,
+    Date.parse("2026-11-20T12:00:00Z")
+  );
+
+  // Assert
+  assert.deepEqual(shown, [local]);
 });
 
 test("an open workspace does not display another repository's run", () => {
@@ -331,6 +539,49 @@ test("an open workspace does not display another repository's run", () => {
     [{ snapshot: other, mirror: true }], folders, Date.parse("2026-11-20T12:00:00Z")
   );
   assert.deepEqual(idle, []);
+});
+
+test("a stale mirror hides its run when the file is checked again", async () => {
+  // Arrange
+  const ui = harness();
+  const disposable = { dispose() {} };
+  let changed;
+  let stale = false;
+  const mirror = { toString: () => "file:///mirror/run.json" };
+  ui.vscode.FileType = { File: 1 };
+  ui.vscode.Uri = { file: () => mirror, joinPath: () => mirror };
+  ui.vscode.commands = { registerCommand: () => disposable };
+  ui.vscode.workspace = {
+    workspaceFolders: [],
+    getWorkspaceFolder: () => undefined,
+    findFiles: async () => [],
+    createFileSystemWatcher: () => ({
+      ...disposable, onDidCreate: () => disposable,
+      onDidChange: callback => { changed = callback; return disposable; },
+      onDidDelete: () => disposable
+    }),
+    fs: {
+      readDirectory: async () => [["run.json", 1]],
+      stat: async () => ({
+        size: 1000,
+        mtime: stale ? Date.now() - 13 * 60 * 60 * 1000 : Date.now()
+      }),
+      readFile: async () => Buffer.from(JSON.stringify(snapshot()))
+    }
+  };
+  const context = { subscriptions: [] };
+  await activate(context, ui.vscode);
+  assert.match(ui.bars.at(-1).text, /Waiting for AI/);
+  let hidden = 0;
+  ui.bars.at(-1).hide = () => { hidden += 1; };
+  stale = true;
+
+  // Act
+  await changed(mirror);
+
+  // Assert
+  assert.equal(hidden, 1);
+  for (const subscription of context.subscriptions) subscription.dispose();
 });
 
 test("stale mirror files are not reread on every poll", async () => {

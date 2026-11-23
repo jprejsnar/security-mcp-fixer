@@ -133,6 +133,7 @@ ALLOWED_HOSTS = frozenset(
     }
 )
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_DOC_URL_REJECTED = "Official documentation URL was rejected for %s: %s"
 _CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _CWE = re.compile(r"CWE-(\d{1,5})", re.IGNORECASE)
 _MAX_BODY = 1_000_000
@@ -430,7 +431,8 @@ class OfficialDocs:
             )
         try:
             parsed = httpx.URL(url)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            logger.warning(_LOG_DOC_URL_REJECTED, name, exc, exc_info=True)
             return DocSource(
                 name, url, False, None, None, "URL is not an allowlisted https document"
             )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import gc
 import hashlib
 import json
@@ -33,6 +34,16 @@ _RAISE_MISSING = "Missing {}"
 _RAISE_UNSAFE = "Unsafe {}"
 
 _HTTP_LOG_LOCK = threading.Lock()
+_LOG_PROCESS_MEMORY_UNAVAILABLE = "Could not read process memory: %s"
+_LOG_CONVERTED_FAILURE = (
+    "Converted %s into a failed result during %s: %s; traceback follows"
+)
+_LOG_RESOLVE_INSIDE = "Could not resolve %s inside %s: %s"
+_SERVER_LOG_DIRECTORY = "gitlab-security-mcp"
+_server_log_handler: logging.Handler | None = None
+_WINDOWS_MEMORY_QUERY_FAILED = "Windows process memory query failed"
+_memory_log_lock = threading.Lock()
+_memory_unavailable_logged = False
 logger = logging.getLogger("gitlab_security_mcp")
 GIT_OPERATION_FAILURES = (OSError, RuntimeError, ValueError, SubprocessError)
 CONVERTED_DEFECTS = (AttributeError, LookupError, TypeError)
@@ -45,6 +56,90 @@ ADVISORY_READ_FAILURES = (
     *CONVERTED_DEFECTS,
 )
 PROGRESS_PUBLISH_FAILURES = (OSError, RuntimeError, ValueError, TypeError)
+
+
+class _ServerLogHandler(logging.Handler):
+    """Append redacted server diagnostics for the end-of-run archive."""
+
+    def __init__(self, path: Path):
+        """Open the process spool. It is not a home log file."""
+        super().__init__()
+        self.path = path
+        self._stream = path.open("a", encoding="utf-8", newline="\n")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Write one formatted line and flush it before the next record."""
+        try:
+            self._stream.write(self.format(record) + "\n")
+            self._stream.flush()
+        except OSError:
+            self.handleError(record)
+
+    def flush(self) -> None:
+        """Push buffered lines to disk so the archive reads a complete log."""
+        self.acquire()
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+        finally:
+            self.release()
+
+    def close(self) -> None:
+        """Close the spool. The archive already holds its own copy."""
+        self.acquire()
+        try:
+            self._stream.close()
+        except OSError:
+            pass
+        finally:
+            self.release()
+            super().close()
+
+
+def attach_server_log(formatter: logging.Formatter) -> None:
+    """Copy server diagnostics into a process spool and keep writing stderr.
+
+    The package logger does not propagate, so the spool has to sit on that
+    logger and on the root logger. One handler instance receives each record
+    once. The file lives in the temp directory and is removed when the
+    process exits.
+    """
+    global _server_log_handler
+    if _server_log_handler is None:
+        directory = Path(tempfile.gettempdir()) / _SERVER_LOG_DIRECTORY
+        directory.mkdir(parents=True, exist_ok=True)
+        handler = _ServerLogHandler(directory / f"{os.getpid()}.log")
+        handler.setFormatter(formatter)
+        handler.setLevel(logging.INFO)
+        _server_log_handler = handler
+        atexit.register(_close_server_log)
+    handler = _server_log_handler
+    for target in (logging.getLogger("gitlab_security_mcp"), logging.getLogger()):
+        if handler not in target.handlers:
+            target.addHandler(handler)
+
+
+def read_server_log() -> str:
+    """Return the redacted server log captured so far, or an empty string."""
+    handler = _server_log_handler
+    if not isinstance(handler, _ServerLogHandler):
+        return ""
+    handler.flush()
+    try:
+        return handler.path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _close_server_log() -> None:
+    """Drop the process spool after the archive has copied what it needs."""
+    handler = _server_log_handler
+    if not isinstance(handler, _ServerLogHandler):
+        return
+    path = handler.path
+    handler.close()
+    path.unlink(missing_ok=True)
 
 
 CHECKOUT_FILE_ID_LENGTH = 12
@@ -65,6 +160,16 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _log_memory_unavailable(exc: BaseException) -> None:
+    """Record the first memory-probe failure without repeating it on every task."""
+    global _memory_unavailable_logged
+    with _memory_log_lock:
+        if _memory_unavailable_logged:
+            return
+        _memory_unavailable_logged = True
+    logger.warning(_LOG_PROCESS_MEMORY_UNAVAILABLE, exc)
+
+
 def _memory_bytes() -> int | None:
     """Return this process's working set, or None when the OS will not report it."""
     try:
@@ -74,7 +179,8 @@ def _memory_bytes() -> int | None:
 
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return int(rss) if sys.platform == "darwin" else int(rss) * 1024
-    except (OSError, AttributeError, ValueError, OverflowError):
+    except (OSError, AttributeError, ValueError, OverflowError) as exc:
+        _log_memory_unavailable(exc)
         return None
 
 
@@ -109,7 +215,7 @@ def _windows_working_set() -> int | None:
     query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
     query.restype = wintypes.BOOL
     if not query(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
-        return None
+        raise OSError(_WINDOWS_MEMORY_QUERY_FAILED)
     return int(counters.WorkingSetSize)
 
 
@@ -174,22 +280,18 @@ def _log_performance(name: str, before: dict) -> None:
 
 
 def log_unexpected(exc: BaseException, context: str) -> None:
-    """Keep a traceback when a handler converts a programming error into a result.
+    """Record every failure a handler converts into a result, with its stack.
 
-    Expected I/O, validation, command and HTTP failures are already recorded in
-    the returned result, so they are not logged again. Types such as TypeError,
-    AttributeError or KeyError usually indicate a defect; their message alone
-    lacks the file and line needed to diagnose it. Malformed external data can
-    raise the same types, so the record is a warning rather than an error.
+    The returned result keeps the message. The warning adds the operation and
+    the traceback so a later reader can find the file and line. Malformed
+    external data can raise the same types as a defect, so the record is a
+    warning rather than an error.
     """
-    if isinstance(exc, (OSError, ValueError, RuntimeError, SubprocessError)):
-        return
-    if isinstance(exc, httpx.HTTPError):
-        return
     logger.warning(
-        "Converted %s into a failed result during %s; traceback follows",
+        _LOG_CONVERTED_FAILURE,
         type(exc).__name__,
         context,
+        exc,
         exc_info=exc,
     )
 
@@ -309,9 +411,7 @@ def timed_http_stream(
                     with log_path.open("a", encoding="utf-8") as handle:
                         handle.write(text + "\n")
             except OSError as exc:
-                logger.warning(
-                    "Could not write HTTP timing log: %s", type(exc).__name__
-                )
+                logger.warning("Could not write HTTP timing log %s: %s", log_path, exc)
 
 
 def json_object(text: str) -> dict:
@@ -455,7 +555,10 @@ def resolve_inside(root: Path, raw: str | Path) -> Path | None:
     try:
         resolved = candidate.resolve()
         resolved.relative_to(root.resolve())
-    except (OSError, ValueError):
+    except ValueError:
+        return None
+    except OSError as exc:
+        logger.warning(_LOG_RESOLVE_INSIDE, raw, root, exc, exc_info=True)
         return None
     return resolved
 
