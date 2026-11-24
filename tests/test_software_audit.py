@@ -594,6 +594,7 @@ def test_audit_continuation_bounds_context_without_losing_recovery(
         "repo_root": str(engine.repo_root),
         "output_path": str(tmp_path / "audit.md"),
         "audit_prompt": render_audit_prompt(datetime.now(UTC), "abc123"),
+        "prompt_delivered": True,
         "coverage": coverage,
     }
     remaining = paths[140:]
@@ -699,29 +700,280 @@ def test_repeated_audit_polls_do_not_resend_saved_receipts(
     assert engine.state.software_audit == saved
 
 
-def test_first_audit_handoff_keeps_the_prompt_its_message_references(
+def test_first_audit_response_keeps_the_prompt_and_later_reads_omit_it(
     tmp_path, monkeypatch
 ):
-    """Compaction must not strip audit_prompt/coverage while the message still cites them."""
+    """Deliver the prompt once. A status poll must not send it again."""
     # Arrange
     engine = _engine(tmp_path / "checkout")
     (engine.repo_root / "app.java").write_text("class App {}", encoding="utf-8")
     monkeypatch.setattr(server, "_engine_for", lambda root: engine)
     monkeypatch.setenv("PROGRESS_CONSOLE", "off")
-    asyncio.run(
+
+    # Act
+    first = asyncio.run(
         server.choose_software_audit_action(
             _context(), str(engine.repo_root), choice="generate_report"
         )
     )
-
-    # Act
+    again = asyncio.run(
+        server.choose_software_audit_action(_context(), str(engine.repo_root))
+    )
     audit = server.get_run_status(str(engine.repo_root))["software_audit"]
+    recovered = server.get_run_status(
+        str(engine.repo_root), include_audit_details=True
+    )["software_audit"]
 
     # Assert
-    assert audit["status"] == "GENERATE_AUDIT_REPORT"
-    assert "Follow audit_prompt exactly" in audit["message"]
-    assert "## Evidence required before a finding" in audit["audit_prompt"]
-    assert audit["coverage"]["files"] == ["app.java"]
+    assert first["status"] == "GENERATE_AUDIT_REPORT"
+    assert "Follow audit_prompt exactly" in first["message"]
+    assert "## Evidence required before a finding" in first["audit_prompt"]
+    assert first["coverage"]["files"] == ["app.java"]
+    assert "audit_prompt" not in again and "coverage" not in again
+    assert again["next_files"] == ["app.java"]
+    assert "audit_prompt" not in audit and "coverage" not in audit
+    assert "already delivered" in audit["message"]
+    assert recovered["audit_prompt"] == first["audit_prompt"]
+    assert recovered["coverage"]["files"] == ["app.java"]
+
+
+def test_status_poll_does_not_consume_the_first_prompt_delivery(tmp_path, monkeypatch):
+    """A status read before the handoff must not claim the prompt was already sent."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    (engine.repo_root / "app.java").write_text("class App {}", encoding="utf-8")
+    workflow.start(engine)
+    while engine.state.workflow["current"] < 6:
+        workflow.advance(engine)
+    prompt = render_audit_prompt(datetime.now(UTC), "abc123")
+    engine.record_software_audit(
+        {
+            "status": "GENERATE_AUDIT_REPORT",
+            "choice": "generate_report",
+            "repo_root": str(engine.repo_root),
+            "output_path": str(tmp_path / "audit.md"),
+            "audit_prompt": prompt,
+            "coverage": {
+                "files": ["app.java"],
+                "reviews": {},
+                "completed_phases": [],
+                "truncated": False,
+            },
+            "message": "Follow audit_prompt exactly. Inventory paths are in coverage.files.",
+        }
+    )
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+
+    # Act
+    status = server.get_run_status(str(engine.repo_root))["software_audit"]
+    pending_after_poll = engine.state.software_audit.get("prompt_delivered")
+    first = asyncio.run(server.complete_security_run(_context(), str(engine.repo_root)))
+    second = asyncio.run(
+        server.complete_security_run(_context(), str(engine.repo_root))
+    )
+
+    # Assert
+    assert "audit_prompt" not in status and "coverage" not in status
+    assert "not been delivered" in status["message"]
+    assert "already delivered" not in status["message"]
+    assert pending_after_poll is not True
+    assert first.structured_content["audit_prompt"] == prompt
+    assert first.structured_content["coverage"]["files"] == ["app.java"]
+    assert "full_details" not in first.structured_content
+    assert "not been delivered" not in first.structured_content["message"]
+    assert "Follow audit_prompt exactly" in first.structured_content["message"]
+    assert engine.state.software_audit["prompt_delivered"] is True
+    assert "audit_prompt" not in second.structured_content
+
+
+def test_failed_prompt_delivery_save_can_be_retried(tmp_path, monkeypatch):
+    """A failed state save must not consume the one prompt delivery."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    (engine.repo_root / "app.java").write_text("class App {}", encoding="utf-8")
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+    remembers = {"count": 0}
+    original = engine._remember
+
+    def flaky_remember():
+        """Fail the save that records delivery, after the audit itself is stored."""
+        remembers["count"] += 1
+        if remembers["count"] == 2:
+            raise OSError("disk full")
+        original()
+
+    monkeypatch.setattr(engine, "_remember", flaky_remember)
+
+    # Act
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(
+            server.choose_software_audit_action(
+                _context(), str(engine.repo_root), choice="generate_report"
+            )
+        )
+    pending_after_failure = engine.state.software_audit.get("prompt_delivered")
+    monkeypatch.setattr(engine, "_remember", original)
+    delivered = asyncio.run(
+        server.choose_software_audit_action(_context(), str(engine.repo_root))
+    )
+
+    # Assert
+    assert pending_after_failure is not True
+    assert "## Evidence required before a finding" in delivered["audit_prompt"]
+    assert engine.state.software_audit["prompt_delivered"] is True
+
+
+def _pending_prompt(engine, prompt, report: Path):
+    """Store a generated audit whose prompt has not been sent to the host."""
+    engine.record_software_audit(
+        {
+            "status": "GENERATE_AUDIT_REPORT",
+            "choice": "generate_report",
+            "repo_root": str(engine.repo_root),
+            "output_path": str(report),
+            "audit_prompt": prompt,
+            "coverage": audit_inventory(engine.repo_root),
+            "message": "Follow audit_prompt exactly. Inventory paths are in coverage.files.",
+        }
+    )
+
+
+def test_first_progress_receipt_delivers_the_prompt_once(tmp_path, monkeypatch):
+    """Send the prompt with the first progress receipt when no earlier result carried it."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    source = engine.repo_root / "app.java"
+    source.write_text("class App {}", encoding="utf-8")
+    (engine.repo_root / "other.java").write_text("class Other {}", encoding="utf-8")
+    report = tmp_path / "audit.md"
+    report.write_text("INCOMPLETE draft\n", encoding="utf-8")
+    prompt = render_audit_prompt(datetime.now(UTC), "abc123")
+    _pending_prompt(engine, prompt, report)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+
+    async def exercise():
+        """Submit one reviewed file, then continue without another prompt."""
+        first = await server.choose_software_audit_action(
+            _context(),
+            str(engine.repo_root),
+            progress={
+                "message": "Read the application entry.",
+                "files": [
+                    {
+                        "path": "app.java",
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "assessment": "Read the application entry.",
+                    }
+                ],
+            },
+        )
+        second = await server.choose_software_audit_action(
+            _context(), str(engine.repo_root)
+        )
+        return first, second
+
+    # Act
+    first, second = asyncio.run(exercise())
+
+    # Assert
+    assert first["audit_prompt"] == prompt
+    assert "app.java" in first["coverage"]["files"]
+    assert first["next_files"] == ["other.java"]
+    assert "included in this response" in first["next_action"]
+    assert "audit_prompt" not in second and "coverage" not in second
+    assert "Do not reread audit_prompt" in second["next_action"]
+    assert engine.state.software_audit["prompt_delivered"] is True
+
+
+def test_failed_progress_delivery_save_can_be_retried(tmp_path, monkeypatch):
+    """A failed delivery save after a progress receipt must leave the prompt available."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    source = engine.repo_root / "app.java"
+    source.write_text("class App {}", encoding="utf-8")
+    report = tmp_path / "audit.md"
+    report.write_text("INCOMPLETE draft\n", encoding="utf-8")
+    prompt = render_audit_prompt(datetime.now(UTC), "abc123")
+    _pending_prompt(engine, prompt, report)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+    original = engine._remember
+
+    def fail_delivery_save():
+        """Reject only the save that marks the prompt delivered."""
+        if engine.state.software_audit.get("prompt_delivered"):
+            raise OSError("disk full")
+        original()
+
+    monkeypatch.setattr(engine, "_remember", fail_delivery_save)
+
+    # Act
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(
+            server.choose_software_audit_action(
+                _context(),
+                str(engine.repo_root),
+                progress={
+                    "message": "Read the application entry.",
+                    "files": [
+                        {
+                            "path": "app.java",
+                            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                            "assessment": "Read the application entry.",
+                        }
+                    ],
+                },
+            )
+        )
+    pending_after_failure = engine.state.software_audit.get("prompt_delivered")
+    monkeypatch.setattr(engine, "_remember", original)
+    delivered = asyncio.run(
+        server.choose_software_audit_action(_context(), str(engine.repo_root))
+    )
+
+    # Assert
+    assert pending_after_failure is not True
+    assert engine.state.software_audit["status"] == "AUDIT_IN_PROGRESS"
+    assert delivered["audit_prompt"] == prompt
+    assert engine.state.software_audit["prompt_delivered"] is True
+
+
+def test_early_report_ready_delivers_the_prompt_once(tmp_path, monkeypatch):
+    """Send the prompt with an early report_ready result, then omit it."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    (engine.repo_root / "app.java").write_text("class App {}", encoding="utf-8")
+    report = tmp_path / "audit.md"
+    report.write_text("INCOMPLETE draft\n", encoding="utf-8")
+    prompt = render_audit_prompt(datetime.now(UTC), "abc123")
+    _pending_prompt(engine, prompt, report)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setenv("PROGRESS_CONSOLE", "off")
+
+    async def exercise():
+        """Reject the unfinished report, then continue the same scan."""
+        first = await server.choose_software_audit_action(
+            _context(), str(engine.repo_root), report_ready=True
+        )
+        second = await server.choose_software_audit_action(
+            _context(), str(engine.repo_root)
+        )
+        return first, second
+
+    # Act
+    first, second = asyncio.run(exercise())
+
+    # Assert
+    assert first["status"] == "AUDIT_INCOMPLETE"
+    assert first["audit_prompt"] == prompt
+    assert first["next_files"] == ["app.java"]
+    assert "included in this response" in first["next_action"]
+    assert "audit_prompt" not in second and "coverage" not in second
+    assert "Do not reread audit_prompt" in second["next_action"]
+    assert engine.state.software_audit["prompt_delivered"] is True
 
 
 def test_progress_draft_is_persisted_but_cannot_be_accepted_as_a_finished_report(

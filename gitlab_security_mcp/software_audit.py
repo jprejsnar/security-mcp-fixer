@@ -358,13 +358,23 @@ _ITEM = re.compile(
 )
 
 
+_AUDIT_PROMPT_TEXT: str | None = None
+
+
 def audit_prompt() -> str:
-    """Return the shipped meta-audit prompt, including its placeholders."""
-    return (
-        files("gitlab_security_mcp")
-        .joinpath("software_audit_prompt.md")
-        .read_text(encoding="utf-8")
-    )
+    """Return the shipped meta-audit prompt, including its placeholders.
+
+    The file is read once per process. Later renders reuse that text so a
+    continuation does not open the prompt again.
+    """
+    global _AUDIT_PROMPT_TEXT
+    if _AUDIT_PROMPT_TEXT is None:
+        _AUDIT_PROMPT_TEXT = (
+            files("gitlab_security_mcp")
+            .joinpath("software_audit_prompt.md")
+            .read_text(encoding="utf-8")
+        )
+    return _AUDIT_PROMPT_TEXT
 
 
 def render_audit_prompt(when: datetime, revision: str) -> str:

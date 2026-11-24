@@ -2801,7 +2801,7 @@ async def _continue_workflow(
                 message=_AUDIT_FIX_OUTCOMES_RECORDED,
             )
         elif audit.get("status") not in _AUDIT_FINISHED:
-            return _compact_audit(audit)
+            return _deliver_compact_audit(selected, audit)
         _keep_audit_visible(selected)
         workflow.advance(
             selected,
@@ -3015,7 +3015,10 @@ async def _finish_audit_approval(
             raise ValueError(_RAISE_THIS_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN)
         if stage == "CONSENT":
             await asyncio.to_thread(
-                _software_audit_result, selected, response["choice"]
+                _software_audit_result,
+                selected,
+                response["choice"],
+                deliver=False,
             )
             if response["choice"] == "done":
                 await complete_security_run(ctx, str(selected.repo_root))
@@ -3176,7 +3179,7 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
             "CONSENT_REQUIRED",
             "CONSENT_UNAVAILABLE",
         }:
-            return _compact_audit(previous)
+            return _deliver_compact_audit(selected, previous)
         state = selected.state
         workflow.activity(
             selected,
@@ -3252,7 +3255,7 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
             )
     pending = await asyncio.to_thread(selected.begin_software_audit)
     if not pending.pop("created"):
-        return _compact_audit(pending)
+        return _deliver_compact_audit(selected, pending)
     return await asyncio.to_thread(_software_audit_result, selected, "generate_report")
 
 
@@ -3327,15 +3330,34 @@ def _audit_project_name(engine: Engine) -> str:
     return project_file_name(engine.state.gitlab_project_path, engine.repo_root.name)
 
 
+_AUDIT_PROMPT_ALREADY_DELIVERED = (
+    "The audit prompt and file inventory were already delivered. "
+    "Do not request or reread them. Continue with next_files from the audit handoff. "
+    "Only after context loss call "
+    "get_run_status(repo_root=..., include_audit_details=True)."
+)
+_AUDIT_PROMPT_PENDING = (
+    "The audit prompt and file inventory have not been delivered yet. "
+    "Call choose_software_audit_action with repo_root only to receive them once. "
+    "Do not use include_audit_details for that first copy."
+)
+_AUDIT_DETAILS_AFTER_LOSS = (
+    "Omitted to save tokens. Only after context loss call "
+    "get_run_status(repo_root=..., include_audit_details=True)."
+)
+_REREAD_SAVED_PROMPT = "Do not reread audit_prompt, the output_path draft,"
+_FOLLOW_INCLUDED_PROMPT = (
+    "Follow the audit_prompt included in this response once. "
+    "Do not request it again or reread the output_path draft,"
+)
+
+
 def _compact_audit(audit: dict[str, Any]) -> dict[str, Any]:
     """Summarize saved audit state; resending its prompt and receipts multiplies AI tokens."""
-    if audit.get("status") == "GENERATE_AUDIT_REPORT":
-        # Its message tells the host to follow audit_prompt and coverage.files.
-        return deepcopy(audit)
     compact = {
         key: deepcopy(value)
         for key, value in audit.items()
-        if key not in {"audit_prompt", "coverage", "coverage_gaps"}
+        if key not in {"audit_prompt", "coverage", "coverage_gaps", "prompt_delivered"}
     }
     coverage = audit.get("coverage") or {}
     if coverage:
@@ -3355,11 +3377,76 @@ def _compact_audit(audit: dict[str, Any]) -> dict[str, Any]:
             "remaining_files_truncated": len(remaining) > 20,
         }
     if coverage or "audit_prompt" in audit:
+        pending = _prompt_pending(audit)
         compact["full_details"] = (
-            "Omitted to save tokens. Only after context loss call "
-            "get_run_status(repo_root=..., include_audit_details=True)."
+            _AUDIT_PROMPT_PENDING if pending else _AUDIT_DETAILS_AFTER_LOSS
         )
+        message = str(compact.get("message") or "")
+        if pending:
+            compact["message"] = _AUDIT_PROMPT_PENDING
+        elif audit.get("prompt_delivered") and (
+            "audit_prompt" in message or "coverage.files" in message
+        ):
+            compact["message"] = _AUDIT_PROMPT_ALREADY_DELIVERED
     return compact
+
+
+def _prompt_pending(audit: dict[str, Any]) -> bool:
+    """Return whether the host has not yet received this scan's prompt and inventory."""
+    return (
+        not audit.get("prompt_delivered")
+        and audit.get("status")
+        in {"GENERATE_AUDIT_REPORT", "AUDIT_IN_PROGRESS", "AUDIT_INCOMPLETE"}
+        and "audit_prompt" in audit
+    )
+
+
+def _mark_prompt_delivered(engine: Engine) -> None:
+    """Remember that the host received the prompt. A failed save can retry."""
+    saved = engine.state.software_audit
+    saved["prompt_delivered"] = True
+    try:
+        engine._remember()
+    except OSError:
+        saved["prompt_delivered"] = False
+        raise
+
+
+def _include_saved_prompt(
+    response: dict[str, Any], source: dict[str, Any], coverage: dict | None = None
+) -> dict[str, Any]:
+    """Attach the prompt and inventory that this response is delivering."""
+    delivered = {
+        **response,
+        "audit_prompt": source["audit_prompt"],
+        "coverage": deepcopy(
+            coverage if coverage is not None else source.get("coverage") or {}
+        ),
+        "message": source.get("message") or response.get("message"),
+    }
+    # Those fields describe an omitted prompt. This response includes it.
+    delivered.pop("full_details", None)
+    delivered.pop("coverage_summary", None)
+    action = delivered.get("next_action")
+    if isinstance(action, str):
+        delivered["next_action"] = action.replace(
+            _REREAD_SAVED_PROMPT, _FOLLOW_INCLUDED_PROMPT, 1
+        )
+    return delivered
+
+
+def _first_prompt_delivery(engine: Engine, response: dict[str, Any]) -> dict[str, Any]:
+    """Attach the saved prompt and inventory once, on the first host-visible result."""
+    saved = engine.state.software_audit
+    if not _prompt_pending(saved):
+        return response
+    _mark_prompt_delivered(engine)
+    return _include_saved_prompt(response, saved)
+
+
+def _deliver_compact_audit(engine: Engine, audit: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact audit, including the prompt when the host has not received it."""
+    return _first_prompt_delivery(engine, _compact_audit(audit))
 
 
 def _software_audit_blocked(engine: Engine) -> dict[str, Any] | None:
@@ -3411,12 +3498,8 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
     response = {
         key: value
         for key, value in result.items()
-        if key not in {"audit_prompt", "coverage", "coverage_gaps"}
+        if key not in {"audit_prompt", "coverage", "coverage_gaps", "prompt_delivered"}
     }
-    if result["status"] == "GENERATE_AUDIT_REPORT":
-        response.update(
-            {key: result[key] for key in ("audit_prompt", "coverage") if key in result}
-        )
     if gaps is not None:
         response["coverage_gaps"] = {
             **gaps,
@@ -3443,7 +3526,8 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
                 "partial findings summary or ask the developer to type continue. "
                 "Read only the paths in next_files, then submit their real progress.files "
                 "receipts in one call. Record candidate findings with exact lines in each "
-                "receipt's assessment. Do not reread audit_prompt, the output_path draft, "
+                "receipt's assessment. "
+                f"{_REREAD_SAVED_PROMPT} "
                 "or any file that already has a receipt; the server keeps the draft. "
                 "Repeat with each returned next_files until remaining_file_count is zero "
                 "and every phase is complete. Then write output_path once, replacing the "
@@ -3472,7 +3556,11 @@ def _show_audit_prompt(engine: Engine, prompt: str) -> None:
 
 
 def _software_audit_result(
-    engine: Engine, choice: str, *, select_after_report: bool = False
+    engine: Engine,
+    choice: str,
+    *,
+    select_after_report: bool = False,
+    deliver: bool = True,
 ) -> dict[str, Any]:
     """Prepare the automatic read-only audit or retain the human's exit choice."""
     when = datetime.now(UTC)
@@ -3521,7 +3609,10 @@ def _software_audit_result(
             "choice": "done",
             "message": "No further action. Do not change code, commit, or push.",
         }
-    return _record_audit_result(engine, result)
+    recorded = _record_audit_result(engine, result)
+    if deliver and _prompt_pending(engine.state.software_audit):
+        _mark_prompt_delivered(engine)
+    return recorded
 
 
 def _audit_fix_from_report(
@@ -3652,7 +3743,7 @@ def _software_audit_fix(
             engine, "fix_from_report", select_after_report=True
         )
     if not pending.get("report_complete"):
-        return _compact_audit(pending)
+        return _deliver_compact_audit(engine, pending)
     result = _audit_fix_from_report(existing, selected_ids, expected_report_hash)
     if destination:
         result.update(
@@ -3673,6 +3764,7 @@ def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, An
                 for key in (
                     "repo_root",
                     "audit_prompt",
+                    "prompt_delivered",
                     "output_path",
                     "coverage",
                     "report_complete",
@@ -4044,9 +4136,12 @@ async def choose_software_audit_action(
             },
         )
         _publish_audit_progress(result)
-        return _audit_review_handoff(
-            {key: result[key] for key in ("status", "output_path", "progress")},
-            coverage,
+        return _first_prompt_delivery(
+            selected,
+            _audit_review_handoff(
+                {key: result[key] for key in ("status", "output_path", "progress")},
+                coverage,
+            ),
         )
     if report_ready:
         if (
@@ -4089,7 +4184,9 @@ async def choose_software_audit_action(
                     "message": "Continue the read-only audit: review every remaining file and phase, refresh changed-file receipts, and update the report before report_ready. Do not add speculative findings to fill a quota.",
                 },
             )
-            return _audit_review_handoff(incomplete, coverage)
+            return _first_prompt_delivery(
+                selected, _audit_review_handoff(incomplete, coverage)
+            )
         result = await asyncio.to_thread(_audit_fix_from_report, report, None)
         if result["status"] in {"ERROR", "ITEMS_REQUIRED"}:
             return await asyncio.to_thread(_record_audit_result, selected, result)
@@ -4113,7 +4210,10 @@ async def choose_software_audit_action(
         "AUDIT_IN_PROGRESS",
         "AUDIT_INCOMPLETE",
     } and (choice is None or normalize_choice(choice) == previous.get("choice")):
-        return _audit_review_handoff(previous, previous.get("coverage") or {})
+        return _first_prompt_delivery(
+            selected,
+            _audit_review_handoff(previous, previous.get("coverage") or {}),
+        )
     selected_choice = normalize_choice(choice)
     if choice is None:
         previous = selected.state.software_audit

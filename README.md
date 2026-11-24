@@ -941,11 +941,12 @@ False positives found while fixing a checked item stay inside
 each one `failed` and shows an unchecked list. GitLab dismissal remains the job
 4 tool.
 
-The first `GENERATE_AUDIT_REPORT` response delivers the full prompt and file
-inventory once. Later responses are compact (counts, next files, remaining
-phases) to keep AI token use low. The full prompt, inventory and receipts stay
-on disk and are returned only by `get_run_status(..., include_audit_details=True)`
-after context loss.
+The first host-visible audit result delivers the full prompt and file inventory
+once, including a progress receipt or an unfinished `report_ready` result. A
+failed save of that delivery does not consume it. Later responses are compact.
+A status poll before that delivery stays compact and does not count as the
+delivery. The full prompt, inventory and receipts stay on disk and are returned
+only by `get_run_status(..., include_audit_details=True)` after context loss.
 
 ## Architecture
 
