@@ -385,6 +385,44 @@ _SELECTABLE = re.compile(r"^###\s+(?:\d+\.\s+)?selectable findings$", re.IGNOREC
 _ITEM = re.compile(
     r"^-\s+([A-Z][A-Z0-9]{1,8})\s+\|\s+([^|]+?)\s+\|\s+([^|]+?)\s+\|\s+(.+?)\s*$"
 )
+# Section titles from the prompt's "Output format"; numbering and heading level may vary.
+REQUIRED_REPORT_SECTIONS = (
+    "Scope summary",
+    "Functional, reliability, performance, and quality findings",
+    "Security findings",
+    "Verification performed",
+    "Recommended fix order",
+    "Limitations",
+    "Selectable findings",
+    "Unfinished work",
+    "Investigated and rejected",
+)
+_HEADING = re.compile(r"^#{2,4}\s+(?:\d+\.\s+)?(.+?)\s*$")
+_LINKED_LOCATION = re.compile(r"^\[[^\]]+\]\([^)\s]+#L\d+\)$")
+_MISSING_SECTION = "Missing required section: {}"
+_UNLINKED_LOCATION = (
+    "Selectable finding {} location is not a Markdown link with a #L line: {}"
+)
+
+
+def audit_format_issues(text: str) -> list[str]:
+    """List departures from the prompt's required report structure and link format."""
+    headings = [
+        matched.group(1).lower()
+        for line in text.splitlines()
+        if (matched := _HEADING.match(line.strip()))
+    ]
+    issues = [
+        _MISSING_SECTION.format(section)
+        for section in REQUIRED_REPORT_SECTIONS
+        if not any(heading.startswith(section.lower()) for heading in headings)
+    ]
+    issues.extend(
+        _UNLINKED_LOCATION.format(item["id"], item["location"])
+        for item in audit_items(text)
+        if not _LINKED_LOCATION.fullmatch(item["location"])
+    )
+    return issues
 
 
 _AUDIT_PROMPT_TEXT: str | None = None

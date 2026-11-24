@@ -3810,6 +3810,96 @@ def test_unresolved_report_never_prints_an_empty_code_findings_table(tmp_path):
     )
 
 
+def test_unresolved_report_lists_declined_audit_findings_with_location_and_problem(
+    tmp_path,
+):
+    """Declining AI fixes still records what the audit found and where to fix it."""
+    # Arrange
+    from gitlab_security_mcp.report import write_unresolved_report
+    from gitlab_security_mcp.state import RunState
+
+    audit_report = tmp_path / "service_software_audit_report.md"
+    audit_report.write_text("# audit\n", encoding="utf-8")
+    state = RunState(
+        software_audit={
+            "status": "NONE_SELECTED",
+            "output_path": str(audit_report),
+            "selected_items": [],
+            "items": [
+                {
+                    "id": "F1",
+                    "severity": "Medium",
+                    "location": "src/main/java/Auth.java:212",
+                    "problem": "A JWT with no audience throws instead of failing validation",
+                },
+                {
+                    "id": "F2",
+                    "severity": "High",
+                    "location": "src/main/java/Client.java:37",
+                    "problem": "Unused method embeds a client credential",
+                },
+            ],
+        }
+    )
+
+    # Act
+    markdown = write_unresolved_report(tmp_path, state)["final_summary_markdown"]
+
+    # Assert
+    section = markdown.split("## Software audit findings not fixed")[1].split("## ")[0]
+    assert audit_report.resolve().as_uri() in section
+    rows = [
+        line for line in section.splitlines() if line.startswith(("| F1 ", "| F2 "))
+    ]
+    assert rows[0].startswith("| F2 | High | src/main/java/Client.java:37 |")
+    assert "A JWT with no audience" in rows[1]
+    assert "Not selected; no edit authorized" not in markdown
+
+
+def test_unresolved_report_links_audit_locations_to_checkout_files(tmp_path):
+    """Bare and audit-relative locations become links that work from the report folder."""
+    # Arrange
+    from gitlab_security_mcp.report import write_unresolved_report
+    from gitlab_security_mcp.state import RunState
+
+    source = tmp_path / "src" / "My Auth.java"
+    source.parent.mkdir()
+    source.write_text("class Auth {}\n", encoding="utf-8")
+    items = [
+        {
+            "id": "F1",
+            "severity": "High",
+            "location": "src/My Auth.java:3",
+            "problem": "a",
+        },
+        {
+            "id": "F2",
+            "severity": "Low",
+            "location": "[src/My Auth.java:9](./source/repo/src/My%20Auth.java#L9)",
+            "problem": "b",
+        },
+        {
+            "id": "F3",
+            "severity": "Low",
+            "location": "src/Missing.java:1",
+            "problem": "c",
+        },
+    ]
+    state = RunState(software_audit={"selected_items": [], "items": items})
+
+    # Act
+    markdown = write_unresolved_report(tmp_path, state)["final_summary_markdown"]
+
+    # Assert
+    assert (
+        "| F1 | High | [src/My Auth.java:3](../../src/My%20Auth.java#L3) |" in markdown
+    )
+    assert (
+        "| F2 | Low | [src/My Auth.java:9](../../src/My%20Auth.java#L9) |" in markdown
+    )
+    assert "| F3 | Low | src/Missing.java:1 |" in markdown
+
+
 def test_final_summary_exposes_baseline_and_optional_validation_gaps():
     """Passing builds/tests do not hide failed lint or unavailable security audits."""
     # Arrange

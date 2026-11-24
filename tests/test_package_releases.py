@@ -481,6 +481,30 @@ def test_no_free_supported_release_blocks_a_previously_selected_plan(release_eng
         engine._require_package_version(engine.state.findings[0]["proposedFix"])
 
 
+def test_review_excluding_every_release_blocks_in_one_call(release_engine):
+    """An honest "nothing is compatible" review blocks without extra resubmissions."""
+    # Arrange
+    exclusions = [
+        {
+            "version": version,
+            "reason": "runtime_incompatible",
+            "sources": ["https://publisher.example/platform-bom"],
+            "assessment": "The platform BOM pins the SDK; forcing the API splits them",
+        }
+        for version in ("3.0.0", "2.0.0", "1.0.1")
+    ]
+    review = _support(
+        target="3.0.0", runtime_compatible=False, excluded_releases=exclusions
+    )
+
+    # Act
+    blocked = release_engine.select_package_version("one", review)
+
+    # Assert
+    assert blocked["status"] == "NO_SAFE_FIX"
+    assert blocked["selection"]["target"] is None
+
+
 def _license(**changes):
     """Provide target-specific fixture license evidence with explicit uncertainty overrides."""
     return {

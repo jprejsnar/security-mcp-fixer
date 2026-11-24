@@ -35,17 +35,22 @@ Review the first-party application code, shared libraries, tests, scripts, Git h
 - Lockfiles are not finding targets for this audit.
 - Selected dependency code may be inspected only to verify integration contracts.
 
-**Audit categories to cover:**
-- Security
+**Audit categories to cover (apply every category to every reviewed source file):**
+- Security, including PHI/PII exposure in logs, errors, and responses
 - Performance
-- Concurrency / threading / async lifetime
-- CPU
-- Memory
-- Unreleased resources
-- Uncaught exceptions / error handling
+- Scalability
+- Concurrency, threading, and async lifetime
+- Locking and deadlocks
+- CPU and memory growth that is not bounded
+- Resources that are not closed or released
+- Uncaught exceptions and exceptions handled incorrectly
+- Errors handled incorrectly (wrong result, status, retry, or silent failure)
+- Deprecated or unsupported APIs, replaced by the current API for the declared version
+- Date-time values that are not ISO 8601
+- General coding defects
 - Language/tooling quality (TypeScript, C#, Java, Crystal, etc. as applicable)
 
-Related symptoms may be grouped. Use the evidence requirements and severity levels below.
+Related symptoms may be grouped. Use the evidence requirements and severity levels below. "Per-file review checklist" defines what counts as a finding in each category.
 
 This is a repository-wide static review (with selected local reproductions where practical). It is not a penetration test, load test, heap profile, or guarantee that every possible defect has been found.
 
@@ -73,7 +78,9 @@ For Dockerfile/nginx findings, a caller can be the CI build invocation, containe
 
 ## Build dependencies and official documentation
 
-Complete this preflight before reviewing application code for the audit categories.
+Complete this preflight before reviewing any application source file. The
+documentation facts gathered here are applied to every file in "Per-file review
+checklist"; a review that skips this step produces a lower-quality report.
 
 1. Read every build and dependency manifest that is present: `package.json`,
    `pnpm-workspace.yaml`, `.nvmrc`/`engines`, `pom.xml`, `build.gradle(.kts)`,
@@ -82,26 +89,32 @@ Complete this preflight before reviewing application code for the audit categori
    `pyproject.toml`, `requirements*.txt`, Dockerfile base images, and CI
    tool/runtime versions. Read lockfiles only to resolve exact installed versions;
    they remain out of scope as finding targets.
-2. List the runtimes, frameworks, and libraries the reviewed code actually uses for
-   security, data access, messaging, HTTP, concurrency, resource lifetime, and error
-   handling, with their exact resolved versions.
-3. For each listed dependency, read the publisher's official online documentation
-   for that version: API reference, thread-safety and disposal/lifetime rules,
-   configuration defaults, security guidance, release notes, and breaking-change or
+2. List the stack the reviewed code actually uses, with exact resolved versions:
+   the language runtime and its declared version, application frameworks, and the
+   libraries used for security, data access, messaging, HTTP, concurrency, caching,
+   resource lifetime, logging, date-time handling, and error handling. Include
+   container base images and nginx when present.
+3. For each listed item, read the publisher's official online documentation for
+   that version: API reference, thread-safety and disposal/lifetime rules, locking
+   and async guidance, configuration defaults (timeouts, pool sizes, limits),
+   security and logging guidance, date-time formatting/parsing APIs, release notes,
+   deprecation and removal lists, support/end-of-life status, and breaking-change or
    migration notes. Use official publisher or project sources only, not blogs or
-   answers. If documentation cannot be retrieved, record that in section 6.
+   answers. If documentation cannot be retrieved, record that in section 6 and do
+   not report a finding that depends on it.
 4. Record each source URL and version in section 1. Read each dependency's
    documentation once and keep a concise summary of the facts that apply to this
    code; do not re-read it for every file.
 
 Documentation defines the correct contract; it does not replace code evidence. A
 finding still needs every item in "Evidence required before a finding". Do not
-report an outdated or vulnerable version alone; dependency upgrades are handled
-by the separate GitLab package job.
+report an outdated or vulnerable dependency version alone; dependency upgrades are
+handled by the separate GitLab package job. A deprecated or unsupported API call in
+the code is in scope; see "Per-file review checklist".
 
 ## Language contracts
 
-Apply these only to the version the repo declares. Do not retarget Java, .NET, TypeScript, JavaScript, or any other language as an audit finding or a selected fix. Read the publisher page for that declared version before a language-quality finding or a fix. A style preference, a missing type by itself, or a newer-language feature is not a finding. A deprecated or removed API is a finding only when the call is on a reachable path and the publisher page for the declared version says it is deprecated or removed. The recommended replacement is the current API from that page, not a removed one.
+Apply these only to the version the repo declares. Do not retarget Java, .NET, TypeScript, JavaScript, or any other language as an audit finding or a selected fix. Read the publisher page for that declared version before a language-quality finding or a fix. A style preference, a missing type by itself, or a newer-language feature is not a finding. A non-ISO 8601 date-time value is not a style preference in this audit; it is a required project rule (see "Per-file review checklist"). A deprecated or removed API is a finding only when the call is on a reachable path and the publisher page for the declared version says it is deprecated or removed. The recommended replacement is the current API from that page, available in the declared version, not a removed one.
 
 - **Java (declared 17 or newer, including Java 17):** Follow the Java SE documentation for that release. Close `AutoCloseable` resources with try-with-resources. Do not recommend `sun.*` or the deprecated `SecurityManager` as a fix. Quarkus and Jakarta libraries use `jakarta.*` when the project's imports already do. Do not rewrite `javax` to `jakarta`, or the reverse, as a style pass.
 - **JavaScript:** Follow the current MDN reference for the syntax the repo's `engines` or toolchain accepts. On a line you are already changing for a proven defect, use `const` or `let` rather than `var`. `===` is the fix only when the reachable bug is a coerced comparison. An unhandled rejection is a finding only on a reachable path. Optional chaining does not validate input.
@@ -112,13 +125,34 @@ Apply these only to the version the repo declares. Do not retarget Java, .NET, T
 
 The audit's Arrange-Act-Assert test uses the test style the repo already uses. This MCP server's Python 3.11 floor applies to this server, not to the audited repository.
 
+## Per-file review checklist
+
+Apply every item below to every reviewed source file, using the documentation facts from the preflight. Each item names what counts as a finding. A candidate still needs every item in "Evidence required before a finding": a reachable path, an opened caller, the triggering input, and the smallest root-cause fix. A pattern-search hit alone is never a finding; check whether the code already guards it.
+
+- **Performance:** repeated or redundant work on a hot path (work inside a loop that could run once, a query or remote call per item, recompiling a pattern per call, loading a whole collection to use one element), blocking or synchronous I/O on a request or event-loop thread, and missing timeouts on remote calls.
+- **Scalability:** per-item queries (N+1), queries or reads with no page size or limit, building an unbounded result in memory, creating a new HTTP or database client per request instead of reusing one the documentation says to share, and in-process state (a lock, cache, or counter) that the code relies on for correctness across instances when the deployment or CI configuration shows more than one instance. Record the instance count as a limitation when it cannot be established.
+- **Concurrency and threading:** shared mutable state read and written by more than one thread or request without synchronization, use of a type the documentation says is not thread-safe from more than one thread, check-then-act races, fire-and-forget tasks or promises whose failure is lost, and thread-pool starvation from blocking calls inside async code.
+- **Locking and deadlocks:** locks acquired in inconsistent order, a lock held across I/O, `await`, or a callback, a lock not released on every exit path (`finally`, `using`, try-with-resources), blocking on async work (`.Result`, `.Wait()`, `.get()` on the same executor), and nested locks that can wait on each other.
+- **Unbounded CPU and memory growth:** caches, maps, lists, queues, listeners, or subscriptions that grow per request or per message with no eviction, size bound, or removal; retries or loops without a bound or backoff; recursion on external input without a depth limit. Static evidence can show the unbounded path; do not claim a measured leak.
+- **Resources not closed or released:** streams, readers, connections, cursors, sessions, HTTP responses, file handles, timers, subscriptions, and executors that are not closed or disposed on every path, including the exception path. Use the language's structured form (try-with-resources, `using`/`await using`, `finally`, `with`) as the fix.
+- **Exceptions not handled correctly or uncaught:** an exception that escapes a request, message handler, scheduled job, or thread and fails the operation the code claims to handle; a broad catch that swallows the error or converts it to success; a catch that loses the cause; an unhandled promise rejection or task exception; stack traces or internal details returned to a caller.
+- **Errors handled incorrectly:** returning success or a default value after a failure, wrong HTTP status or error code for the failure, retrying a non-retryable error, acknowledging a message before the work is saved, ignoring a returned error or status, and partial writes with no rollback or compensation.
+- **Deprecated or unsupported APIs:** a reachable call that the publisher documentation for the declared version marks as deprecated, removed, unsupported, or insecure. The fix is the documented current API that exists in the declared version. Do not retarget the language or framework version to reach a replacement.
+- **PHI/PII in logs and errors:** a log statement, exception message, metric label, trace attribute, or error response that can contain personal or health data (for example names, email addresses, phone numbers, postal addresses, dates of birth, patient or subject identifiers, clinical data) or credentials and tokens, at any log level. Check whether a sanitizing filter or redaction actually applies to that output before reporting. Never copy the sensitive value into the report; cite the file and line only.
+- **Date-time values that are not ISO 8601:** every date-time that is logged, serialized, persisted as text, sent across a process boundary (API, message, file, header), used in a file or object name, or parsed from external input must use ISO 8601. Flag each reachable formatter, parser, or string concatenation that produces or accepts another format, including locale or custom patterns, epoch numbers in text interfaces, and timestamps without a UTC offset or `Z` where another system reads them. Use the declared version's standard ISO 8601 API as the fix (for example Java `DateTimeFormatter.ISO_OFFSET_DATE_TIME` or `Instant.toString()`, .NET round-trip `"O"` format, JavaScript `Date.prototype.toISOString()`, Python `datetime.isoformat()`). In file and object names, use `YYYY-MM-DD` or basic `YYYY-MM-DDTHHMMSSZ`, because a colon is not legal in a Windows file name. Human-facing UI text that is formatted for display only is a Low finding. A format that an external standard or protocol requires is not a finding: for example JWT `exp`/`iat`/`nbf` NumericDate values (RFC 7519), HTTP date headers such as `Retry-After`, `Last-Modified`, and cookie `Expires` (RFC 9110/6265), and native database date-time types that are not stored as text.
+- **General coding defects:** wrong conditions or off-by-one errors, null or undefined dereferences on a reachable path, incorrect comparisons, dead branches that hide a missing case, and copy-paste errors that change behavior.
+
+In each file's receipt assessment, record the checklist items that produced a candidate, with exact lines, and state "checklist applied" for the rest. Do not write a separate verdict for every item in every receipt.
+
+In test files, report only real PHI/PII, credentials, or tokens committed in fixtures, and defects that let a test pass while the behavior it checks is broken. Sample dates, fake names, and other synthetic test data are not findings.
+
 ## Review order
 
 Review in this order and record each entry point you opened:
 
 1. HTTP and message entry points: every controller action, middleware, health check, and background worker. For each action, note the auth scheme and the authorization rule.
 2. Data access: repository queries, raw SQL, and values that cross a process boundary. Compare frontend field names and separators with the backend DTO and database value.
-3. Error and log output: exception responses, retry logs, and client logs. A finding needs the value that leaves the process.
+3. Error and log output: exception responses, retry logs, and client logs. A finding needs the value that leaves the process. Check each output for PHI/PII and for date-time values that are not ISO 8601.
 4. Resource lifetime and bounded work: subscriptions, transactions, HTTP clients, timers, retries, queues, caches, and growing collections. Trace cancellation/teardown and concrete inputs that can cause repeated, multiplicative, or unbounded work or retention. Distinguish temporary allocations and expected caching from unreleased resources. A subscription that is tied to destroy, or an HTTP observable that completes, is not a leak. Static evidence can establish an unbounded path; do not claim measured runaway CPU/memory or its absence without runtime evidence.
 5. UI behavior that already has a sibling implementation. Read that sibling before calling the other one wrong.
 
@@ -241,9 +275,9 @@ lower the evidence bar, or inflate severity to satisfy an expected count.
 
 ## Severity
 
-- **High:** A reachable path loses or exposes data, skips an authorization check, fails a request that production code claims to handle, or exhausts resources and makes the service unavailable under a concrete triggering input.
-- **Medium:** A reachable implemented path returns the wrong result, reports success when it did not save, or accumulates unreleased resources or avoidable unbounded work under a named trigger.
-- **Low:** A local defect with a named caller and a small fix.
+- **High:** A reachable path loses or exposes data (including PHI/PII written to logs, errors, or responses), skips an authorization check, fails a request that production code claims to handle, deadlocks, or exhausts resources and makes the service unavailable under a concrete triggering input.
+- **Medium:** A reachable implemented path returns the wrong result, reports success when it did not save, accumulates unreleased resources or avoidable unbounded work under a named trigger, races on shared state, or exchanges a non-ISO 8601 date-time that another system parses or orders incorrectly.
+- **Low:** A local defect with a named caller and a small fix, including a non-ISO 8601 date-time that is shown only to people or a reachable deprecated API with no current failure.
 - **Conditional:** The dangerous call exists, and you could not prove a caller. Keep these in the security section only.
 
 An empty High section is a valid result. Do not raise severity to fill the table.
@@ -277,6 +311,8 @@ Use a table:
 | Issue Type | Filename | Line Number | Problem | Solution |
 |------------|----------|-------------|---------|----------|
 
+Issue Type is one checklist category: Performance, Scalability, Concurrency, Locking, Memory/CPU growth, Resource lifetime, Exception handling, Error handling, Deprecated API, ISO 8601 date-time, General defect, or Language quality. PHI/PII and other security findings go in section 3.
+
 For each finding include:
 - Severity (High / Medium / Low)
 - Short ID (e.g. R01, R02…)
@@ -288,7 +324,7 @@ For each finding include:
 
 ### 3. Security findings and conditional hardening items
 
-Separate table or section for security items (including conditional ones). Include CWE references where appropriate. Note confidence and whether reachability was established.
+Separate table or section for security items (including conditional ones), including PHI/PII exposure in logs, errors, or responses. Include CWE references where appropriate (for example CWE-532 for sensitive data in log files). Note confidence and whether reachability was established. Do not reproduce any PHI, PII, credential, or token value in the report.
 Use the same file-and-line links and per-finding evidence fields as section 2. Label any unproven caller explicitly for Conditional items.
 
 ### 4. Verification performed
@@ -330,6 +366,7 @@ Apply a change only when all of these are true:
 4. An Arrange-Act-Assert test fails before the change and passes after it. Record the command and the result.
 5. The change adds no compiler errors and no new warnings. Pre-existing warnings outside the change stay as they are.
 6. The edit includes a comment, in that file's normal comment syntax, at the changed code, Dockerfile instruction, nginx directive, or build/script line. The comment states what defect the change corrects and why this change corrects it. A team lead must be able to read that comment without the audit report. Use the evidence from this investigation. Leave the file unchanged when you cannot write that comment from observed behavior.
+7. The change follows "Per-file review checklist" itself: it closes what it opens, handles errors on every path, adds no lock held across I/O or `await`, logs no PHI/PII, writes date-times only in ISO 8601, and uses only APIs that the declared version's documentation supports.
 
 Leave the code unchanged when any item above is missing. Report that selected item as `failed` and name the blocker. A guessed cause, an invented line, an invented test result, or a change that makes the code less correct or less stable is not a fix. Keep the change to the root cause.
 

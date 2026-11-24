@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.57** (progress extension 1.0.51). In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.59** (progress extension 1.0.51). In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -40,6 +40,11 @@ This is one chat request, not a terminal command. The workflow runs these
 7. **Final unresolved report:** write and display
    `.security-mcp/reports/unresolved-remediation.md`, with package current/target
    versions and blockers, plus unsuccessful code attempts and their reasons.
+   Confirmed software-audit findings that were not selected for an AI fix are
+   listed under **Software audit findings not fixed** with severity, location
+   and problem, sorted by severity, and a link to the audit report. Each location
+   that names an existing checkout file links to that file and line from the
+   report's folder.
    All generated evidence and the redacted server log are then zipped under
    `~/softwareSecurityAuditReports/`. Only checkout log copies are removed.
    Reports and inspection state stay available and are also in the ZIP.
@@ -66,6 +71,25 @@ A window with open folders shows a run only when that checkout is one of those
 folders, or a directory inside one of them. A window with no open folder still
 shows the newest mirror for each checkout. Another VS Code or Cursor window can
 run a different repository at the same time.
+
+Release 1.0.59 enforces the audit report format once and links unresolved locations:
+- At `report_ready`, a report missing the nine required sections or linked
+  selectable locations gets one restructuring request with `format_issues`;
+  the next `report_ready` proceeds and records any remaining issues.
+- Each location under **Software audit findings not fixed** links to the
+  checkout file and line from the unresolved report's folder.
+
+Release 1.0.58 improves the software audit and its final report:
+- The audit reads the official documentation for the project's exact stack
+  versions first, then applies a per-file checklist to every source file:
+  performance, scalability, concurrency and threading, locking and deadlocks,
+  unbounded CPU/memory growth, resources not closed, exception and error
+  handling, deprecated or unsupported APIs, PHI/PII in logs and errors,
+  non-ISO 8601 date-time values, and general defects. The evidence bar is unchanged.
+- Confirmed audit findings that were not selected for an AI fix are listed in
+  the unresolved report with severity, location, problem, and an audit-report link.
+- A release review that excludes every eligible release is accepted in one call
+  with honest values, instead of forcing contradictory resubmissions.
 
 Release 1.0.57 fixes a missing log ZIP: a `progress.json` or `run-state.json`
 rewrite by background work finishing during job 7 no longer aborts archival.
@@ -1314,6 +1338,26 @@ Conditional items in the security section, and separates Unfinished work and
 Investigated and rejected leads from findings. Only findings from sections 2
 and 3 appear in section 7's fix-selection checkboxes.
 
+Before reviewing any file, the AI reads the official online documentation for
+the exact versions of the project's stack. It then applies a per-file checklist
+to every reviewed source file: performance, scalability, concurrency and
+threading, locking and deadlocks, unbounded CPU/memory growth, resources not
+closed, exceptions and errors handled incorrectly, deprecated or unsupported
+APIs (replaced by the current API in the declared version), PHI/PII in logs and
+errors, date-time values that are not ISO 8601, and general defects. Every
+checklist candidate still needs the same evidence. Formats that an external
+standard requires, such as JWT NumericDate or HTTP-date headers, are not ISO 8601
+findings. The report never copies a PHI, PII, credential, or token value, and a
+selected fix must itself follow the checklist.
+
+At `report_ready`, the server checks the report once against the prompt's
+output format: the nine section titles and a `[path:line](...#L<line>)` link for
+every selectable location. A report that departs from it returns
+`ITEMS_REQUIRED` with `format_issues`, asking the host to restructure the same
+findings without reviewing files again. The second `report_ready` proceeds even
+if issues remain, and records them as `format_issues` on the audit result, so the
+check can never loop.
+
 Always finish with `complete_security_run`, even if every package is blocked or
 no fix was approved. `NO_SAFE_FIX` is a per-package outcome, not the end of the
 run. A documented release review that excludes every target is carried into
@@ -1988,7 +2032,10 @@ call the same tool with this review:
 ```
 
 The server chooses the newest remaining stable release at or above the advisory
-floor, checks public advisory evidence, and replans the edit. A known affected
+floor, checks public advisory evidence, and replans the edit. When the
+exclusions leave no eligible release, send `"target": null` with honest
+`supported`/`runtime_compatible` values; the finding is blocked in that one call
+and nothing is edited. A known affected
 target or an advisory/package mismatch blocks selection. Missing public bounds
 do not block an otherwise evidenced update: the checkbox, qualification warnings,
 and reports disclose that the target is not verified unaffected. Human approval,
@@ -2505,7 +2552,7 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 The current version produces
-`dist/gitlab_security_mcp-1.0.57-py3-none-any.whl`; use the newly built filename if
+`dist/gitlab_security_mcp-1.0.59-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
@@ -2521,7 +2568,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.57-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-1.0.59-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -2581,7 +2628,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.57-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.59-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
@@ -2597,7 +2644,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.57-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.59-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -2618,7 +2665,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.57-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.59-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -2627,7 +2674,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.57-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.59-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -3011,7 +3058,7 @@ VS Code/Cursor windows, including Agents/background windows, and use
 **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.57-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.59-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -3085,7 +3132,7 @@ installation.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.57**
+3. Apply the deployment-specific update and verify installed version **1.0.59**
    (or the newer wheel you intentionally selected) and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
@@ -3094,7 +3141,7 @@ installation.
    `review_false_positives` among the seventeen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.57`
+   edits before requesting a new run. Its `server_version` must be `1.0.59`
    for this release. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
@@ -3567,7 +3614,7 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
 | `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full output for every allowed non-Git command, including Gradle `assemble` and runtime-version checks. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files and deletes checkout log copies. |
-| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status. Archived and retained in the checkout. |
+| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status, and every confirmed software-audit finding not selected for an AI fix (severity, location, problem, audit-report link). Archived and retained in the checkout. |
 | `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | One ZIP per finished run containing every checkout `.log`/`.jsonl`, generated reports/state/progress/lint/helper files, any optional software-audit report, and redacted `server.log`. User policies and unknown files are excluded. Retries merge into the same ZIP, preserving earlier members. Stable checkout log copies are deleted only after archival succeeds; non-log copies remain. A log that changes while the ZIP is written aborts archival and keeps every checkout log; a `progress.json` or `run-state.json` rewrite by finishing background work does not, because those copies stay in the checkout. The temp spool stays until process exit. Tests use disposable destinations. The checkout token separates repositories with the same project name. |
 | Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr, and the same redacted text in a process temp spool. Job 7 copies the spool into the run zip as `server.log`. The spool is not a home file and is removed when the process exits. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |

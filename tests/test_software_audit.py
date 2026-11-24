@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,8 +16,10 @@ from mcp.types import ClientCapabilities
 from gitlab_security_mcp import server, workflow
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.software_audit import (
+    REQUIRED_REPORT_SECTIONS,
     REVIEW_PHASES,
     audit_coverage_gaps,
+    audit_format_issues,
     audit_inventory,
     audit_items,
     audit_report_path,
@@ -25,6 +28,20 @@ from gitlab_security_mcp.software_audit import (
     render_audit_prompt,
 )
 from gitlab_security_mcp.util import checkout_file_id
+
+
+def _compliant_report(selectable: str) -> str:
+    """Wrap a section-7 body in the prompt's required sections with linked locations."""
+    linked = re.sub(
+        r"^(- \w+ \| [^|]+ \| )([^|\[\s][^|]*?):(\d+)( \|)",
+        r"\1[\2:\3](./\2#L\3)\4",
+        selectable,
+        flags=re.MULTILINE,
+    )
+    sections = REQUIRED_REPORT_SECTIONS
+    head = "".join(f"### {n}. {title}\n\n" for n, title in enumerate(sections[:6], 1))
+    tail = f"\n### 8. {sections[7]}\n\n### 9. {sections[8]}\n"
+    return head + linked + tail
 
 
 @pytest.fixture(autouse=True)
@@ -172,7 +189,9 @@ def test_native_audit_fix_checklist_hands_back_checked_items_without_reopening(
     # Arrange
     report = tmp_path / "audit.md"
     report.write_text(
-        "### 7. Selectable findings\n- S01 | Medium | app.java:1 | Wrong result\n",
+        _compliant_report(
+            "### 7. Selectable findings\n- S01 | Medium | app.java:1 | Wrong result\n"
+        ),
         encoding="utf-8",
     )
     engine = _engine(tmp_path / "checkout", report)
@@ -314,7 +333,9 @@ def test_ordered_audit_consent_report_checkboxes_and_recorded_fix_report(
         report = Path(audit["output_path"])
         await asyncio.to_thread(
             report.write_text,
-            "### 7. Selectable findings\n- S01 | Medium | src/App.java:12 | Wrong result\n- S02 | Low | src/Other.java:5 | Local defect\n",
+            _compliant_report(
+                "### 7. Selectable findings\n- S01 | Medium | src/App.java:12 | Wrong result\n- S02 | Low | src/Other.java:5 | Local defect\n"
+            ),
             encoding="utf-8",
         )
         await server.choose_software_audit_action(
@@ -1142,8 +1163,10 @@ def test_scan_progress_then_report_ready_opens_the_exact_report(tmp_path, monkey
         assert not boxes.called
         await asyncio.to_thread(
             Path(initial["output_path"]).write_text,
-            "### 7. Selectable findings\n"
-            "- R01 | High | [App.cs:12](./checkout/App.cs#L12) | Null on startup\n",
+            _compliant_report(
+                "### 7. Selectable findings\n"
+                "- R01 | High | [App.cs:12](./checkout/App.cs#L12) | Null on startup\n"
+            ),
             encoding="utf-8",
         )
         return await server.choose_software_audit_action(
@@ -1165,7 +1188,10 @@ def test_scan_progress_then_report_ready_opens_the_exact_report(tmp_path, monkey
     [
         (None, "ERROR"),
         ("# Incomplete audit\n", "ITEMS_REQUIRED"),
-        ("### 7. Selectable findings\nNo selectable findings.\n", "CHOICE_REQUIRED"),
+        (
+            _compliant_report("### 7. Selectable findings\nNo selectable findings.\n"),
+            "CHOICE_REQUIRED",
+        ),
     ],
 )
 def test_report_ready_never_uses_an_unrelated_report(
@@ -1205,6 +1231,66 @@ def test_report_ready_never_uses_an_unrelated_report(
     # Assert
     assert result["status"] == expected
     boxes.assert_not_called()
+
+
+def test_format_issues_name_missing_sections_and_unlinked_locations():
+    """A report with its own headings and bare path:line locations is flagged."""
+    # Arrange
+    nonconforming = (
+        "## 1. Documentation read\n## 2. Confirmed findings\n"
+        "### Selectable findings\n- F1 | Medium | src/Auth.java:212 | Null audience\n"
+    )
+    compliant = _compliant_report(
+        "### 7. Selectable findings\n- F1 | Medium | src/Auth.java:212 | Null audience\n"
+    )
+
+    # Act
+    issues = audit_format_issues(nonconforming)
+
+    # Assert
+    assert "Missing required section: Scope summary" in issues
+    assert "Missing required section: Investigated and rejected" in issues
+    assert any("F1 location is not a Markdown link" in issue for issue in issues)
+    assert audit_format_issues(compliant) == []
+
+
+def test_report_ready_requests_the_required_format_once(tmp_path, monkeypatch):
+    """A nonconforming report gets one restructuring request, then proceeds."""
+    # Arrange
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("gitlab_security_mcp.software_audit.Path.home", lambda: home)
+    engine = _engine(tmp_path / "checkout")
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    monkeypatch.setattr(server, "_ask_audit_items", AsyncMock())
+
+    async def exercise():
+        """Submit the same nonconforming report twice."""
+        initial = await server.choose_software_audit_action(
+            _context(), str(engine.repo_root), choice="fix_from_report"
+        )
+        await asyncio.to_thread(
+            Path(initial["output_path"]).write_text,
+            "### Selectable findings\nNo selectable findings.\n",
+            encoding="utf-8",
+        )
+        first = await server.choose_software_audit_action(
+            _context(), str(engine.repo_root), report_ready=True
+        )
+        second = await server.choose_software_audit_action(
+            _context(), str(engine.repo_root), report_ready=True
+        )
+        return first, second
+
+    # Act
+    first, second = asyncio.run(exercise())
+
+    # Assert
+    assert first["status"] == "ITEMS_REQUIRED"
+    assert "Missing required section: Scope summary" in first["format_issues"]
+    assert "runs once" in first["message"]
+    assert second["status"] == "CHOICE_REQUIRED"
+    assert engine.state.software_audit["format_issues"]
 
 
 def _report(home, body):
@@ -1306,7 +1392,7 @@ def test_background_handoff_stays_visible_after_the_starting_request(
         console.close.assert_not_called()
         await asyncio.to_thread(
             Path(result["output_path"]).write_text,
-            "### 7. Selectable findings\nNo selectable findings.\n",
+            _compliant_report("### 7. Selectable findings\nNo selectable findings.\n"),
             encoding="utf-8",
         )
 
@@ -1665,7 +1751,9 @@ def test_failed_audit_offer_is_explicit_and_does_not_authorize_an_action(
     )
     initial = asyncio.run(server.complete_security_run(context, str(tmp_path)))
     Path(initial.structured_content["software_audit"]["output_path"]).write_text(
-        "### 7. Selectable findings\n- R01 | Low | App.cs:1 | Local defect\n",
+        _compliant_report(
+            "### 7. Selectable findings\n- R01 | Low | App.cs:1 | Local defect\n"
+        ),
         encoding="utf-8",
     )
 
@@ -2082,7 +2170,9 @@ def test_partial_review_is_rejected_but_one_evidenced_finding_is_allowed(
         report = Path(initial["output_path"])
         await asyncio.to_thread(
             report.write_text,
-            "### 7. Selectable findings\n- R01 | Low | Controller.java:1 | Local defect\n",
+            _compliant_report(
+                "### 7. Selectable findings\n- R01 | Low | Controller.java:1 | Local defect\n"
+            ),
             encoding="utf-8",
         )
         await server.choose_software_audit_action(
@@ -2165,7 +2255,7 @@ def test_changed_files_invalidate_a_completed_review(tmp_path, monkeypatch):
         )
         await asyncio.to_thread(
             Path(initial["output_path"]).write_text,
-            "### 7. Selectable findings\nNo selectable findings.\n",
+            _compliant_report("### 7. Selectable findings\nNo selectable findings.\n"),
             encoding="utf-8",
         )
         return await server.choose_software_audit_action(

@@ -1911,7 +1911,9 @@ class Engine:
                         "fees. Supply target=<exact reviewed eligible version>,"
                         "supported=true,runtime_compatible=true,sources,assessment and "
                         "excluded_releases [{version,reason: unsupported|runtime_incompatible|paid,"
-                        "sources,assessment}]. Never exclude a release merely because it is a major upgrade. "
+                        "sources,assessment}]. If the exclusions leave no eligible release, supply "
+                        "target=null and honest supported/runtime_compatible values; the finding is "
+                        "then blocked and nothing is edited. Never exclude a release merely because it is a major upgrade. "
                         "Every paid release must be flagged for user investigation."
                     ),
                 }
@@ -1927,7 +1929,9 @@ class Engine:
                 )
                 if warning not in finding.setdefault("evidence", []):
                     finding["evidence"].append(warning)
-            if "target" not in review or review["target"] != selection["target"]:
+            if selection["target"] is not None and (
+                "target" not in review or review["target"] != selection["target"]
+            ):
                 raise ValueError(
                     _RAISE_THE_LATEST_ELIGIBLE_TARGET_IS_R_BUT_THE.format(
                         selection["target"]

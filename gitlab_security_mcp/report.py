@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
+from urllib.parse import quote
 
 from gitlab_security_mcp.gitlab_client import dismissal_is_confirmed
 from gitlab_security_mcp.source_findings import pending_source_reviews
@@ -14,6 +17,76 @@ from gitlab_security_mcp.workflow import JOB_REPORT
 _NO_OTHER_UNRESOLVED_ROW = (
     "| None reported | No other unresolved or unattempted code findings |"
 )
+_AUDIT_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_PATH_LINE = re.compile(r"(?P<path>[^:\s][^:]*?):(?P<line>\d+)(?:-\d+)?")
+_AUDIT_NOT_SELECTED = "Not selected for an AI fix; still needs a fix."
+_AUDIT_SECTION_INTRO = (
+    "The software audit confirmed these findings, but they were not selected "
+    "for an AI fix, so no code was changed. Each one still needs a fix."
+)
+_AUDIT_REPORT_LINK = (
+    "Evidence, affected lines and the recommended change for each finding are in "
+    "the [software audit report]({})."
+)
+
+
+def _audit_location_cell(root: Path, report_dir: Path, location: str) -> str:
+    """Link an audit location to its checkout file from the unresolved report.
+
+    Audit reports link relative to the home-directory audit report, so their
+    targets break here; rebuild the link from the label's path and line. A
+    location that does not name an existing checkout file stays plain text.
+    """
+    linked = _MARKDOWN_LINK.fullmatch(location.strip())
+    label = linked.group(1) if linked else location.strip()
+    parsed = _PATH_LINE.fullmatch(label)
+    if parsed is None:
+        return _table_cell(location)
+    target = (root / parsed.group("path")).resolve()
+    if not target.is_file() or not target.is_relative_to(root.resolve()):
+        return _table_cell(label)
+    relative = Path(os.path.relpath(target, report_dir.resolve())).as_posix()
+    return f"[{_table_cell(label)}]({quote(relative)}#L{parsed.group('line')})"
+
+
+def _unselected_audit_section(root: Path, state: RunState) -> list[str]:
+    """List every confirmed audit finding the human did not select, with its fix target."""
+    audit = state.software_audit
+    selected = {item["id"] for item in audit.get("selected_items", [])}
+    items = sorted(
+        (item for item in audit.get("items", []) if item["id"] not in selected),
+        key=lambda item: _AUDIT_SEVERITY_ORDER.get(
+            str(item.get("severity", "")).lower(), len(_AUDIT_SEVERITY_ORDER)
+        ),
+    )
+    if not items:
+        return []
+    lines = ["", "## Software audit findings not fixed", "", _AUDIT_SECTION_INTRO]
+    if audit.get("output_path"):
+        lines.append(
+            _AUDIT_REPORT_LINK.format(Path(audit["output_path"]).resolve().as_uri())
+        )
+    lines.extend(
+        [
+            "",
+            "| Finding | Severity | Location | Problem | Status |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    report_dir = root / ".security-mcp" / "reports"
+    for item in items:
+        cells = (
+            _table_cell(item["id"]),
+            _table_cell(item.get("severity") or "Not stated"),
+            _audit_location_cell(root, report_dir, item["location"])
+            if item.get("location")
+            else "Not stated",
+            _table_cell(item.get("problem") or "Not stated"),
+            _AUDIT_NOT_SELECTED,
+        )
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
 
 
 def _table_cell(value: object) -> str:
@@ -340,16 +413,9 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
             lines.append(
                 f"| {_table_cell(item['id'])} | {_table_cell(item['reason'])} |"
             )
-    selected_audit = {
-        item["id"] for item in state.software_audit.get("selected_items", [])
-    }
-    for item in state.software_audit.get("items", []):
-        if item["id"] not in selected_audit:
-            lines.append(
-                f"| Audit {_table_cell(item['id'])} | Not selected; no edit authorized. |"
-            )
     if len(lines) == other_rows:
         lines.append(_NO_OTHER_UNRESOLVED_ROW)
+    lines.extend(_unselected_audit_section(root, state))
     lines.extend(["", "## Workflow jobs"])
     for job in state.workflow.get("jobs", []):
         status = "FINISHED" if job["number"] == JOB_REPORT else job["status"]

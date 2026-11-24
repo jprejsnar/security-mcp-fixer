@@ -194,16 +194,14 @@ def release_catalog(
 
 
 def reviewed_selection(catalog: dict, floor: str, review: dict) -> dict:
-    """Choose the newest release not excluded by documented support/runtime/fee evidence."""
+    """Choose the newest release not excluded by documented support/runtime/fee evidence.
+
+    The top-level supported/runtime_compatible attestations describe the selected
+    target. When the review's exclusions leave no eligible release, there is no
+    target to attest, so an honest false or null is accepted and nothing is edited.
+    """
     if not isinstance(review, dict):
         raise ValueError(_RAISE_PROVIDE_A_RELEASE_REVIEW_FOR_THE_ACTUAL_PROJECT)
-    if (
-        review.get("supported") is not True
-        or review.get("runtime_compatible") is not True
-    ):
-        raise ValueError(
-            _RAISE_CONFIRM_PUBLISHER_SUPPORT_AND_COMPATIBILITY_WITH_THE_ACTUAL
-        )
     _evidence(review)
     exclusions = review.get("excluded_releases", [])
     if not isinstance(exclusions, list):
@@ -233,6 +231,13 @@ def reviewed_selection(catalog: dict, floor: str, review: dict) -> dict:
         for raw in catalog["versions"]
         if raw not in excluded and parse_version(raw) >= minimum
     ]
+    if candidates and (
+        review.get("supported") is not True
+        or review.get("runtime_compatible") is not True
+    ):
+        raise ValueError(
+            _RAISE_CONFIRM_PUBLISHER_SUPPORT_AND_COMPATIBILITY_WITH_THE_ACTUAL
+        )
     paid = [item for item in exclusions if item["reason"] == "paid"]
     return {
         "target": candidates[0] if candidates else None,

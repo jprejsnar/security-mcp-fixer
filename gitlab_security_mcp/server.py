@@ -57,6 +57,7 @@ from gitlab_security_mcp.software_audit import (
     REVIEW_PHASES,
     append_coverage_appendix,
     audit_coverage_gaps,
+    audit_format_issues,
     audit_has_no_findings,
     audit_inventory,
     audit_items,
@@ -184,7 +185,8 @@ For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    select_security_fixes again with repo_root only; the server reuses the stored
    qualification. Do not invent evidence or approval.
    Release review schema: target:<exact reviewed eligible version or null if none>,
-   supported:true,runtime_compatible:true,sources:[official
+   supported:true,runtime_compatible:true (honest values when target is null),
+   sources:[official
    HTTPS URLs],assessment,excluded_releases:[{version,reason:unsupported|
    runtime_incompatible|paid,sources:[official HTTPS URLs],assessment}].
    Qualification review schema: ecosystem,package,target,documentation
@@ -585,6 +587,13 @@ _AUDIT_FINISHED_MESSAGE = (
     "Software audit finished; see the final report for unresolved findings."
 )
 _AUDIT_FIX_OUTCOMES_RECORDED = "All selected audit fix outcomes are recorded; unresolved findings remain in the final report."
+_AUDIT_FORMAT_REQUIRED = (
+    "The report does not follow the prompt's required output format; see format_issues. "
+    "Rewrite the same report at output_path into sections 1-9 with the exact titles from "
+    "'Output format', and make every source location a Markdown link to the file with "
+    "#L<line>. Do not add, drop, or change findings, and do not review files again. Then "
+    "call choose_software_audit_action with report_ready=True. This format check runs once."
+)
 
 
 def _editor_progress(
@@ -3852,6 +3861,11 @@ def _software_audit_fix(
     return _record_audit_result(engine, result)
 
 
+def _report_format_issues(report: Path) -> list[str]:
+    """Read the finished audit report and list its departures from the required format."""
+    return audit_format_issues(report.read_text(encoding="utf-8"))
+
+
 def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, Any]:
     """Store the closing choice and return the same result."""
     previous = engine.state.software_audit
@@ -3869,6 +3883,8 @@ def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, An
                     "report_complete",
                     "items",
                     "requested_at",
+                    "format_checked",
+                    "format_issues",
                 )
                 if key in previous
             },
@@ -4289,6 +4305,21 @@ async def choose_software_audit_action(
         result = await asyncio.to_thread(_audit_fix_from_report, report, None)
         if result["status"] in {"ERROR", "ITEMS_REQUIRED"}:
             return await asyncio.to_thread(_record_audit_result, selected, result)
+        format_issues = await asyncio.to_thread(_report_format_issues, report)
+        if format_issues and not previous.get("format_checked"):
+            # One restructuring request only; a second report_ready proceeds.
+            return await asyncio.to_thread(
+                _record_audit_result,
+                selected,
+                {
+                    "status": "ITEMS_REQUIRED",
+                    "choice": "generate_report",
+                    "report_path": str(report),
+                    "format_checked": True,
+                    "format_issues": format_issues,
+                    "message": _AUDIT_FORMAT_REQUIRED,
+                },
+            )
         await asyncio.to_thread(append_coverage_appendix, report, coverage)
         await asyncio.to_thread(
             _record_audit_result,
@@ -4298,6 +4329,7 @@ async def choose_software_audit_action(
                 "choice": None,
                 "report_path": str(report),
                 "report_complete": True,
+                "format_issues": format_issues,
             },
         )
         if selected.state.workflow:
