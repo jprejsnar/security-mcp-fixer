@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import threading
 from copy import deepcopy
 from subprocess import TimeoutExpired
 
@@ -534,6 +535,95 @@ def test_test_requiring_policy_allows_qualification_and_package_edits(
     assert path.read_bytes() == original_policy
     assert manifest.read_bytes() != original_manifest
     assert package_engine.state.changes[0]["validation_pending"]
+
+
+def test_failed_lockfile_batch_preserves_its_reason_and_skipped_validation(
+    package_engine, package_review, monkeypatch
+):
+    """Keep the real rejection and rollback visible after a later selection is skipped."""
+    # Arrange
+    from unittest.mock import Mock
+
+    from gitlab_security_mcp import workflow
+
+    engine = package_engine
+    manifest = engine.repo_root / "package.json"
+    original = manifest.read_bytes()
+    failure = "Lockfile refresh failed: ERR_PNPM_TARBALL_URL_MISMATCH"
+
+    def reject_lockfile(root, plan, runner, which):
+        """Model a package manager rejecting provenance after the manifest edit."""
+        contents = json.loads(manifest.read_text(encoding="utf-8"))
+        contents["dependencies"]["example"] = plan.target
+        manifest.write_text(json.dumps(contents), encoding="utf-8")
+        return {
+            "status": "FIX_FAILED_LOCKFILE",
+            "files": ["package.json"],
+            "detail": failure,
+        }
+
+    monkeypatch.setattr("gitlab_security_mcp.engine.apply_plan", reject_lockfile)
+    validation = Mock(wraps=engine.run_validation_matrix)
+    progress = Mock(wraps=engine._progress)
+    monkeypatch.setattr(engine, "run_validation_matrix", validation)
+    monkeypatch.setattr(engine, "_progress", progress)
+    workflow.start(engine)
+    while engine.state.workflow["current"] < workflow.JOB_PACKAGES:
+        workflow.advance(engine)
+    candidates = engine.fix_selection_candidates()["candidates"]
+    pending = engine.record_fix_selection(
+        candidates, [], "REQUESTED", presentation="WINDOWS_DIALOG"
+    )
+    engine.record_fix_selection(
+        candidates,
+        ["package"],
+        "APPROVED",
+        request_id=pending["request_id"],
+        presentation="WINDOWS_DIALOG",
+    )
+
+    # Act
+    batch = engine.execute_selected_package_updates(
+        pending["request_id"],
+        {"package": package_review},
+        tree_snapshot(engine.repo_root),
+        threading.Event(),
+    )
+    assert batch["status"] == "PARTIAL_FAILURE", batch
+    while engine.state.workflow["current"] < workflow.JOB_SOURCE:
+        workflow.advance(engine)
+    later_selection = engine.fix_selection_candidates()
+    assert "candidates" in later_selection, later_selection
+    engine.record_fix_selection(later_selection["candidates"], [], "SKIPPED")
+
+    # Assert
+    assert batch["status"] == "PARTIAL_FAILURE"
+    assert failure in batch["reason"]
+    failed = next(
+        row for row in batch["results"] if row["stage"] == "apply_minimal_fix"
+    )
+    assert failure in failed["reason"]
+    assert batch["validation_status"] == "NOT_RUN_FIX_APPLICATION_FAILED"
+    assert engine.state.validation_status == batch["validation_status"]
+    assert manifest.read_bytes() == original
+    assert engine.state.changes[0]["rollback"]["status"] == "ROLLED_BACK"
+    assert engine.state.changes[0]["rollback"]["detail"] in batch["reason"]
+    assert not engine.state.manual_cleanup_required
+    validation.assert_not_called()
+    messages = [call.args[1] for call in progress.call_args_list]
+    assert any(
+        "production validation of this edit was not started" in text
+        for text in messages
+    )
+    assert not any(
+        "production build/dependency verification follows" in text for text in messages
+    )
+    saved = json.loads(
+        (engine.repo_root / ".security-mcp" / "run-state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["validation_status"] == batch["validation_status"]
 
 
 @pytest.fixture

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.tools.base import Tool
 from mcp.shared.exceptions import MCPError
 from mcp.types import ClientCapabilities
@@ -1538,7 +1539,12 @@ def test_ai_review_failures_cannot_become_false_positives(
     # Act
     tool = Tool.from_function(server.verify_security_finding)
     result = asyncio.run(tool.run({"finding_id": "finding-1"}, ctx))
-    if failure != "declined":
+    if failure == "invalid-review":
+        with pytest.raises(ToolError, match=r"source_review\.decision"):
+            asyncio.run(
+                tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
+            )
+    elif failure != "declined":
         result = asyncio.run(
             tool.run({"finding_id": "finding-1", "source_review": review}, ctx)
         )

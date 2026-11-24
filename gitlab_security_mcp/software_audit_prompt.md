@@ -19,6 +19,12 @@ Review the first-party application code, shared libraries, tests, scripts, Git h
 - Mixed front-end + back-end repositories
 - Any other languages or frameworks found in the repo
 
+**Container and web-server discovery (every product):**
+- Perform a recursive filename/directory search inside the actual audited checkout for `Dockerfile` and `nginx.conf`, including hidden directories such as `frontend/.docker`, `backend/.docker`, and nested service/deployment folders. Do not search only the root or assume every product is literally named frontend or backend. Keep the generated, vendored, build-output, and Git exclusions below.
+- Use `coverage.files` as the starting inventory, but verify discovery before claiming a product has no container or nginx configuration. Read every in-scope match and its referenced handwritten configuration/templates. Trace Dockerfile `COPY`/`ADD`, `ENTRYPOINT`/`CMD`, CI build contexts and `-f` paths, and nginx includes, routing/upstreams, headers, and limits to their actual consumers.
+- Static file discovery and review do not require the `docker` or `nginx` executable. A missing executable skips only the corresponding execution check, never the file search or static review. Do not execute builds, containers, or deployment scripts merely to discover files.
+- In section 1, list the discovered paths and their product/deployment roles. Explicitly record when no matching file was found after searching a product. In sections 4 and 6, distinguish files reviewed from configuration/image checks or deployed behavior that could not be executed.
+
 **Project AI guidance (use only what exists):**
 - Look for and load any available AI rules, skills, instructions, AGENT files, Copilot instructions, Cursor rules, `.github/copilot-instructions.md`, `AGENTS.md`, `.cursorrules`, skill files, rule bodies, or similar guidance in the repository root or standard locations.
 - Do **not** assume a fixed count of rules, skills, or references. Use whatever is actually present.
@@ -62,6 +68,8 @@ For each finding, add:
 If a path is incomplete on purpose (mock data, TODO, method that throws "not implemented" and has no production caller), list it under Unfinished work. Do not put it in the findings tables.
 
 Conditional security items are the only exception to proven reachability and caller evidence: the dangerous call must exist and be opened, and you must state which caller or reachability evidence could not be established. Keep them in section 3 only, separate from confirmed findings; do not present a hypothetical input as observed behavior.
+
+For Dockerfile/nginx findings, a caller can be the CI build invocation, container startup command, nginx include, or deployment template that consumes the configuration; it need not be an application function. A passing build, an existing test that asserts current behavior, or a reassuring comment alone does not disprove a candidate defect. Compare the reachable behavior with its callers, intended contract, and official documentation before rejecting the lead.
 
 ## Build dependencies and official documentation
 
@@ -111,7 +119,7 @@ Review in this order and record each entry point you opened:
 1. HTTP and message entry points: every controller action, middleware, health check, and background worker. For each action, note the auth scheme and the authorization rule.
 2. Data access: repository queries, raw SQL, and values that cross a process boundary. Compare frontend field names and separators with the backend DTO and database value.
 3. Error and log output: exception responses, retry logs, and client logs. A finding needs the value that leaves the process.
-4. Resource lifetime: subscriptions, transactions, HTTP clients, and timers. A subscription that is tied to destroy, or an HTTP observable that completes, is not a leak.
+4. Resource lifetime and bounded work: subscriptions, transactions, HTTP clients, timers, retries, queues, caches, and growing collections. Trace cancellation/teardown and concrete inputs that can cause repeated, multiplicative, or unbounded work or retention. Distinguish temporary allocations and expected caching from unreleased resources. A subscription that is tied to destroy, or an HTTP observable that completes, is not a leak. Static evidence can establish an unbounded path; do not claim measured runaway CPU/memory or its absence without runtime evidence.
 5. UI behavior that already has a sibling implementation. Read that sibling before calling the other one wrong.
 
 Review every remaining inventoried file. Stop tracing a path when it is unimplemented, and list that path under Unfinished work. Do not stop the audit after the first implemented path. Do not code-review generated files, generated coverage, lockfiles, or vendored packages for these findings.
@@ -228,8 +236,8 @@ lower the evidence bar, or inflate severity to satisfy an expected count.
 
 ## Severity
 
-- **High:** A reachable path loses or exposes data, skips an authorization check, or fails a request that production code claims to handle.
-- **Medium:** A reachable implemented path returns the wrong result or reports success when it did not save.
+- **High:** A reachable path loses or exposes data, skips an authorization check, fails a request that production code claims to handle, or exhausts resources and makes the service unavailable under a concrete triggering input.
+- **Medium:** A reachable implemented path returns the wrong result, reports success when it did not save, or accumulates unreleased resources or avoidable unbounded work under a named trigger.
 - **Low:** A local defect with a named caller and a small fix.
 - **Conditional:** The dangerous call exists, and you could not prove a caller. Keep these in the security section only.
 

@@ -265,8 +265,15 @@ def test_native_audit_fix_checklist_hands_back_checked_items_without_reopening(
     assert [item["id"] for item in result["selected_items"]] == ["S01"]
 
 
-def test_ordered_audit_consent_report_checkboxes_and_failed_fix_report(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("outcome", "reason"),
+    [
+        ("failed", "Required database contract cannot be verified."),
+        ("fixed", "Scoped fix passed production validation."),
+    ],
+)
+def test_ordered_audit_consent_report_checkboxes_and_recorded_fix_report(
+    tmp_path, monkeypatch, outcome, reason
 ):
     """Require consent before scanning and outcomes before final reporting."""
     # Arrange
@@ -296,7 +303,7 @@ def test_ordered_audit_consent_report_checkboxes_and_failed_fix_report(
     ctx.elicit.side_effect = elicit
 
     async def exercise():
-        """Run audit consent, review completion, human selection and failed-fix reporting."""
+        """Run audit consent, review completion, human selection and outcome reporting."""
         denied = await server.choose_software_audit_action(
             ctx, str(engine.repo_root), choice="fix_from_report"
         )
@@ -325,29 +332,84 @@ def test_ordered_audit_consent_report_checkboxes_and_failed_fix_report(
         missing = await server.complete_security_run(ctx, str(engine.repo_root))
         assert missing.structured_content["status"] == "CODE_FIX_RESULTS_REQUIRED"
         assert engine.state.workflow["current"] == 6
-        return await server.complete_security_run(
+        assert engine.state.software_audit["status"] == "FIX_FROM_AUDIT_REPORT"
+        heartbeat = server._audit_activity_tasks[engine.repo_root][1]
+        assert not heartbeat.done()
+        completed = await server.complete_security_run(
             ctx,
             str(engine.repo_root),
             code_results=[
                 {
                     "id": "S01",
-                    "status": "failed",
-                    "reason": "Required database contract cannot be verified.",
+                    "status": outcome,
+                    "reason": reason,
+                    "validation": "gradlew assemble: exit 0",
                 }
             ],
         )
+        assert engine.repo_root not in server._audit_activity_tasks
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        return completed
 
     # Act
     result = asyncio.run(exercise()).structured_content
     # Assert
     assert calls == ["consent", "audit fixes"]
     assert result["status"] == "WORKFLOW_COMPLETE"
-    assert (
-        "Required database contract cannot be verified."
-        in result["final_summary_markdown"]
-    )
+    if outcome == "failed":
+        assert reason in result["final_summary_markdown"]
     assert "S02" in result["final_summary_markdown"]
     assert "Not selected" in result["final_summary_markdown"]
+    assert engine.state.software_audit["status"] == "DONE"
+    assert engine.state.workflow["code_results"]["audit:S01"]["status"] == outcome
+    persisted = json.loads(
+        (engine.repo_root / ".security-mcp" / "run-state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted["software_audit"]["status"] == "DONE"
+    progress = json.loads(
+        (engine.repo_root / ".security-mcp" / "progress.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    audit_task = next(
+        item for item in progress["tasks"] if item["id"] == "software-audit"
+    )
+    assert audit_task["status"] == "FINISHED"
+
+
+@pytest.mark.parametrize("status", ["DONE", "NONE_SELECTED", "NO_FINDINGS"])
+def test_terminal_audit_stops_its_heartbeat_and_replaces_waiting_progress(
+    tmp_path, monkeypatch, status
+):
+    """Remove naturally finished heartbeat ownership and persist terminal progress."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    engine.state.software_audit = {"status": "AUDIT_IN_PROGRESS"}
+    monkeypatch.setattr(server, "_BACKGROUND_HEARTBEAT_SECONDS", 0.001)
+
+    async def exercise():
+        """Finish between requests so the pulse must release itself."""
+        server._keep_audit_visible(engine)
+        heartbeat = server._audit_activity_tasks[engine.repo_root][1]
+        engine.state.software_audit["status"] = status
+        await asyncio.wait_for(heartbeat, timeout=1)
+        assert engine.repo_root not in server._audit_activity_tasks
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    progress = json.loads(
+        (engine.repo_root / ".security-mcp" / "progress.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    audit_task = next(
+        item for item in progress["tasks"] if item["id"] == "software-audit"
+    )
+    assert audit_task["status"] == "FINISHED"
 
 
 def test_report_path_uses_the_project_and_a_windows_safe_utc_stamp(

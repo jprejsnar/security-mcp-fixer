@@ -112,6 +112,19 @@ from gitlab_security_mcp.versions import (
 )
 from gitlab_security_mcp.workflow import JOB_PACKAGES, JOB_SOURCE
 
+_VALIDATION_NOT_RUN_APPLICATION_FAILED = "NOT_RUN_FIX_APPLICATION_FAILED"
+_PACKAGE_STEP_SUCCESS_STATUSES = frozenset(
+    {"QUALIFIED", "APPLIED", "VALIDATION_COMPLETE"}
+)
+_PACKAGE_BATCH_FAILURE_REASON = "One or more approved updates were not accepted; see the per-finding outcomes in the final report."
+_DEPENDENCY_EDIT_PROGRESS = "Dependency/configuration edit and lockfile refresh finished in {:.1f} ms with status={}; {}"
+_DEPENDENCY_EDIT_VALIDATION_FOLLOWS = (
+    "production build/dependency verification follows without tests."
+)
+_DEPENDENCY_EDIT_VALIDATION_NOT_STARTED = (
+    "the edit was not applied; production validation of this edit was not started."
+)
+
 _RAISE_REPO_ROOT_CONTAINS_AN_UNRESOLVED_HOST_PLACEHOLDER_SET = "REPO_ROOT contains an unresolved host placeholder. Set REPO_ROOT to the absolute application checkout path, or call run_prechecks(repo_root=<absolute checkout path>). Restart the MCP server after changing its configuration."
 _RAISE_REPOSITORY_DIRECTORY_DOES_NOT_EXIST_SET_REPO_ROOT = "Repository directory does not exist: {}. Set REPO_ROOT or call run_prechecks(repo_root=<absolute checkout path>)."
 _RAISE_CALL_SELECT_PACKAGE_VERSION_BEFORE_APPROVAL_THE_ADVISORY = "Call select_package_version before approval: the advisory fix is only a minimum, not proof of the latest supported runtime-compatible stable release"
@@ -1441,7 +1454,7 @@ class Engine:
         self._fix_selection_snapshot = (
             deepcopy(candidates) if status in {"REQUESTED", "AWAITING_HUMAN"} else None
         )
-        if not self.state.validation_results:
+        if not self.state.validation_results and not self.state.changes:
             self.state.validation_status = (
                 "NOT_RUN_NO_APPROVED_FIXES"
                 if status in {"SKIPPED", "UNAVAILABLE", "INVALID"}
@@ -1788,6 +1801,16 @@ class Engine:
                     _RAISE_SERVER_SHUTDOWN_INTERRUPTED_THE_APPROVED_PACKAGE_BATCH
                 )
             status = "PARTIAL_FAILURE" if failed else "COMPLETED"
+            if failed:
+                reason = next(
+                    (
+                        result["reason"]
+                        for result in execution["results"]
+                        if result["status"] not in _PACKAGE_STEP_SUCCESS_STATUSES
+                        and result.get("reason")
+                    ),
+                    _PACKAGE_BATCH_FAILURE_REASON,
+                )
         except InterruptedError as exc:
             status, reason = "INTERRUPTED", str(exc)
             logger.warning("%s", reason, exc_info=True)
@@ -2348,7 +2371,13 @@ class Engine:
         edit_duration_ms = round((monotonic() - edit_started) * 1000, 3)
         self._progress(
             finding_id,
-            f"Dependency/configuration edit and lockfile refresh finished in {edit_duration_ms:.1f} ms; production build/dependency verification follows without tests.",
+            _DEPENDENCY_EDIT_PROGRESS.format(
+                edit_duration_ms,
+                outcome["status"],
+                _DEPENDENCY_EDIT_VALIDATION_FOLLOWS
+                if outcome["status"] == "APPLIED"
+                else _DEPENDENCY_EDIT_VALIDATION_NOT_STARTED,
+            ),
         )
         if package_update:
             receipt["applied_dependency_hashes"] = dependency_file_hashes(
@@ -2409,6 +2438,10 @@ class Engine:
                 + " "
                 + rollback["detail"]
             )
+            if not self.state.validation_results and not any(
+                item.get("validation_pending") for item in self.state.changes
+            ):
+                self.state.validation_status = _VALIDATION_NOT_RUN_APPLICATION_FAILED
             self.state.no_solution.append(
                 {
                     "id": finding_id,
@@ -2422,6 +2455,7 @@ class Engine:
             "status": outcome["status"],
             "finding_id": finding_id,
             "change": change,
+            **({"reason": change["detail"]} if outcome["status"] != "APPLIED" else {}),
             "continue_with_next_finding": outcome.get("continue_with_next_finding"),
             "note": "Require production builds, exact dependency resolution and test-free policy checks. Do not run unit/integration tests. Revert offending updates; retain passing updates. Source and check scripts remain unchanged.",
         }

@@ -1,8 +1,17 @@
 """Verify source conclusions wait for language docs and cited CVE/CWE pages."""
 
+import asyncio
 import hashlib
+import json
+from functools import partial
 from unittest.mock import Mock
 
+import anyio
+import pytest
+from mcp import ClientSession
+from mcp.shared.memory import create_client_server_memory_streams
+
+from gitlab_security_mcp import server
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS
 from gitlab_security_mcp.source_findings import (
@@ -49,6 +58,117 @@ def _engine(tmp_path, name, content, identifiers=None):
         ],
     }
     return engine, review
+
+
+def test_source_review_tool_advertises_decisions_and_required_file_assessments():
+    """Expose the complete nested contract instead of an unconstrained object."""
+    # Arrange
+    tools = asyncio.run(server.mcp.list_tools())
+    tool = next(item for item in tools if item.name == "verify_security_finding")
+
+    # Act
+    definitions = tool.input_schema["$defs"]
+    review = definitions["SourceReview"]
+    reviewed_file = definitions["ReviewedSourceFile"]
+
+    # Assert
+    assert set(review["properties"]["decision"]["enum"]) == {
+        "FALSE_POSITIVE",
+        "CONFIRMED_VULNERABILITY",
+        "MANUAL_REVIEW",
+    }
+    assert set(review["required"]) == {
+        "decision",
+        "reason",
+        "input_origin",
+        "finding_analysis",
+        "reachability_analysis",
+        "reviewed_files",
+    }
+    assert set(reviewed_file["required"]) == {"path", "sha256", "assessment"}
+    assert review["properties"]["reviewed_files"]["minItems"] == 1
+    assert review["properties"]["reviewed_files"]["maxItems"] == 100
+
+
+@pytest.mark.parametrize("analysis_key", ["finding_analysis", "pattern_analysis"])
+def test_mcp_source_review_rejects_malformed_inputs_before_running_engine(
+    tmp_path, monkeypatch, analysis_key
+):
+    """Reject the SQE payload mistakes while accepting current and legacy valid reviews."""
+    # Arrange
+    engine, review = _engine(tmp_path, "widget.py", "ready = True\n")
+    review[analysis_key] = review.pop("finding_analysis")
+    run = Mock(return_value={"decision": "CONFIRMED_VULNERABILITY"})
+    monkeypatch.setattr(server, "_run", run)
+    monkeypatch.setattr(server, "_engine_for", lambda _root: engine)
+
+    async def exercise():
+        """Send malformed and valid JSON through the real MCP client and dispatcher."""
+        async with create_client_server_memory_streams() as (client, remote):
+            async with anyio.create_task_group() as tasks:
+                lowlevel = server.mcp._lowlevel_server
+                tasks.start_soon(
+                    partial(
+                        lowlevel.run, *remote, lowlevel.create_initialization_options()
+                    )
+                )
+                async with ClientSession(*client) as session:
+                    await session.initialize()
+                    catalog = await session.list_tools()
+                    advertised = json.dumps(
+                        [
+                            tool.model_dump(
+                                mode="json", by_alias=True, exclude_none=True
+                            )
+                            for tool in catalog.tools
+                        ],
+                        ensure_ascii=False,
+                    )
+                    assert len(advertised) < 12_000
+                    arguments = {
+                        "finding_id": "source",
+                        "repo_root": str(tmp_path),
+                        "source_review": {**review, "decision": "CONFIRMED"},
+                    }
+                    invalid_decision = await session.call_tool(
+                        "verify_security_finding", arguments
+                    )
+                    assert invalid_decision.is_error
+                    assert "decision" in str(invalid_decision.content)
+                    incomplete = {
+                        key: value
+                        for key, value in review["reviewed_files"][0].items()
+                        if key != "assessment"
+                    }
+                    arguments["source_review"] = {
+                        **review,
+                        "reviewed_files": [incomplete],
+                    }
+                    invalid_file = await session.call_tool(
+                        "verify_security_finding", arguments
+                    )
+                    assert invalid_file.is_error
+                    assert "assessment" in str(invalid_file.content)
+                    run.assert_not_called()
+                    arguments["source_review"] = review
+                    accepted = await session.call_tool(
+                        "verify_security_finding", arguments
+                    )
+                tasks.cancel_scope.cancel()
+                return accepted
+
+    # Act
+    try:
+        accepted = anyio.run(exercise)
+    finally:
+        engine.docs.close()
+
+    # Assert
+    assert not accepted.is_error
+    run.assert_called_once()
+    forwarded = run.call_args.kwargs["source_review"]
+    assert forwarded["finding_analysis"] == review[analysis_key]
+    assert forwarded["reviewed_files"] == review["reviewed_files"]
 
 
 def test_source_languages_follow_the_cited_file():

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -15,6 +16,8 @@ from contextlib import contextmanager
 from ctypes import wintypes
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from gitlab_security_mcp.util import read_bounded
 
 logger = logging.getLogger("gitlab_security_mcp")
 
@@ -32,6 +35,22 @@ _MAC_CLI_JS = Path("Resources") / "app" / "out" / "cli.js"
 _MAC_EXECUTABLE_MARKER = "Contents/MacOS/"
 _PS_QUOTES = "\"'"
 _PS_TIMEOUT_SECONDS = 5
+_MAX_LAUNCHER_BYTES = 16 * 1024
+_WINDOWS_LAUNCHER_DIRECTORY = "bin"
+_NO_EDITOR_CLI_MESSAGE = (
+    "Progress extension install skipped; no supported editor CLI was found in the process ancestry. "
+    "The graphical progress bar requires GitLab Security Progress: use Extensions: Install from VSIX if this server was launched outside the editor."
+)
+_OVERSIZED_LAUNCHER_MESSAGE = "Editor CLI launcher exceeds %s bytes: %s"
+_WINDOWS_LAUNCHERS = {
+    "code.exe": "code.cmd",
+    "code - insiders.exe": "code-insiders.cmd",
+    "cursor.exe": "cursor.cmd",
+}
+_VERSIONED_CLI = re.compile(
+    r'"%~dp0\.\.\\(?P<version>[0-9a-f]{7,40})\\resources\\app\\out\\cli\.js"',
+    re.IGNORECASE,
+)
 _EDITOR_EXECUTABLES = frozenset(
     {
         "cursor.exe",
@@ -172,13 +191,11 @@ def install_progress_extension() -> None:
         else:
             tree = _posix_process_tree()
         command = editor_command(os.getppid(), *tree)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         logger.warning("Could not identify the editor process", exc_info=True)
         return
     if command is None:
-        logger.info(
-            "Progress extension install skipped; this process is not a VS Code or Cursor child."
-        )
+        logger.warning(_NO_EDITOR_CLI_MESSAGE)
         return
     try:
         _install_with_command(command)
@@ -241,6 +258,21 @@ def _editor_cli(image: Path) -> Path | None:
         image.parent.parent / _CLI_JS,
     )
     for cli in candidates:
+        if cli.is_file():
+            return cli
+    launcher_name = _WINDOWS_LAUNCHERS.get(image.name.lower())
+    if launcher_name is None:
+        return None
+    launcher = image.parent / _WINDOWS_LAUNCHER_DIRECTORY / launcher_name
+    if not launcher.is_file():
+        return None
+    raw = read_bounded(launcher, _MAX_LAUNCHER_BYTES)
+    if raw is None:
+        logger.warning(_OVERSIZED_LAUNCHER_MESSAGE, _MAX_LAUNCHER_BYTES, launcher)
+        return None
+    match = _VERSIONED_CLI.search(raw.decode("utf-8"))
+    if match is not None:
+        cli = image.parent / match["version"] / _CLI_JS
         if cli.is_file():
             return cli
     return None

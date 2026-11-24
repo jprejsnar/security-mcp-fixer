@@ -8,6 +8,8 @@ import threading
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from gitlab_security_mcp.progress_extension import (
     _editor_cli,
     _linux_process_tree,
@@ -119,6 +121,80 @@ def test_editor_command_finds_a_macos_app_bundle(tmp_path):
 
     # Assert
     assert command == [str(image), str(cli)]
+
+
+@pytest.mark.parametrize(
+    ("executable", "launcher_name"),
+    [("Code.exe", "code.cmd"), ("Code - Insiders.exe", "code-insiders.cmd")],
+)
+def test_editor_command_finds_the_versioned_cli_named_by_its_launcher(
+    tmp_path, executable, launcher_name
+):
+    """Use the installed launcher's active version, not a stale version directory."""
+    # Arrange
+    image = tmp_path / executable
+    image.write_bytes(b"")
+    active_version = "8a14f0cc1b"
+    for version in (active_version, "0000000000"):
+        cli = tmp_path / version / "resources" / "app" / "out" / "cli.js"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("", encoding="utf-8")
+    launcher = tmp_path / "bin" / launcher_name
+    launcher.parent.mkdir()
+    launcher.write_text(
+        f'"%~dp0..\\{executable}" "%~dp0..\\{active_version}\\resources\\app\\out\\cli.js" %*\n',
+        encoding="utf-8",
+    )
+    parents = {PYTHON_PID: (CURSOR_PID, PYTHON_NAME), CURSOR_PID: (1, executable)}
+
+    # Act
+    command = editor_command(PYTHON_PID, parents, {CURSOR_PID: image})
+
+    # Assert
+    expected = tmp_path / active_version / "resources" / "app" / "out" / "cli.js"
+    assert command == [str(image), str(expected)]
+
+
+@pytest.mark.parametrize("version", [r"..\outside", "not-a-version"])
+def test_editor_cli_does_not_follow_unrecognized_launcher_paths(tmp_path, version):
+    """Do not execute the wrapper or accept arbitrary paths it contains."""
+    # Arrange
+    image = tmp_path / "Code.exe"
+    cli = tmp_path / version / "resources" / "app" / "out" / "cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("", encoding="utf-8")
+    launcher = tmp_path / "bin" / "code.cmd"
+    launcher.parent.mkdir()
+    launcher.write_text(
+        f'"%~dp0..\\{version}\\resources\\app\\out\\cli.js"\n', encoding="utf-8"
+    )
+
+    # Act
+    result = _editor_cli(image)
+
+    # Assert
+    assert result is None
+
+
+def test_editor_cli_reports_an_oversized_launcher(tmp_path, monkeypatch, caplog):
+    """Bound startup reads and explain why an oversized launcher cannot be used."""
+    # Arrange
+    limit = 32
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension._MAX_LAUNCHER_BYTES", limit
+    )
+    launcher = tmp_path / "bin" / "code.cmd"
+    launcher.parent.mkdir()
+    launcher.write_bytes(b"x" * (limit + 1))
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="gitlab_security_mcp"):
+        result = _editor_cli(tmp_path / "Code.exe")
+
+    # Assert
+    assert result is None
+    assert "launcher exceeds" in caplog.text
+    assert str(launcher) in caplog.text
 
 
 def test_linux_proc_tree_keeps_the_editor_executable(tmp_path, monkeypatch):

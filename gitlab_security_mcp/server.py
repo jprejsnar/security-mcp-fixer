@@ -42,6 +42,7 @@ from mcp.types import (
     TextContent,
     ToolAnnotations,
 )
+from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
 
 from gitlab_security_mcp import __version__, desktop_approval, workflow
@@ -67,6 +68,7 @@ from gitlab_security_mcp.software_audit import (
     record_audit_coverage,
     render_audit_prompt,
 )
+from gitlab_security_mcp.source_findings import SourceReview
 from gitlab_security_mcp.state import RunState
 from gitlab_security_mcp.util import (
     PROGRESS_PUBLISH_FAILURES,
@@ -383,7 +385,48 @@ def _install_host_logging() -> None:
 
 _install_host_logging()
 
-mcp = MCPServer(
+
+def _compact_tool_schema(
+    schema: dict[str, Any] | None, *, auto_titles: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Drop redundant generated titles without mutating SDK-owned validation schemas."""
+    if schema is None:
+        return None
+    compact = deepcopy(schema)
+    if compact.get("title") in auto_titles:
+        compact.pop("title")
+    for name, field in compact.get("properties", {}).items():
+        if (
+            isinstance(field, dict)
+            and field.get("title") == name.replace("_", " ").title()
+        ):
+            field.pop("title")
+    return compact
+
+
+class _CompactMCPServer(MCPServer):
+    """Keep structured tool discovery inside the existing AI context budget."""
+
+    async def list_tools(self) -> list[MCPTool]:
+        """Preserve tool titles, contracts and constraints while trimming duplicate labels."""
+        tools = await super().list_tools()
+        return [
+            tool.model_copy(
+                update={
+                    "input_schema": _compact_tool_schema(
+                        tool.input_schema, auto_titles=(f"{tool.name}Arguments",)
+                    ),
+                    "output_schema": _compact_tool_schema(
+                        tool.output_schema,
+                        auto_titles=(f"{tool.name}Output", f"{tool.name}DictOutput"),
+                    ),
+                }
+            )
+            for tool in tools
+        ]
+
+
+mcp = _CompactMCPServer(
     "gitlab-security-mcp",
     instructions=INSTRUCTIONS,
     version=__version__,
@@ -530,6 +573,12 @@ _AUDIT_PENDING = {
     "ITEMS_REQUIRED",
     "AUDIT_INCOMPLETE",
 }
+_AUDIT_FINISHED = {"DONE", "NONE_SELECTED", "NO_FINDINGS"}
+_AUDIT_FINISHED_LABEL = "Software audit: finished"
+_AUDIT_FINISHED_MESSAGE = (
+    "Software audit finished; see the final report for unresolved findings."
+)
+_AUDIT_FIX_OUTCOMES_RECORDED = "All selected audit fix outcomes are recorded; unresolved findings remain in the final report."
 
 
 def _editor_progress(
@@ -611,6 +660,14 @@ def _publish_audit_activity(selected: Engine) -> bool:
         if status == "FIX_FROM_AUDIT_REPORT":
             reviewed = total = None
     else:
+        if status in _AUDIT_FINISHED:
+            _editor_progress(
+                selected.repo_root,
+                "software-audit",
+                _AUDIT_FINISHED_LABEL,
+                audit.get("message") or _AUDIT_FINISHED_MESSAGE,
+                status="FINISHED",
+            )
         return False
     _editor_progress(
         selected.repo_root,
@@ -640,10 +697,15 @@ def _keep_audit_visible(selected: Engine) -> None:
 
     async def pulse() -> None:
         """Report server liveness and time since the last actual host update."""
-        while True:
-            await asyncio.sleep(_BACKGROUND_HEARTBEAT_SECONDS)
-            if selected.state is not state or not _publish_audit_activity(selected):
-                return
+        try:
+            while True:
+                await asyncio.sleep(_BACKGROUND_HEARTBEAT_SECONDS)
+                if selected.state is not state or not _publish_audit_activity(selected):
+                    return
+        finally:
+            current = _audit_activity_tasks.get(selected.repo_root)
+            if current is not None and current[1] is asyncio.current_task():
+                _audit_activity_tasks.pop(selected.repo_root, None)
 
     task = asyncio.create_task(pulse())
     _audit_activity_tasks[selected.repo_root] = (state, task)
@@ -1296,15 +1358,15 @@ def list_security_findings(
 async def verify_security_finding(
     finding_id: str,
     repo_root: str | None = None,
-    source_review: dict[str, Any] | None = None,
+    source_review: SourceReview | None = None,
 ) -> dict[str, Any]:
-    """Assess read-only. Read the cited code, callers and inputs. source_review.reason: <=2 everyday sentences, <=400 chars. HOST_REVIEW_REQUIRED is unfinished."""
+    """Return a finding decision, evidence and pending-review instructions. Read cited code, callers and inputs. source_review.reason: <=2 everyday sentences, <=400 chars. HOST_REVIEW_REQUIRED is unfinished."""
     result = await asyncio.to_thread(
         _run,
         "verify_security_finding",
         finding_id,
         repo_root=repo_root,
-        source_review=source_review,
+        source_review=source_review.model_dump() if source_review is not None else None,
     )
     if source_review is not None or result.get("decision") != "SOURCE_REVIEW_REQUIRED":
         return result
@@ -1320,8 +1382,8 @@ async def verify_security_finding(
             "The host AI must open the file and line GitLab already reported, "
             "read the cited file in the checkout, and call verify_security_finding "
             "with source_review. Write reason in everyday words, at most 2 "
-            "sentences and 400 characters: what was flagged and why that code "
-            "does not do it. cited_source only locates the line. "
+            "sentences and 400 characters: what was flagged and what the review "
+            "established. cited_source only locates the line. "
             "No false-positive conclusion has been recorded."
         )
         result.update(
@@ -1523,6 +1585,14 @@ def _fix_choice_text(item: dict) -> tuple[str, str]:
 
 
 _desktop_fix_selection_tasks: dict[str, asyncio.Task] = {}
+_NATIVE_SELECTION_HANDOFF_TOOL = "choose_software_audit_action"
+_NATIVE_SELECTION_HANDOFF_MESSAGE = (
+    "Do not end the host AI turn here. Call choose_software_audit_action once "
+    "with repo_root only to await the owned native work and collect the live "
+    "source/audit handoff. Follow the returned instructions: source fixes and "
+    "an approved software audit require the host AI, not the MCP server. "
+    "Do not poll, reopen selection, restart MCP, or create another run."
+)
 
 
 def _desktop_task_done(
@@ -1676,6 +1746,20 @@ async def _finish_desktop_fix_selection(
             await dialog.close()
 
 
+def _native_selection_handoff(
+    result: dict[str, Any], selected: Engine
+) -> dict[str, Any]:
+    """Keep ordered native selection attached to its eventual host-owned work."""
+    if result.get("status") != "AWAITING_HUMAN" or not selected.state.workflow:
+        return result
+    return {
+        **result,
+        "repo_root": str(selected.repo_root),
+        "next_tool": _NATIVE_SELECTION_HANDOFF_TOOL,
+        "message": f"{result.get('message') or ''} {_NATIVE_SELECTION_HANDOFF_MESSAGE}".strip(),
+    }
+
+
 async def _open_fix_selection(
     ctx: Context,
     selected: Engine,
@@ -1791,7 +1875,7 @@ async def _open_fix_selection(
             "This tool call is complete. Do not poll, reopen selection, start fixes or complete the run. "
             "After submission the server automatically qualifies, edits and validates selected package updates, applies and validates "
             "selected documented Dockerfile, nginx or GitLab CI line fixes, then saves reports and offers separate false-positive approvals. "
-            "Keep the server running. Only other selected source-code fixes require the IDE agent to continue.",
+            "Keep the server running. Other selected source-code fixes require the IDE agent to continue.",
         }
     except asyncio.CancelledError:
         if task is not None:
@@ -1841,7 +1925,7 @@ async def select_security_fixes(
     repo_root: str | None = None,
     package_reviews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | InputRequiredResult:
-    """Unchecked human GUI: job 3 packages, job 5 source. package_reviews[id] uses workflow evidence; blocked_reason disables unsafe updates."""
+    """Unchecked human GUI: job 3 packages, job 5 source. package_reviews[id] uses workflow evidence; blocked_reason disables unsafe updates. Collect native results with choose_software_audit_action(repo_root only)."""
     selected = await asyncio.to_thread(_engine_for, repo_root)
     blocked = workflow.require(selected, JOB_PACKAGES, JOB_SOURCE)
     if blocked:
@@ -1881,7 +1965,7 @@ async def select_security_fixes(
     else:
         snapshot = await asyncio.to_thread(selected.fix_selection_candidates)
     if snapshot["status"] not in {"OK", "REQUESTED"}:
-        return snapshot
+        return _native_selection_handoff(snapshot, selected) if native else snapshot
     candidates = snapshot["candidates"]
     if not candidates or (not native and not _form_supported(ctx)):
         return await asyncio.to_thread(
@@ -1920,7 +2004,8 @@ async def select_security_fixes(
                 ],
                 "completion": completion.structured_content,
             }
-        return await _open_fix_selection(ctx, selected, candidates, schema, prepared)
+        result = await _open_fix_selection(ctx, selected, candidates, schema, prepared)
+        return _native_selection_handoff(result, selected)
     pending = (
         snapshot
         if snapshot["status"] == "REQUESTED"
@@ -2708,8 +2793,14 @@ async def _continue_workflow(
             missing = _record_code_results(selected, code_results)
             if missing:
                 return missing
-        elif audit.get("status") not in {"DONE", "NONE_SELECTED", "NO_FINDINGS"}:
+            audit.update(
+                status="DONE",
+                completed_at=datetime.now(UTC).isoformat(),
+                message=_AUDIT_FIX_OUTCOMES_RECORDED,
+            )
+        elif audit.get("status") not in _AUDIT_FINISHED:
             return _compact_audit(audit)
+        _keep_audit_visible(selected)
         workflow.advance(
             selected,
             status="SKIPPED" if not audit.get("output_path") else "FINISHED",

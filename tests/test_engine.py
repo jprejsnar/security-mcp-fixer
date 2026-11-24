@@ -3828,3 +3828,32 @@ def test_mcp_discovery_catalog_stays_within_context_budget():
     )
     # Assert
     assert len(catalog) < 12_000
+
+
+def test_tool_schema_compaction_preserves_validation_and_explicit_titles():
+    """Trim duplicate labels on copies, not human titles or validation requirements."""
+    # Arrange
+    from gitlab_security_mcp.server import _compact_tool_schema
+
+    schema = {
+        "title": "exampleArguments",
+        "properties": {
+            "repo_root": {"title": "Repo Root", "type": "string"},
+            "choice": {"title": "Choose a finding", "enum": ["one", "two"]},
+        },
+        "required": ["choice"],
+    }
+
+    # Act
+    compact = _compact_tool_schema(schema, auto_titles=("exampleArguments",))
+
+    # Assert
+    assert compact == {
+        "properties": {
+            "repo_root": {"type": "string"},
+            "choice": {"title": "Choose a finding", "enum": ["one", "two"]},
+        },
+        "required": ["choice"],
+    }
+    assert schema["title"] == "exampleArguments"
+    assert schema["properties"]["repo_root"]["title"] == "Repo Root"

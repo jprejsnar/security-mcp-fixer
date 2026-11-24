@@ -1045,6 +1045,58 @@ def test_native_selection_releases_host_request_and_records_only_human_choices(
     assert not server._desktop_fix_selection_tasks
 
 
+@pytest.mark.parametrize("job", [workflow.JOB_PACKAGES, workflow.JOB_SOURCE])
+def test_ordered_native_selection_routes_host_to_live_audit_handoff(
+    tmp_path, monkeypatch, job
+):
+    """Keep the host attached to later source/audit work after native startup returns."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch, job=job)
+    _native_lifecycle(monkeypatch, engine)
+    monkeypatch.setattr(server, "_resume_desktop_workflow", AsyncMock())
+    ctx = _context(supported=False)
+    dialog = Mock(close=AsyncMock())
+    opened = AsyncMock(return_value=dialog)
+    monkeypatch.setattr(server.desktop_approval, "open_dialog", opened)
+
+    async def exercise():
+        """Collect initial and duplicate handoffs without approving any fix."""
+        release = asyncio.Event()
+
+        async def wait():
+            """Keep the real native worker waiting for a human response."""
+            await release.wait()
+            return {"action": "cancel"}
+
+        dialog.wait = wait
+        result = await server.select_security_fixes(ctx, str(tmp_path))
+        task = server._desktop_fix_selection_tasks[result["request_id"]]
+        try:
+            duplicate = await server.select_security_fixes(ctx, str(tmp_path))
+            for receipt in (result, duplicate):
+                assert receipt["status"] == "AWAITING_HUMAN"
+                assert receipt["next_tool"] == "choose_software_audit_action"
+                assert receipt["repo_root"] == str(engine.repo_root)
+                assert "repo_root only" in receipt["message"]
+                assert "once" in receipt["message"]
+            assert not task.done()
+            assert engine.state.fix_selection["selected_ids"] == []
+            assert not engine.state.software_audit
+        finally:
+            release.set()
+            await task
+
+    # Act
+    asyncio.run(exercise())
+
+    # Assert
+    opened.assert_awaited_once()
+    dialog.close.assert_awaited_once()
+    ctx.elicit.assert_not_called()
+    engine.execute_selected_package_updates.assert_not_called()
+    assert not server._desktop_fix_selection_tasks
+
+
 def test_concurrent_native_selection_reserves_only_one_window(tmp_path, monkeypatch):
     """Concurrent tool requests cannot replace a starting window or its snapshot."""
     # Arrange

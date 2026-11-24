@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Literal
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from gitlab_security_mcp.config_findings import config_kind
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_pages
@@ -49,6 +52,7 @@ _RAISE_SOURCE_REVIEW_MUST_BE_AN_OBJECT = "source_review must be an object"
 
 _MIN_AUDIT_SENTENCE = 24
 _MAX_APPROVAL_REASON = 400
+_MAX_REVIEWED_SOURCE_FILES = 100
 
 MAX_SOURCE_BYTES = 1_000_000
 # Names and review limits from the TypeScript utility-types reference
@@ -63,6 +67,41 @@ TYPESCRIPT_UTILITY_REVIEW = (
     "ConstructorParameters, InstanceType, Extract, Exclude, Uppercase, Lowercase, "
     "Capitalize and Uncapitalize do not sanitize runtime values."
 )
+
+
+class ReviewedSourceFile(BaseModel):
+    """Advertise the required evidence for each host-reviewed source file."""
+
+    model_config = ConfigDict(strict=True, extra="allow")
+
+    path: str = Field(min_length=1)
+    sha256: str = Field(
+        min_length=1, description="SHA256 of the current full file bytes."
+    )
+    assessment: str = Field(
+        min_length=1, description="What the host established by reading this file."
+    )
+
+
+class SourceReview(BaseModel):
+    """Expose the source-review contract while retaining legacy analysis aliases."""
+
+    model_config = ConfigDict(strict=True, extra="allow")
+
+    decision: Literal["FALSE_POSITIVE", "CONFIRMED_VULNERABILITY", "MANUAL_REVIEW"]
+    reason: str = Field(
+        min_length=1,
+        description=f"Concise everyday explanation of the verdict. False-positive reasons must be at most {_MAX_APPROVAL_REASON} characters.",
+    )
+    input_origin: str = Field(min_length=1)
+    finding_analysis: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("finding_analysis", "pattern_analysis"),
+    )
+    reachability_analysis: str = Field(min_length=1)
+    reviewed_files: list[ReviewedSourceFile] = Field(
+        min_length=1, max_length=_MAX_REVIEWED_SOURCE_FILES
+    )
 
 
 def source_languages(file_path: str | None) -> tuple[str, ...]:
@@ -138,7 +177,7 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
             "Open the file and line GitLab already reported, read that code, and "
             "call verify_security_finding for every listed ID. source_review.reason "
             "is the text a non-developer sees: at most 2 sentences and 400 "
-            "characters, saying what was flagged and why that code does not do it. "
+            "characters, saying what was flagged and what the review established. "
             "Put the trace in input_origin, finding_analysis, "
             "reachability_analysis, and reviewed_files. Then complete_security_run."
         )
@@ -185,7 +224,11 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
                     )
                 )
     reviewed = review.get("reviewed_files")
-    if not isinstance(reviewed, list) or not reviewed or len(reviewed) > 100:
+    if (
+        not isinstance(reviewed, list)
+        or not reviewed
+        or len(reviewed) > _MAX_REVIEWED_SOURCE_FILES
+    ):
         raise ValueError(_RAISE_SOURCE_REVIEW_REQUIRES_1_TO_100_REVIEWED_FILES)
     paths = set()
     evidence = []
@@ -248,10 +291,11 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
             "the stages and the final image. For a non-literal pattern, read the "
             "values that reach it and their bounds.",
             "Write source_review.reason for a non-developer: at most 2 sentences "
-            "and 400 characters, saying what was flagged and why this code does "
-            "not do that. Do not put the file path or line number in that text. "
+            "and 400 characters, saying what was flagged and what the review "
+            "established. Do not put the file path or line number in that text. "
             "Put the trace, every CVE and CWE GitLab named, input_origin, "
-            "finding_analysis, reachability_analysis, and reviewed_files hashes "
+            "finding_analysis, reachability_analysis, and reviewed_files entries "
+            "with path, full-byte sha256, and assessment "
             "in the other source_review fields. Do not invent a patch or dismiss "
             "the finding.",
             *(
