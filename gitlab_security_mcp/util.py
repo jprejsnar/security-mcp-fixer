@@ -41,8 +41,9 @@ _LOG_CONVERTED_FAILURE = (
 )
 _LOG_RESOLVE_INSIDE = "Could not resolve %s inside %s: %s"
 _SERVER_LOG_DIRECTORY = "gitlab-security-mcp"
-_ATOMIC_REPLACE_ATTEMPTS = 6
+_ATOMIC_REPLACE_ATTEMPTS = 10
 _ATOMIC_REPLACE_RETRY_SECONDS = 0.02
+_ATOMIC_REPLACE_MAX_RETRY_SECONDS = 0.25
 _WINDOWS_TRANSIENT_FILE_ERRORS = {5, 32, 33}
 _LOG_ATOMIC_REPLACE_RETRY = (
     "Retrying atomic replacement of %s after a Windows file lock: %s"
@@ -50,6 +51,7 @@ _LOG_ATOMIC_REPLACE_RETRY = (
 _server_log_handler: logging.Handler | None = None
 _WINDOWS_MEMORY_QUERY_FAILED = "Windows process memory query failed"
 _memory_log_lock = threading.Lock()
+_atomic_replace_lock = threading.Lock()
 _memory_unavailable_logged = False
 logger = logging.getLogger("gitlab_security_mcp")
 GIT_OPERATION_FAILURES = (OSError, RuntimeError, ValueError, SubprocessError)
@@ -468,20 +470,28 @@ def atomic_write_text(path: Path, text: str, *, exclusive: bool = False) -> None
         if exclusive:
             os.link(temporary, path)
         else:
-            for attempt in range(_ATOMIC_REPLACE_ATTEMPTS):
-                try:
-                    os.replace(temporary, path)
-                    break
-                except PermissionError as exc:
-                    if (
-                        getattr(exc, "winerror", None)
-                        not in _WINDOWS_TRANSIENT_FILE_ERRORS
-                        or attempt == _ATOMIC_REPLACE_ATTEMPTS - 1
-                    ):
-                        raise
-                    if attempt == 0:
-                        logger.warning(_LOG_ATOMIC_REPLACE_RETRY, path, exc)
-                    sleep(_ATOMIC_REPLACE_RETRY_SECONDS * 2**attempt)
+            with _atomic_replace_lock:
+                for attempt in range(_ATOMIC_REPLACE_ATTEMPTS):
+                    try:
+                        os.replace(temporary, path)
+                        break
+                    except PermissionError as exc:
+                        if (
+                            getattr(exc, "winerror", None)
+                            not in _WINDOWS_TRANSIENT_FILE_ERRORS
+                            or attempt == _ATOMIC_REPLACE_ATTEMPTS - 1
+                        ):
+                            raise
+                        # A retried replace that later succeeds is not a failure;
+                        # an exhausted retry propagates to the caller's warning.
+                        if attempt == 0:
+                            logger.info(_LOG_ATOMIC_REPLACE_RETRY, path, exc)
+                        sleep(
+                            min(
+                                _ATOMIC_REPLACE_RETRY_SECONDS * 2**attempt,
+                                _ATOMIC_REPLACE_MAX_RETRY_SECONDS,
+                            )
+                        )
     finally:
         Path(temporary).unlink(missing_ok=True)
 

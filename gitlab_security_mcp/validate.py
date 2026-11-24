@@ -38,6 +38,21 @@ _RAISE_GRADLE_TEST_VALIDATION_REQUIRES_A_WORKING_DIRECTORY = (
 _RAISE_JUNIT_REPORT_EXCEEDS_10_MIB = "JUnit report exceeds 10 MiB: {}"
 _RAISE_INVALID_JUNIT_REPORT = "Invalid JUnit report {}: {}"
 _RAISE_JUNIT_REPORT_CONTAINS_FAILING_TESTS = "JUnit report contains failing tests: {}"
+# Corporate proxies such as Nexus often reject the npm bulk-advisory endpoint.
+_AUDIT_ENDPOINT_UNSUPPORTED_MARKERS = (
+    "ERR_PNPM_AUDIT_BAD_RESPONSE",
+    "audit endpoint returned an error",
+)
+_AUDIT_ENDPOINT_UNSUPPORTED_DETAIL = (
+    "The configured registry rejected the advisory audit endpoint earlier in this "
+    "server process; the informational audit is not repeated. GitLab findings remain "
+    "the advisory source."
+)
+_audit_endpoint_unsupported: set[Path] = set()
+_UNLOCKED_NODE_PROJECT = (
+    "{} has no {}; this side library was not changed by package remediation and "
+    "a locked install does not apply. Other Node projects in the checkout were validated."
+)
 
 
 def run_validation(
@@ -103,11 +118,18 @@ def _run_validation(
         node_roots = sorted(
             {path.parent for path in files if path.name == "package.json"}
         )
+        components = []
         for component in node_roots:
             if any(parent in node_roots for parent in component.parents):
                 continue
             component_files = [path for path in files if path.is_relative_to(component)]
-            component_stack = detect_stack(component, component_files)
+            components.append((component, detect_stack(component, component_files)))
+        locked = {
+            component
+            for component, component_stack in components
+            if _node_commands(component, component_stack)[0].is_file()
+        }
+        for component, component_stack in components:
             results.extend(
                 _node(
                     component,
@@ -119,6 +141,7 @@ def _run_validation(
                     record_lint=record_lint,
                     skip_lint=skip_lint,
                     lint_only=lint_only,
+                    skip_unlocked=bool(locked - {component}),
                 )
             )
     if stack.dotnet:
@@ -292,17 +315,51 @@ def _prepare_node(
     runner, tool: str, install: list[str], audit: list[str], timeout: int, root: Path
 ) -> list[dict]:
     """Run one locked install, then one informational audit."""
-    return [
-        _run(runner, [tool, *install], timeout, required=True, cwd=root),
-        _run(
-            runner,
-            [tool, *audit],
-            timeout,
-            required=False,
-            informational=True,
-            cwd=root,
-        ),
-    ]
+    install_row = _run(runner, [tool, *install], timeout, required=True, cwd=root)
+    if root in _audit_endpoint_unsupported:
+        audit_row = _row(None, "SKIPPED", False, _AUDIT_ENDPOINT_UNSUPPORTED_DETAIL)
+        audit_row["cwd"] = str(root)
+        return [install_row, audit_row]
+    audit_row = _run(
+        runner,
+        [tool, *audit],
+        timeout,
+        required=False,
+        informational=True,
+        cwd=root,
+    )
+    if audit_row["status"] == "INFORMATIONAL" and any(
+        marker in audit_row["detail"] for marker in _AUDIT_ENDPOINT_UNSUPPORTED_MARKERS
+    ):
+        _audit_endpoint_unsupported.add(root)
+    return [install_row, audit_row]
+
+
+def _node_commands(root: Path, stack: StackInfo) -> tuple[Path, list[str], list[str]]:
+    """Return the manager's lockfile, frozen-install and audit arguments."""
+    manager = stack.node_manager or "npm"
+    if manager == "npm":
+        lock = root / "package-lock.json"
+        if not lock.is_file():
+            lock = root / "npm-shrinkwrap.json"
+        return lock, ["ci", "--ignore-scripts"], ["audit", "--json"]
+    if manager == "pnpm":
+        return (
+            root / "pnpm-lock.yaml",
+            ["install", "--frozen-lockfile", "--ignore-scripts"],
+            ["audit", "--json"],
+        )
+    if is_modern_yarn(root):
+        return (
+            root / "yarn.lock",
+            ["install", "--immutable", "--mode=skip-build"],
+            ["npm", "audit", "--json"],
+        )
+    return (
+        root / "yarn.lock",
+        ["install", "--frozen-lockfile", "--ignore-scripts"],
+        ["audit", "--json"],
+    )
 
 
 def _node(
@@ -316,8 +373,14 @@ def _node(
     record_lint: bool = False,
     skip_lint: bool = False,
     lint_only: bool = False,
+    skip_unlocked: bool = False,
 ) -> list[dict]:
-    """Install locked Node dependencies, then run declared project checks."""
+    """Install locked Node dependencies, then run declared project checks.
+
+    With skip_unlocked, a project without its manager's lockfile is skipped as a
+    side library: package remediation always writes the lockfile it updates, so
+    an unlocked project beside locked ones was not changed and cannot `npm ci`.
+    """
     manager = stack.node_manager or "npm"
     data = _read_json(root / "package.json") or {}
     scripts = data.get("scripts", {})
@@ -343,23 +406,13 @@ def _node(
         )
         row.update(kind="lint", cwd=str(root), required=False, baseline_only=True)
         return [row]
-    if manager == "npm":
-        install, audit = ["ci", "--ignore-scripts"], ["audit", "--json"]
-    elif manager == "pnpm":
-        install, audit = (
-            ["install", "--frozen-lockfile", "--ignore-scripts"],
-            ["audit", "--json"],
+    lock, install, audit = _node_commands(root, stack)
+    if skip_unlocked and not lock.is_file():
+        row = _row(
+            None, "SKIPPED", False, _UNLOCKED_NODE_PROJECT.format(root, lock.name)
         )
-    elif is_modern_yarn(root):
-        install, audit = (
-            ["install", "--immutable", "--mode=skip-build"],
-            ["npm", "audit", "--json"],
-        )
-    else:
-        install, audit = (
-            ["install", "--frozen-lockfile", "--ignore-scripts"],
-            ["audit", "--json"],
-        )
+        row["cwd"] = str(root)
+        return [row]
     rows = _prepare_node(runner, tool, install, audit, timeout, root)
     if rows[0]["status"] == "FAILED":
         rows.append(

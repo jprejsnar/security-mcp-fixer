@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $WheelPath,
     [string] $InstallDirectory = (Join-Path $env:USERPROFILE 'Tools\gitlab-security-mcp'),
-    [switch] $EnableAuditContinuation
+    [switch] $EnableAuditContinuation,
+    [string[]] $ApproveToolsForRepository = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -164,6 +165,13 @@ if ($EnableAuditContinuation) {
 }
 else {
     Write-Warning 'Automatic audit continuation requires -EnableAuditContinuation. MCP instructions alone cannot restart a host AI turn.'
+}
+if ($ApproveToolsForRepository.Count -gt 0) {
+    & $python -m gitlab_security_mcp.host_permissions @ApproveToolsForRepository
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Saving the VS Code Copilot tool approval failed. Review the error above.'
+    }
+    Write-Host 'VS Code Copilot will run gitlab-security tools without prompting in those repositories. Start a new chat session to load the approval.'
 }
 
 $sitePackages = Join-Path $installRoot 'Lib\site-packages'

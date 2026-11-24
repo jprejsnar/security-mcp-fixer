@@ -2914,8 +2914,13 @@ def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
 
     frontend = tmp_path / "frontend"
     backend = tmp_path / "backend"
+    library = tmp_path / "libs" / "activity-executor"
     frontend.mkdir()
     backend.mkdir()
+    library.mkdir(parents=True)
+    (frontend / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n", encoding="utf-8"
+    )
     (frontend / "package.json").write_text(
         json.dumps(
             {
@@ -2923,6 +2928,10 @@ def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
                 "scripts": {"build": "ng build", "test": "jest"},
             }
         ),
+        encoding="utf-8",
+    )
+    (library / "package.json").write_text(
+        json.dumps({"scripts": {"build": "tsc"}}),
         encoding="utf-8",
     )
     (backend / "app.slnx").write_text("<Solution />", encoding="utf-8")
@@ -2958,6 +2967,7 @@ def test_split_frontend_backend_validation_uses_component_directories(tmp_path):
     for call in calls:
         if call.args[0][0] == "pnpm":
             assert call.kwargs["cwd"] == frontend
+        assert call.args[0][:2] != ["npm", "ci"]
         if call.args[0][0] == "dotnet" and call.args[0][1] != "--version":
             assert call.kwargs["cwd"] == backend
 

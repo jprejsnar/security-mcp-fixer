@@ -290,6 +290,17 @@ def _workspace_checkout() -> Path | None:
     return None
 
 
+def _package_review_problems(plan: dict, review: dict) -> list[str]:
+    """Report every independent review gap at once so the host needs one retry."""
+    problems = []
+    for check in (review_package, functools.partial(review_manager_guidance, plan)):
+        try:
+            check(review)
+        except (ValueError, TypeError) as exc:
+            problems.append(str(exc))
+    return problems
+
+
 def _progress_severity(finding: dict) -> str:
     """Group display counts without changing the scanner's severity."""
     severity = str(finding.get("severity") or "unknown").strip().lower()
@@ -1607,7 +1618,12 @@ class Engine:
                     for key in ("ecosystem", "package", "target")
                 ):
                     raise ValueError(
-                        _RAISE_PROVIDE_THE_COMPLETE_COMPATIBILITY_LICENSE_REVIEW_FOR_THIS
+                        " ".join(
+                            [
+                                _RAISE_PROVIDE_THE_COMPLETE_COMPATIBILITY_LICENSE_REVIEW_FOR_THIS,
+                                *_package_review_problems(plan, {}),
+                            ]
+                        )
                     )
                 if "blocked_reason" in review:
                     if (
@@ -1619,7 +1635,9 @@ class Engine:
                         )
                     prepared[item["id"]] = deepcopy(review)
                     continue
-                review_package(review)
+                problems = _package_review_problems(plan, review)
+                if problems:
+                    raise ValueError(" ".join(problems))
                 review_major_upgrade(self.repo_root, plan, review)
                 policy = self._package_policy(plan, review)
                 self._require_package_version(plan)

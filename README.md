@@ -1193,8 +1193,12 @@ creating another run.
 the server scanned code. At consent the server creates an explicitly INCOMPLETE
 Markdown progress draft at the reserved home-directory `output_path`; file
 existence alone never proves that the audit is complete. Progress is persisted
-without overwriting host-written findings. The host replaces the draft with the
-actual report incrementally and completes coverage before `report_ready=True`.
+without overwriting host-written findings. Each handoff returns up to 20
+`next_files`. The host reads only those files and submits their receipts in one
+call. It does not reread the audit prompt, the draft report, or files that
+already have receipts. Candidate findings, with exact lines, go in each receipt's
+assessment. After the last batch the host writes the report once, replacing the
+draft, and completes coverage before `report_ready=True`.
 The AI scans the returned `repo_root`, periodically
 calls the same tool with
 `progress={"message": "Reviewing controller/caller", "files": [{"path": "src/Controller.java", "sha256": "<current full-file hash>", "assessment": "<behavior traced>"}], "completed_phases": ["entry_points"]}`,
@@ -1304,6 +1308,9 @@ is needed. The host must supply `package_reviews` before opening the form using
 the evidence schema of `qualify_package_update`; collecting reviews is read-only,
 not consent. If evidence cannot establish safety, supply the exact package/target
 and an honest `blocked_reason`; that choice is labeled blocked and never edited.
+A `PACKAGE_REVIEW_REQUIRED` reason lists every missing piece at once: the review
+itself, the complete package documentation fields, and each required manager
+documentation source, so one corrected call can satisfy it.
 Only selected source-code work still needs the agent to continue. Read
 `get_run_status` when requested; never reopen approved selections. While
 `REQUESTED`/`AWAITING_HUMAN` or `package_execution.status=QUEUED/RUNNING`,
@@ -1824,7 +1831,11 @@ evidence requires manual review instead of being treated as package absence.
 Validation read or execution failures produce `VALIDATION_FAILED`.
 
 State, manifests, and individual report files are replaced atomically. Generated
-tests are published without replacing existing files. Command readers stop
+tests are published without replacing existing files. On Windows, a replace that
+another process briefly blocks (for example the editor or antivirus reading
+`progress.json`) is retried with capped backoff for about 1.5 seconds; the retry
+is logged at INFO and only an exhausted retry reaches the caller's warning.
+Command readers stop
 even when descendants retain inherited pipes. This does not guarantee cleanup
 of detached descendant processes, coordinate multiple MCP processes editing
 the same checkout, or make the Markdown/JSON report pair a single transaction.
@@ -2655,6 +2666,77 @@ Never paste real tokens into agent chat or commit them in configuration files.
 4. Review the trust request and enable the tools. In that session's MCP controls,
    start `gitlab-security`; inspect its output if startup fails.
 5. Continue with [Running within VS Code and GitHub Copilot](#running-within-vs-code-and-github-copilot).
+
+#### Run the tools without approval prompts (like Cursor)
+
+Cursor runs MCP tools that are on its allowlist or in auto-run mode without a
+prompt. The VS Code Copilot harness asks for each MCP tool call under **Manual
+permissions**, and `"tools": ["*"]` only makes tools available; it does not approve
+them. Copilot saves a per-repository "don't ask again" approval in
+`permissions-config.json` in the Copilot configuration directory
+(`COPILOT_HOME`, otherwise `%USERPROFILE%\.copilot`). The steps below save that
+approval for every `gitlab-security` tool in one application repository.
+
+**What you need**
+
+- The MCP server is installed (for example by `Install-GitLabSecurityMcp.ps1`)
+  at a version that includes `gitlab_security_mcp.host_permissions`.
+- The server is registered in the Copilot harness under the key
+  `gitlab-security` (see [Current Copilot harness](#current-copilot-harness)).
+  If you used a different key, pass it with `--server <name>`.
+- The **Git root** of each application repository you want to approve, meaning
+  the folder that contains `.git`. Copilot keys saved approvals by the Git root,
+  so a subfolder does not work. To find it, run `git rev-parse --show-toplevel`
+  inside the repository.
+- If you set `COPILOT_HOME`, set it to the same value in the shell that runs
+  the command. Otherwise the command writes to `%USERPROFILE%\.copilot`.
+
+**Option 1: during install or repair.** Pass one or more Git roots to the
+installer. You can list several, separated by commas:
+
+```powershell
+.\Install-GitLabSecurityMcp.ps1 -WheelPath C:\path\to\gitlab_security_mcp-<version>-py3-none-any.whl `
+    -ApproveToolsForRepository C:\path\to\application-repo, C:\path\to\another-repo
+```
+
+**Option 2: without reinstalling.** Run the module with the installed
+interpreter. The default install location is shown; change it if you used
+`-InstallDirectory`:
+
+```powershell
+& "$env:USERPROFILE\Tools\gitlab-security-mcp\Scripts\python.exe" -m gitlab_security_mcp.host_permissions `
+    C:\path\to\application-repo C:\path\to\another-repo
+```
+
+On macOS or Linux, run
+`<install-dir>/bin/python -m gitlab_security_mcp.host_permissions /path/to/application-repo`.
+To use a different server key, add `--server my-server-name`.
+
+On success, the command prints the path of the file it wrote. Running it again
+is safe and does not add duplicate entries. Existing saved approvals are kept.
+For each repository it adds this entry under the repository's location:
+
+```json
+{ "kind": "mcp", "serverName": "gitlab-security", "toolName": null }
+```
+
+`toolName: null` approves every tool on that server. If a path is not a Git
+root, the command exits with code 1, names the path and writes nothing.
+
+**After running it**
+
+1. Start a **new** chat session in VS Code. Copilot loads saved approvals when a
+   session starts; an open session keeps its old permissions. Avoid running the
+   command while a session is saving its own approval, because the two writes
+   can overwrite each other.
+2. Open the application repository and call a `gitlab-security` tool. It runs
+   without an approval prompt.
+3. To review or remove the approval, run **Chat: Manage Tool Approval**, or
+   delete the repository's entry from `permissions-config.json`.
+
+This covers only this server's tools. Shell commands and file edits still follow
+the session's permission level. The server's own human gates (fix selection,
+false-positive approval and audit consent windows) still open.
 
 Native Copilot configuration does not accept editor-only `inputs` or
 `${input:gitlabToken}` secret prompts. Workspace-root configuration forms may
@@ -3566,7 +3648,7 @@ A Gradle plugin edit changes one `id ... version` declaration in `build.gradle`,
 
 | Stack | Commands |
 | --- | --- |
-| Node | After approved updates: frozen install with `--ignore-scripts` (modern Yarn: `--mode=skip-build`), production `build`, informational advisory audit. No eager clean/install, lint baseline, test discovery or test execution. |
+| Node | After approved updates: frozen install with `--ignore-scripts` (modern Yarn: `--mode=skip-build`), production `build`, informational advisory audit. A `package.json` with no lockfile for its manager is skipped as an unchanged side library when another Node project in the checkout has its lockfile (package remediation always writes the lockfile it updates); `npm ci` is not run there. When the registry rejects the advisory audit endpoint (for example a Nexus proxy returning `ERR_PNPM_AUDIT_BAD_RESPONSE`), that project's audit is skipped for the rest of the server process. No eager clean/install, lint baseline, test discovery or test execution. |
 | .NET | Restore and Release production build; no `dotnet test`. A non-`net10.0` target is reported. |
 | Java | Maven `clean package -Dmaven.test.skip=true` and `dependency:tree`; Gradle `assemble -x test` with an owned no-tests initialization script. Every Gradle coordinate update requires fresh exact-target resolution in the scanner configuration (default `runtimeClasspath`). JDK 17+ and project toolchain compatibility remain required. |
 | NGINX | `nginx -t` when `nginx` is installed and a config file is present |

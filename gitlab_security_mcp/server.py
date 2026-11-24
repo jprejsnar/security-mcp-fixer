@@ -216,7 +216,9 @@ If the human accepts the audit, generate the complete report BEFORE its fixes.
    with choose_software_audit_action(progress={message:...,
    files:[{path:<inventory-relative>,sha256:<current full-file hash>,assessment:...}],
    completed_phases:[entry_points|data_access|errors_logs|resource_lifetime|ui_siblings]})
-   after each small batch. Complete every inventory file and all five phases;
+   after each batch of the returned next_files paths. Read only next_files; do not
+   reread the audit prompt, the draft report, or files with receipts. Write the
+   report once after the last batch. Complete every inventory file and all five phases;
    record non-applicable phases honestly. Counts are derived from receipts.
    After writing the exact output_path,
    call choose_software_audit_action(report_ready=True) to open the fix checklist
@@ -3439,14 +3441,15 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
                 "Continue the read-only audit now, including after delegated reviews finish. "
                 "A progress receipt is not a completed job: do not end the turn with a "
                 "partial findings summary or ask the developer to type continue. "
-                "Persist actual findings incrementally to output_path, replacing the "
-                "server's explicitly incomplete progress draft. "
-                "Read the next unreviewed non-generated files and submit "
-                "their real progress.files receipts. Finish every remaining file and "
-                "phase, write output_path, then call choose_software_audit_action with "
-                "the same repo_root and report_ready=True. That call opens the unchecked "
-                "fix-selection GUI. Wait for its human selection before any code changes. "
-                "Reuse audit_prompt and evidence already read. Only after context loss, "
+                "Read only the paths in next_files, then submit their real progress.files "
+                "receipts in one call. Record candidate findings with exact lines in each "
+                "receipt's assessment. Do not reread audit_prompt, the output_path draft, "
+                "or any file that already has a receipt; the server keeps the draft. "
+                "Repeat with each returned next_files until remaining_file_count is zero "
+                "and every phase is complete. Then write output_path once, replacing the "
+                "draft, and call choose_software_audit_action with the same repo_root and "
+                "report_ready=True. That call opens the unchecked fix-selection GUI. "
+                "Wait for its human selection before any code changes. Only after context loss, "
                 "call get_run_status with the same repo_root and include_audit_details=True "
                 "to recover software_audit's full prompt, inventory, receipts and coverage gaps."
             ),
@@ -3495,11 +3498,12 @@ def _software_audit_result(
                 "Do not change application code, tests, dependencies, CI, or GitLab. "
                 "Do not commit or push. "
                 "The host AI must scan repo_root now; this server does not run an AI scan. "
-                "The home-directory progress draft already exists. Replace it with "
-                "actual report content incrementally, not only after the final file. "
+                "The home-directory progress draft already exists and the server keeps it "
+                "current; do not read it. Write output_path once, after the last batch. "
                 "Do not ask the developer to type continue for this approved audit. "
-                "After each small batch call choose_software_audit_action with the same "
-                "repo_root and per-file progress receipts. Counts describe reviewed files, "
+                "Review the inventory in batches of the next 20 paths. After each batch call "
+                "choose_software_audit_action with the same repo_root and per-file progress "
+                "receipts, then read only the next_files it returns. Counts describe reviewed files, "
                 "not successful fixes. Inventory paths are in coverage.files. "
                 "Submit progress.files=[{path,sha256,assessment}] for every file and "
                 "progress.completed_phases for all five review phases. Partial scans "

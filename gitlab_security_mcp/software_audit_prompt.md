@@ -166,7 +166,7 @@ not automatically recognized, register its exclusion with the configuration
 evidence above; do not invent a review receipt or mark the audit
 complete while that inventory mismatch remains unresolved.
 
-After each small batch, call `choose_software_audit_action` with the same
+After each batch of the returned `next_files` paths, call `choose_software_audit_action` with the same
 `repo_root` and `progress={"message": "<stage and files>", "files": [{"path":
 "<inventory-relative path>", "sha256": "<current full-file SHA-256>",
 "assessment": "<what was read and which behavior was traced>"}],
@@ -179,12 +179,15 @@ Do not copy an inventory entry as an assessment or claim an unread file was read
 
 ### Context-efficient execution
 
-- Review related files in batches, usually 10-20 when practical. Open bounded,
-  line-numbered ranges and expand them wherever a caller, contract, or behavior
-  remains unclear; search hits alone never count as a review.
-- Reuse unchanged source, guidance, and evidence already read in the current
-  context. Reopen changed files or anything needed to resolve uncertainty.
-  Do not repeatedly load every rule/skill body or unrelated reference document.
+- Each batch is exactly the `next_files` list the last handoff returned (up to
+  20 paths). Read only those files, submit their receipts in one call, then read
+  the next returned list. Open bounded, line-numbered ranges and expand them
+  wherever a caller, contract, or behavior remains unclear; search hits alone
+  never count as a review.
+- Do not reread this prompt, the `output_path` draft, or any file that already
+  has a receipt. Reopen a reviewed file only when it changed or a current caller
+  cannot be understood without it. Do not repeatedly load every rule/skill body
+  or unrelated reference document.
 - Compute current full-file hashes together locally for the files actually read.
   Submit only new or refreshed receipts, with concise, file-specific behavioral
   assessments; do not resend previous receipts or echo file contents in progress.
@@ -204,8 +207,9 @@ Do not copy an inventory entry as an assessment or claim an unread file was read
   requirements, severity rules, output format, or human-approval boundaries.
   After any compaction, follow the original prompt text, not a summary of it; if
   it is no longer in context, recover it as described above before continuing.
-- Update only changed report sections after each batch, keeping the report on
-  disk. Do not rewrite or repeat the entire report in chat for each update.
+- Put each candidate finding, with its exact lines, in that file's receipt
+  assessment. Receipts are the durable notes; write the report once after the
+  last batch. Do not repeat the report in chat.
 
 A progress receipt and a finished delegated review are intermediate results, not
 permission to end the audit turn. Continue opening the remaining inventory and
@@ -213,9 +217,9 @@ recording genuine receipts until all coverage and phases are complete. Do not
 replace the report/GUI handoff with a chat summary of a partial review.
 Never ask the developer to type "continue" for this already approved report.
 The server creates a clearly marked INCOMPLETE progress draft in the home
-directory at consent and persists progress there. Replace that draft with actual
-findings incrementally after each review batch; do not defer all report writing
-until the final file. A progress draft is not a completed report, even when all
+directory at consent and appends each batch's progress there. Do not read that
+draft. After the last batch, replace it once with the actual findings, built from
+the receipt assessments. A progress draft is not a completed report, even when all
 coverage receipts exist. Remove its incomplete-draft marker only when replacing
 it with the actual report. Editor stop hooks can continue a prematurely ended
 turn when installed, but must respect cancellation, errors, stalled progress,

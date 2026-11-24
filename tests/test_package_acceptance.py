@@ -24,7 +24,7 @@ from gitlab_security_mcp.manifests import (
 )
 from gitlab_security_mcp.qualification import run_checks
 from gitlab_security_mcp.remediate import apply_plan, plan_remediation
-from gitlab_security_mcp.validate import _product_result, run_validation
+from gitlab_security_mcp.validate import _prepare_node, _product_result, run_validation
 from tests.conftest import (
     documentation_client,
     manager_doc_sources,
@@ -680,6 +680,68 @@ def test_native_preparation_rejects_unreviewed_target_or_license(tmp_path, inval
         assert invalid in result["required_reviews"][0]["reason"]
     engine.runner.run.assert_not_called()
     assert not engine.state.changes
+
+
+def test_native_preparation_reports_every_review_gap_in_one_response(tmp_path):
+    """A missing review names package-doc and manager-doc gaps together."""
+    # Arrange
+    plan = {
+        "ecosystem": "npm",
+        "package": "qs",
+        "target": "6.16.1",
+        "manager": "pnpm",
+    }
+    engine = Engine(
+        tmp_path, gitlab=Mock(), advisory=Mock(), docs=Mock(), runner=Mock()
+    )
+    engine.state.status = "FINDINGS_LISTED"
+    engine.state.findings = [{"id": "one", "proposedFix": plan}]
+    engine.state.decisions = {"one": {"decision": "CHANGE_REQUIRED"}}
+    candidates = engine.fix_selection_candidates()["candidates"]
+
+    # Act
+    result = engine.prepare_package_updates(candidates, {})
+
+    # Assert
+    reason = result["required_reviews"][0]["reason"]
+    assert "compatibility/license review" in reason
+    assert "complete official package documentation" in reason
+    assert "official manager docs" in reason
+
+
+def test_rejected_audit_endpoint_is_not_requeried_for_the_same_project(tmp_path):
+    """A registry without the advisory endpoint is reported once, then skipped."""
+    # Arrange
+    calls = []
+
+    def run(argv, **_kwargs):
+        """Fail only the audit as a Nexus proxy does."""
+        calls.append(argv)
+        audit = "audit" in argv
+        return CommandResult(
+            argv,
+            1 if audit else 0,
+            "",
+            "Error: ERR_PNPM_AUDIT_BAD_RESPONSE" if audit else "",
+            1,
+            False,
+            "",
+            "",
+        )
+
+    runner = Mock(run=run)
+    install = ["install", "--frozen-lockfile", "--ignore-scripts"]
+
+    # Act
+    first = _prepare_node(runner, "pnpm", install, ["audit", "--json"], 60, tmp_path)
+    second = _prepare_node(runner, "pnpm", install, ["audit", "--json"], 60, tmp_path)
+
+    # Assert
+    assert first[1]["status"] == "INFORMATIONAL"
+    assert second[1]["status"] == "SKIPPED"
+    assert second[1]["required"] is False
+    assert sum("audit" in argv for argv in calls) == 1
+    assert sum("install" in argv for argv in calls) == 2
 
 
 @pytest.mark.parametrize(

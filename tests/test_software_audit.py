@@ -627,6 +627,9 @@ def test_audit_continuation_bounds_context_without_losing_recovery(
     assert "coverage" not in resumed
     assert resumed["continue_review"] is True
     assert resumed["next_files"] == remaining[:20]
+    assert "Read only the paths in next_files" in resumed["next_action"]
+    assert "Do not reread audit_prompt, the output_path draft" in resumed["next_action"]
+    assert "write output_path once" in resumed["next_action"]
     assert resumed["remaining_file_count"] == len(remaining)
     assert set(resumed["remaining_phases"]) == REVIEW_PHASES - {"entry_points"}
     assert resumed["context_recovery_tool"] == "get_run_status"
