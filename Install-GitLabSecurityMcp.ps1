@@ -182,12 +182,10 @@ if ($leftovers.Count -gt 0) {
         "They were not deleted automatically: " + (($leftovers | ForEach-Object { $_.FullName }) -join ', '))
 }
 Write-Host 'Installation and dependency checks completed. Reopen VS Code/Cursor and start the MCP server.'
-$wheelVersion = [regex]::Match($wheelItem.Name, '^gitlab_security_mcp-([^-]+)-').Groups[1].Value
-$progressVsix = Join-Path $wheelItem.DirectoryName "gitlab-security-progress-$wheelVersion.vsix"
-Write-Host 'In-editor progress requires the companion VSIX installed in EACH editor using Extensions: Install from VSIX.'
+$extensionManifest = Join-Path $sitePackages 'gitlab_security_mcp\editor_progress\package.json'
+$extensionVersion = (Get-Content -LiteralPath $extensionManifest -Raw -Encoding utf8 | ConvertFrom-Json).version
+Write-Host "The MCP server installs the bundled progress extension $extensionVersion into the VS Code or Cursor window that starts it. Reload the MCP server (or the window) after this install."
+$progressVsix = Join-Path $wheelItem.DirectoryName "gitlab-security-progress-$extensionVersion.vsix"
 if (Test-Path -LiteralPath $progressVsix -PathType Leaf) {
-    Write-Host "Progress extension: $progressVsix"
-}
-else {
-    Write-Warning "Download gitlab-security-progress-$wheelVersion.vsix alongside the wheel. The Python wheel alone cannot add an editor status bar."
+    Write-Host "Manual fallback if automatic installation is blocked: Extensions: Install from VSIX with $progressVsix"
 }

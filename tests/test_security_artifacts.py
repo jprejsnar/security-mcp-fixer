@@ -436,3 +436,35 @@ def test_archive_failure_preserves_checkout_logs(tmp_path, monkeypatch, failure)
 
     # Assert
     assert path.is_file()
+
+
+def test_archive_tolerates_live_progress_updates_while_zipping(tmp_path, monkeypatch):
+    """A background progress rewrite is not a changed log; archival still completes."""
+    # Arrange
+    from datetime import UTC, datetime
+
+    from gitlab_security_mcp import security_artifacts
+
+    monkeypatch.setattr(security_artifacts.Path, "home", lambda: tmp_path)
+    metadata = tmp_path / ".security-mcp"
+    metadata.mkdir()
+    log = metadata / "audit.jsonl"
+    log.write_text('{"exit_code": 0}\n', encoding="utf-8")
+    progress = metadata / "progress.json"
+    progress.write_text('{"tasks": []}', encoding="utf-8")
+    original = security_artifacts.zipfile.ZipFile.write
+
+    def write(archive, *args, **kwargs):
+        """Model another task publishing progress after its bytes were read."""
+        original(archive, *args, **kwargs)
+        progress.write_text('{"tasks": [{"status": "FINISHED"}]}', encoding="utf-8")
+
+    monkeypatch.setattr(security_artifacts.zipfile.ZipFile, "write", write)
+
+    # Act
+    result = security_artifacts.archive_run_logs(tmp_path, "sample", datetime.now(UTC))
+
+    # Assert
+    assert result["status"] == "ARCHIVED"
+    assert not log.exists()
+    assert progress.is_file()

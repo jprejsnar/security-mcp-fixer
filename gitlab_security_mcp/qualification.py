@@ -11,7 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import threading
+import time
 from itertools import pairwise
 from pathlib import Path
 from subprocess import SubprocessError
@@ -200,6 +203,12 @@ ARTIFACT_DIRS = {
     ".nyc_output",
 }
 MAX_TREE_BYTES = 100 * 1024 * 1024
+# A file modified this recently could change again within the timestamp's
+# resolution without a size change, so its digest is not reused next time.
+_SNAPSHOT_RACY_WINDOW_NS = 2_000_000_000
+_SNAPSHOT_CACHED_CHECKOUTS = 8
+_snapshot_digests: dict[str, dict[str, tuple[int, int, str]]] = {}
+_snapshot_digests_lock = threading.Lock()
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_POLICY_BYTES = 1024 * 1024
 _ALIGNMENT_VERSION = re.compile(r"(\d+(?:\.\d+)+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)")
@@ -982,30 +991,57 @@ def run_checks(
 def tree_snapshot(root: Path) -> dict[str, str]:
     """Hash a bounded, pruned checkout to invalidate stale qualification.
 
-    The byte budget is the running total of bytes read. The next file is not
+    The byte budget is the running total of file bytes. The next file is not
     opened after that total crosses the limit, and no partial snapshot is returned.
+    A file whose size and modification time match the previous snapshot of this
+    checkout reuses its digest instead of being read again; recently modified
+    files are always reread.
     """
     files, truncated = iter_files(root)
     if truncated:
         raise ValueError(
             _RAISE_CHECKOUT_SNAPSHOT_IS_TRUNCATED_MANUAL_QUALIFICATION_IS_REQUIRED
         )
+    checkout = os.path.normcase(str(root))
+    with _snapshot_digests_lock:
+        previous = _snapshot_digests.get(checkout, {})
+    started_ns = time.time_ns()
+    current: dict[str, tuple[int, int, str]] = {}
     hashes = {}
     total = 0
     for path in files:
         relative = path.relative_to(root)
         if any(part in ARTIFACT_DIRS for part in relative.parts):
             continue
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            while block := stream.read(65536):
-                total += len(block)
-                if total > MAX_TREE_BYTES:
-                    raise ValueError(
-                        _RAISE_CHECKOUT_SNAPSHOT_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT
-                    )
-                digest.update(block)
-        hashes[relative.as_posix()] = digest.hexdigest()
+        key = relative.as_posix()
+        stat = path.stat()
+        known = previous.get(key)
+        if known is not None and known[:2] == (stat.st_size, stat.st_mtime_ns):
+            total += stat.st_size
+            if total > MAX_TREE_BYTES:
+                raise ValueError(
+                    _RAISE_CHECKOUT_SNAPSHOT_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT
+                )
+            hexdigest = known[2]
+        else:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                while block := stream.read(65536):
+                    total += len(block)
+                    if total > MAX_TREE_BYTES:
+                        raise ValueError(
+                            _RAISE_CHECKOUT_SNAPSHOT_EXCEEDS_THE_QUALIFICATION_SIZE_LIMIT
+                        )
+                    digest.update(block)
+            hexdigest = digest.hexdigest()
+        hashes[key] = hexdigest
+        if started_ns - stat.st_mtime_ns > _SNAPSHOT_RACY_WINDOW_NS:
+            current[key] = (stat.st_size, stat.st_mtime_ns, hexdigest)
+    with _snapshot_digests_lock:
+        _snapshot_digests.pop(checkout, None)
+        _snapshot_digests[checkout] = current
+        while len(_snapshot_digests) > _SNAPSHOT_CACHED_CHECKOUTS:
+            _snapshot_digests.pop(next(iter(_snapshot_digests)))
     return hashes
 
 

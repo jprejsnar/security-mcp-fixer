@@ -7,9 +7,13 @@ from pathlib import Path
 
 from gitlab_security_mcp.gitlab_client import dismissal_is_confirmed
 from gitlab_security_mcp.source_findings import pending_source_reviews
-from gitlab_security_mcp.state import RunState
+from gitlab_security_mcp.state import RunState, summarize_trees
 from gitlab_security_mcp.util import atomic_write_text
 from gitlab_security_mcp.workflow import JOB_REPORT
+
+_NO_OTHER_UNRESOLVED_ROW = (
+    "| None reported | No other unresolved or unattempted code findings |"
+)
 
 
 def _table_cell(value: object) -> str:
@@ -330,6 +334,7 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
         ]
     )
     failed_ids = {item["id"] for item in failed if item["origin"] == "gitlab"}
+    other_rows = len(lines)
     for item in unresolved:
         if item["id"] not in package_ids | failed_ids:
             lines.append(
@@ -343,6 +348,8 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
             lines.append(
                 f"| Audit {_table_cell(item['id'])} | Not selected; no edit authorized. |"
             )
+    if len(lines) == other_rows:
+        lines.append(_NO_OTHER_UNRESOLVED_ROW)
     lines.extend(["", "## Workflow jobs"])
     for job in state.workflow.get("jobs", []):
         status = "FINISHED" if job["number"] == JOB_REPORT else job["status"]
@@ -534,7 +541,7 @@ def render(
         "validation": state.validation_results,
         "validation_caveats": _validation_caveats(state),
         "batch_isolation": state.batch_isolation,
-        "lint_baseline": state.lint_baseline,
+        "lint_baseline": summarize_trees(state.lint_baseline),
         "lint_issues_file": ".security-mcp/lint-issues.json"
         if state.lint_baseline is not None
         else None,

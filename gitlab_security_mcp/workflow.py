@@ -32,6 +32,15 @@ JOB_LABELS = (
     JOB_REPORT,
 ) = range(1, len(JOB_LABELS) + 1)
 JOB_COUNT = len(JOB_LABELS)
+# Job 1 finishes only when the branch exists, so its unfinished steps name their own tool.
+_PRECHECK_NEXT_TOOL = {
+    "PRECHECK_PASSED": "pull_main_twice",
+    "PULLS_SUCCEEDED": "create_security_branch",
+}
+_DEFAULT_NEXT_TOOL = "complete_security_run"
+_JOB_ORDER_MESSAGE = (
+    "Finish the current job before starting another. Call {} to continue."
+)
 
 
 def start(engine: Engine) -> None:
@@ -104,10 +113,15 @@ def require(engine: Engine, *numbers: int) -> dict | None:
     logger.warning(
         "Out-of-order workflow call: current job %s, expected %s", current, numbers
     )
+    next_tool = (
+        _PRECHECK_NEXT_TOOL.get(engine.state.status, _DEFAULT_NEXT_TOOL)
+        if current == JOB_PRECHECKS
+        else _DEFAULT_NEXT_TOOL
+    )
     return {
         "status": "JOB_ORDER_REQUIRED",
         "current_job": current,
         "job": JOB_LABELS[current - 1],
-        "message": "Finish the current job before starting another. Call complete_security_run to continue.",
-        "next_tool": "complete_security_run",
+        "message": _JOB_ORDER_MESSAGE.format(next_tool),
+        "next_tool": next_tool,
     }

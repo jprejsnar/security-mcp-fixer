@@ -4432,11 +4432,20 @@ class Engine:
             ):
                 ecosystem = "NuGet"
         self._progress(finding.get("id"), "Checking public advisory evidence")
+        operating_system = str(
+            (finding.get("location") or {}).get("operatingSystem") or ""
+        ).strip()
+        distribution = (
+            {"distribution": operating_system}
+            if operating_system and category == "container_scanning" and hit is None
+            else {}
+        )
         looked_up = self.advisory.lookup(
             finding,
             ecosystem or (hit.manager if hit else None),
             package_name,
             installed,
+            **distribution,
         )
         self._record_validation_sites(finding, looked_up.validation_sites)
         evidence.append(looked_up.summary or "No advisory summary.")

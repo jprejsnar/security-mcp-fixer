@@ -202,6 +202,51 @@ def test_cna_structured_versions_fill_missing_nvd_bounds(
         assert result.outcome == "lookup_failed"
 
 
+def test_distribution_package_skips_github_and_nvd_and_is_never_cleared():
+    """An upstream CNA range cannot clear a backported Ubuntu build or cost NVD pacing."""
+    # Arrange
+    ident = "CVE-2026-107708"
+    hosts = []
+
+    def handler(request):
+        """Publish an upstream range that the Ubuntu build version sits above."""
+        hosts.append(request.url.host)
+        if request.url.host == "cveawg.mitre.org":
+            entry = {
+                "product": "tar",
+                "defaultStatus": "unaffected",
+                "versions": [
+                    {"version": "0", "lessThan": "1.20", "status": "affected"}
+                ],
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "cveMetadata": {"cveId": ident, "state": "PUBLISHED"},
+                    "containers": {"cna": {"affected": [entry]}},
+                },
+            )
+        return httpx.Response(404)
+
+    # Act
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with AdvisoryClient(http=http) as client:
+            result = client.lookup(
+                {"identifiers": [ident]},
+                None,
+                "tar",
+                "1.35+dfsg-3.1",
+                distribution="ubuntu 26.04",
+            )
+
+    # Assert
+    assert result.affected is None
+    assert "ubuntu 26.04" in result.summary
+    assert "api.github.com" not in hosts
+    assert "services.nvd.nist.gov" not in hosts
+    assert "cveawg.mitre.org" in hosts
+
+
 @pytest.mark.parametrize(
     "version, affected", [("2.7.5-r0", False), ("2.8.3-r0", True), ("2.8.4-r0", False)]
 )

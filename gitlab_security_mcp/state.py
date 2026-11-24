@@ -14,6 +14,42 @@ _BACKUP_MANIFESTS = {
     "dependency_before": "dependency_backup_manifest",
     "version_alignment_before": "version_alignment_backup_manifest",
 }
+_TREE_KEY_SUFFIX = "tree"
+_SHA256_HEX_LENGTH = 64
+
+
+def _is_file_hash_map(value: object) -> bool:
+    """Recognize a checkout snapshot: relative path -> SHA-256 hex digest."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(
+            isinstance(path, str)
+            and isinstance(digest, str)
+            and len(digest) == _SHA256_HEX_LENGTH
+            for path, digest in value.items()
+        )
+    )
+
+
+def summarize_trees(value: object, key: str = "") -> object:
+    """Replace each whole-checkout snapshot with its file count and one digest.
+
+    Every qualification receipt keeps a full checkout hash map in memory. On
+    disk, one copy per receipt grows with findings times repository files, so
+    the inspection file records only the identity of each snapshot.
+    """
+    if key.endswith(_TREE_KEY_SUFFIX) and _is_file_hash_map(value):
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return {
+            "files": len(value),
+            "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        }
+    if isinstance(value, dict):
+        return {name: summarize_trees(item, str(name)) for name, item in value.items()}
+    if isinstance(value, list):
+        return [summarize_trees(item, key) for item in value]
+    return value
 
 
 @dataclass
@@ -21,7 +57,8 @@ class RunState:
     """Everything one remediation run has decided so far.
 
     The snapshot on disk is for the user to inspect. It is never reloaded,
-    so a restarted server must pass the prechecks again.
+    so a restarted server must pass the prechecks again. Whole-checkout hash
+    maps are written as a file count and digest, not every file hash.
     """
 
     status: str = "NOT_STARTED"
@@ -83,7 +120,7 @@ class RunState:
                                 }
                         inspection[key][manifest_key] = manifest
             snapshot["findings"].append(inspection)
-        text = json.dumps(snapshot, indent=2, ensure_ascii=False)
+        text = json.dumps(summarize_trees(snapshot), indent=2, ensure_ascii=False)
         atomic_write_text(path, text)
 
     def forget(self, finding_id: str) -> None:

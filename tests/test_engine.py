@@ -3444,6 +3444,36 @@ def test_container_package_fix_without_supported_edit_requires_review(repo, fixe
     assert recipe.read_text(encoding="utf-8") == original
 
 
+def test_container_os_package_lookup_names_its_distribution(repo):
+    """An image OS package is checked as a distribution build, not an upstream release."""
+    # Arrange
+    from contextlib import closing
+    from unittest.mock import Mock
+
+    finding = _finding("os-package", "libkrb5-3", "CVE-fixture", version="1.22.1-2")
+    finding.update(
+        category="container_scanning",
+        location={
+            "image": "registry.example.invalid/app:sha",
+            "operatingSystem": "ubuntu 26.04",
+        },
+    )
+    advisory = Mock()
+    advisory.lookup.return_value = AdvisoryLookup(outcome="not_found", summary="None.")
+    with closing(
+        Engine(repo, gitlab=FakeGitLab([finding]), advisory=advisory)
+    ) as engine:
+        engine.state.status = "FINDINGS_LISTED"
+        engine.state.findings = [finding]
+
+        # Act
+        result = engine.verify_security_finding(finding["id"])
+
+    # Assert
+    assert result["decision"] == "MANUAL_REVIEW"
+    assert advisory.lookup.call_args.kwargs == {"distribution": "ubuntu 26.04"}
+
+
 def test_image_bump_and_aaa_test(repo):
     """Image bump and aaa test."""
     # Arrange
@@ -3731,6 +3761,53 @@ def test_inspection_snapshot_keeps_hashes_not_raw_rollback_text(
     }
     assert snapshot[manifest_key]["new-file"] is None
     assert receipt[backup_key]["original.md"] == original
+
+
+def test_saved_state_and_report_summarize_checkout_snapshots(tmp_path):
+    """Write each whole-checkout hash map once as a count and digest, not every file."""
+    # Arrange
+    from gitlab_security_mcp.report import render
+    from gitlab_security_mcp.state import RunState
+
+    tree = {f"src/file{index}.java": "a" * 64 for index in range(500)}
+    state = RunState(
+        findings=[{"id": "a", "packageQualification": {"tree": tree}}],
+        lint_baseline={"tree": tree, "results": []},
+    )
+
+    # Act
+    state.save(tmp_path)
+    saved = json.loads(
+        (tmp_path / ".security-mcp" / "run-state.json").read_text(encoding="utf-8")
+    )
+    payload, _markdown = render(state, staged=[], diff_stat="", diff_files="")
+
+    # Assert
+    summary = saved["findings"][0]["packageQualification"]["tree"]
+    assert summary["files"] == 500
+    assert summary == saved["lint_baseline"]["tree"]
+    assert payload["lint_baseline"]["tree"] == summary
+    assert state.findings[0]["packageQualification"]["tree"] is tree
+    assert "src/file0.java" not in json.dumps(saved)
+
+
+def test_unresolved_report_never_prints_an_empty_code_findings_table(tmp_path):
+    """A run with no other unresolved code findings says so instead of a bare header."""
+    # Arrange
+    from gitlab_security_mcp.report import write_unresolved_report
+    from gitlab_security_mcp.state import RunState
+
+    # Act
+    result = write_unresolved_report(tmp_path, RunState())
+
+    # Assert
+    section = result["final_summary_markdown"].split(
+        "## Other unresolved or unattempted code findings"
+    )[1]
+    assert (
+        "| None reported | No other unresolved or unattempted code findings |"
+        in (section.split("##")[0])
+    )
 
 
 def test_final_summary_exposes_baseline_and_optional_validation_gaps():

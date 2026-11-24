@@ -353,6 +353,22 @@ def _archive_snapshot(repo_root: Path) -> dict[Path, tuple[int, int, int]]:
     }
 
 
+def _logs_only(
+    snapshot: dict[Path, tuple[int, int, int]],
+) -> dict[Path, tuple[int, int, int]]:
+    """Keep the logs that archival removes; kept files are point-in-time copies.
+
+    progress.json and run-state.json are atomically replaced while other
+    background work finishes. They stay in the checkout, so a newer version
+    does not lose evidence, and only removed logs must be unchanged.
+    """
+    return {
+        path: info
+        for path, info in snapshot.items()
+        if path.suffix.lower() in _LOG_SUFFIXES
+    }
+
+
 def archive_run_logs(
     repo_root: Path,
     project_name: str,
@@ -435,7 +451,7 @@ def archive_run_logs(
                         remaining -= len(chunk)
             if audit_report is not None:
                 archive.write(audit_report, arcname=audit_member)
-        if _archive_snapshot(repo_root) != snapshot:
+        if _logs_only(_archive_snapshot(repo_root)) != _logs_only(snapshot):
             raise ValueError(_RAISE_LOGS_CHANGED_DURING_ARCHIVE)
         if audit_report is not None:
             info = audit_report.lstat()

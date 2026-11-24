@@ -214,6 +214,28 @@ def test_precheck_branch_and_download_tools_start_jobs_in_order(tmp_path, monkey
     engine.list_security_findings.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        ("PRECHECK_PASSED", "pull_main_twice"),
+        ("PULLS_SUCCEEDED", "create_security_branch"),
+    ],
+)
+def test_early_download_names_the_unfinished_precheck_step(status, expected):
+    """A job-2 call during job 1 points at the missing step, not run completion."""
+    # Arrange
+    engine = SimpleNamespace(
+        state=SimpleNamespace(status=status, workflow={"current": 1})
+    )
+
+    # Act
+    denied = workflow.require(engine, workflow.JOB_DOWNLOAD)
+
+    # Assert
+    assert denied["next_tool"] == expected
+    assert expected in denied["message"]
+
+
 def test_source_validation_keeps_prior_package_permission_without_allowing_more_package_edits(
     tmp_path, monkeypatch
 ):

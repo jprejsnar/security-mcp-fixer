@@ -53,6 +53,13 @@ _RAISE_NVD_REQUESTED_A_1F_S_RETRY_AFTER_COOLDOWN = "NVD requested a {:.1f}s Retr
 # The advisory exists, but it does not name the package we found locally.
 # That can be a GitLab mislabel or a naming mismatch, so a person decides.
 PACKAGE_MISMATCH = "package_mismatch"
+_DISTRIBUTION_UPSTREAM_BOUNDS = (
+    "Public advisory version ranges for {package} are not trusted for the "
+    "{distribution} build {version}. Distribution packages carry backported fixes, so "
+    "an upstream range comparison cannot establish whether the installed build is "
+    "affected. Check the distribution's security tracker or rebuild the image on a "
+    "patched base."
+)
 
 OSV_VULN = "https://api.osv.dev/v1/vulns/{ident}"
 OSV_QUERY = "https://api.osv.dev/v1/query"
@@ -228,6 +235,8 @@ class AdvisoryClient:
         ecosystem: str | None,
         package: str | None,
         version: str | None,
+        *,
+        distribution: str | None = None,
     ) -> AdvisoryLookup:
         """Match online advisory evidence to a package and installed version.
 
@@ -236,6 +245,10 @@ class AdvisoryClient:
         records without treating withdrawal as proof of safety. Identifiers within
         one source are requested together. Return an AdvisoryLookup with
         affected status, candidate fixes, and sources.
+        For an operating-system package (``distribution``, for example
+        ``ubuntu 26.04``), skip GitHub, which has no OS ecosystems, and the paced
+        NVD API, whose upstream bounds do not describe backported distribution
+        builds; an upstream CNA range never marks such a build unaffected.
         Failed requests, malformed responses, and calls after close return
         lookup_failed rather than claiming the version is safe. The engine may
         still use an explicit GitLab fix. Coordinate active reads with shutdown and
@@ -253,7 +266,16 @@ class AdvisoryClient:
         token = self._validation_sites.set(sites)
         try:
             try:
-                result = self._lookup(finding, ecosystem, package, version)
+                result = self._lookup(
+                    finding, ecosystem, package, version, distribution=distribution
+                )
+                if distribution and result.affected is False:
+                    result.affected = None
+                    result.summary = _DISTRIBUTION_UPSTREAM_BOUNDS.format(
+                        package=package or "product",
+                        distribution=distribution,
+                        version=version or "unknown",
+                    )
             except ADVISORY_READ_FAILURES as exc:
                 log_unexpected(exc, "advisory lookup")
                 result = AdvisoryLookup(
@@ -275,6 +297,8 @@ class AdvisoryClient:
         ecosystem: str | None,
         package: str | None,
         version: str | None,
+        *,
+        distribution: str | None = None,
     ) -> AdvisoryLookup:
         """Resolve identifiers through advisory sources in priority order."""
         identifiers = list(
@@ -337,8 +361,10 @@ class AdvisoryClient:
                 return osv_result
             mismatch = osv_result
 
-        github_record = self._github(
-            identifiers, errors, sources, package, osv_ecosystem
+        github_record = (
+            None
+            if distribution
+            else self._github(identifiers, errors, sources, package, osv_ecosystem)
         )
         if github_record is not None:
             github_result = _from_github(
@@ -353,7 +379,7 @@ class AdvisoryClient:
         )
         nvd_fallback = None
         if cve:
-            nvd_record = self._nvd(cve, errors, sources)
+            nvd_record = None if distribution else self._nvd(cve, errors, sources)
             if nvd_record is not None:
                 nvd_result = _from_nvd(nvd_record, package, version, sources, errors)
                 if nvd_result.outcome == "lookup_failed":
@@ -367,6 +393,13 @@ class AdvisoryClient:
                 cna_result = _from_cve(
                     cna_record, ecosystem, package, version, sources, errors
                 )
+                if distribution and cna_result.outcome != PACKAGE_MISMATCH:
+                    cna_result.affected = None
+                    cna_result.summary = _DISTRIBUTION_UPSTREAM_BOUNDS.format(
+                        package=package or "product",
+                        distribution=distribution,
+                        version=version or "unknown",
+                    )
                 if cna_result.outcome != PACKAGE_MISMATCH:
                     return cna_result
                 mismatch = cna_result

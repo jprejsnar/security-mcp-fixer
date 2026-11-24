@@ -2663,6 +2663,43 @@ def test_tree_snapshot_stops_at_the_byte_budget_before_later_files(
     assert len(opened) == 2
 
 
+def test_tree_snapshot_reuses_unchanged_digests_and_rereads_changes(
+    tmp_path, monkeypatch
+):
+    """Repeated snapshots read only files whose size or modification time changed."""
+    # Arrange
+    import os
+    import time
+    from pathlib import Path
+
+    from gitlab_security_mcp import qualification
+
+    old = time.time_ns() - 10_000_000_000
+    for name in ("same.txt", "edited.txt"):
+        path = tmp_path / name
+        path.write_bytes(b"before")
+        os.utime(path, ns=(old, old))
+    first = qualification.tree_snapshot(tmp_path)
+    (tmp_path / "edited.txt").write_bytes(b"after!")
+    opened = []
+    real_open = Path.open
+
+    def tracking_open(self, *args, **kwargs):
+        """Record which files are read for hashing."""
+        opened.append(self.name)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    # Act
+    second = qualification.tree_snapshot(tmp_path)
+
+    # Assert
+    assert opened == ["edited.txt"]
+    assert second["same.txt"] == first["same.txt"]
+    assert second["edited.txt"] != first["edited.txt"]
+
+
 @pytest.mark.parametrize(
     "mode", ["small", "rewrite", "rewrite_increments", "undeclared", "delete"]
 )
