@@ -948,6 +948,15 @@ A status poll before that delivery stays compact and does not count as the
 delivery. The full prompt, inventory and receipts stay on disk and are returned
 only by `get_run_status(..., include_audit_details=True)` after context loss.
 
+The server hashes every reviewed file, so a progress receipt and a source review
+do not include `sha256`. It returns the cited source in the verification result,
+and the host does not open that file again. A package qualification stored by
+`qualify_package_update` is reused by the fix form; the host does not paste that
+review or re-read its pages. A source fix reported as `fixed` with an empty
+`validation` field is checked by the server's production build, and the host
+does not run that build or paste its log. The accepted audit report gets a
+server coverage appendix, so the host does not restate the inventory or phases.
+
 ## Architecture
 
 These fenced Mermaid diagrams render directly on GitHub. In an editor, use a

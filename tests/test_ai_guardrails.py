@@ -55,6 +55,7 @@ def test_startup_files_load_once_per_editor():
     # Assert
     assert _EDIT_SOURCE in body
     assert _README_UPDATE in body
+    assert "Do not spend host AI tokens" in body
     assert _EDIT_THE_COPY not in body
     assert _ALWAYS_APPLY in rule
     assert rule == cursor_rule

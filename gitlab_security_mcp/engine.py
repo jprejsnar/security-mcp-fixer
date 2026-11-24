@@ -1612,6 +1612,10 @@ class Engine:
                 }
                 continue
             review = reviews.get(item["id"])
+            if not isinstance(review, dict):
+                stored = (finding.get("packageQualification") or {}).get("review")
+                if isinstance(stored, dict):
+                    review = stored
             try:
                 if not isinstance(review, dict) or any(
                     review.get(key) != plan.get(key)
@@ -1660,12 +1664,7 @@ class Engine:
                 "status": "PACKAGE_REVIEW_REQUIRED",
                 "required_reviews": required,
                 "next_tool": "select_security_fixes",
-                "message": "Before opening the Windows checkboxes, the host AI must review the official docs, actual framework/API compatibility and license terms. "
-                "Use the qualify_package_update review schema, then call select_security_fixes with package_reviews keyed by finding ID. "
-                "For a package that cannot safely qualify, provide its exact ecosystem/package/target and an honest blocked_reason; it will be labeled blocked, never edited, and will not prevent other updates. "
-                "For a non-major target with uncertain callers but no known incompatibility, use an explicit validation_mode=build_only review with known_incompatibilities=[] and compatibility_limitations; keep unknown compatibility flags null. "
-                "Assess each finding separately: another advisory requiring source changes does not block a version fix for this finding. "
-                "Collect evidence only; do not call qualification or edit files before human selection. Never invent missing evidence or approvals.",
+                "message": "Call qualify_package_update once for each listed finding. Do not re-read the pages that tool returns and do not paste its review into package_reviews. Call select_security_fixes again with repo_root only; the server reuses the stored qualification. A major upgrade still needs that one qualification call. Do not invent evidence.",
             }
         return {
             "status": "READY",

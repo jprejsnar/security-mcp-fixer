@@ -76,7 +76,8 @@ class ReviewedSourceFile(BaseModel):
 
     path: str = Field(min_length=1)
     sha256: str = Field(
-        min_length=1, description="SHA256 of the current full file bytes."
+        default="",
+        description="Leave empty. The server hashes the current file bytes.",
     )
     assessment: str = Field(
         min_length=1, description="What the host established by reading this file."
@@ -242,10 +243,12 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
             raise ValueError(_RAISE_REVIEWED_FILE_PATH_IS_MISSING)
         contents = _read_source(root, relative)
         digest = hashlib.sha256(contents).hexdigest()
-        if item.get("sha256") != digest:
+        supplied = item.get("sha256") or ""
+        if supplied and supplied != digest:
             raise ValueError(
                 _RAISE_REVIEWED_FILE_CHANGED_OR_SHA256_IS_MISSING.format(relative)
             )
+        item["sha256"] = digest
         assessment = item.get("assessment")
         if not isinstance(assessment, str) or not assessment.strip():
             raise ValueError(
@@ -261,7 +264,7 @@ def _review_source(root: Path, finding: dict, review: dict) -> list[str]:
                 )
             )
         paths.add(resolve_inside(root, relative))
-        evidence.append(f"Reviewed {relative} SHA256={digest}: {assessment}")
+        evidence.append(f"Reviewed {relative}: {assessment}")
     cited = resolve_inside(root, finding["location"]["file"])
     if cited not in paths:
         raise ValueError(_RAISE_SOURCE_REVIEW_MUST_INCLUDE_THE_SCANNER_CITED_FILE)
@@ -285,8 +288,9 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
         "location": location,
         "languages": source_languages(str(location.get("file") or "")),
         "steps": [
-            "Open the file and line GitLab already reported and read that code, "
-            "including callers and inputs. A filename or a missing CVE is not a verdict.",
+            "Open a caller only when this result does not already include it. "
+            "Do not open the cited file again; source.context is that read. "
+            "A filename or a missing CVE is not a verdict.",
             "For nginx, read includes and the active server. For Dockerfiles, read "
             "the stages and the final image. For a non-literal pattern, read the "
             "values that reach it and their bounds.",
@@ -295,8 +299,8 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
             "established. Do not put the file path or line number in that text. "
             "Put the trace, every CVE and CWE GitLab named, input_origin, "
             "finding_analysis, reachability_analysis, and reviewed_files entries "
-            "with path, full-byte sha256, and assessment "
-            "in the other source_review fields. Do not invent a patch or dismiss "
+            "with path and assessment. Do not send sha256; the server hashes "
+            "each path. Do not invent a patch or dismiss "
             "the finding.",
             *(
                 (TYPESCRIPT_UTILITY_REVIEW,)

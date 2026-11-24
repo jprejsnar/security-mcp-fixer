@@ -161,9 +161,9 @@ def persist_audit_draft(
         f"Checkout: `{root}`\n\n"
         "Only non-generated first-party inputs are review targets. Generated source "
         "must not be reviewed, including as supporting evidence.\n\n"
-        "The host AI must replace this draft with the complete findings report, "
-        "then submit report_ready=True before any fix-selection window can open.\n"
-        + receipt
+        "The host AI must replace this draft with the findings report. "
+        "Do not list the inventory or phases; the server appends that appendix "
+        "when the report is accepted. Do not open this draft.\n" + receipt
     )
     try:
         atomic_write_text(report, initial, exclusive=True)
@@ -177,6 +177,28 @@ def persist_audit_draft(
             return
         with report.open("a", encoding="utf-8", newline="") as stream:
             stream.write(receipt)
+
+
+_COVERAGE_APPENDIX = "## Server coverage appendix"
+
+
+def append_coverage_appendix(report: Path, coverage: dict) -> None:
+    """Record inventory counts on the finished report so the host does not restate them."""
+    if not report.is_file():
+        return
+    text = report.read_text(encoding="utf-8")
+    if audit_report_is_draft(text) or _COVERAGE_APPENDIX in text:
+        return
+    reviewed = len(coverage.get("reviews") or {})
+    total = len(coverage.get("files") or [])
+    phases = ", ".join(coverage.get("completed_phases") or []) or "none"
+    appendix = (
+        f"\n{_COVERAGE_APPENDIX}\n\n"
+        f"Reviewed files: {reviewed} of {total}.\n"
+        f"Completed phases: {phases}.\n"
+    )
+    with report.open("a", encoding="utf-8", newline="") as stream:
+        stream.write(appendix)
 
 
 def _progress_body(text: str) -> list[str]:
@@ -228,15 +250,15 @@ def _generated_output_paths(root: Path, exclusions: list[dict]) -> set[Path]:
             raise ValueError(
                 _RAISE_INVALID_GENERATED_EXCLUSION_EVIDENCE.format(evidence["path"])
             )
-        if (
-            not evidence["assessment"].strip()
-            or hashlib.sha256(config.read_bytes()).hexdigest() != evidence["sha256"]
-        ):
+        supplied = evidence.get("sha256") or ""
+        digest = hashlib.sha256(config.read_bytes()).hexdigest()
+        if not evidence["assessment"].strip() or (supplied and supplied != digest):
             raise ValueError(
                 _RAISE_GENERATED_EXCLUSION_NEEDS_CURRENT_CONFIGURATION_EVIDENCE.format(
                     evidence["path"]
                 )
             )
+        evidence["sha256"] = digest
     return outputs
 
 
@@ -311,13 +333,20 @@ def record_audit_coverage(
                 _RAISE_AUDIT_REVIEW_IS_OUTSIDE_THE_INVENTORY.format(review["path"])
             )
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if review["sha256"] != digest or not review["assessment"].strip():
+        supplied = review.get("sha256") or ""
+        if supplied and supplied != digest:
             raise ValueError(
                 _RAISE_AUDIT_REVIEW_NEEDS_THE_CURRENT_FILE_HASH_AND.format(
                     review["path"]
                 )
             )
-        updated["reviews"][review["path"]] = dict(review)
+        if not review["assessment"].strip():
+            raise ValueError(
+                _RAISE_AUDIT_REVIEW_NEEDS_THE_CURRENT_FILE_HASH_AND.format(
+                    review["path"]
+                )
+            )
+        updated["reviews"][review["path"]] = {**review, "sha256": digest}
     updated["completed_phases"] = sorted(
         set(coverage["completed_phases"]) | set(phases)
     )

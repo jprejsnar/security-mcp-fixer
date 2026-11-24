@@ -55,6 +55,7 @@ from gitlab_security_mcp.report import write_unresolved_report
 from gitlab_security_mcp.security_artifacts import archive_run_logs, run_log_files
 from gitlab_security_mcp.software_audit import (
     REVIEW_PHASES,
+    append_coverage_appendix,
     audit_coverage_gaps,
     audit_has_no_findings,
     audit_inventory,
@@ -214,7 +215,7 @@ If the human accepts the audit, generate the complete report BEFORE its fixes.
    GENERATE_AUDIT_REPORT and AUDIT_IN_PROGRESS require the host AI to scan
    repo_root now; the server cannot run that AI scan itself. Report progress
    with choose_software_audit_action(progress={message:...,
-   files:[{path:<inventory-relative>,sha256:<current full-file hash>,assessment:...}],
+   files:[{path:<inventory-relative>,assessment:...}],
    completed_phases:[entry_points|data_access|errors_logs|resource_lifetime|ui_siblings]})
    after each batch of the returned next_files paths. Read only next_files; do not
    reread the audit prompt, the draft report, or files with receipts. Write the
@@ -1381,12 +1382,12 @@ async def verify_security_finding(
         request = result["source_review_request"]
         cited = await asyncio.to_thread(evidence.read, request["location"]["file"])
         reason = (
-            "The host AI must open the file and line GitLab already reported, "
-            "read the cited file in the checkout, and call verify_security_finding "
-            "with source_review. Write reason in everyday words, at most 2 "
-            "sentences and 400 characters: what was flagged and what the review "
-            "established. cited_source only locates the line. "
-            "No false-positive conclusion has been recorded."
+            "The cited file is already in cited_source. Do not open that file again. "
+            "Open a caller only when this result does not include it. "
+            "Call verify_security_finding with source_review. Do not send sha256; "
+            "the server hashes each reviewed path. Write reason in everyday words, "
+            "at most 2 sentences and 400 characters: what was flagged and what the "
+            "review established. No false-positive conclusion has been recorded."
         )
         result.update(
             await asyncio.to_thread(
@@ -2544,6 +2545,61 @@ class CodeFixResult(BaseModel):
     validation: str = Field(default="", strict=True)
 
 
+def _server_source_validation(engine: Engine) -> tuple[str, bool]:
+    """Run the production build. The host does not paste the command log."""
+    import shutil
+
+    from gitlab_security_mcp.validate import run_validation
+
+    outcome = run_validation(
+        engine.repo_root,
+        engine.runner,
+        shutil.which,
+        timeout=engine.validation_timeout,
+    )
+    parts = []
+    for row in outcome.get("results") or []:
+        command = row.get("command")
+        if isinstance(command, list):
+            command = " ".join(str(part) for part in command)
+        detail = " ".join(str(row.get("detail") or "").split())
+        parts.append(
+            f"{row.get('status')}: {command or 'no command'}: {detail}".strip(": ")
+        )
+    text = "Server production build; unit tests were not run. " + " | ".join(parts)
+    return text[:2000], outcome.get("status") == "VALIDATION_COMPLETE"
+
+
+async def _fill_source_validation(
+    engine: Engine, results: list[dict] | None
+) -> list[dict] | None:
+    """Record the server build for a fixed outcome that has no pasted log."""
+    if not results:
+        return results
+    needs = [
+        item
+        for item in results
+        if isinstance(item, dict)
+        and item.get("status") == "fixed"
+        and not str(item.get("validation") or "").strip()
+    ]
+    if not needs:
+        return results
+    summary, passed = await asyncio.to_thread(_server_source_validation, engine)
+    filled = []
+    for item in results:
+        if item not in needs:
+            filled.append(item)
+            continue
+        updated = {**item, "validation": summary}
+        if not passed:
+            updated["status"] = "failed"
+            reason = str(updated.get("reason") or "Source fix").rstrip()
+            updated["reason"] = f"{reason} Server production build did not pass."
+        filled.append(updated)
+    return filled
+
+
 def _record_code_results(selected: Engine, results: list[dict] | None) -> dict | None:
     """Require a result for each approved host-led fix before leaving its job."""
     state = selected.state
@@ -2621,7 +2677,7 @@ def _record_code_results(selected: Engine, results: list[dict] | None) -> dict |
         return {
             "status": "CODE_FIX_RESULTS_REQUIRED",
             "selected_ids": missing,
-            "message": "Fix only selected items, then call complete_security_run(code_results=[{id,status:fixed|failed,reason,validation}]). Report real failures, not success-shaped fallbacks. Send progress={id,message} while working.",
+            "message": "Fix only selected items, then call complete_security_run(code_results=[{id,status:fixed|failed,reason}]). Leave validation empty. The server runs the production build and records it. Do not run that build or paste its log. Report real failures, not success-shaped fallbacks. Send progress={id,message} while working.",
         }
     return None
 
@@ -2772,6 +2828,7 @@ async def _continue_workflow(
                 "next_tool": "select_security_fixes",
                 "message": "Call select_security_fixes now to display a NEW unchecked source-only human form. Package choices are not source permission.",
             }
+        code_results = await _fill_source_validation(selected, code_results)
         missing = _record_code_results(selected, code_results)
         if missing:
             if missing["status"] == "ERROR":
@@ -2792,6 +2849,7 @@ async def _continue_workflow(
         }:
             return await _offer_software_audit(ctx, selected)
         if audit.get("status") == "FIX_FROM_AUDIT_REPORT":
+            code_results = await _fill_source_validation(selected, code_results)
             missing = _record_code_results(selected, code_results)
             if missing:
                 return missing
@@ -2951,7 +3009,7 @@ class AuditReviewedFile(BaseModel):
     """Bind a host review assessment to a named file and its actual content."""
 
     path: str = Field(min_length=1)
-    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    sha256: str = Field(default="", pattern=r"^$|^[a-f0-9]{64}$")
     assessment: str = Field(min_length=1)
 
 
@@ -3593,9 +3651,12 @@ def _software_audit_result(
                 "choose_software_audit_action with the same repo_root and per-file progress "
                 "receipts, then read only the next_files it returns. Counts describe reviewed files, "
                 "not successful fixes. Inventory paths are in coverage.files. "
-                "Submit progress.files=[{path,sha256,assessment}] for every file and "
-                "progress.completed_phases for all five review phases. Partial scans "
-                "cannot be accepted as complete. Never inflate the finding count. "
+                "Submit progress.files=[{path,assessment}] for every file. "
+                "Do not compute or send sha256; the server hashes the file. "
+                "Submit progress.completed_phases for all five review phases. "
+                "Do not list the inventory or phases in the report; the server appends "
+                "the coverage appendix. Partial scans cannot be accepted as complete. "
+                "Never inflate the finding count. "
                 "After saving the exact output_path, call "
                 "choose_software_audit_action(repo_root=..., report_ready=True). "
                 "Do not end the workflow before that call; it opens unchecked findings "
@@ -4190,6 +4251,7 @@ async def choose_software_audit_action(
         result = await asyncio.to_thread(_audit_fix_from_report, report, None)
         if result["status"] in {"ERROR", "ITEMS_REQUIRED"}:
             return await asyncio.to_thread(_record_audit_result, selected, result)
+        await asyncio.to_thread(append_coverage_appendix, report, coverage)
         await asyncio.to_thread(
             _record_audit_result,
             selected,

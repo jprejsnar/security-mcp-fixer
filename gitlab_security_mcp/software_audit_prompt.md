@@ -144,8 +144,8 @@ additional project-specific generated outputs with
 `choose_software_audit_action(repo_root=..., progress={"message": "Project
 generation preflight", "generated_exclusions": [{"path":
 "backend/custom-client", "evidence": {"path": "backend/build.gradle",
-"sha256": "<current configuration SHA-256>", "assessment": "<generator,
-output declaration, and resolved destination>"}}]})`.
+"assessment": "<generator, output declaration, and resolved destination>"}}]})`.
+Do not send sha256. The server hashes the configuration file.
 Paths are concrete checkout-relative files or directories, not glob patterns.
 These are host-attested exclusions with current configuration evidence, not
 permission to hide uncertain or handwritten code. The server prunes those
@@ -168,9 +168,10 @@ complete while that inventory mismatch remains unresolved.
 
 After each batch of the returned `next_files` paths, call `choose_software_audit_action` with the same
 `repo_root` and `progress={"message": "<stage and files>", "files": [{"path":
-"<inventory-relative path>", "sha256": "<current full-file SHA-256>",
-"assessment": "<what was read and which behavior was traced>"}],
+"<inventory-relative path>", "assessment": "<what was read and which behavior was traced>"}],
 "completed_phases": ["<completed review phase>"]}`.
+Do not compute or send sha256. The server hashes each path.
+Do not list the inventory or phases in the report. The server appends the coverage appendix.
 Phases are `entry_points`, `data_access`, `errors_logs`, `resource_lifetime`,
 and `ui_siblings`. Mark non-applicable phases explicitly in the report and
 complete their phase receipt only after checking applicability. File counts

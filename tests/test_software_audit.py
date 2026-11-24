@@ -941,6 +941,30 @@ def test_failed_progress_delivery_save_can_be_retried(tmp_path, monkeypatch):
     assert engine.state.software_audit["prompt_delivered"] is True
 
 
+def test_audit_receipt_hash_is_computed_by_the_server(tmp_path):
+    """A progress receipt names the file and the assessment. The server hashes it."""
+    # Arrange
+    root = tmp_path / "checkout"
+    root.mkdir()
+    source = root / "app.java"
+    source.write_text("class App {}", encoding="utf-8")
+    coverage = audit_inventory(root)
+
+    # Act
+    updated = record_audit_coverage(
+        root,
+        coverage,
+        [{"path": "app.java", "assessment": "Read the application entry."}],
+        [],
+    )
+
+    # Assert
+    assert (
+        updated["reviews"]["app.java"]["sha256"]
+        == hashlib.sha256(source.read_bytes()).hexdigest()
+    )
+
+
 def test_early_report_ready_delivers_the_prompt_once(tmp_path, monkeypatch):
     """Send the prompt with an early report_ready result, then omit it."""
     # Arrange

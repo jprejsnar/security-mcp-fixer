@@ -417,8 +417,8 @@ def test_failed_source_outcome_and_declined_audit_still_display_final_report(
     assert (task["completed"], task["total"], task["unit"]) == (7, 7, "jobs finished")
 
 
-def test_source_fixed_outcome_requires_actual_validation(tmp_path, monkeypatch):
-    """Reject a success attestation without its validation command and result."""
+def test_source_fixed_outcome_uses_the_server_build(tmp_path, monkeypatch):
+    """A fixed source outcome leaves validation empty and the server records the build."""
     # Arrange
     engine = _ordered_engine(tmp_path, monkeypatch, job=5)
     engine.record_fix_selection(
@@ -435,9 +435,10 @@ def test_source_fixed_outcome_requires_actual_validation(tmp_path, monkeypatch):
         )
     )
     # Assert
-    assert result.is_error
-    assert "validation" in result.structured_content["reason"]
-    assert engine.state.workflow["current"] == 5
+    stored = engine.state.workflow["code_results"]["gitlab:source"]
+    assert stored["validation"].startswith("Server production build")
+    assert "unit tests were not run" in stored["validation"]
+    assert result.structured_content["status"] != "ERROR"
 
 
 @pytest.mark.parametrize("interruption", [1, 2])
