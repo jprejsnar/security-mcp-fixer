@@ -25,6 +25,7 @@ This is the startup guardrail. Change it only in `ai/guardrails.md`, then run `p
 - Read GitLab findings and dismiss false positives with the current GraphQL vulnerability API. Do not call the deprecated vulnerability REST API or a removed dismissal mutation.
 - After a code change, fix, or enhancement, update `README.md` in the same change so its current-operation text, diagrams, and artifact tables match the code. Leave dated historical release notes as history.
 - Do not spend host AI tokens on work this server or a command can do. The server hashes reviewed files, returns cited source so the host does not open that file again, reuses a stored package qualification instead of a pasted review, runs the production build for a reported source fix, and appends the audit coverage appendix. Do not ask the host to recompute those hashes, re-read those pages, paste command logs, or restate the inventory.
+- Run the suite once, after the change is finished, at the end. Do not run it after each edit.
 
 ## Do not reintroduce
 

@@ -1512,8 +1512,8 @@ def test_host_receives_full_source_and_must_record_review(tmp_path, monkeypatch)
     assert "content" not in cited
     assert cited["cited_text"] in source.read_text(encoding="utf-8")
     assert cited["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
-    assert "open the file and line GitLab already reported" in pending["reason"]
-    assert "read the cited file in the checkout" in pending["reason"]
+    assert "already in cited_source" in pending["reason"]
+    assert "Do not open that file again" in pending["reason"]
     assert recorded["decision"] == "FALSE_POSITIVE"
     engine.gitlab.dismiss_false_positive.assert_not_called()
 

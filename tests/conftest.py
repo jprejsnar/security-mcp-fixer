@@ -43,12 +43,10 @@ def corporate_dns(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def nvd_clock(monkeypatch, request):
-    """Virtualize offline NVD timing without bypassing opt-in live API limits."""
+def nvd_clock(monkeypatch):
+    """Virtualize offline NVD timing so advisory tests do not sleep."""
     from gitlab_security_mcp import advisory
 
-    if request.node.path.name == "test_patient_web_live.py":
-        return None
     now = [0.0]
     waits = []
 
@@ -62,16 +60,6 @@ def nvd_clock(monkeypatch, request):
     monkeypatch.setattr(advisory, "_nvd_last_request", None)
     monkeypatch.setattr(advisory, "_nvd_retry_until", 0.0)
     return now, waits
-
-
-def pytest_addoption(parser):
-    """Keep private GitLab integration requests explicitly opt-in."""
-    parser.addoption(
-        "--patient-web-live",
-        action="store_true",
-        default=False,
-        help="Retrieve patient-web findings and validate solutions against live advisories.",
-    )
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

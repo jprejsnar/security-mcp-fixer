@@ -2454,7 +2454,7 @@ ls dist/*.whl
 ```
 
 Stop if a check fails; building the wheel does not itself run these checks.
-Live GitLab tests remain opt-in. The current version produces
+The current version produces
 `dist/gitlab_security_mcp-1.0.54-py3-none-any.whl`; use the newly built filename if
 the project version changes. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
@@ -3801,35 +3801,6 @@ command timeouts, qualification bounds, cited-line edits, manifest changes, and
 report outcomes. Fatal resource and thread warnings expose regressions; they do
 not prove the absence of every possible leak/race on arbitrary workloads or
 certify free-threaded Python.
-
-### Patient-web live integration checks
-
-Live tests are skipped unless `--patient-web-live` is supplied. Set `GITLAB_TOKEN`
-or `GITLAB_PERSONAL_ACCESS_TOKEN` securely in the test process environment with
-`read_api` and report access. The project path is fixed to
-`clario-clinical/NxT/ecoa-swift/patient-web/patient-web`; this is a specific
-integration fixture, not a restriction on the server's configurable project.
-
-Retrieval only:
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_patient_web_live.py::test_retrieve_patient_web_security_findings --patient-web-live -v -s
-```
-
-Retrieval plus local-checkout/advisory verification:
-
-```powershell
-$env:PATIENT_WEB_REPO_ROOT = 'C:\path\to\patient-web'
-.\.venv\Scripts\python.exe -m pytest tests/test_patient_web_live.py --patient-web-live -v -s
-```
-
-The retrieval test requires a nonempty, untruncated active report; revise that
-expectation intentionally once the project is clean. The verification test
-prints decisions and fails on manual-review/no-safe-fix outcomes or proposed
-targets that advisories cannot confirm are unaffected. Evidence-backed false
-positives need no edit. These tests do not apply fixes, execute Git/package
-commands, or write MCP state/reports into patient-web. They require real access
-and network connectivity; offline unit results do not substitute for them.
 
 ### MCP inspection
 

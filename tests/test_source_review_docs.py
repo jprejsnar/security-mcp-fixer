@@ -85,7 +85,8 @@ def test_source_review_tool_advertises_decisions_and_required_file_assessments()
         "reachability_analysis",
         "reviewed_files",
     }
-    assert set(reviewed_file["required"]) == {"path", "sha256", "assessment"}
+    assert set(reviewed_file["required"]) == {"path", "assessment"}
+    assert reviewed_file["properties"]["sha256"]["default"] == ""
     assert review["properties"]["reviewed_files"]["minItems"] == 1
     assert review["properties"]["reviewed_files"]["maxItems"] == 100
 

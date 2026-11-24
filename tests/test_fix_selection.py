@@ -1292,7 +1292,8 @@ def test_native_packages_require_real_reviews_before_opening_selection(
     # Assert
     assert result["status"] == "PACKAGE_REVIEW_REQUIRED"
     assert {item["finding_id"] for item in result["required_reviews"]} == {"one", "two"}
-    assert "license" in result["message"]
+    assert "qualify_package_update once" in result["message"]
+    assert "Do not invent evidence" in result["message"]
     opened.assert_not_called()
     assert not engine.state.fix_selection
     assert not engine.state.changes
