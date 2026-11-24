@@ -267,7 +267,9 @@ package may still need code changes and must remain unresolved independently.
 Blocked packages are disabled in the form, not selectable promises of an update.
 Do not open an approval form during finding verification. Only the human may
 select or submit. Do not infer approval, poll AWAITING_HUMAN, or commit, push,
-or open a merge request. Only the human form may dismiss a finding. Unknown
+or open a merge request. When a response names a single waiting call as
+next_tool (for example after the false-positive window opens), make that one
+call and wait for it; it is not polling. Only the human form may dismiss a finding. Unknown
 reachability is not a false positive, and a missing CVE does not prove safety.
 Do not invent a version, a corporate approval, or a source patch. Do not weaken
 code or tests to make an update pass. Missing advisory data does not block a
@@ -587,6 +589,25 @@ _AUDIT_FINISHED_MESSAGE = (
     "Software audit finished; see the final report for unresolved findings."
 )
 _AUDIT_FIX_OUTCOMES_RECORDED = "All selected audit fix outcomes are recorded; unresolved findings remain in the final report."
+_AUDIT_PROMPT_UNDELIVERED_LABEL = "Software audit: send a chat message to start"
+# The server cannot start an AI turn, so the AI must hold one waiting request open
+# while the human answers this window and the windows that follow it.
+_FALSE_POSITIVE_WINDOW_OPEN = (
+    "The Windows checkbox approval window is open and has no selection timeout. Only "
+    "checked human submissions can dismiss findings. Now call "
+    'choose_software_audit_action(repo_root="{repo_root}") once, with no other '
+    "arguments, and wait for it. That call stays open with heartbeats while the human "
+    "answers this window and any window that follows, such as source-fix selection and "
+    "software-audit consent. It then returns the next job's work, including the audit "
+    "prompt when the human accepts the audit. Do not call other tools, poll, or end "
+    "your turn before it returns."
+)
+_AUDIT_PROMPT_UNDELIVERED = (
+    "The software audit is approved, but the AI has not received its instructions: "
+    "its chat turn ended before the approval, and the MCP server cannot start a new "
+    "AI turn. In the AI chat for this repository, send: continue the gitlab-security "
+    "run. The AI then calls complete_security_run and receives the audit prompt."
+)
 _AUDIT_FORMAT_REQUIRED = (
     "The report does not follow the prompt's required output format; see format_issues. "
     "Rewrite the same report at output_path into sections 1-9 with the exact titles from "
@@ -672,6 +693,16 @@ def _publish_audit_activity(selected: Engine) -> bool:
             if status == "FIX_FROM_AUDIT_REPORT"
             else "Software audit: reviewing"
         )
+        if (
+            _prompt_pending(audit)
+            and age is not None
+            and age >= _BACKGROUND_HEARTBEAT_SECONDS
+        ):
+            # MCP cannot start a host turn; approval in a server-owned window can
+            # finish after the AI's turn ended, so only the developer can resume it.
+            message = _AUDIT_PROMPT_UNDELIVERED
+            activity_status = "WAITING_FOR_HUMAN"
+            label = _AUDIT_PROMPT_UNDELIVERED_LABEL
         if status == "FIX_FROM_AUDIT_REPORT":
             reviewed = total = None
     else:
@@ -2404,11 +2435,9 @@ async def submit_false_positive_approvals(
                 receipt,
                 {
                     "status": "AWAITING_HUMAN",
-                    "message": (
-                        "The Windows checkbox approval window is open. This MCP call is complete; "
-                        "the window has no selection timeout. Only checked human submissions can "
-                        "dismiss findings. Saved reports update after submission or cancellation. "
-                        "Do not repeat completion or poll while the human is reviewing."
+                    "next_tool": "choose_software_audit_action",
+                    "message": _FALSE_POSITIVE_WINDOW_OPEN.format(
+                        repo_root=str(selected.repo_root)
                     ),
                 },
             )
@@ -3033,7 +3062,7 @@ async def _complete_legacy(
             note += f"\n{review[key]}"
     audit = None
     if review["status"] == "AWAITING_HUMAN":
-        note += "\nThe software-audit choice is offered automatically after this window closes."
+        note += "\nThe software-audit choice is offered automatically after this window closes; the waiting choose_software_audit_action call returns its result."
     elif not report.is_error:
         audit = await _offer_software_audit(ctx, selected)
         note += f"\nSoftware audit: {audit['status']}."

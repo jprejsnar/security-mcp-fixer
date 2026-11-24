@@ -9,6 +9,13 @@ const { activeStates, parseSnapshot, taskText } = require("./progress-model");
 const MIRROR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 const WINDOWS_UNC_DEVICE_PREFIX = "\\\\?\\UNC\\";
 const WINDOWS_DEVICE_PREFIX = "\\\\?\\";
+const EXTENSION_VERSION = require("./package.json").version;
+const UNKNOWN_VERSION = "unknown";
+
+function versionText(serverVersion) {
+  const server = typeof serverVersion === "string" && serverVersion ? serverVersion : UNKNOWN_VERSION;
+  return `MCP server v${server} | Progress extension v${EXTENSION_VERSION}`;
+}
 
 function mirrorDirectory() {
   return process.env.GITLAB_SECURITY_PROGRESS_DIR ||
@@ -128,8 +135,10 @@ progress::-webkit-progress-bar { background: var(--vscode-input-background); bor
 progress::-webkit-progress-value { background: var(--vscode-progressBar-background); border-radius: 4px; }
 .activity { padding: 12px; border-left: 4px solid var(--vscode-progressBar-background); background: var(--vscode-textBlockQuote-background); overflow-wrap: anywhere; }
 li { margin-bottom: 12px; }
+.version { margin-top: -12px; color: var(--vscode-descriptionForeground); }
 </style></head><body><main>
 <h1>GitLab Security Progress</h1>
+<p class="version">${escapeHtml(versionText(current?.serverVersion))}</p>
 <h2>${escapeHtml(current?.label || "No task receipts found")}</h2>
 <p role="status">${escapeHtml(state || "Start a GitLab Security run in this workspace.")}</p>
 <progress aria-label="${escapeHtml(current?.unit || "Task progress")}" ${progress}></progress>
@@ -179,6 +188,7 @@ function createPresenter(vscode) {
     const tasks = snapshots.flatMap(snapshot => snapshot.tasks.map(task => ({
       ...task,
       workspace: snapshot.repo_root || "",
+      serverVersion: snapshot.server_version,
       label: `${(snapshot.repo_root || "").split(/[\\/]/).pop() || "Repository"} / ${task.label}`
     })));
     const active = tasks.filter(task => activeStates.has(task.status));
@@ -211,7 +221,7 @@ function createPresenter(vscode) {
     const label = current.id === "software-audit" ? current.label :
       workflow && jobNumber != null ? `Job ${jobNumber}/7` : current.label;
     bar.text = active.length ? `${stale || current.status !== "RUNNING" ? "$(clock)" : "$(sync~spin)"} Security: ${label}${meter}${counts} | ${state}` : `$(list-unordered) Security: ${current.status}`;
-    bar.tooltip = tasks.map(task => taskText(task)).join("\n");
+    bar.tooltip = [versionText(current.serverVersion), ...tasks.map(task => taskText(task))].join("\n");
     bar.show();
     view = { current, workflow: tasks.find(task => task.id === "workflow"), state, stale };
     if (panel) panel.webview.html = progressHtml(view);

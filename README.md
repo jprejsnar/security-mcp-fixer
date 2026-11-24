@@ -15,7 +15,7 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.59** (progress extension 1.0.51). In either VS Code/Copilot or Cursor Agent chat, use:
+**Current release: 1.0.59** (progress extension 1.0.52). In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -1320,6 +1320,18 @@ requests, host context/credit limits, and native safety caps cannot be bypassed.
 The legacy VS Code Local hook response is available with `--host vscode-local`;
 configure it in that harness's supported hook locations rather than assuming
 that Copilot user-hook discovery applies to Local.
+
+Approval windows run in the background. When the false-positive window opens,
+the response names `choose_software_audit_action(repo_root=...)` as the single
+`next_tool`: the AI makes that one call and waits. It stays open with heartbeats
+while you answer that window and any that follow (source-fix selection, audit
+consent), then returns the next job's work, including the audit prompt, so no
+chat message is needed. If the AI ends its turn anyway, the server prepares the
+prompt but cannot deliver it: MCP has no way to start an AI turn, and no hook
+event fires without one. If the prompt is still undelivered after one heartbeat, the
+progress view shows **Software audit: send a chat message to start** and asks
+you to send `continue the gitlab-security run` in that repository's AI chat.
+The AI's next `complete_security_run` receives the full prompt and inventory.
 It must then call `choose_software_audit_action(repo_root=..., report_ready=True)`.
 `AUDIT_INCOMPLETE` means continue the review, not show fix checkboxes. File hashes
 are rechecked; changed files need fresh receipts. These are host-attested review
@@ -3297,8 +3309,11 @@ than relying only on a short natural-language success message.
 
 For progress **inside** Cursor or VS Code on Windows, macOS, or Linux, reloading
 this MCP server installs the progress extension into that editor. A manual
-`gitlab-security-progress-1.0.51.vsix` install is only needed when the server
-is not launched by the editor. The extension reads the checkout progress file
+`gitlab-security-progress-1.0.52.vsix` install is only needed when the server
+is not launched by the editor. The progress panel header and the status-bar
+tooltip show the MCP server version that wrote the progress file and the
+progress extension's own version (`unknown` for a server that does not report
+one). The extension reads the checkout progress file
 and the per-user mirror in `~/.cache/gitlab-security-mcp/progress/`
 (mirrors older than 12 hours are ignored, and a file without a finite
 ISO 8601 `updated_at` is rejected). A window with open folders shows
@@ -3614,7 +3629,7 @@ All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
 | `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full output for every allowed non-Git command, including Gradle `assemble` and runtime-version checks. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files and deletes checkout log copies. |
-| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status, and every confirmed software-audit finding not selected for an AI fix (severity, location, problem, audit-report link). Archived and retained in the checkout. |
+| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status, and every confirmed software-audit finding not selected for an AI fix (severity, location, problem, audit-report link). A blocked package shows `None eligible (blocked; advisory floor <version>)` as its target, never the rejected version. Archived and retained in the checkout. |
 | `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | One ZIP per finished run containing every checkout `.log`/`.jsonl`, generated reports/state/progress/lint/helper files, any optional software-audit report, and redacted `server.log`. User policies and unknown files are excluded. Retries merge into the same ZIP, preserving earlier members. Stable checkout log copies are deleted only after archival succeeds; non-log copies remain. A log that changes while the ZIP is written aborts archival and keeps every checkout log; a `progress.json` or `run-state.json` rewrite by finishing background work does not, because those copies stay in the checkout. The temp spool stays until process exit. Tests use disposable destinations. The checkout token separates repositories with the same project name. |
 | Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr, and the same redacted text in a process temp spool. Job 7 copies the spool into the run zip as `server.log`. The spool is not a home file and is removed when the process exits. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |

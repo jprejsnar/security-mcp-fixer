@@ -3,7 +3,7 @@
   "displayName": "GitLab Security Progress",
   "description": "Visible local MCP task status and audit coverage in VS Code and Cursor.",
   "publisher": "local-security-tools",
-  "version": "1.0.51",
+  "version": "1.0.52",
   "private": true,
   "license": "UNLICENSED",
   "engines": { "vscode": "^1.85.0" },

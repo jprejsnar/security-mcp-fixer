@@ -18,6 +18,8 @@ _NO_OTHER_UNRESOLVED_ROW = (
     "| None reported | No other unresolved or unattempted code findings |"
 )
 _AUDIT_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_BLOCKED_TARGET = "None eligible (blocked)"
+_BLOCKED_TARGET_WITH_FLOOR = "None eligible (blocked; advisory floor {})"
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 _PATH_LINE = re.compile(r"(?P<path>[^:\s][^:]*?):(?P<line>\d+)(?:-\d+)?")
 _AUDIT_NOT_SELECTED = "Not selected for an AI fix; still needs a fix."
@@ -356,15 +358,22 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
         package_ids.add(item["id"])
         version_review = finding.get("packageVersionSelection") or {}
         reason = reviews.get(item["id"], {}).get("blocked_reason")
+        blocked = bool(reason) or version_review.get("status") == "BLOCKED"
         if not reason and version_review.get("status") == "BLOCKED":
             reason = (version_review.get("review") or {}).get("assessment")
+        target = plan.get("target")
+        if blocked:
+            # The plan keeps the advisory floor; a blocked review rejected it as a target.
+            target = (
+                _BLOCKED_TARGET_WITH_FLOOR.format(target) if target else _BLOCKED_TARGET
+            )
         cells = (
             f"{item['id']}: {plan.get('package') or finding.get('component') or finding.get('title')}",
             plan.get("installed")
             or finding.get("installedVersion")
             or item["installed_version"]
             or "Not established",
-            plan.get("target") or "No verified eligible target",
+            target or "No verified eligible target",
             reason or item["reason"],
         )
         lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")

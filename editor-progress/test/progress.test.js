@@ -116,6 +116,19 @@ test("ignored progress files are discovered even without search or watcher event
   for (const subscription of context.subscriptions) subscription.dispose();
 });
 
+test("the panel and tooltip show the MCP server and extension versions", () => {
+  const ui = harness();
+  const extensionVersion = require("../package.json").version;
+  ui.presenter.update([{ ...snapshot(), server_version: "1.0.59" }]);
+  ui.presenter.show();
+  const expected = `MCP server v1.0.59 | Progress extension v${extensionVersion}`;
+  assert.equal(ui.bars[0].tooltip.split("\n")[0], expected);
+  assert.ok(ui.panels[0].webview.html.includes(expected));
+  ui.presenter.update([snapshot({ completed: 3 })]);
+  assert.match(ui.bars[0].tooltip, /^MCP server vunknown/);
+  ui.presenter.dispose();
+});
+
 test("the seven-job bar stays visible while command and worker receipts change", () => {
   const ui = harness();
   const workflow = {

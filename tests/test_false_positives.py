@@ -165,6 +165,13 @@ def test_desktop_approval_returns_before_human_response_and_refreshes_report(
             result.structured_content["false_positive_review"]["status"]
             == "AWAITING_HUMAN"
         )
+        review = result.structured_content["false_positive_review"]
+        assert review["next_tool"] == "choose_software_audit_action"
+        assert (
+            f'choose_software_audit_action(repo_root="{tmp_path}")'
+            in (review["message"])
+        )
+        assert "Do not call other tools, poll, or end your turn" in review["message"]
         engine.gitlab.dismiss_false_positive.assert_not_called()
         duplicate = await server.submit_false_positive_approvals(ctx, str(tmp_path))
         assert duplicate["status"] == "AWAITING_HUMAN"

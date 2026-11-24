@@ -148,6 +148,35 @@ def test_native_audit_consent_survives_cancelled_host_wait_and_keeps_editor_aliv
     assert engine.state.software_audit["status"] == "GENERATE_AUDIT_REPORT"
 
 
+def test_undelivered_audit_prompt_tells_the_developer_how_to_resume(tmp_path):
+    """An approval that finished after the AI's turn ended asks for a chat message."""
+    # Arrange
+    engine = _engine(tmp_path / "checkout")
+    workflow.start(engine)
+    stale = datetime(2026, 11, 24, 21, 16, 35, tzinfo=UTC).isoformat()
+    engine.state.software_audit = {
+        "status": "GENERATE_AUDIT_REPORT",
+        "audit_prompt": "prompt",
+        "coverage": {"files": ["app.java"], "reviews": {}},
+        "requested_at": stale,
+    }
+
+    # Act
+    active = server._publish_audit_activity(engine)
+
+    # Assert
+    progress = json.loads(
+        (engine.repo_root / ".security-mcp" / "progress.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    task = next(item for item in progress["tasks"] if item["id"] == "software-audit")
+    assert active is True
+    assert task["status"] == "WAITING_FOR_HUMAN"
+    assert "continue the gitlab-security run" in task["message"]
+    assert "complete_security_run" in task["message"]
+
+
 def test_interrupted_host_audit_consent_records_no_scan_instead_of_running(
     tmp_path, monkeypatch
 ):

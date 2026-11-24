@@ -3900,6 +3900,38 @@ def test_unresolved_report_links_audit_locations_to_checkout_files(tmp_path):
     assert "| F3 | Low | src/Missing.java:1 |" in markdown
 
 
+def test_blocked_package_never_shows_its_rejected_floor_as_the_target(tmp_path):
+    """A release review that blocks the only release must not present it as proposed."""
+    # Arrange
+    from gitlab_security_mcp.report import write_unresolved_report
+    from gitlab_security_mcp.state import RunState
+
+    finding = {
+        "id": "pkg",
+        "category": "dependency_scanning",
+        "component": "parse5",
+        "installedVersion": "7.3.0",
+        "proposedFix": {"ecosystem": "npm", "package": "parse5", "target": "8.1.1"},
+        "packageVersionSelection": {
+            "status": "BLOCKED",
+            "target": None,
+            "review": {"assessment": "8.1.1 is ESM-only; jsdom requires parse5 7."},
+        },
+    }
+    state = RunState(
+        findings=[finding], decisions={"pkg": {"decision": "CHANGE_REQUIRED"}}
+    )
+
+    # Act
+    markdown = write_unresolved_report(tmp_path, state)["final_summary_markdown"]
+
+    # Assert
+    row = next(line for line in markdown.splitlines() if line.startswith("| pkg:"))
+    assert "| None eligible (blocked; advisory floor 8.1.1) |" in row
+    assert "| 8.1.1 |" not in row
+    assert "ESM-only" in row
+
+
 def test_final_summary_exposes_baseline_and_optional_validation_gaps():
     """Passing builds/tests do not hide failed lint or unavailable security audits."""
     # Arrange
