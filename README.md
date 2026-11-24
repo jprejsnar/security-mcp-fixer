@@ -67,6 +67,10 @@ folders, or a directory inside one of them. A window with no open folder still
 shows the newest mirror for each checkout. Another VS Code or Cursor window can
 run a different repository at the same time.
 
+Release 1.0.57 fixes a missing log ZIP: a `progress.json` or `run-state.json`
+rewrite by background work finishing during job 7 no longer aborts archival.
+Only the checkout logs that archival removes must stay unchanged.
+
 Release 1.0.56 fixes issues found in two more real runs:
 - Container OS packages (for example Ubuntu `libkrb5-3`) skip GitHub and the
   paced NVD API, and an upstream version range never marks a backported
