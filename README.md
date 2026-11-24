@@ -697,9 +697,12 @@ What each job still does:
   larger than 8 MiB is rejected. Read requests retry transport failures and HTTP
   429, 500, 502, 503, and 504 up to four times, waiting 1, 2, then 4 seconds.
   A `Retry-After` longer than 4 seconds fails on that first response. Dismissal
-  writes are not retried. A successful list advances to job 3. `ERROR` or a
-  status ending in `_FAILED` blocks the run the same way as job 1. Verification
-  starts in job 3, not in this job.
+  writes are not retried. A successful list advances to job 3. The tool
+  result is an index of id, title, severity, category, package, and location.
+  Descriptions, solutions, and scanner bodies stay on the server.
+  `verify_security_finding` loads one full record. `ERROR` or a status ending
+  in `_FAILED` blocks the run the same way as job 1. Verification starts in
+  job 3, not in this job.
 - **Job 3.** Package findings are assessed here. `verify_security_finding` may
   overlap for up to eight findings. Each one uses local manifests, lockfiles,
   Gradle or Maven trees, then OSV, GitHub, and NVD, plus named CVE and CWE
@@ -3569,9 +3572,9 @@ not package-advisory findings. `verify_security_finding` returns
 `SOURCE_REVIEW_REQUIRED` with `source_workflow`; the MCP tool additionally returns
 the cited path, full-byte SHA256, line, and a short window in
 `ai_source_review.cited_source`, with `status: "HOST_REVIEW_REQUIRED"`.
-The file body is not returned.
-The calling host AI opens the file and line GitLab already reported, reads that
-code in the checkout, and traces configuration, callers, and inputs. The
+The file body is not returned. The host uses that cited window and does not
+open the cited file again. It opens a caller only when the result does not
+include that caller, and traces configuration and inputs. The
 false-positive `reason` is what a non-developer reads: at most 2 sentences and
 400 characters, with no path or line number. The trace stays in the other
 `source_review` fields. Neither a test filename, missing source, nor missing
@@ -3847,11 +3850,11 @@ for deployment and restart differences.
 | `Ctrl+Shift+P` does not open MCP settings | It opens the Command Palette only. In VS Code use **Chat: Open Customizations > MCP Servers** or **MCP: List Servers** when available; in Cursor use Customize/MCP settings. Verify the IDE features and organization policy. |
 | `APPROVAL_UNAVAILABLE` | The host did not advertise form support or could not open the form. No new findings are dismissed by that call. Use a form-capable host or the GitLab UI; do not generate AI approval values or repeatedly reopen a declined form. |
 | No eligible false-positive assessments | Inspect `SOURCE_REVIEW_REQUIRED`, `ASSESSMENT_REQUIRED` or `ALREADY_DISMISSED` and the excluded-finding blockers. The host AI must finish source review and submit valid current evidence first; a scanner flag alone is insufficient. Do not relist or rescan merely to open approvals. |
-| `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI opens the file and line GitLab already reported, reads that code in the checkout, and submits `source_review`. The visible reason is at most 2 everyday sentences and 400 characters. This is not a request for the user to analyze code. The file body is not returned. Deprecated sampling is intentionally disabled. |
+| `HOST_REVIEW_REQUIRED` | The calling Copilot/Cursor AI uses the cited window already in the result and submits `source_review`. It does not open that file again. It opens a caller only when the result does not include it. The visible reason is at most 2 everyday sentences and 400 characters. This is not a request for the user to analyze code. The file body is not returned. Deprecated sampling is intentionally disabled. |
 | Assessment says false positive but GitLab is unchanged | Compare local `review_status` with `false_positive_approval`, `gitlab_dismissal_counts` and saved `gitlab_dismissals` verification. Only an independent read of persisted `DISMISSED` / `FALSE_POSITIVE` establishes confirmation; mutation acknowledgements alone remain unverified. Check the Vulnerability report's Dismissed/False positive filters and tracked ref, not historical scanner artifacts. Inspect unknown outcomes; never automatically retry writes. |
 | NVD returns 429/503 or times out | Review recorded errors and pacing/retry progress. Bounded retries honor shared cooldowns and `Retry-After`; long cooldowns fail explicitly. Do not bypass rate limits or treat an outage as proof of safety. |
 | Approval window opens on an unexpected monitor | Search server stderr, or `server.log` inside the run zip, for `Approval window pid=... reported diagnostics`. It names why the MCP host window could not be identified; the dialog then uses the active monitor. |
 | `Desktop task failed` or `Approval window pid=... returned unreadable output` | The background approval owner or native dialog failed. The saved form/selection status records the failure and nothing was authorized. Use the logged traceback, process ID and exit code, then reopen the form. |
 | Windows command containment cannot be established | The command fails explicitly before its suspended child resumes; owned resources are cleaned up. Inspect the error and host/job/security-policy restrictions with your administrator rather than disabling containment or launching an uncontained fallback. |
 | Cursor says a background task finished but chat could not resume | Inspect Cursor's Agent Host log, not just command logs. `AgentLoopError` / `Agent Looping Detected` means the model repeated its response. Switch models or start a new conversation and request status/report only; do not rerun pulls or clean/install blindly. Reports identify each finding by ID/location and should be displayed once without repeated rows. This MCP cannot repair Cursor's internal chat state. |
-| `SOURCE_REVIEW_REQUIRED` | Open the file and line in `source_workflow`, read that code, and supply the hash-bound review or reproduce, fix, and validate the source defect. The visible false-positive reason is at most 2 everyday sentences. Missing advisories are not a SAST disposition. |
+| `SOURCE_REVIEW_REQUIRED` | Call `verify_security_finding`. Use the cited window in that result and do not open the cited file again. Open a caller only when the result does not include it. Supply the review, or reproduce, fix, and validate the source defect. The visible false-positive reason is at most 2 everyday sentences. Missing advisories are not a SAST disposition. |

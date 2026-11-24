@@ -151,8 +151,9 @@ A request to run gitlab-security on this repo uses seven sequential jobs:
    unchecked dismissal boxes with the evidence-backed reasons uploaded to GitLab.
 5. GitLab source fixes: a NEW unchecked select_security_fixes form shows only
    source/config findings. Fix only selected IDs, then complete_security_run with
-   code_results=[{id,status:fixed|failed,reason,validation}]. Failed attempts need
-   the real blocker; fixed outcomes need actual validation evidence.
+   code_results=[{id,status:fixed|failed,reason}]. Leave validation empty. The
+   server runs the production build and records it. Do not run that build or
+   paste its log. Failed attempts need the real blocker.
 6. Ask the human YES/NO before a deep-dive software audit. No means skip the
    audit, not the final report. Yes generates the complete coverage-checked report,
    THEN opens unchecked audit-fix boxes. Complete selected audit fixes with the
@@ -165,8 +166,9 @@ A precheck, branch,
 or execution blocker stops edits, not reporting. A package with no safe release
 stays unresolved; continue other findings, save reports, and offer the audit.
 Each tool description is the procedure for that step.
-Use verify_security_finding for every finding. Open the file and line GitLab
-   already reported and read that code. A false-positive reason is at most
+Use verify_security_finding for every finding. The cited file is in that
+   result. Do not open it again. Open a caller only when the result does not
+   include it. A false-positive reason is at most
    2 everyday sentences about why the warning does not apply.
 For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    select_package_version to read the public stable-release catalog, then again
@@ -176,11 +178,11 @@ For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    merely to minimize the version bump. Flag all paid releases for user
    investigation; never automatically upgrade to paid terms. Unverified licensing
    is allowed only with an explicit warning; configured corporate policy may be stricter.
-   Then select_security_fixes before any remediation edit. For Windows package
-   checkboxes, first collect the exact-target documentation/API/framework/license
-   evidence described by qualify_package_update. Supply package_reviews keyed by
-   finding ID. PACKAGE_REVIEW_REQUIRED means finish that read-only AI review and
-   repeat selection with the evidence; do not invent evidence or approval.
+   Then select_security_fixes before any remediation edit. Call
+   qualify_package_update once for each selected finding. Do not paste that
+   review into package_reviews and do not re-read the pages it returns. Call
+   select_security_fixes again with repo_root only; the server reuses the stored
+   qualification. Do not invent evidence or approval.
    Release review schema: target:<exact reviewed eligible version or null if none>,
    supported:true,runtime_compatible:true,sources:[official
    HTTPS URLs],assessment,excluded_releases:[{version,reason:unsupported|
@@ -196,7 +198,8 @@ For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    {scan_id:proposed_fix.caller_scan.scan_id,compatible_without_code_changes:true,
    caller_breakages_found:false,migration_sources:[official HTTPS URLs],
    api_comparison,caller_assessment,dependency_assessment,
-   reviewed_files:[{path,sha256,assessment}]}.
+   reviewed_files:[{path,assessment}]}. Do not send sha256; the server hashes
+   each path.
 Call qualify_package_update for each selected package update, apply_minimal_fix
 for each selected eligible fix with no build between package edits, and
 run_validation_matrix once for that package batch. generate_aaa_test applies
@@ -1199,6 +1202,40 @@ def _engine_for(repo_root: str | None) -> Engine:
         return created
 
 
+_FINDING_INDEX_NOTE = (
+    "Read-only index of active findings. Descriptions, solutions, and scanner "
+    "bodies stay on the server. Call verify_security_finding with one id to "
+    "load that record."
+)
+_FINDING_INDEX_LOCATION_KEYS = ("file", "startLine", "endLine", "image")
+
+
+def _index_listed_findings(result: dict[str, Any]) -> dict[str, Any]:
+    """Return ids and locations. The engine keeps the full finding records."""
+    rows = []
+    for finding in result.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        location = finding.get("location") or {}
+        rows.append(
+            {
+                "id": finding.get("id"),
+                "title": finding.get("title"),
+                "severity": finding.get("severity"),
+                "category": finding.get("category"),
+                "component": finding.get("component"),
+                "installedVersion": finding.get("installedVersion"),
+                "location": {
+                    key: location.get(key)
+                    for key in _FINDING_INDEX_LOCATION_KEYS
+                    if isinstance(location, dict)
+                    and location.get(key) not in (None, "")
+                },
+            }
+        )
+    return {**result, "findings": rows, "note": _FINDING_INDEX_NOTE}
+
+
 def _run(
     tool_name: str, *args, repo_root: str | None = None, **kwargs
 ) -> dict[str, Any]:
@@ -1258,6 +1295,7 @@ def _run(
                 workflow.advance(selected)
             elif tool_name == "list_security_findings" and result["status"] == "OK":
                 workflow.advance(selected)
+                result = _index_listed_findings(result)
             elif tool_name in {
                 "pull_main_twice",
                 "create_security_branch",
@@ -2809,7 +2847,7 @@ async def _continue_workflow(
                 "status": "FINDING_REVIEW_REQUIRED",
                 "finding_ids": missing,
                 "next_tool": "verify_security_finding",
-                "message": "Read the GitLab-cited code and callers; submit evidence, then complete_security_run. Unknown reachability is not a false positive.",
+                "message": "Call verify_security_finding for each id. The cited file is in that result. Do not open it again. Open a caller only when the result does not include it. Unknown reachability is not a false positive.",
             }
         if not state.false_positive_approval_form:
             review = await submit_false_positive_approvals(ctx, str(selected.repo_root))

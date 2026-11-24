@@ -175,8 +175,9 @@ def pending_source_reviews(findings: list[dict], decisions: dict[str, dict]) -> 
         "files": list(files.values()),
         "next_tool": "verify_security_finding" if count else None,
         "action": (
-            "Open the file and line GitLab already reported, read that code, and "
-            "call verify_security_finding for every listed ID. source_review.reason "
+            "Call verify_security_finding for every listed ID. The cited file is "
+            "in that result. Do not open it again. Open a caller only when the "
+            "result does not include it. source_review.reason "
             "is the text a non-developer sees: at most 2 sentences and 400 "
             "characters, saying what was flagged and what the review established. "
             "Put the trace in input_origin, finding_analysis, "

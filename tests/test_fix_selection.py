@@ -40,6 +40,58 @@ def _ordered_engine(tmp_path, monkeypatch, job=3):
     return engine
 
 
+def test_download_tool_returns_an_index_and_keeps_the_full_record(
+    tmp_path, monkeypatch
+):
+    """Send the host ids and locations. Scanner bodies stay off that result."""
+    # Arrange
+    engine = _ordered_engine(tmp_path, monkeypatch, job=2)
+    stored = {
+        "id": "f1",
+        "title": "lodash advisory",
+        "severity": "high",
+        "category": "dependency_scanning",
+        "component": "lodash",
+        "installedVersion": "4.17.20",
+        "location": {"file": "package-lock.json", "startLine": 10},
+        "description": "x" * 200,
+        "solution": "upgrade",
+        "scannerEvidence": {"request": {"body": "secret-body"}},
+    }
+    engine.state.findings = [stored]
+    monkeypatch.setattr(
+        engine,
+        "list_security_findings",
+        lambda *args, **kwargs: {
+            "status": "OK",
+            "count": 1,
+            "truncated": False,
+            "findings": [stored],
+            "note": "full",
+        },
+    )
+
+    # Act
+    result = server.list_security_findings(repo_root=str(tmp_path))
+
+    # Assert
+    assert result["findings"] == [
+        {
+            "id": "f1",
+            "title": "lodash advisory",
+            "severity": "high",
+            "category": "dependency_scanning",
+            "component": "lodash",
+            "installedVersion": "4.17.20",
+            "location": {"file": "package-lock.json", "startLine": 10},
+        }
+    ]
+    assert result["note"] == server._FINDING_INDEX_NOTE
+    assert engine.state.findings[0]["scannerEvidence"]["request"]["body"] == (
+        "secret-body"
+    )
+
+
 def test_ordered_jobs_reject_early_dismissal_source_and_audit(tmp_path, monkeypatch):
     """Prevent remote approval and audit work before the package job completes."""
     # Arrange
