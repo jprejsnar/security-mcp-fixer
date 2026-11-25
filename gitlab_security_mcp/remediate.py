@@ -309,7 +309,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
             manager=hit.manager,
             description=f"Constrain observed transitive {hit.name} to {fixed} in {hit.manifest}; require configuration-specific resolution and a production build, without tests.",
         )
-    if hit.manager == "maven" and hit.manifest and hit.direct:
+    if hit.manager in {"maven", "gradle"} and hit.manifest and hit.direct:
         return Plan(
             strategy="manifest_bump",
             score=2,
@@ -318,19 +318,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
             installed=hit.version,
             target=fixed,
             files=[hit.manifest],
-            manager="maven",
-            description=f"Set {hit.name} in {hit.manifest} to {fixed}.",
-        )
-    if hit.manager == "gradle" and hit.manifest and hit.direct:
-        return Plan(
-            strategy="manifest_bump",
-            score=2,
-            ecosystem=hit.ecosystem,
-            package=hit.name,
-            installed=hit.version,
-            target=fixed,
-            files=[hit.manifest],
-            manager="gradle",
+            manager=hit.manager,
             description=f"Set {hit.name} in {hit.manifest} to {fixed}.",
         )
     if hit.manager == "nuget":

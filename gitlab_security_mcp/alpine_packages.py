@@ -34,7 +34,7 @@ from urllib.parse import urlencode
 import httpx
 
 from gitlab_security_mcp.fanout import map_ordered
-from gitlab_security_mcp.util import timed_http_stream
+from gitlab_security_mcp.util import share_in_flight, timed_http_stream
 
 _RAISE_DATA_COULD_NOT_BE_READ_FROM = "Data could not be read from {}"
 _RAISE_ALPINE_INDEX_EXCEEDS_THE_READ_LIMIT = "Alpine {} {} index exceeds the read limit"
@@ -625,26 +625,27 @@ class AlpinePackages:
     def _index(self, branch: str, repo: str) -> dict[str, set[str]]:
         """Return one parsed index, sharing an in-flight download with other threads."""
         key = (branch, repo)
-        with self._ready:
-            self._ready.wait_for(lambda: key not in self._pending)
-            if key in self._indexes:
-                return self._indexes[key]
+
+        def reject() -> None:
+            """Stop a new download after close has begun."""
             if self._closed:
                 raise AlpineLookupError(_RAISE_ALPINE_PACKAGE_LOOKUP_IS_CLOSED)
-            self._pending.add(key)
-        try:
-            parsed = _parse_index(
+
+        def fetch() -> dict[str, set[str]]:
+            """Download and parse this index outside the cache lock."""
+            return _parse_index(
                 self._download(_index_url(branch, repo), _MAX_ARCHIVE), branch, repo
             )
-            with self._ready:
-                self._indexes[key] = parsed
-                while len(self._indexes) > _MAX_CACHED_INDEXES:
-                    self._indexes.pop(next(iter(self._indexes)))
-            return parsed
-        finally:
-            with self._ready:
-                self._pending.discard(key)
-                self._ready.notify_all()
+
+        return share_in_flight(
+            self._ready,
+            self._pending,
+            self._indexes,
+            key,
+            fetch,
+            max_entries=_MAX_CACHED_INDEXES,
+            reject=reject,
+        )
 
     def _download(self, url: str, limit: int) -> bytes:
         """Read one bounded official response and log its timing."""

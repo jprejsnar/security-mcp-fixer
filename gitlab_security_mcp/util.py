@@ -15,7 +15,7 @@ import tempfile
 import threading
 import xml.etree.ElementTree as ET
 import xml.parsers.expat as expat
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -358,6 +358,54 @@ def logged_lock(
         lock.release()
         if waited_ms >= 1:
             log_concurrency("lock_wait", name, wait_ms=round(waited_ms, 3))
+
+
+def read_bounded_response(response: httpx.Response, limit: int, *, error: str) -> bytes:
+    """Read a response body and reject one that exceeds ``limit``."""
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in response.iter_bytes():
+        size += len(chunk)
+        if size > limit:
+            raise ValueError(error)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def share_in_flight(
+    condition: threading.Condition,
+    pending: set,
+    cache: dict,
+    key: object,
+    fetch: Callable[[], object],
+    *,
+    max_entries: int,
+    reject: Callable[[], None] | None = None,
+) -> object:
+    """Run one fetch per key and let later callers reuse the stored result.
+
+    ``reject`` runs under the condition after a cache miss and before the key
+    is marked in flight. A fetch that raises is not stored. The cache drops
+    its oldest entry when it grows past ``max_entries``.
+    """
+    with condition:
+        condition.wait_for(lambda: key not in pending)
+        if key in cache:
+            return cache[key]
+        if reject is not None:
+            reject()
+        pending.add(key)
+    try:
+        value = fetch()
+        with condition:
+            cache[key] = value
+            while len(cache) > max_entries:
+                cache.pop(next(iter(cache)))
+        return value
+    finally:
+        with condition:
+            pending.discard(key)
+            condition.notify_all()
 
 
 @contextmanager

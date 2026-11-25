@@ -12,7 +12,11 @@ from gitlab_security_mcp.advisory import _MAX_ADVISORY_BYTES, AdvisoryClient
 from gitlab_security_mcp.fanout import map_ordered
 from gitlab_security_mcp.gitlab_client import GitLabClient
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, OfficialDocs
-from gitlab_security_mcp.util import timed_http_stream
+from gitlab_security_mcp.util import (
+    read_bounded_response,
+    share_in_flight,
+    timed_http_stream,
+)
 
 
 @pytest.mark.parametrize("boundary", ["fanout", "http"])
@@ -1216,3 +1220,93 @@ def test_fanout_logs_worker_count_duration_and_failure(caplog):
     assert records[0]["error"] is None
     assert records[1]["error"] == "RuntimeError"
     assert all("glpat-hidden" not in record.message for record in caplog.records)
+
+
+class _Chunks:
+    """Expose a fixed sequence of body chunks as an HTTP response."""
+
+    def __init__(self, chunks: list[bytes]):
+        """Store the chunks ``read_bounded_response`` will pull."""
+        self._chunks = chunks
+
+    def iter_bytes(self) -> list[bytes]:
+        """Return every chunk, including ones past the caller's limit."""
+        return self._chunks
+
+
+def test_read_bounded_response_keeps_a_short_body_and_rejects_a_longer_one():
+    """One reader enforces the byte cap for GitLab and advisory responses."""
+    # Arrange
+    body = _Chunks([b"abcd", b"efgh"])
+
+    # Act
+    kept = read_bounded_response(body, 8, error="too big")
+
+    # Assert
+    assert kept == b"abcdefgh"
+    with pytest.raises(ValueError, match="too big"):
+        read_bounded_response(body, 7, error="too big")
+
+
+def test_share_in_flight_reuses_one_success_and_drops_a_failed_fetch():
+    """Waiters share a stored value, and a failed fetch stays out of the cache."""
+    # Arrange
+    condition = threading.Condition()
+    pending: set[str] = set()
+    cache: dict[str, str] = {}
+    calls = {"count": 0}
+
+    def fetch() -> str:
+        """Count one successful read."""
+        calls["count"] += 1
+        return "kept"
+
+    def fail() -> str:
+        """Fail before a value can be stored."""
+        raise RuntimeError("missing")
+
+    # Act
+    first = share_in_flight(condition, pending, cache, "a", fetch, max_entries=1)
+    second = share_in_flight(condition, pending, cache, "a", fetch, max_entries=1)
+    with pytest.raises(RuntimeError, match="missing"):
+        share_in_flight(condition, pending, cache, "missing", fail, max_entries=1)
+    third = share_in_flight(condition, pending, cache, "b", fetch, max_entries=1)
+
+    # Assert
+    assert first == second == "kept"
+    assert calls["count"] == 2
+    assert third == "kept"
+    assert list(cache) == ["b"]
+    assert pending == set()
+
+
+def test_share_in_flight_reject_runs_before_a_fetch_is_marked():
+    """A closed client refuses a new key without leaving it in flight."""
+    # Arrange
+    condition = threading.Condition()
+    pending: set[str] = set()
+    cache: dict[str, str] = {}
+
+    def reject() -> None:
+        """Model a client that has already started to close."""
+        raise RuntimeError("closed")
+
+    def fetch() -> str:
+        """Fail the test when a rejected key is still fetched."""
+        raise AssertionError("fetch")
+
+    # Act
+    with pytest.raises(RuntimeError, match="closed"):
+        share_in_flight(
+            condition,
+            pending,
+            cache,
+            "a",
+            fetch,
+            max_entries=1,
+            reject=reject,
+        )
+
+    # Assert
+    assert cache == {}
+    assert pending == set()

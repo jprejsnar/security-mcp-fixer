@@ -20,6 +20,7 @@ import httpx
 from gitlab_security_mcp.fanout import map_ordered
 from gitlab_security_mcp.util import (
     log_unexpected,
+    read_bounded_response,
     redact,
     timed_http_stream,
     utc_now_iso,
@@ -842,7 +843,13 @@ class GitLabClient:
                         )
                         return None, delay
                 raise RuntimeError(detail)
-            payload = json.loads(_bounded_body(response))
+            payload = json.loads(
+                read_bounded_response(
+                    response,
+                    MAX_GITLAB_RESPONSE_BYTES,
+                    error=_RAISE_GITLAB_RESPONSE_EXCEEDS_THE_SIZE_LIMIT,
+                )
+            )
         return payload, None
 
     def _clean(self, text: str) -> str:
@@ -863,18 +870,6 @@ def _retry_wait(response: httpx.Response, attempt: int) -> float | None:
                 return None
             return delay
     return _GITLAB_BACKOFF_SECONDS * 2**attempt
-
-
-def _bounded_body(response: httpx.Response) -> bytes:
-    """Read a GitLab body without retaining more than the response cap."""
-    chunks: list[bytes] = []
-    size = 0
-    for chunk in response.iter_bytes():
-        size += len(chunk)
-        if size > MAX_GITLAB_RESPONSE_BYTES:
-            raise ValueError(_RAISE_GITLAB_RESPONSE_EXCEEDS_THE_SIZE_LIMIT)
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _response_excerpt(

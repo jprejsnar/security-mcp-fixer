@@ -3204,6 +3204,15 @@ class SoftwareAuditConsent(BaseModel):
     )
 
 
+def _audit_request_is_current(
+    selected: Engine, state: RunState, request_id: str
+) -> bool:
+    """Report whether this approval still belongs to the run that opened it."""
+    return (
+        selected.state is state and state.software_audit.get("request_id") == request_id
+    )
+
+
 @_with_background_progress("Software audit approval")
 async def _finish_audit_approval(
     ctx: Context,
@@ -3218,10 +3227,7 @@ async def _finish_audit_approval(
     state = selected.state
     try:
         response = await dialog.wait()
-        if (
-            selected.state is not state
-            or state.software_audit.get("request_id") != request_id
-        ):
+        if not _audit_request_is_current(selected, state, request_id):
             raise ValueError(_RAISE_THIS_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN)
         if stage == "CONSENT":
             await asyncio.to_thread(
@@ -3249,10 +3255,7 @@ async def _finish_audit_approval(
             )
             await _finish_empty_audit(ctx, selected, result)
     except asyncio.CancelledError:
-        if (
-            selected.state is state
-            and state.software_audit.get("request_id") == request_id
-        ):
+        if _audit_request_is_current(selected, state, request_id):
             _record_audit_result(
                 selected,
                 {
@@ -3265,10 +3268,7 @@ async def _finish_audit_approval(
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         logger.exception(_LOG_AUDIT_APPROVAL_FAILED)
-        if (
-            selected.state is state
-            and state.software_audit.get("request_id") == request_id
-        ):
+        if _audit_request_is_current(selected, state, request_id):
             _record_audit_result(
                 selected,
                 {
@@ -3337,10 +3337,7 @@ async def _open_audit_approval(
                 detail_header="Finding",
                 submit_label="Fix checked items",
             )
-        if (
-            selected.state is not state
-            or state.software_audit.get("request_id") != request_id
-        ):
+        if not _audit_request_is_current(selected, state, request_id):
             raise ValueError(_RAISE_THE_AUDIT_APPROVAL_BELONGS_TO_A_REPLACED_RUN)
         task = asyncio.create_task(
             _finish_audit_approval(
@@ -3360,10 +3357,7 @@ async def _open_audit_approval(
     except BaseException:
         if dialog is not None:
             await dialog.close()
-        if (
-            selected.state is state
-            and state.software_audit.get("request_id") == request_id
-        ):
+        if _audit_request_is_current(selected, state, request_id):
             _record_audit_result(
                 selected,
                 {

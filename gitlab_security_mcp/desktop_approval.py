@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -409,6 +410,96 @@ def _close_stream(stream: object) -> None:
     transport.close()
 
 
+def _powershell_launch(script: str) -> list[str]:
+    """Build the hidden STA PowerShell command that hosts one window."""
+    return [str(powershell()), "-NoProfile", "-STA", "-Command", script]
+
+
+def _checkbox_payload(
+    message: str,
+    properties: dict,
+    *,
+    title: str,
+    detail_header: str,
+    submit_label: str,
+) -> dict:
+    """Build the body shared by the async and synchronous checkbox windows."""
+    return {
+        "host_process_id": os.getpid(),
+        "message": message,
+        "title": title,
+        "detail_header": detail_header,
+        "submit_label": submit_label,
+        "choices": [
+            {
+                "key": key,
+                "title": value["title"],
+                "summary": value["summary"],
+                "enabled": value.get("enabled", True),
+            }
+            for key, value in properties.items()
+        ],
+    }
+
+
+def _run_powershell_json(
+    script: str,
+    payload: dict,
+    *,
+    failed: str,
+    unreadable: str,
+    diagnostics: str,
+) -> object:
+    """Run one window script and return the last JSON value it wrote."""
+    completed = subprocess.run(
+        _powershell_launch(script),
+        input=json.dumps(payload, ensure_ascii=True),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        shell=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
+        raise RuntimeError(failed.format(completed.returncode, detail))
+    if completed.stderr.strip():
+        logger.warning(diagnostics, completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:])
+    try:
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise ValueError(unreadable) from exc
+
+
+async def _show_ready_window(
+    process: asyncio.subprocess.Process,
+    dialog: DesktopApproval,
+    payload: dict,
+    *,
+    pipes_error: str,
+    show_error: Callable[[asyncio.subprocess.Process, bytes], str],
+    visible_log: str,
+) -> DesktopApproval:
+    """Send the payload and return after the window writes READY."""
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError(pipes_error)
+        process.stdin.write(json.dumps(payload, ensure_ascii=True).encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        if (await process.stdout.readline()).strip() != b"READY":
+            _, stderr = await process.communicate()
+            raise RuntimeError(show_error(process, stderr))
+        logger.info(visible_log, process.pid)
+        return dialog
+    except BaseException:
+        await dialog.close()
+        raise
+
+
 async def open_dialog(
     message: str,
     properties: dict,
@@ -419,11 +510,7 @@ async def open_dialog(
 ) -> DesktopApproval:
     """Return after the actual checkbox window is shown, not after human selection."""
     process = await asyncio.create_subprocess_exec(
-        str(powershell()),
-        "-NoProfile",
-        "-STA",
-        "-Command",
-        SCRIPT,
+        *_powershell_launch(SCRIPT),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -436,41 +523,24 @@ async def open_dialog(
         title,
         len(properties),
     )
-    try:
-        if process.stdin is None or process.stdout is None:
-            raise RuntimeError(_RAISE_APPROVAL_WINDOW_PIPES_WERE_NOT_CREATED)
-        payload = {
-            "host_process_id": os.getpid(),
-            "message": message,
-            "title": title,
-            "detail_header": detail_header,
-            "submit_label": submit_label,
-            "choices": [
-                {
-                    "key": key,
-                    "title": value["title"],
-                    "summary": value["summary"],
-                    "enabled": value.get("enabled", True),
-                }
-                for key, value in properties.items()
-            ],
-        }
-        process.stdin.write(json.dumps(payload, ensure_ascii=True).encode())
-        await process.stdin.drain()
-        process.stdin.close()
-        await process.stdin.wait_closed()
-        if (await process.stdout.readline()).strip() != b"READY":
-            _, stderr = await process.communicate()
-            raise RuntimeError(
-                _RAISE_THE_WINDOWS_APPROVAL_WINDOW_PID_COULD_NOT_BE.format(
-                    process.pid, process.returncode, _diagnostic_text(stderr)
-                )
+    return await _show_ready_window(
+        process,
+        dialog,
+        _checkbox_payload(
+            message,
+            properties,
+            title=title,
+            detail_header=detail_header,
+            submit_label=submit_label,
+        ),
+        pipes_error=_RAISE_APPROVAL_WINDOW_PIPES_WERE_NOT_CREATED,
+        show_error=lambda shown, stderr: (
+            _RAISE_THE_WINDOWS_APPROVAL_WINDOW_PID_COULD_NOT_BE.format(
+                shown.pid, shown.returncode, _diagnostic_text(stderr)
             )
-        logger.info(_LOG_APPROVAL_WINDOW_IS_VISIBLE, process.pid)
-        return dialog
-    except BaseException:
-        await dialog.close()
-        raise
+        ),
+        visible_log=_LOG_APPROVAL_WINDOW_IS_VISIBLE,
+    )
 
 
 _CHOICE_SCRIPT = (
@@ -525,43 +595,31 @@ async def open_choice(
 ) -> DesktopApproval:
     """Return once a native choice window is visible, without waiting inside the host request."""
     process = await asyncio.create_subprocess_exec(
-        str(powershell()),
-        "-NoProfile",
-        "-STA",
-        "-Command",
-        _CHOICE_SCRIPT,
+        *_powershell_launch(_CHOICE_SCRIPT),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     dialog = DesktopApproval(process, frozenset(item["id"] for item in choices))
-    try:
-        if process.stdin is None or process.stdout is None:
-            raise RuntimeError(_RAISE_CHOICE_WINDOW_PIPES_WERE_NOT_CREATED)
-        payload = {
+    return await _show_ready_window(
+        process,
+        dialog,
+        {
             "host_process_id": os.getpid(),
             "title": title,
             "message": message,
             "choices": choices,
             "notify_ready": True,
-        }
-        process.stdin.write(json.dumps(payload, ensure_ascii=True).encode("utf-8"))
-        await process.stdin.drain()
-        process.stdin.close()
-        await process.stdin.wait_closed()
-        if (await process.stdout.readline()).strip() != b"READY":
-            _, stderr = await process.communicate()
-            raise RuntimeError(
-                _RAISE_CHOICE_WINDOW_PID_COULD_NOT_BE_SHOWN.format(
-                    process.pid, _diagnostic_text(stderr)
-                )
+        },
+        pipes_error=_RAISE_CHOICE_WINDOW_PIPES_WERE_NOT_CREATED,
+        show_error=lambda shown, stderr: (
+            _RAISE_CHOICE_WINDOW_PID_COULD_NOT_BE_SHOWN.format(
+                shown.pid, _diagnostic_text(stderr)
             )
-        logger.info(_LOG_CHOICE_WINDOW_IS_VISIBLE, process.pid)
-        return dialog
-    except BaseException:
-        await dialog.close()
-        raise
+        ),
+        visible_log=_LOG_CHOICE_WINDOW_IS_VISIBLE,
+    )
 
 
 def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
@@ -570,43 +628,18 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
     Closing the window or choosing the last listed stop action returns ``done``.
     There is no selection deadline.
     """
-    completed = subprocess.run(
-        [str(powershell()), "-NoProfile", "-STA", "-Command", _CHOICE_SCRIPT],
-        input=json.dumps(
-            {
-                "host_process_id": os.getpid(),
-                "title": title,
-                "message": message,
-                "choices": choices,
-            },
-            ensure_ascii=True,
-        ),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        shell=False,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+    response = _run_powershell_json(
+        _CHOICE_SCRIPT,
+        {
+            "host_process_id": os.getpid(),
+            "title": title,
+            "message": message,
+            "choices": choices,
+        },
+        failed=_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_EXITED_WITH_CODE,
+        unreadable=_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_UNREADABLE_OUTPUT,
+        diagnostics=_LOG_SOFTWARE_AUDIT_CHOICE_WINDOW_REPORTED_DIAGNOSTICS,
     )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
-        raise RuntimeError(
-            _RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_EXITED_WITH_CODE.format(
-                completed.returncode, detail
-            )
-        )
-    if completed.stderr.strip():
-        logger.warning(
-            _LOG_SOFTWARE_AUDIT_CHOICE_WINDOW_REPORTED_DIAGNOSTICS,
-            completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:],
-        )
-    try:
-        response = json.loads(completed.stdout.strip().splitlines()[-1])
-    except (IndexError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            _RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_UNREADABLE_OUTPUT
-        ) from exc
     choice = response.get("choice") if isinstance(response, dict) else None
     if not isinstance(choice, str) or not choice:
         raise ValueError(_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_AN_INVALID)
@@ -627,51 +660,19 @@ def ask_checkboxes(
     The returned action is ``accept`` or ``cancel``. An accept with no checked
     boxes is an empty selection, not a request to fix every item.
     """
-    payload = {
-        "host_process_id": os.getpid(),
-        "message": message,
-        "title": title,
-        "detail_header": detail_header,
-        "submit_label": submit_label,
-        "choices": [
-            {
-                "key": key,
-                "title": value["title"],
-                "summary": value["summary"],
-                "enabled": value.get("enabled", True),
-            }
-            for key, value in properties.items()
-        ],
-    }
-    completed = subprocess.run(
-        [str(powershell()), "-NoProfile", "-STA", "-Command", SCRIPT],
-        input=json.dumps(payload, ensure_ascii=True),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        shell=False,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+    response = _run_powershell_json(
+        SCRIPT,
+        _checkbox_payload(
+            message,
+            properties,
+            title=title,
+            detail_header=detail_header,
+            submit_label=submit_label,
+        ),
+        failed=_RAISE_THE_AUDIT_ITEM_WINDOW_EXITED_WITH_CODE,
+        unreadable=_RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_UNREADABLE_OUTPUT,
+        diagnostics=_LOG_AUDIT_ITEM_WINDOW_REPORTED_DIAGNOSTICS,
     )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-_MAX_DIAGNOSTIC_CHARS:]
-        raise RuntimeError(
-            _RAISE_THE_AUDIT_ITEM_WINDOW_EXITED_WITH_CODE.format(
-                completed.returncode, detail
-            )
-        )
-    if completed.stderr.strip():
-        logger.warning(
-            _LOG_AUDIT_ITEM_WINDOW_REPORTED_DIAGNOSTICS,
-            completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:],
-        )
-    try:
-        response = json.loads(completed.stdout.strip().splitlines()[-1])
-    except (IndexError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            _RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_UNREADABLE_OUTPUT
-        ) from exc
     if not isinstance(response, dict) or response.get("action") not in {
         "accept",
         "cancel",

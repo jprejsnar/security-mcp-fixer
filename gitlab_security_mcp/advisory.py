@@ -25,7 +25,9 @@ from gitlab_security_mcp.util import (
     ADVISORY_READ_FAILURES,
     PROGRESS_PUBLISH_FAILURES,
     log_unexpected,
+    read_bounded_response,
     redact,
+    share_in_flight,
     timed_http_stream,
 )
 from gitlab_security_mcp.versions import (
@@ -618,22 +620,14 @@ class AdvisoryClient:
         self, key: str, fetch: Callable[[], dict | list | None]
     ) -> dict | list | None:
         """Share in-flight reads and cache only successfully decoded responses."""
-        with self._cache_ready:
-            self._cache_ready.wait_for(lambda: key not in self._pending)
-            if key in self._cache:
-                return self._cache[key]
-            self._pending.add(key)
-        try:
-            payload = fetch()
-            with self._cache_ready:
-                self._cache[key] = payload
-                if len(self._cache) > MAX_CACHE_ENTRIES:
-                    self._cache.pop(next(iter(self._cache)))
-            return payload
-        finally:
-            with self._cache_ready:
-                self._pending.remove(key)
-                self._cache_ready.notify_all()
+        return share_in_flight(
+            self._cache_ready,
+            self._pending,
+            self._cache,
+            key,
+            fetch,
+            max_entries=MAX_CACHE_ENTRIES,
+        )
 
     def _post_json(self, url: str, body: dict) -> dict | None:
         """Cache repeated package/version queries and close responses after parsing."""
@@ -682,21 +676,15 @@ class AdvisoryClient:
         return redact(text, [self.github_token, self.nvd_api_key])
 
 
-def _bounded_bytes(response: httpx.Response, limit: int) -> bytes:
-    """Read a response without retaining more than ``limit`` bytes."""
-    chunks: list[bytes] = []
-    size = 0
-    for chunk in response.iter_bytes():
-        size += len(chunk)
-        if size > limit:
-            raise ValueError(_RAISE_ADVISORY_RESPONSE_EXCEEDS_THE_SIZE_LIMIT)
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 def _decode_advisory(response: httpx.Response) -> dict | list:
     """Parse one advisory JSON body after enforcing the size limit."""
-    payload = json.loads(_bounded_bytes(response, _MAX_ADVISORY_BYTES))
+    payload = json.loads(
+        read_bounded_response(
+            response,
+            _MAX_ADVISORY_BYTES,
+            error=_RAISE_ADVISORY_RESPONSE_EXCEEDS_THE_SIZE_LIMIT,
+        )
+    )
     if not isinstance(payload, (dict, list)):
         raise ValueError(_RAISE_ADVISORY_RESPONSE_MUST_BE_A_JSON_OBJECT_OR)
     return payload
