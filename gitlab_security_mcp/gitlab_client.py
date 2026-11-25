@@ -343,7 +343,7 @@ class GitLabClient:
         self.close()
 
     def fetch(self, project_id: str) -> FetchResult:
-        """Fetch still-detected needs-triage or confirmed findings on main.
+        """Fetch detected and confirmed findings on main, plus non-main findings resolved there.
 
         project_id may be a numeric GitLab id or a namespace/project path.
         Return FetchResult with normalized findings, exclusions, and a

@@ -172,7 +172,7 @@ def persist_audit_draft(
             text = stream.read()
         if not audit_report_is_draft(text):
             return
-        # The server and both editor hooks persist the same batch; the AI rereads this file.
+        # The server and both editor hooks persist the same batch. Skip a duplicate receipt.
         if _progress_body(text) == _progress_body(receipt):
             return
         with report.open("a", encoding="utf-8", newline="") as stream:
