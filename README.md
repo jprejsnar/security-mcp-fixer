@@ -76,7 +76,7 @@ folders, or a directory inside one of them. A window with no open folder still
 shows the newest mirror for each checkout. Another VS Code or Cursor window can
 run a different repository at the same time.
 
-Current changes after 1.0.60 (unreleased):
+Release 1.0.61 keeps one version source and names the report files:
 - Package reviews: the `PACKAGE_REVIEW_REQUIRED` reason and server instructions
   no longer tell the AI to call `qualify_package_update` before human selection.
   That call was refused by the approval gate and caused a retry loop.
@@ -800,7 +800,9 @@ What each job still does:
   overlap for up to eight findings. Each one uses local manifests, lockfiles,
   Gradle or Maven trees, then OSV, GitHub, and NVD, plus named CVE and CWE
   pages. The same finding stays serialized. Source and config findings loop
-  until the host submits a hash-bound `source_review`. `CHANGE_REQUIRED`,
+  until the host submits a `source_review` with a path and an assessment for each
+  file. The server hashes those files. A supplied hash that does not match the
+  current bytes is rejected. `CHANGE_REQUIRED`,
   `FALSE_POSITIVE`, confirmed source or config issues, `MANUAL_REVIEW`,
   `NO_SAFE_FIX`, and `REPRODUCTION_REQUIRED` stay recorded for the later job
   that handles them. `select_package_version` chooses the latest supported
@@ -830,7 +832,10 @@ What each job still does:
   fresh docs read, then validates them. `generate_aaa_test` adds an
   Arrange-Act-Assert test only for a supported base-image fix. The host fixes
   the other checked source findings and reports each as `fixed` or `failed`
-  with validation evidence.
+  with a reason. Leave `validation` empty. The server runs the production
+  build, records it, and marks that outcome `failed` when the build does not
+  pass. A validation string the host already supplied is kept, and the server
+  does not run a second build.
   `CODE_FIX_RESULTS_REQUIRED` waits until every checked host item has an
   outcome. Nothing checked fixes nothing. The job still finishes into job 6.
 - **Job 6.** Consent is `CONSENT_REQUIRED` when no form is available,
@@ -1076,8 +1081,8 @@ flowchart TB
   reviewer["Human reviewer"] --> host["MCP host and AI agent"]
   host <-->|"MCP requests and results over stdio"| server["Local Python MCP process"]
   host -->|"Read exact-version package docs and compatibility guides"| publisher["Official publisher documentation"]
-  host -->|"Open the GitLab file and line, then trace callers and inputs"| checkout["One or more application checkouts"]
-  host -->|"Submit per-finding review with full-byte hashes"| server
+  host -->|"Open a caller only when the verification result does not include it"| checkout["One or more application checkouts"]
+  host -->|"Submit path and assessment; the server hashes each file"| server
   server -->|"Windows checkbox windows, or a host form when Windows is unavailable"| reviewer
   reviewer -->|"Checked boxes only"| approval["Human-approved false-positive dismissal"]
   approval -->|"Fixed GitLab mutation and exact assessment reason"| gitlab
@@ -1171,8 +1176,8 @@ flowchart TB
     versions["versions.py: affected ranges and version comparison"]
     configFindings["config_findings.py: cited nginx, GitLab CI and Dockerfile apk lines"]
     alpinePackages["alpine_packages.py: image Alpine release, releases.json and APKINDEX current versions"]
-    sourceFindings["source_findings.py: source workflows, hash-bound review and stale-evidence checks"]
-    sourceEvidence["ai_source_review.py: bounded complete cited source for host AI"]
+    sourceFindings["source_findings.py: source workflows; the server hashes each reviewed file"]
+    sourceEvidence["ai_source_review.py: cited line and a short window, not the whole file"]
   end
 
   engine --> gitlabClient
@@ -1258,8 +1263,8 @@ checkout is active.
 | `run_prechecks(repo_root=None)` | Require clean `main` or today's exact `security-fixes-YYYY-MM-DD` branch; reject Git operations in progress. Prior log errors are reported and do not block a fresh run or preserve the previous snapshot as permission. |
 | `pull_main_twice(repo_root=None)` | Perform two fast-forward-only pulls on `main`. Dependency preparation is deferred until an approved update/build needs it. |
 | `create_security_branch(repo_root=None)` | Create or reuse today's exact `security-fixes-YYYY-MM-DD` branch, review logs, safely clean generated untracked outputs, and prepare pnpm on a reused branch. |
-| `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. Do not relist after decisions or edits. |
-| `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence or return the cited path, full-file hash, line, and short window for host-AI review. Submit the host's hash-bound source/input-flow assessment through `source_review`; no deprecated sampling is used. Config proposals also record publisher-page evidence. |
+| `list_security_findings(project_id=None, repo_root=None)` | Require the branch; retrieve and normalize filtered findings. A successful tool result is an index of id, title, severity, category, package, and location. Descriptions, solutions, and scanner bodies stay on the server. Do not relist after decisions or edits. |
+| `verify_security_finding(finding_id, repo_root=None, source_review=None)` | Record package evidence, or return the cited path, the server's full-file SHA-256, line, cited text, and a short window. The host does not open that file again and does not send `sha256`. Open a caller only when the result does not include it. Submit `source_review` with path and assessment; the server hashes each path. No deprecated sampling is used. Config proposals also record publisher-page evidence. |
 | `select_security_fixes(repo_root=None, package_reviews=None)` | Job 3 shows package-only unchecked GUI choices; job 5 shows a fresh source/config-only GUI after false-positive review. On Windows, supply exact-target package reviews before selection. No AI selection arguments. Only checked findings authorize edits; source fixes remain host-led. |
 | `select_package_version(finding_id, review=None, repo_root=None)` | Read the public npm/NuGet/Maven stable-release catalog, then submit documented publisher-support/runtime exclusions to select the latest eligible version before human fix approval. Paid exclusions are reported for investigation. |
 | `qualify_package_update(finding_id, review, repo_root=None)` | Require human issue selection, exact-target API/license review and informational lint capture. Enforce corporate approval evidence now; defer product commands until final validation. |
@@ -1268,7 +1273,7 @@ checkout is active.
 | `run_validation_matrix(repo_root=None)` | Validate the human-authorized batch once; skip remediation checks when code fixes were declined. Only on failure, isolate grouped subsets, revert incompatible updates and prove the retained checkout green. Unchanged successful validation is reused. |
 | `review_false_positives(repo_root=None)` | List eligible assessments for verification. Returns immediately and dismisses nothing. |
 | `submit_false_positive_approvals(repo_root=None)` | Open human approval checkboxes, automatically invoked by completion or explicitly requested to reopen. Only selected findings are dismissed; no AI approval argument is accepted. |
-| `complete_security_run(repo_root=None, code_results=None, progress=None)` | Advance the seven sequential jobs. Report each selected host code outcome as `{id,status:"fixed" or "failed",reason,validation}`; a fixed outcome requires actual validation evidence. Send `{id,message}` in `progress` while fixing a selected item. Ask audit consent after source work; finish with displayed unresolved Markdown, including failed audit fixes. Host outcomes are attestations, not independent MCP validation. |
+| `complete_security_run(repo_root=None, code_results=None, progress=None)` | Advance the seven sequential jobs. Report each selected host code outcome as `{id,status:"fixed" or "failed",reason}`. Leave `validation` empty. The server runs the production build for a `fixed` outcome that has none, records that log, and changes the outcome to `failed` when the build does not pass. A validation string already supplied is kept. Send `{id,message}` in `progress` while fixing a selected item. Ask audit consent after source work; finish with displayed unresolved Markdown, including failed audit fixes. |
 | `generate_local_report(repo_root=None)` | Legacy alias for `complete_security_run`; follows the same ordered job gates. It is not a report-only or approval-order bypass. |
 | `choose_software_audit_action(repo_root=None, choice=None, selected_ids=None, report_ready=False, progress=None)` | Await owned work and collect the next sequential job handoff. In job 6 obtain Yes/No consent, then submit file/phase coverage and write the reserved audit report. `report_ready=True` checks coverage before opening unchecked findings. Cancel/empty selection proceeds to the final report. |
 | `get_run_status(repo_root=None, include_audit_details=False)` | Return phase, counts, package-validation status, and compact audit/workflow summaries without resending saved package reviews or final-report Markdown. Pass `include_audit_details=True` only after context loss to recover the full audit prompt, inventory and receipts, including workflow evidence. During owned background work, return a nonblocking activity snapshot and finished execution steps instead of waiting behind a build's engine lock. Completed steps do not imply successful validation. |
@@ -1311,7 +1316,7 @@ assessment. After the last batch the host writes the report once, replacing the
 draft, and completes coverage before `report_ready=True`.
 The AI scans the returned `repo_root`, periodically
 calls the same tool with
-`progress={"message": "Reviewing controller/caller", "files": [{"path": "src/Controller.java", "sha256": "<current full-file hash>", "assessment": "<behavior traced>"}], "completed_phases": ["entry_points"]}`,
+`progress={"message": "Reviewing controller/caller", "files": [{"path": "src/Controller.java", "assessment": "<behavior traced>"}], "completed_phases": ["entry_points"]}`,
 and writes the exact `output_path`. Inventory paths are in `coverage.files`.
 Complete every first-party inventory file and all five phases: `entry_points`,
 `data_access`, `errors_logs`, `resource_lifetime`, and `ui_siblings`.
@@ -1330,11 +1335,12 @@ generator markers in their leading comments (checked within the first 8 KiB).
 Before reviewing implementations, the host must inspect every project's build
 and generator configuration, including nested projects and copied outputs.
 Custom generated files/folders are registered through
-`progress.generated_exclusions=[{"path":"backend/custom-client","evidence":{"path":"backend/build.gradle","sha256":"<current configuration hash>","assessment":"<generator and resolved output declaration>"}}]`.
-The server prunes these concrete paths before opening their source, keeps
-same-named handwritten sibling folders, and excludes them from coverage and
-review receipts. Exclusions are host attestations backed by current configuration
-hashes; stale evidence, paths outside the checkout, and exclusions hiding the
+`progress.generated_exclusions=[{"path":"backend/custom-client","evidence":{"path":"backend/build.gradle","assessment":"<generator and resolved output declaration>"}}]`.
+The server hashes that evidence file. A supplied hash that does not match the
+current bytes is rejected. It prunes these concrete paths before opening their
+source, keeps same-named handwritten sibling folders, and excludes them from
+coverage and review receipts. Exclusions are host attestations backed by the
+server's current configuration hashes; stale evidence, paths outside the checkout, and exclusions hiding the
 checkout or their evidence are rejected. Refresh the declaration if its
 configuration changes. Unresolved generator boundaries block completion rather
 than authorizing review of possibly generated code.
@@ -1725,24 +1731,24 @@ These responses make no new GitLab changes; they do not recheck remote status.
 
 For source/configuration SAST and IaC, reading the cited excerpt is only evidence collection, not a verdict.
 `SOURCE_REVIEW_REQUIRED` returns a `source_review_queue`, grouped by file, through
-the approval tool, run status, and reports. The host AI must read the source and
-relevant callers/configuration, assess each finding separately, and call
+the approval tool, run status, and reports. The host uses the cited window
+already in the verification result, opens a caller only when that result does
+not include it, assesses each finding separately, and calls
 `verify_security_finding` with `source_review` before asking for dismissal approval.
 Reports explicitly mark unfinished source review rather than implying all findings
 were fully assessed.
 
 `verify_security_finding` uses `ai_source_review.status=HOST_REVIEW_REQUIRED`:
-the calling Copilot/Cursor AI receives the cited path, full-file SHA-256, line,
-and a short window. It reads the file in the checkout.
+the calling Copilot/Cursor AI receives the cited path, the server's full-file
+SHA-256, line, cited text, and a short window. It does not open that file again.
 The deprecated MCP sampling API is never called, even if a host advertises it.
 No separate AI account, API key, provider endpoint, or autonomous GitLab dismissal
 is added. Host permission and model selection remain controlled by VS Code/Cursor.
-The calling AI reads the cited file in the checkout and must finish the
-code/input-flow analysis with its own code tools, then submit `source_review`
+The calling AI finishes the code/input-flow analysis from that window, opens a
+caller only when the result does not include it, then submits `source_review`
 in the same workflow. This is unfinished AI work, not a request for the user
 to analyze code. The server still hashes the whole file, up to 256,000 bytes,
-and returns that hash with the cited line; the host reads callers with its own
-code tools.
+and returns that hash with the cited line. Do not send `sha256` back.
 The server rechecks full-byte hashes and requires a separate assessment for every
 finding before recording conclusions. These are audited host attestations, not
 proof that the host actually read the files. Denied access, missing/oversized files,
@@ -1765,7 +1771,8 @@ sufficient evidence stay unresolved rather than receiving invented verdicts.
 
 Source reviews accept `FALSE_POSITIVE`, `CONFIRMED_VULNERABILITY`, or `MANUAL_REVIEW`,
 with `reason`, `input_origin`, rule-specific `finding_analysis`, `reachability_analysis`,
-and `reviewed_files` containing `path`, full-byte `sha256`, and `assessment`.
+and `reviewed_files` containing `path` and `assessment`. The server fills each
+file's SHA-256. A supplied hash that does not match the current bytes is rejected.
 Legacy `pattern_analysis` remains supported for regex reviews. Only evidenced
 `FALSE_POSITIVE` outcomes can enter the checkbox form; confirmed defects and
 uncertainty stay unresolved. Changed reviewed files invalidate all source-review
@@ -3773,8 +3780,8 @@ unless the human approves false-positive dismissal through
 Source-code findings such as **Regular expression with non-literal value** are
 not package-advisory findings. `verify_security_finding` returns
 `SOURCE_REVIEW_REQUIRED` with `source_workflow`; the MCP tool additionally returns
-the cited path, full-byte SHA256, line, and a short window in
-`ai_source_review.cited_source`, with `status: "HOST_REVIEW_REQUIRED"`.
+the cited path, the server's full-file SHA-256, line, cited text, and a short
+window in `ai_source_review.cited_source`, with `status: "HOST_REVIEW_REQUIRED"`.
 The file body is not returned. The host uses that cited window and does not
 open the cited file again. It opens a caller only when the result does not
 include that caller, and traces configuration and inputs. The
@@ -3787,8 +3794,9 @@ For a proven false positive, call `verify_security_finding` again with
 `source_review` containing `decision: "FALSE_POSITIVE"`, `reason`, `input_origin`,
 `finding_analysis` (legacy `pattern_analysis` is accepted),
 `reachability_analysis`, and `reviewed_files` entries with
-`path`, current full-byte `sha256`, and `assessment`. Include the cited source
-and every configuration/caller file relied on. The server validates file
+`path` and `assessment`. Include the cited source and every
+configuration/caller file relied on. Leave `sha256` empty; the server hashes
+each path and rejects a supplied hash that does not match. The server validates file
 boundaries, hashes and review completeness; the reasoning remains an audited
 host attestation, not automatic data-flow proof. Status/report refresh retracts
 false positives if reviewed files change. These decisions alone do not dismiss
@@ -3798,8 +3806,8 @@ request, without deprecated sampling.
 
 | Source or configuration | What the host AI must inspect |
 | --- | --- |
-| Java 17+ and .NET/C# | Cited code, actual inputs, callers, framework/runtime configuration and relevant controls. |
-| TypeScript/Node.js, JavaScript and Python | Complete cited code and callers/configuration, including input origin, mutation and reachability. |
+| Java 17+ and .NET/C# | The cited window, actual inputs, callers not already in the result, framework/runtime configuration and relevant controls. |
+| TypeScript/Node.js, JavaScript and Python | The cited window and callers/configuration not already in the result, including input origin, mutation and reachability. |
 | Dockerfile variants | Build stages, final image, runtime controls and the exact scanner-cited issue. |
 | nginx.conf and recognized include files | Includes, directive inheritance, active server/location and actual exposure. |
 
@@ -3809,8 +3817,9 @@ reason and evidence. Uncertainty becomes `MANUAL_REVIEW`, not a guessed
 false positive.
 
 For a reproduced defect, the host applies a scoped source fix and regression
-test separately from package updates, then runs the same reproduction, boundary
-cases and production builds, without executing unit/integration suites.
+test separately from package updates, then runs the same reproduction and
+boundary cases. Leave `validation` empty so the server runs the production
+build. Do not run unit or integration suites.
 `apply_minimal_fix` does not
 rewrite arbitrary source code. Do not blanket-escape intentional regular
 expressions or replace test assertions merely to remove a scanner warning.
@@ -3927,6 +3936,14 @@ Helpers take only the inputs they use; package review validates evidence without
 returning a source-edit plan. Python 3.11+ supplies `tomllib` directly.
 Retain tests for active safety contracts; remove obsolete scaffolding and tests
 for deleted behavior, not callbacks or platform paths merely absent from one run.
+
+Editor instructions have one source. Edit `ai/guardrails.md`, `ai/skill.md`,
+and `ai/agent.md`. Shared sentences live in `ai/common.md`; the startup file
+includes that block once. Then run `scripts/sync_ai_guardrails.py` with this
+checkout's `.venv` interpreter. The script writes the Cursor rule, the Copilot
+instructions, both agent copies, and both skill copies. Do not hand-edit those
+generated files, and do not add a root `AGENTS.md`. `ai/quality-sources.md` is
+the bibliography and is not loaded at startup.
 
 Run development commands from this MCP project's root. Use the equivalent
 `.venv/bin/python` executable on macOS/Linux.
