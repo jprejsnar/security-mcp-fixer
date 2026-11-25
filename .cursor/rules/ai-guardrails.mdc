@@ -5,7 +5,9 @@ alwaysApply: true
 
 # AI guardrails
 
-This is the startup guardrail. Change it only in `ai/guardrails.md`, then run `python scripts/sync_ai_guardrails.py` with the checkout's `.venv` interpreter. Cursor injects `.cursor/rules/ai-guardrails.mdc` on every chat because `alwaysApply` is true. VS Code Copilot injects `.github/copilot-instructions.md` on every chat. Do not add a root `AGENTS.md` with this text: Cursor would inject it beside that rule, and VS Code would inject it beside the Copilot file. Skills and custom agents are not injected at startup. `ai/quality-sources.md` is the bibliography and is not injected.
+This is the startup guardrail.
+
+Change it only in `ai/guardrails.md`, `ai/skill.md`, or `ai/agent.md`. This block is the shared text; the startup guardrail includes it once. Then run `python scripts/sync_ai_guardrails.py` with the checkout's `.venv` interpreter. Use `--check` to confirm the generated copies match. The script overwrites `.github/copilot-instructions.md`, `.cursor/rules/ai-guardrails.mdc`, both `ai-guardrails` agent files, and both `ai-guardrails/SKILL.md` files, so never hand-edit them. Then run `tests/test_ai_guardrails.py`, which checks the sync and phrases the guardrail must keep. Cursor injects `.cursor/rules/ai-guardrails.mdc` on every chat because `alwaysApply` is true. VS Code Copilot injects `.github/copilot-instructions.md` on every chat. Do not add a root `AGENTS.md` with this text: Cursor would inject it beside that rule, and VS Code would inject it beside the Copilot file. Skills and custom agents are not injected at startup. `ai/quality-sources.md` is the bibliography and is not injected. Keep each rule stated once, and verify any command or code fact against the repository before writing it.
 
 ## Compaction
 

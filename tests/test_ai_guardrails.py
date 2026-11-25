@@ -1,10 +1,16 @@
 """Keep Cursor and Copilot startup guidance on one canonical guardrail."""
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_SYNC_PATH = ROOT / "scripts" / "sync_ai_guardrails.py"
+_SYNC_SPEC = importlib.util.spec_from_file_location("sync_ai_guardrails", _SYNC_PATH)
+_SYNC = importlib.util.module_from_spec(_SYNC_SPEC)
+assert _SYNC_SPEC.loader is not None
+_SYNC_SPEC.loader.exec_module(_SYNC)
 _CURSOR_RULE = ROOT / ".cursor" / "rules" / "ai-guardrails.mdc"
 _COPILOT = ROOT / ".github" / "copilot-instructions.md"
 _AGENT = ROOT / ".cursor" / "agents" / "ai-guardrails.md"
@@ -25,7 +31,7 @@ _CURSOR_FRONTMATTER = (
 def test_ai_guardrails_stay_in_sync():
     """Require both hosts to load the same generated startup files."""
     # Arrange
-    script = ROOT / "scripts" / "sync_ai_guardrails.py"
+    script = _SYNC_PATH
 
     # Act
     completed = subprocess.run(
@@ -44,7 +50,11 @@ def test_ai_guardrails_stay_in_sync():
 def test_startup_files_load_once_per_editor():
     """Cursor and VS Code each load one full copy, and agents do not repeat it."""
     # Arrange
-    body = (ROOT / "ai" / "guardrails.md").read_text(encoding="utf-8")
+    source = (ROOT / "ai" / "guardrails.md").read_text(encoding="utf-8")
+    body = _SYNC.expand(source)
+    common = (ROOT / "ai" / "common.md").read_text(encoding="utf-8").strip("\n")
+    skill = (ROOT / "ai" / "skill.md").read_text(encoding="utf-8")
+    agent_source = (ROOT / "ai" / "agent.md").read_text(encoding="utf-8")
     rule = _CURSOR_RULE.read_text(encoding="utf-8")
     copilot = _COPILOT.read_text(encoding="utf-8")
     agent = _AGENT.read_text(encoding="utf-8")
@@ -53,6 +63,12 @@ def test_startup_files_load_once_per_editor():
     cursor_rule = _CURSOR_FRONTMATTER + body
 
     # Assert
+    assert _SYNC._COMMON_MARKER in source
+    assert _SYNC._COMMON_MARKER not in body
+    assert common in body
+    assert body.count(common) == 1
+    assert common not in skill
+    assert common not in agent_source
     assert _EDIT_SOURCE in body
     assert _README_UPDATE in body
     assert "Do not spend host AI tokens" in body

@@ -1,6 +1,8 @@
 # AI guardrails
 
-This is the startup guardrail. Change it only in `ai/guardrails.md`, then run `python scripts/sync_ai_guardrails.py` with the checkout's `.venv` interpreter. Cursor injects `.cursor/rules/ai-guardrails.mdc` on every chat because `alwaysApply` is true. VS Code Copilot injects `.github/copilot-instructions.md` on every chat. Do not add a root `AGENTS.md` with this text: Cursor would inject it beside that rule, and VS Code would inject it beside the Copilot file. Skills and custom agents are not injected at startup. `ai/quality-sources.md` is the bibliography and is not injected.
+This is the startup guardrail.
+
+<!-- include: ai/common.md -->
 
 ## Compaction
 

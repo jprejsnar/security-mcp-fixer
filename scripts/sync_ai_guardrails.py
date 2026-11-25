@@ -1,4 +1,8 @@
-"""Copy the canonical AI guardrail into the Cursor and Copilot startup files."""
+"""Copy the canonical AI guardrail into the Cursor and Copilot startup files.
+
+`ai/common.md` is the shared block. The startup source includes it with
+`<!-- include: ai/common.md -->`. Generated files receive that text once.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +10,21 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BODY = (ROOT / "ai" / "guardrails.md").read_text(encoding="utf-8")
-SKILL = (ROOT / "ai" / "skill.md").read_text(encoding="utf-8")
-AGENT = (ROOT / "ai" / "agent.md").read_text(encoding="utf-8")
+_COMMON_MARKER = "<!-- include: ai/common.md -->"
+_RAISE_COMMON_BLOCK_INCLUDES_ITSELF = "The common AI block cannot include itself"
+
+
+def expand(text: str) -> str:
+    """Insert the shared AI block into a source that marks where it belongs."""
+    common = (ROOT / "ai" / "common.md").read_text(encoding="utf-8").strip("\n")
+    if _COMMON_MARKER in common:
+        raise ValueError(_RAISE_COMMON_BLOCK_INCLUDES_ITSELF)
+    return text.replace(_COMMON_MARKER, common)
+
+
+BODY = expand((ROOT / "ai" / "guardrails.md").read_text(encoding="utf-8"))
+SKILL = expand((ROOT / "ai" / "skill.md").read_text(encoding="utf-8"))
+AGENT = expand((ROOT / "ai" / "agent.md").read_text(encoding="utf-8"))
 RULE = (
     "---\n"
     "description: Compaction and code-quality guardrails for every session\n"
