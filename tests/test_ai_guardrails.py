@@ -57,6 +57,8 @@ def test_startup_files_load_once_per_editor():
     assert _README_UPDATE in body
     assert "Do not spend host AI tokens" in body
     assert "Run the suite once, after the change is finished, at the end." in body
+    assert "ruff format gitlab_security_mcp server.py tests" in body
+    assert "Before the final run, run only the test file" not in body
     assert _EDIT_THE_COPY not in body
     assert _ALWAYS_APPLY in rule
     assert rule == cursor_rule
