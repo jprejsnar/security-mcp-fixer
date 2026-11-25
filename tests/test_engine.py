@@ -3791,6 +3791,33 @@ def test_saved_state_and_report_summarize_checkout_snapshots(tmp_path):
     assert "src/file0.java" not in json.dumps(saved)
 
 
+def test_all_three_reports_start_with_the_gitlab_project_name(tmp_path):
+    """Reports from different projects stay distinguishable outside the checkout."""
+    # Arrange
+    from gitlab_security_mcp.report import write_report, write_unresolved_report
+    from gitlab_security_mcp.state import RunState
+
+    state = RunState(
+        gitlab_project_path="group/patient-web", branch_name="security-fixes"
+    )
+
+    # Act
+    report = write_report(tmp_path, state, staged=[], diff_stat="", diff_files="")
+    unresolved = write_unresolved_report(tmp_path, state)
+
+    # Assert
+    names = {
+        Path(report["human_report"]).name,
+        Path(report["json_report"]).name,
+        Path(unresolved["report_path"]).name,
+    }
+    assert names == {
+        "patient-web-security-remediation-report-security-fixes.md",
+        "patient-web-security-remediation-report-security-fixes.json",
+        "patient-web-unresolved-remediation.md",
+    }
+
+
 def test_unresolved_report_never_prints_an_empty_code_findings_table(tmp_path):
     """A run with no other unresolved code findings says so instead of a bare header."""
     # Arrange

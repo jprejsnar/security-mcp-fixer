@@ -123,6 +123,7 @@ SKIP_DIRS = {
     "__pycache__",
 }
 MAX_FILES = 5000
+_MAX_GRADLE_WARNING_LENGTH = 500
 DEPENDENCY_SECTIONS = (
     "dependencies",
     "devDependencies",
@@ -803,7 +804,7 @@ def parse_gradle_report(report: str) -> GradleReport:
     project, configuration, resolvable = "", "unscoped", True
     for line in report.splitlines():
         if line.startswith("Deprecated Gradle features were used"):
-            warning = line.strip()[:500]
+            warning = line.strip()[:_MAX_GRADLE_WARNING_LENGTH]
             if warning not in parsed.warnings:
                 parsed.warnings.append(warning)
             continue

@@ -264,9 +264,10 @@ for (const trusted of [true, false]) {
     const opened = [];
     let changed;
     const progressUri = { fsPath: "C:\\repo\\.security-mcp\\progress.json", toString: () => "file:///repo/.security-mcp/progress.json" };
-    const reportUri = { fsPath: "C:\\repo\\.security-mcp\\reports\\unresolved-remediation.md" };
+    const reportUri = { fsPath: "C:\\repo\\.security-mcp\\reports\\study-service-unresolved-remediation.md" };
     const disposable = { dispose() {} };
-    ui.vscode.Uri = { joinPath: (base, ...parts) => parts.includes("unresolved-remediation.md") ? reportUri : progressUri };
+    ui.vscode.FileType = { File: 1 };
+    ui.vscode.Uri = { joinPath: (base, ...parts) => parts.includes("study-service-unresolved-remediation.md") ? reportUri : progressUri };
     ui.vscode.commands = {
       registerCommand: () => disposable,
       executeCommand: async (...args) => opened.push(args)
@@ -281,6 +282,7 @@ for (const trusted of [true, false]) {
         onDidDelete: () => disposable
       }),
       fs: {
+        readDirectory: async () => [["notes.md", 1], ["study-service-unresolved-remediation.md", 1]],
         stat: async () => ({ size: 1000 }),
         readFile: async () => Buffer.from(JSON.stringify(snapshot({
           id: "workflow", status: "FINISHED", started_at: "2026-11-19T12:00:00Z",
@@ -341,10 +343,11 @@ test("a failed final report preview warns once", async () => {
   };
   ui.vscode.window.showWarningMessage = message => warnings.push(message);
   ui.vscode.Uri = {
-    joinPath: (_base, ...parts) => parts.includes("unresolved-remediation.md")
-      ? { fsPath: "C:\\repo\\.security-mcp\\reports\\unresolved-remediation.md" }
+    joinPath: (_base, ...parts) => parts.includes("study-service-unresolved-remediation.md")
+      ? { fsPath: "C:\\repo\\.security-mcp\\reports\\study-service-unresolved-remediation.md" }
       : progressUri
   };
+  ui.vscode.FileType = { File: 1 };
   ui.vscode.commands = {
     registerCommand: () => disposable,
     executeCommand: async () => { throw new Error("permission denied"); }
@@ -360,6 +363,7 @@ test("a failed final report preview warns once", async () => {
       onDidDelete: () => disposable
     }),
     fs: {
+      readDirectory: async () => [["study-service-unresolved-remediation.md", 1]],
       stat: async () => ({ size: 1000 }),
       readFile: async () => Buffer.from(JSON.stringify(snapshot({
         id: "workflow", status: "FINISHED", started_at: "2026-11-19T12:00:00Z",
@@ -382,11 +386,11 @@ test("a mirrored final report opens from the checkout path", async () => {
   const ui = harness();
   const disposable = { dispose() {} };
   const opened = [];
-  const report = { fsPath: "C:\\repo\\.security-mcp\\reports\\unresolved-remediation.md" };
+  const report = { fsPath: "C:\\repo\\.security-mcp\\reports\\study-service-unresolved-remediation.md" };
   ui.vscode.FileType = { File: 1 };
   ui.vscode.Uri = {
     file: root => ({ root }),
-    joinPath: (base, ...parts) => parts.at(-1) === "unresolved-remediation.md" ? report : { base, parts }
+    joinPath: (base, ...parts) => parts.at(-1) === "study-service-unresolved-remediation.md" ? report : { base, parts }
   };
   ui.vscode.commands = {
     registerCommand: () => disposable,
@@ -402,7 +406,9 @@ test("a mirrored final report opens from the checkout path", async () => {
       onDidChange: () => disposable, onDidDelete: () => disposable
     }),
     fs: {
-      readDirectory: async () => [["run.json", 1]],
+      readDirectory: async directory => directory.parts?.at(-1) === "reports"
+        ? [["study-service-unresolved-remediation.md", 1]]
+        : [["run.json", 1]],
       stat: async () => ({ size: 1000, mtime: Date.now() }),
       readFile: async () => Buffer.from(JSON.stringify(snapshot({
         id: "workflow", status: "FINISHED", started_at: "2026-11-19T12:00:00Z",

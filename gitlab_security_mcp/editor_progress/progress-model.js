@@ -1,9 +1,12 @@
 "use strict";
 
 const activeStates = new Set(["RUNNING", "WAITING_FOR_HUMAN", "WAITING_FOR_AI"]);
+const MAX_SNAPSHOT_BYTES = 256 * 1024;
+const SNAPSHOT_TOO_LARGE = "Progress snapshot exceeds 256 KiB.";
+const WORKFLOW_JOB_COUNT = 7;
 
 function parseSnapshot(text) {
-  if (text.length > 256 * 1024) throw new Error("Progress snapshot exceeds 256 KiB.");
+  if (text.length > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_TOO_LARGE);
   const snapshot = JSON.parse(text);
   if (!snapshot || !Array.isArray(snapshot.tasks)) {
     throw new Error("Missing progress task array.");
@@ -24,7 +27,7 @@ function parseSnapshot(text) {
       throw new Error("Invalid progress counts.");
     }
     if (task.unit != null && typeof task.unit !== "string") throw new Error("Invalid progress unit.");
-    if (task.jobs != null && (!Array.isArray(task.jobs) || task.jobs.length > 7 ||
+    if (task.jobs != null && (!Array.isArray(task.jobs) || task.jobs.length > WORKFLOW_JOB_COUNT ||
         task.jobs.some(job => !job || typeof job.label !== "string" ||
           typeof job.status !== "string" || !Number.isInteger(job.number)))) {
       throw new Error("Invalid workflow jobs.");
@@ -41,4 +44,11 @@ function taskText(task, now = Date.now()) {
   return `${task.label}: ${task.status} | ${count} | ${task.message}${stale}${jobs}`;
 }
 
-module.exports = { activeStates, parseSnapshot, taskText };
+module.exports = {
+  activeStates,
+  MAX_SNAPSHOT_BYTES,
+  parseSnapshot,
+  SNAPSHOT_TOO_LARGE,
+  taskText,
+  WORKFLOW_JOB_COUNT,
+};

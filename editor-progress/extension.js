@@ -3,10 +3,22 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { activeStates, parseSnapshot, taskText } = require("./progress-model");
+const {
+  activeStates,
+  MAX_SNAPSHOT_BYTES,
+  parseSnapshot,
+  SNAPSHOT_TOO_LARGE,
+  taskText,
+  WORKFLOW_JOB_COUNT,
+} = require("./progress-model");
 
 // Mirrors let the GUI follow a run whose checkout is not an open workspace folder.
 const MIRROR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = 5000;
+const MAX_INITIAL_PROGRESS_FILES = 100;
+const METER_WIDTH = 10;
+const REPORTS_DIRECTORY = "reports";
+const UNRESOLVED_REPORT_NAME = "unresolved-remediation.md";
 const WINDOWS_UNC_DEVICE_PREFIX = "\\\\?\\UNC\\";
 const WINDOWS_DEVICE_PREFIX = "\\\\?\\";
 const EXTENSION_VERSION = require("./package.json").version;
@@ -211,15 +223,15 @@ function createPresenter(vscode) {
       active.length ? "Running" : current.status;
     const counts = current.total > 0 ? ` | ${current.completed}/${current.total}` : "";
     const percent = current.total > 0 ? Math.floor(100 * current.completed / current.total) : null;
-    const filled = percent == null ? 0 : Math.floor(percent / 10);
-    const meter = percent == null ? "" : ` [${"#".repeat(filled)}${"-".repeat(10 - filled)}] ${percent}%`;
+    const filled = percent == null ? 0 : Math.floor(percent * METER_WIDTH / 100);
+    const meter = percent == null ? "" : ` [${"#".repeat(filled)}${"-".repeat(METER_WIDTH - filled)}] ${percent}%`;
     const runningJob = (workflow?.jobs || []).find(job =>
-      job.status === "RUNNING" && Number.isInteger(job.number) && job.number >= 1 && job.number <= 7);
+      job.status === "RUNNING" && Number.isInteger(job.number) && job.number >= 1 && job.number <= WORKFLOW_JOB_COUNT);
     const reportedJob = Number.isInteger(current.completed) ? current.completed + 1 : null;
     const jobNumber = runningJob ? runningJob.number :
-      reportedJob != null && reportedJob <= 7 ? reportedJob : null;
+      reportedJob != null && reportedJob <= WORKFLOW_JOB_COUNT ? reportedJob : null;
     const label = current.id === "software-audit" ? current.label :
-      workflow && jobNumber != null ? `Job ${jobNumber}/7` : current.label;
+      workflow && jobNumber != null ? `Job ${jobNumber}/${WORKFLOW_JOB_COUNT}` : current.label;
     bar.text = active.length ? `${stale || current.status !== "RUNNING" ? "$(clock)" : "$(sync~spin)"} Security: ${label}${meter}${counts} | ${state}` : `$(list-unordered) Security: ${current.status}`;
     bar.tooltip = [versionText(current.serverVersion), ...tasks.map(task => taskText(task))].join("\n");
     bar.show();
@@ -277,6 +289,25 @@ function createPresenter(vscode) {
   };
 }
 
+async function newestUnresolvedReport(vscode, directory) {
+  // The server prefixes the report with the GitLab project name.
+  let entries;
+  try {
+    entries = await vscode.workspace.fs.readDirectory(directory);
+  } catch (error) {
+    if (error.code === "FileNotFound" || error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  let newest;
+  for (const [name, type] of entries) {
+    if (type !== vscode.FileType.File || !name.endsWith(UNRESOLVED_REPORT_NAME)) continue;
+    const uri = vscode.Uri.joinPath(directory, name);
+    const stat = await vscode.workspace.fs.stat(uri);
+    if (!newest || stat.mtime > newest.mtime) newest = { uri, mtime: stat.mtime };
+  }
+  return newest?.uri;
+}
+
 async function activate(context, vscode = require("vscode")) {
   const presenter = createPresenter(vscode);
   const snapshots = new Map();
@@ -298,7 +329,7 @@ async function activate(context, vscode = require("vscode")) {
       if (staleMirror) {
         snapshots.delete(uri.toString());
       } else {
-        if (stat.size > 256 * 1024) throw new Error("Progress snapshot exceeds 256 KiB.");
+        if (stat.size > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_TOO_LARGE);
         const bytes = await vscode.workspace.fs.readFile(uri);
         const next = parseSnapshot(Buffer.from(bytes).toString("utf8"));
         const previous = snapshots.get(uri.toString());
@@ -312,13 +343,13 @@ async function activate(context, vscode = require("vscode")) {
         if (completed && vscode.workspace.isTrusted) {
           const key = `${uri.toString()}:${completed.started_at}`;
           const folder = vscode.workspace.getWorkspaceFolder(uri);
-          const report = folder
-            ? vscode.Uri.joinPath(uri, "..", "reports", "unresolved-remediation.md")
+          const reports = folder
+            ? vscode.Uri.joinPath(uri, "..", REPORTS_DIRECTORY)
             : next.repo_root
-              ? vscode.Uri.joinPath(
-                  vscode.Uri.file(next.repo_root),
-                  ".security-mcp", "reports", "unresolved-remediation.md")
+              ? vscode.Uri.joinPath(vscode.Uri.file(next.repo_root), ".security-mcp", REPORTS_DIRECTORY)
               : undefined;
+          const report = reports && !displayedReports.has(key) &&
+            await newestUnresolvedReport(vscode, reports);
           if (report && !displayedReports.has(key)) {
             displayedReports.add(key);
             try {
@@ -378,12 +409,12 @@ async function activate(context, vscode = require("vscode")) {
     vscode.commands.registerCommand("gitlabSecurity.showProgress", presenter.show),
     vscode.commands.registerCommand("gitlabSecurity.showProgressLog", presenter.showLog)
   );
-  const timer = setInterval(poll, 5000);
+  const timer = setInterval(poll, POLL_INTERVAL_MS);
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
   const existing = await vscode.workspace.findFiles(
     "**/.security-mcp/progress.json",
     "**/{node_modules,.git,.venv,vendor,coverage}/**",
-    100
+    MAX_INITIAL_PROGRESS_FILES
   );
   await Promise.all(existing.map(refresh));
   // Direct polling also works when Git ignores or watcher exclusions hide the file.

@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from gitlab_security_mcp.config_findings import config_kind
+from gitlab_security_mcp.gitlab_client import MAX_DISMISSAL_REASON_LENGTH
 from gitlab_security_mcp.official_docs import REQUIRED_DOCS, cited_security_pages
 from gitlab_security_mcp.util import log_unexpected, read_bounded, resolve_inside
 
@@ -53,6 +54,10 @@ _RAISE_SOURCE_REVIEW_MUST_BE_AN_OBJECT = "source_review must be an object"
 _MIN_AUDIT_SENTENCE = 24
 _MAX_APPROVAL_REASON = 400
 _MAX_REVIEWED_SOURCE_FILES = 100
+_MAX_CITED_TEXT = 2000
+_MAX_CONTEXT_LINE_TEXT = 1000
+_CONTEXT_LINES_BEFORE = 8
+_CONTEXT_LINES_AFTER = 7
 
 MAX_SOURCE_BYTES = 1_000_000
 # Names and review limits from the TypeScript utility-types reference
@@ -328,10 +333,13 @@ def assess_source(root: Path, finding: dict, review: dict | None = None) -> dict
             "path": relative,
             "sha256": hashlib.sha256(contents).hexdigest(),
             "line": number,
-            "cited_text": lines[number - 1][:2000],
+            "cited_text": lines[number - 1][:_MAX_CITED_TEXT],
             "context": [
-                {"line": index + 1, "text": lines[index][:1000]}
-                for index in range(max(0, number - 8), min(len(lines), number + 7))
+                {"line": index + 1, "text": lines[index][:_MAX_CONTEXT_LINE_TEXT]}
+                for index in range(
+                    max(0, number - _CONTEXT_LINES_BEFORE),
+                    min(len(lines), number + _CONTEXT_LINES_AFTER),
+                )
             ],
         }
         evidence.append(
@@ -378,7 +386,7 @@ def assessment_false_positive_comment(finding: dict, assessment: dict) -> str:
         "Evidence:",
         *(f"- {item}" for item in assessment.get("evidence") or []),
     ]
-    return "\n".join(lines)[:50000]
+    return "\n".join(lines)[:MAX_DISMISSAL_REASON_LENGTH]
 
 
 def audit_false_positive_comment(

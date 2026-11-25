@@ -315,8 +315,10 @@ def _thread_exception(args: threading.ExceptHookArgs) -> None:
     if args.exc_type is SystemExit:
         return
     logger.error(
-        "Uncaught thread exception %s",
-        args.exc_type.__name__ if args.exc_type is not None else "unknown",
+        _LOG_UNCAUGHT_THREAD,
+        args.exc_type.__name__
+        if args.exc_type is not None
+        else _UNKNOWN_EXCEPTION_TYPE,
         exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
     )
 
@@ -331,7 +333,59 @@ _LOG_PROGRESS_CONSOLE_NOT_REAPED = (
 _LOG_PROGRESS_CONSOLE_OPEN_FAILED = (
     "Could not open progress console; stderr and tool transcripts remain available: %s"
 )
+# Windows CREATE_NEW_CONSOLE, used when the subprocess module does not expose it.
+_CREATE_NEW_CONSOLE = 0x10
+_MAX_PROGRESS_TEXT = 2000
+_MAX_QUEUED_PROGRESS_MESSAGES = 64
+_AUDIT_FILES_PAGE_SIZE = 20
+_MAX_DETAIL_MESSAGE = 500
+_PROGRESS_CONSOLE_REAP_TIMEOUT_SECONDS = 2
+_UNKNOWN_EXCEPTION_TYPE = "unknown"
 _LOG_FORMAT = "%(asctime)sZ %(levelname)s %(name)s [%(threadName)s]: %(message)s"
+_LOG_UNCAUGHT_THREAD = "Uncaught thread exception %s"
+_LOG_EDITOR_PROGRESS_FAILED = "Could not publish editor progress for %s"
+_LOG_BACKGROUND_EVENT = "Background repo=%s task=%s: %s"
+_LOG_PROGRESS_LOOP_CLOSED = (
+    "Could not queue progress: the MCP event loop has closed: %s"
+)
+_LOG_PROGRESS_SEND_FAILED = "Could not send MCP progress"
+_LOG_PROGRESS_DELIVERY_TIMEOUT = (
+    "MCP progress delivery timed out; the bounded tool transcript remains available."
+)
+_LOG_ENGINE_CLOSE_FAILED = "Could not close the engine for %s"
+_LOG_TOOL_FAILED = "%s failed"
+_LOG_SOURCE_REVIEW_BLOCKED = "AI source review blocked for %s: %s"
+_LOG_DESKTOP_TASK_FAILED = "Desktop task failed repo=%s request=%s"
+_LOG_FIX_SELECTION_FINISHED = (
+    "Desktop fix selection finished: %s; %s approved for local edits."
+)
+_LOG_PACKAGE_EXECUTION_FINISHED = "Approved package execution finished: %s"
+_LOG_FIX_SELECTION_FAILED = "Desktop fix selection failed repo=%s request=%s"
+_LOG_FIX_WINDOW_UNAVAILABLE = "Could not display Windows fix-selection window: %s"
+_LOG_FIX_SELECTION_INVALID = "Security fix selection unavailable or invalid: %s"
+_LOG_FALSE_POSITIVE_FINISHED = "Desktop false-positive approval finished: %s; independently confirmed %s of %s selections"
+_LOG_FALSE_POSITIVE_FAILED = "Desktop false-positive approval failed repo=%s request=%s"
+_LOG_APPROVAL_STARTUP_INTERRUPTED = (
+    "Windows approval startup interrupted before delivery"
+)
+_LOG_APPROVAL_WINDOW_UNAVAILABLE = "Could not display Windows approval window: %s"
+_LOG_FALSE_POSITIVE_INTERRUPTED = (
+    "False-positive form interrupted before a human response"
+)
+_LOG_FALSE_POSITIVE_INVALID = "Invalid false-positive approval response: %s"
+_LOG_FALSE_POSITIVE_UNAVAILABLE = "False-positive approval form unavailable: %s"
+_LOG_CODE_OUTCOME_REJECTED = "Code outcome rejected: %s"
+_LOG_ARCHIVE_FAILED = "Could not archive run logs"
+_LOG_AUDIT_APPROVAL_FAILED = "Software-audit approval failed"
+_LOG_AUDIT_CONSENT_UNAVAILABLE = "Audit consent unavailable: %s"
+_LOG_STALE_AUDIT_RESPONSE = "Ignoring a software-audit response from a previous run"
+_LOG_AUDIT_CHOICE_NOT_COLLECTED = "Software-audit choice was not collected: %s"
+_LOG_GIT_REVISION_UNREADABLE = (
+    "Could not read the Git revision for the audit prompt: %s"
+)
+_LOG_AUDIT_ITEMS_NOT_COLLECTED = "Audit-item checkboxes were not collected: %s"
+_LOG_SERVING_STDIO = "gitlab-security-mcp %s serving stdio"
+_LOG_SHUTDOWN_CLOSE_FAILED = "Could not close the engine during server shutdown"
 _LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -490,12 +544,12 @@ class _ProgressConsole:
             with contextlib.suppress(OSError, ValueError):
                 process.stdin.close()
         try:
-            process.wait(timeout=2)
+            process.wait(timeout=_PROGRESS_CONSOLE_REAP_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 process.kill()
             try:
-                process.wait(timeout=2)
+                process.wait(timeout=_PROGRESS_CONSOLE_REAP_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 logger.warning(
                     _LOG_PROGRESS_CONSOLE_NOT_REAPED, process.pid, exc_info=True
@@ -523,7 +577,9 @@ def _open_progress_console() -> _ProgressConsole | None:
             encoding="utf-8",
             errors="replace",
             shell=False,
-            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10),
+            creationflags=getattr(
+                subprocess, "CREATE_NEW_CONSOLE", _CREATE_NEW_CONSOLE
+            ),
         )
     except OSError as exc:
         logger.warning(_LOG_PROGRESS_CONSOLE_OPEN_FAILED, exc, exc_info=True)
@@ -632,7 +688,7 @@ def _editor_progress(
         publish_editor_progress(root, task_id, label, message, **details)
         _publish_extension_reload_notice(root)
     except (OSError, ValueError):
-        logger.warning("Could not publish editor progress for %s", root, exc_info=True)
+        logger.warning(_LOG_EDITOR_PROGRESS_FAILED, root, exc_info=True)
 
 
 _EXTENSION_RELOAD_TASK_ID = "progress-extension"
@@ -843,7 +899,7 @@ def _with_background_progress(label: str):
                 """Never reuse the original request's progress token from a worker."""
                 if ended.is_set():
                     return
-                text = " ".join(str(text).split())[:2000]
+                text = " ".join(str(text).split())[:_MAX_PROGRESS_TEXT]
                 status = next(
                     (
                         state
@@ -858,9 +914,7 @@ def _with_background_progress(label: str):
                         current_step=text,
                         updated_at=datetime.now(UTC).isoformat(),
                     )
-                logger.info(
-                    "Background repo=%s task=%s: %s", selected.repo_root, label, text
-                )
+                logger.info(_LOG_BACKGROUND_EVENT, selected.repo_root, label, text)
                 _editor_progress(
                     selected.repo_root, request_id, label, text, status=status
                 )
@@ -1039,7 +1093,7 @@ async def _progress_middleware(
         }:
             _progress_console_enabled = True
     loop = asyncio.get_running_loop()
-    messages: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
+    messages: asyncio.Queue[str] = asyncio.Queue(maxsize=_MAX_QUEUED_PROGRESS_MESSAGES)
     transcript: deque[str] = deque(maxlen=_TRANSCRIPT_LINES)
     finished = threading.Event()
     editor_task = uuid4().hex
@@ -1090,7 +1144,7 @@ async def _progress_middleware(
         nonlocal latest
         if finished.is_set():
             return
-        text = str(text)[:2000]
+        text = str(text)[:_MAX_PROGRESS_TEXT]
         latest = text
         editor_update(text)
         console = _console_for_progress()
@@ -1100,7 +1154,7 @@ async def _progress_middleware(
             loop.call_soon_threadsafe(enqueue, text)
         except RuntimeError as exc:
             logger.warning(
-                "Could not queue progress: the MCP event loop has closed: %s",
+                _LOG_PROGRESS_LOOP_CLOSED,
                 exc,
                 exc_info=True,
             )
@@ -1114,7 +1168,7 @@ async def _progress_middleware(
                 sequence += 1
                 await context.session.report_progress(sequence, None, text)
             except (*PROGRESS_PUBLISH_FAILURES, MCPError):
-                logger.warning("Could not send MCP progress", exc_info=True)
+                logger.warning(_LOG_PROGRESS_SEND_FAILED, exc_info=True)
             finally:
                 messages.task_done()
 
@@ -1187,7 +1241,7 @@ async def _progress_middleware(
                 await messages.join()
         except TimeoutError:
             logger.warning(
-                "MCP progress delivery timed out; the bounded tool transcript remains available.",
+                _LOG_PROGRESS_DELIVERY_TIMEOUT,
                 exc_info=True,
             )
         finally:
@@ -1238,7 +1292,7 @@ def _close_engine() -> None:
         try:
             item.close()
         except Exception as exc:
-            logger.exception("Could not close the engine for %s", item.repo_root)
+            logger.exception(_LOG_ENGINE_CLOSE_FAILED, item.repo_root)
             failures.append(exc)
     if failures:
         raise failures[0]
@@ -1379,7 +1433,7 @@ def _run(
                 selected._remember()
         return result
     except Exception as exc:
-        logger.exception("%s failed", tool_name)
+        logger.exception(_LOG_TOOL_FAILED, tool_name)
         return {
             "status": "ERROR",
             "stage": "configuration" if selected is None else tool_name,
@@ -1517,7 +1571,7 @@ async def verify_security_finding(
             "The host AI must examine the source and submit an evidence-backed "
             "source_review. No false-positive conclusion or GitLab change was made."
         )
-        logger.warning("AI source review blocked for %s: %s", finding_id, reason)
+        logger.warning(_LOG_SOURCE_REVIEW_BLOCKED, finding_id, reason)
         result.update(
             await asyncio.to_thread(
                 selected.record_source_review_blocker, finding_id, reason
@@ -1723,7 +1777,7 @@ def _desktop_task_done(
     error = task.exception()
     if error is not None:
         logger.error(
-            "Desktop task failed repo=%s request=%s",
+            _LOG_DESKTOP_TASK_FAILED,
             repo_root,
             request_id,
             exc_info=(type(error), error, error.__traceback__),
@@ -1797,7 +1851,7 @@ async def _finish_desktop_fix_selection(
             presentation="WINDOWS_DIALOG",
         )
         logger.info(
-            "Desktop fix selection finished: %s; %s approved for local edits.",
+            _LOG_FIX_SELECTION_FINISHED,
             result["status"],
             len(result.get("selected_ids", [])),
         )
@@ -1814,7 +1868,7 @@ async def _finish_desktop_fix_selection(
                 ),
             )
             execution = await asyncio.shield(work)
-            logger.info("Approved package execution finished: %s", execution["status"])
+            logger.info(_LOG_PACKAGE_EXECUTION_FINISHED, execution["status"])
             if (
                 selected.state is owner_state
                 and selected.state.fix_selection.get("request_id") == request_id
@@ -1841,7 +1895,7 @@ async def _finish_desktop_fix_selection(
         raise
     except Exception as exc:
         logger.exception(
-            "Desktop fix selection failed repo=%s request=%s",
+            _LOG_FIX_SELECTION_FAILED,
             selected.repo_root,
             request_id,
         )
@@ -2008,9 +2062,7 @@ async def _open_fix_selection(
         )
         raise
     except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning(
-            "Could not display Windows fix-selection window: %s", exc, exc_info=True
-        )
+        logger.warning(_LOG_FIX_WINDOW_UNAVAILABLE, exc, exc_info=True)
         return await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -2151,9 +2203,7 @@ async def select_security_fixes(
         if isinstance(response, InputRequiredResult):
             return response
     except (ValueError, MCPError) as exc:
-        logger.warning(
-            "Security fix selection unavailable or invalid: %s", exc, exc_info=True
-        )
+        logger.warning(_LOG_FIX_SELECTION_INVALID, exc, exc_info=True)
         return await asyncio.to_thread(
             selected.record_fix_selection,
             candidates,
@@ -2228,7 +2278,7 @@ async def _finish_desktop_approval(
             selected.resolve_desktop_approval, request_id, approved
         )
         logger.info(
-            "Desktop false-positive approval finished: %s; independently confirmed %s of %s selections",
+            _LOG_FALSE_POSITIVE_FINISHED,
             result["status"],
             result.get("confirmed_dismissals", 0),
             result.get("selected_count", 0),
@@ -2246,7 +2296,7 @@ async def _finish_desktop_approval(
         raise
     except Exception as exc:
         logger.exception(
-            "Desktop false-positive approval failed repo=%s request=%s",
+            _LOG_FALSE_POSITIVE_FAILED,
             selected.repo_root,
             request_id,
         )
@@ -2449,13 +2499,11 @@ async def submit_false_positive_approvals(
                 properties,
             )
         except asyncio.CancelledError:
-            logger.warning("Windows approval startup interrupted before delivery")
+            logger.warning(_LOG_APPROVAL_STARTUP_INTERRUPTED)
             await asyncio.shield(_interrupt_desktop_startup(selected, receipt))
             raise
         except (OSError, RuntimeError, ValueError) as exc:
-            logger.warning(
-                "Could not display Windows approval window: %s", exc, exc_info=True
-            )
+            logger.warning(_LOG_APPROVAL_WINDOW_UNAVAILABLE, exc, exc_info=True)
             return await _approval_result(
                 selected,
                 receipt,
@@ -2516,7 +2564,7 @@ async def submit_false_positive_approvals(
             schema,
         )
     except asyncio.CancelledError:
-        logger.warning("False-positive form interrupted before a human response")
+        logger.warning(_LOG_FALSE_POSITIVE_INTERRUPTED)
         await asyncio.shield(
             _approval_result(
                 selected,
@@ -2530,9 +2578,7 @@ async def submit_false_positive_approvals(
         await asyncio.shield(asyncio.to_thread(selected.generate_local_report))
         raise
     except ValueError as exc:
-        logger.warning(
-            "Invalid false-positive approval response: %s", exc, exc_info=True
-        )
+        logger.warning(_LOG_FALSE_POSITIVE_INVALID, exc, exc_info=True)
         return await _approval_result(
             selected,
             receipt,
@@ -2543,9 +2589,7 @@ async def submit_false_positive_approvals(
             },
         )
     except MCPError as exc:
-        logger.warning(
-            "False-positive approval form unavailable: %s", exc, exc_info=True
-        )
+        logger.warning(_LOG_FALSE_POSITIVE_UNAVAILABLE, exc, exc_info=True)
         return await _approval_result(
             selected,
             receipt,
@@ -2675,7 +2719,7 @@ def _server_source_validation(engine: Engine) -> tuple[str, bool]:
             f"{row.get('status')}: {command or 'no command'}: {detail}".strip(": ")
         )
     text = "Server production build; unit tests were not run. " + " | ".join(parts)
-    return text[:2000], outcome.get("status") == "VALIDATION_COMPLETE"
+    return text[:_MAX_PROGRESS_TEXT], outcome.get("status") == "VALIDATION_COMPLETE"
 
 
 async def _fill_source_validation(
@@ -2766,7 +2810,7 @@ def _record_code_results(selected: Engine, results: list[dict] | None) -> dict |
                     )
                 )
     except ValueError as exc:
-        logger.warning("Code outcome rejected: %s", exc, exc_info=True)
+        logger.warning(_LOG_CODE_OUTCOME_REJECTED, exc, exc_info=True)
         return {"status": "ERROR", "reason": str(exc)}
     for item in parsed:
         stored[f"{prefix}:{item.id}"] = {
@@ -3017,7 +3061,7 @@ async def _continue_workflow(
                     archive_run_logs, *archive_args, **archive_kwargs
                 )
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
-            logger.exception("Could not archive run logs")
+            logger.exception(_LOG_ARCHIVE_FAILED)
             result["log_archive"] = {"status": "ERROR", "path": None, "error": str(exc)}
             state.workflow["final_result"] = result
             selected._remember()
@@ -3220,7 +3264,7 @@ async def _finish_audit_approval(
             )
         raise
     except (OSError, RuntimeError, ValueError) as exc:
-        logger.exception("Software-audit approval failed")
+        logger.exception(_LOG_AUDIT_APPROVAL_FAILED)
         if (
             selected.state is state
             and state.software_audit.get("request_id") == request_id
@@ -3410,7 +3454,7 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
                 )
             raise
         except (OSError, RuntimeError, ValueError, MCPError) as exc:
-            logger.warning("Audit consent unavailable: %s", exc, exc_info=True)
+            logger.warning(_LOG_AUDIT_CONSENT_UNAVAILABLE, exc, exc_info=True)
             return _record_audit_result(
                 selected,
                 {
@@ -3431,7 +3475,7 @@ async def _offer_audit_choices(ctx: Context, selected: Engine) -> dict[str, Any]
     try:
         choice = await _ask_software_audit_choice(ctx)
         if selected.state is not state:
-            logger.warning("Ignoring a software-audit response from a previous run")
+            logger.warning(_LOG_STALE_AUDIT_RESPONSE)
             return {
                 "status": "CHOICE_UNAVAILABLE",
                 "reason": "The software-audit choice belonged to a previous run. No action was authorized for the current run.",
@@ -3463,9 +3507,7 @@ async def _offer_audit_choices(ctx: Context, selected: Engine) -> dict[str, Any]
             )
         raise
     except (OSError, RuntimeError, ValueError, MCPError) as exc:
-        logger.warning(
-            "Software-audit choice was not collected: %s", exc, exc_info=True
-        )
+        logger.warning(_LOG_AUDIT_CHOICE_NOT_COLLECTED, exc, exc_info=True)
         result = {
             "status": "CHOICE_UNAVAILABLE",
             "choices": choice_labels(),
@@ -3484,7 +3526,7 @@ def _audit_revision(engine: Engine) -> str:
         return f"{engine.git.current_branch()} {engine.git.head()}"
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         logger.warning(
-            "Could not read the Git revision for the audit prompt: %s",
+            _LOG_GIT_REVISION_UNREADABLE,
             exc,
             exc_info=True,
         )
@@ -3538,9 +3580,9 @@ def _compact_audit(audit: dict[str, Any]) -> dict[str, Any]:
         remaining = gaps.get("remaining_files") or []
         compact["coverage_gaps"] = {
             **deepcopy(gaps),
-            "remaining_files": remaining[:20],
+            "remaining_files": remaining[:_AUDIT_FILES_PAGE_SIZE],
             "remaining_file_count": len(remaining),
-            "remaining_files_truncated": len(remaining) > 20,
+            "remaining_files_truncated": len(remaining) > _AUDIT_FILES_PAGE_SIZE,
         }
     if coverage or "audit_prompt" in audit:
         pending = _prompt_pending(audit)
@@ -3669,9 +3711,9 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
     if gaps is not None:
         response["coverage_gaps"] = {
             **gaps,
-            "remaining_files": remaining[:20],
+            "remaining_files": remaining[:_AUDIT_FILES_PAGE_SIZE],
             "remaining_file_count": len(remaining),
-            "remaining_files_truncated": len(remaining) > 20,
+            "remaining_files_truncated": len(remaining) > _AUDIT_FILES_PAGE_SIZE,
         }
     return deepcopy(
         {
@@ -3679,7 +3721,7 @@ def _audit_review_handoff(result: dict[str, Any], coverage: dict) -> dict[str, A
             "continue_review": True,
             "generated_exclusions": coverage.get("generated_exclusions", []),
             "remaining_file_count": len(remaining),
-            "next_files": remaining[:20],
+            "next_files": remaining[:_AUDIT_FILES_PAGE_SIZE],
             "remaining_phases": gaps["remaining_phases"]
             if gaps is not None
             else sorted(REVIEW_PHASES - set(coverage.get("completed_phases", [])))
@@ -4296,7 +4338,7 @@ async def choose_software_audit_action(
                 len(coverage["files"]),
             )
         progress = {
-            "message": " ".join(details.message.split())[:500],
+            "message": " ".join(details.message.split())[:_MAX_DETAIL_MESSAGE],
             "reviewed_files": reviewed_files,
             "total_files": total_files,
             "updated_at": datetime.now(UTC).isoformat(),
@@ -4447,9 +4489,7 @@ async def choose_software_audit_action(
     try:
         checked = await _ask_audit_items(ctx, prepared["items"])
     except (OSError, RuntimeError, ValueError, MCPError) as exc:
-        logger.warning(
-            "Audit-item checkboxes were not collected: %s", exc, exc_info=True
-        )
+        logger.warning(_LOG_AUDIT_ITEMS_NOT_COLLECTED, exc, exc_info=True)
         return prepared
     if checked is None:
         return prepared
@@ -4576,7 +4616,7 @@ def main() -> None:
     """Serve MCP tools over stdio until the client disconnects."""
     global _progress_console
     _install_host_logging()
-    logger.info("gitlab-security-mcp %s serving stdio", __version__)
+    logger.info(_LOG_SERVING_STDIO, __version__)
     # A second window must speak MCP while another window still holds the install lock.
     threading.Thread(
         target=install_progress_extension,
@@ -4589,7 +4629,7 @@ def main() -> None:
         try:
             _close_engine()
         except Exception:
-            logger.exception("Could not close the engine during server shutdown")
+            logger.exception(_LOG_SHUTDOWN_CLOSE_FAILED)
         finally:
             if _progress_console is not None:
                 _progress_console.close()

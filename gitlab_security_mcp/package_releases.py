@@ -72,6 +72,8 @@ _RAISE_PACKAGE_RELEASE_CATALOG_EXCEEDS_THE_SIZE_LIMIT = (
 )
 
 MAX_RELEASE_BYTES = 20 * 1024 * 1024
+_HTTP_TIMEOUT_SECONDS = 30.0
+_MAX_REPORTED_UNKNOWN_VERSIONS = 5
 
 
 def stable_versions(versions: list[str], *, ecosystem: str | None = None) -> list[str]:
@@ -93,7 +95,7 @@ def stable_versions(versions: list[str], *, ecosystem: str | None = None) -> lis
     if unknown:
         raise ValueError(
             _RAISE_RELEASE_CATALOG_CONTAINS_VERSIONS_THAT_CANNOT_BE_COMPARED.format(
-                ", ".join(unknown[:5])
+                ", ".join(unknown[:_MAX_REPORTED_UNKNOWN_VERSIONS])
             )
         )
     return [
@@ -126,7 +128,7 @@ def release_catalog(
         )
     else:
         raise ValueError(_RAISE_NO_SUPPORTED_PUBLIC_RELEASE_CATALOG_FOR_THIS_PACKAGE)
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS) as client:
         with timed_http_stream(
             client,
             "GET",

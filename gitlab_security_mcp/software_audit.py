@@ -29,6 +29,7 @@ _RAISE_AUDIT_REVIEW_IS_OUTSIDE_THE_INVENTORY = (
 _RAISE_AUDIT_REVIEW_NEEDS_THE_CURRENT_FILE_HASH_AND = (
     "Audit review needs the current file hash and an assessment: {}"
 )
+_GENERATED_PREFIX_BYTES = 8192
 
 _CHOICES = {
     "fix_from_report": (
@@ -216,7 +217,7 @@ def _generated_source(path: Path) -> bool:
     if _GENERATED_NAME.search(path.name):
         return True
     with path.open("rb") as stream:
-        prefix = stream.read(8192)
+        prefix = stream.read(_GENERATED_PREFIX_BYTES)
     encoding = (
         "utf-16" if prefix.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
     )

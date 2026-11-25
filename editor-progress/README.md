@@ -35,7 +35,7 @@ Waiting states use a clock, not a spinner claiming that the host AI is busy.
 The heartbeat measures server liveness, not whether the AI is actively reading;
 the message also shows time since the last actual AI progress update.
 Job counts measure finished jobs, not elapsed time or successful fixes. At the
-end the extension opens `.security-mcp/reports/unresolved-remediation.md` once
+end the extension opens the newest `.security-mcp/reports/<project>-unresolved-remediation.md` once
 in a trusted workspace. It never auto-opens reports in an untrusted workspace.
 
 It watches local `.security-mcp/progress.json` inspection files. It does not send

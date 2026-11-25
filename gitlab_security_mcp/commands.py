@@ -54,6 +54,7 @@ _RAISE_SCRIPTS_MUST_BE_AN_OBJECT = "{}: scripts must be an object"
 _RAISE_MAX_OUTPUT_MUST_BE_NON_NEGATIVE = "max_output must be non-negative"
 _RAISE_COMMAND_OUTPUT_READERS_DID_NOT_STOP = "Command output readers did not stop"
 _RAISE_COULD_NOT_READ_COMMAND_OUTPUT = "Could not read command output"
+_RAISE_COULD_NOT_READ_COMMAND_OUTPUT_CAUSE = "{}: {}"
 _RAISE_FAILED = "{} failed ({}): {}"
 _COMMAND_EXCERPT_LIMIT = 500
 _COMMAND_FAILURE_LOG = (
@@ -81,6 +82,19 @@ _RAISE_GRADLE_NO_TESTS_INITIALIZATION_MUST_STAY_INSIDE_THE = (
 )
 _RAISE_COMMAND_DESCENDANTS_CONTINUED_WRITING_AFTER_SHUTDOWN_OUTPUT_CAPTURE = (
     "Command descendants continued writing after shutdown; output capture is incomplete"
+)
+_LOG_COMMAND_PROCESS_WAS_NOT_REAPED_AFTER_TERMINATION = (
+    "Command process was not reaped after termination pid=%s"
+)
+_LOG_COMMAND_EXECUTION_FAILED_BEFORE_A_RESULT = (
+    "Command execution failed before a result: tool=%s cwd=%s pid=%s"
+)
+_LOG_COULD_NOT_PUBLISH_COMMAND_PROGRESS = "Could not publish command progress"
+_LOG_COMMAND_TREE_TERMINATION_FAILED_ATTEMPTING_DIRECT_KILL = (
+    "Command tree termination failed; attempting direct kill pid=%s"
+)
+_LOG_COULD_NOT_TERMINATE_COMMAND_PROCESS_GROUP = (
+    "Could not terminate command process group pid=%s"
 )
 
 FORBIDDEN_GIT = {
@@ -125,6 +139,29 @@ ALLOWED_SCRIPTS = {
 }
 _SECURITY_BRANCH = re.compile(r"^security-fixes-\d{4}-\d{2}-\d{2}$")
 _READ_SIZE = 8192
+_LOGGER_NAME = "gitlab_security_mcp"
+_PROGRESS_EMIT_INTERVAL_SECONDS = 0.25
+_PROGRESS_BAR_WIDTH = 20
+_MAX_TRACKED_SUITES = 20000
+_MAX_PACKAGE_JSON_CHARS = 512 * 1024
+_DEFAULT_MAX_OUTPUT = 65536
+_READER_POLL_SECONDS = 0.1
+_READER_JOIN_TIMEOUT_SECONDS = 5
+# Matches the exit status GNU timeout reports for a command it stopped.
+TIMEOUT_EXIT_CODE = 124
+_PIPE_POLL_SECONDS = 0.02
+_ERROR_BROKEN_PIPE = 109
+_CREATE_SUSPENDED = 0x00000004
+_IO_COUNTER_FIELDS = 6
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_RESUME_THREAD_FAILED = 0xFFFFFFFF
+_TASKKILL_TIMEOUT_SECONDS = 15
+_REAP_TIMEOUT_SECONDS = 10
 progress_sink: ContextVar[Callable[[str], None] | None] = ContextVar(
     "security_mcp_progress", default=None
 )
@@ -515,31 +552,39 @@ class CommandProgress:
         """Publish only changed progress without exposing raw command output."""
         text = f"{self.label}: {detail}"
         now = time.monotonic()
-        if text != self._last and (force or now - self._last_emitted >= 0.25):
+        if text != self._last and (
+            force or now - self._last_emitted >= _PROGRESS_EMIT_INTERVAL_SECONDS
+        ):
             self._last = text
             self._last_emitted = now
             try:
                 self.callback(text)
             except PROGRESS_PUBLISH_FAILURES:
-                logging.getLogger("gitlab_security_mcp").warning(
-                    "Could not publish command progress", exc_info=True
+                logging.getLogger(_LOGGER_NAME).warning(
+                    _LOG_COULD_NOT_PUBLISH_COMMAND_PROGRESS, exc_info=True
                 )
 
     def _tests(self, *, force: bool = False) -> None:
         """Render percentages only when the runner supplied a positive total."""
         if self.total:
-            filled = min(20, self.completed * 20 // self.total)
+            filled = min(
+                _PROGRESS_BAR_WIDTH,
+                self.completed * _PROGRESS_BAR_WIDTH // self.total,
+            )
             self._emit(
-                f"[{'#' * filled}{'.' * (20 - filled)}] "
+                f"[{'#' * filled}{'.' * (_PROGRESS_BAR_WIDTH - filled)}] "
                 f"{self.completed}/{self.total} tests "
                 f"({min(100, self.completed * 100 // self.total)}%)",
                 force=force,
             )
         elif self.total_suites:
             completed = len(self.suites)
-            filled = min(20, completed * 20 // self.total_suites)
+            filled = min(
+                _PROGRESS_BAR_WIDTH,
+                completed * _PROGRESS_BAR_WIDTH // self.total_suites,
+            )
             self._emit(
-                f"[{'#' * filled}{'.' * (20 - filled)}] "
+                f"[{'#' * filled}{'.' * (_PROGRESS_BAR_WIDTH - filled)}] "
                 f"{completed}/{self.total_suites} test suites "
                 f"({min(100, completed * 100 // self.total_suites)}%); "
                 f"{self.completed} test cases reported; case total unavailable",
@@ -580,7 +625,7 @@ class CommandProgress:
                     self.completed += 1
                     self._tests()
                 elif re.match(r"^\s*(?:PASS|FAIL)\s+", line):
-                    if len(self.suites) < 20000:
+                    if len(self.suites) < _MAX_TRACKED_SUITES:
                         self.suites.add(line.strip())
                     self._tests()
             if self._last == previous and block:
@@ -600,7 +645,7 @@ class CommandProgress:
             if self.completed or self.suites:
                 self._tests(force=True)
             self._emit(
-                f"[{'#' * 20 if exit_code == 0 else '!' * 20}] "
+                f"[{'#' * _PROGRESS_BAR_WIDTH if exit_code == 0 else '!' * _PROGRESS_BAR_WIDTH}] "
                 f"command finished; exit {exit_code}",
                 force=True,
             )
@@ -628,8 +673,8 @@ def assert_test_free_scripts(argv: list[str], workdir: Path) -> None:
         if path.name != "package.json":
             continue
         with path.open(encoding="utf-8") as stream:
-            text = stream.read(512 * 1024 + 1)
-        if len(text) > 512 * 1024:
+            text = stream.read(_MAX_PACKAGE_JSON_CHARS + 1)
+        if len(text) > _MAX_PACKAGE_JSON_CHARS:
             raise PermissionError(
                 _RAISE_CANNOT_VERIFY_OVERSIZED_PACKAGE_JSON_BUILD_SCRIPTS
             )
@@ -676,7 +721,7 @@ class CommandRunner:
         self,
         repo_root: Path,
         *,
-        max_output: int = 65536,
+        max_output: int = _DEFAULT_MAX_OUTPUT,
         audit_path: Path | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ):
@@ -800,7 +845,9 @@ class CommandRunner:
             while True:
                 try:
                     exit_code = process.wait(
-                        timeout=max(0, min(0.1, deadline - time.monotonic()))
+                        timeout=max(
+                            0, min(_READER_POLL_SECONDS, deadline - time.monotonic())
+                        )
                     )
                     break
                 except subprocess.TimeoutExpired:
@@ -815,8 +862,8 @@ class CommandRunner:
             timed_out = True
             exit_code = -1
         except BaseException:
-            logging.getLogger("gitlab_security_mcp").exception(
-                "Command execution failed before a result: tool=%s cwd=%s pid=%s",
+            logging.getLogger(_LOGGER_NAME).exception(
+                _LOG_COMMAND_EXECUTION_FAILED_BEFORE_A_RESULT,
                 tool_name(argv[0]),
                 workdir,
                 process.pid if process is not None else None,
@@ -834,7 +881,7 @@ class CommandRunner:
                 stop_readers.set()
                 for thread in threads:
                     if thread.ident is not None:
-                        thread.join(timeout=5)
+                        thread.join(timeout=_READER_JOIN_TIMEOUT_SECONDS)
                 if process is not None and not any(
                     thread.is_alive() for thread in threads
                 ):
@@ -844,13 +891,15 @@ class CommandRunner:
         if errors:
             cause = errors[0]
             raise RuntimeError(
-                f"{_RAISE_COULD_NOT_READ_COMMAND_OUTPUT}: {type(cause).__name__}"
+                _RAISE_COULD_NOT_READ_COMMAND_OUTPUT_CAUSE.format(
+                    _RAISE_COULD_NOT_READ_COMMAND_OUTPUT, type(cause).__name__
+                )
             ) from cause
         stdout, stdout_truncated = captured.get("stdout", ("", False))
         stderr, stderr_truncated = captured.get("stderr", ("", False))
         if timed_out:
             stderr = f"{stderr}\nTimed out after {timeout}s"
-            exit_code = 124
+            exit_code = TIMEOUT_EXIT_CODE
         self._command_progress.finish(exit_code)
         duration_ms = int((time.monotonic() - started) * 1000)
         truncated = stdout_truncated or stderr_truncated
@@ -912,7 +961,7 @@ class CommandRunner:
                     f"command-reader:{name}",
                     error=type(exc).__name__,
                 )
-                logging.getLogger("gitlab_security_mcp").warning(
+                logging.getLogger(_LOGGER_NAME).warning(
                     _COMMAND_READER_FAILURE, name, exc_info=exc
                 )
                 with output_lock:
@@ -1012,7 +1061,7 @@ def _command_failure_text(result: CommandResult) -> str:
 
 def _log_failed_command(result: CommandResult, cwd: Path) -> None:
     """Record a failed command without waiting for a later handler to keep the traceback."""
-    logging.getLogger("gitlab_security_mcp").warning(
+    logging.getLogger(_LOGGER_NAME).warning(
         _COMMAND_FAILURE_LOG,
         tool_name(result.argv[0]) if result.argv else "",
         result.exit_code,
@@ -1055,7 +1104,7 @@ def _read_capped(
             if not available:
                 if stop.is_set():
                     break
-                stop.wait(0.02)
+                stop.wait(_PIPE_POLL_SECONDS)
                 continue
             raw = os.read(pipe.fileno(), min(available, _READ_SIZE))
             if not raw:
@@ -1138,7 +1187,7 @@ def _pipe_available(pipe) -> int | None:
         None,
     ):
         error = ctypes.get_last_error()
-        if error == 109:
+        if error == _ERROR_BROKEN_PIPE:
             return None
         raise ctypes.WinError(error)
     return available.value
@@ -1186,7 +1235,9 @@ def _process_group_options() -> dict:
     """Start the child in its own group so a timeout can stop its children too."""
     if os.name == "nt":
         # Assign the suspended process to its job before it can spawn children.
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000004}
+        return {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | _CREATE_SUSPENDED
+        }
     return {"start_new_session": True}
 
 
@@ -1218,7 +1269,7 @@ class _WindowsJob:
 
             _fields_ = [
                 ("BasicLimitInformation", BasicLimits),
-                ("IoInfo", ctypes.c_ulonglong * 6),
+                ("IoInfo", ctypes.c_ulonglong * _IO_COUNTER_FIELDS),
                 ("ProcessMemoryLimit", ctypes.c_size_t),
                 ("JobMemoryLimit", ctypes.c_size_t),
                 ("PeakProcessMemoryUsed", ctypes.c_size_t),
@@ -1253,9 +1304,14 @@ class _WindowsJob:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
             limits = ExtendedLimits()
-            limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+            limits.BasicLimitInformation.LimitFlags = (
+                _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
             if not self._kernel.SetInformationJobObject(
-                self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+                self._handle,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
         except BaseException:
@@ -1267,7 +1323,9 @@ class _WindowsJob:
         import ctypes
 
         # AssignProcessToJobObject requires PROCESS_SET_QUOTA | PROCESS_TERMINATE.
-        handle = self._kernel.OpenProcess(0x0100 | 0x0001, False, process.pid)
+        handle = self._kernel.OpenProcess(
+            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, process.pid
+        )
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
@@ -1306,7 +1364,7 @@ class _WindowsJob:
         kernel.OpenThread.restype = wintypes.HANDLE
         kernel.ResumeThread.argtypes = [wintypes.HANDLE]
         kernel.ResumeThread.restype = wintypes.DWORD
-        snapshot = kernel.CreateToolhelp32Snapshot(0x00000004, 0)  # SNAPTHREAD
+        snapshot = kernel.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
         if snapshot == ctypes.c_void_p(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
@@ -1315,11 +1373,13 @@ class _WindowsJob:
             found = kernel.Thread32First(snapshot, ctypes.byref(entry))
             while found:
                 if entry.th32OwnerProcessID == pid:
-                    thread = kernel.OpenThread(0x0002, False, entry.th32ThreadID)
+                    thread = kernel.OpenThread(
+                        _THREAD_SUSPEND_RESUME, False, entry.th32ThreadID
+                    )
                     if not thread:
                         raise ctypes.WinError(ctypes.get_last_error())
                     try:
-                        if kernel.ResumeThread(thread) == 0xFFFFFFFF:
+                        if kernel.ResumeThread(thread) == _RESUME_THREAD_FAILED:
                             raise ctypes.WinError(ctypes.get_last_error())
                     finally:
                         kernel.CloseHandle(thread)
@@ -1361,13 +1421,13 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=15,
+                    timeout=_TASKKILL_TIMEOUT_SECONDS,
                     check=False,
                     shell=False,
                 )
             except (OSError, subprocess.TimeoutExpired):
-                logging.getLogger("gitlab_security_mcp").warning(
-                    "Command tree termination failed; attempting direct kill pid=%s",
+                logging.getLogger(_LOGGER_NAME).warning(
+                    _LOG_COMMAND_TREE_TERMINATION_FAILED_ATTEMPTING_DIRECT_KILL,
                     process.pid,
                     exc_info=True,
                 )
@@ -1377,17 +1437,17 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
             except ProcessLookupError:
                 pass
             except OSError:
-                logging.getLogger("gitlab_security_mcp").exception(
-                    "Could not terminate command process group pid=%s", process.pid
+                logging.getLogger(_LOGGER_NAME).exception(
+                    _LOG_COULD_NOT_TERMINATE_COMMAND_PROCESS_GROUP, process.pid
                 )
                 raise
         if process.poll() is None:
             process.kill()
     try:
-        process.wait(timeout=10)
+        process.wait(timeout=_REAP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
-        logging.getLogger("gitlab_security_mcp").exception(
-            "Command process was not reaped after termination pid=%s", process.pid
+        logging.getLogger(_LOGGER_NAME).exception(
+            _LOG_COMMAND_PROCESS_WAS_NOT_REAPED_AFTER_TERMINATION, process.pid
         )
         raise RuntimeError(
             _RAISE_COMMAND_PROCESS_WAS_NOT_REAPED_AFTER_TERMINATION_CLEANUP.format(

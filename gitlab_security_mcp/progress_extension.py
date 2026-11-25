@@ -17,6 +17,7 @@ from ctypes import wintypes
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from gitlab_security_mcp import __version__
 from gitlab_security_mcp.util import read_bounded
 
 logger = logging.getLogger("gitlab_security_mcp")
@@ -30,6 +31,11 @@ _INSTALL_TIMEOUT_SECONDS = 60
 _MAX_PARENT_PROCESSES = 8
 _TH32CS_SNAPPROCESS = 0x00000002
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_MAX_PATH = 260
+_MAX_IMAGE_PATH_CHARS = 32_768
+_RAISE_PROCESS_SNAPSHOT_FAILED = "Process snapshot failed"
+_RAISE_PROCESS_SNAPSHOT_EMPTY = "Process snapshot was empty"
+_RAISE_PS_FAILED = "ps failed"
 _CLI_JS = Path("resources") / "app" / "out" / "cli.js"
 _MAC_CLI_JS = Path("Resources") / "app" / "out" / "cli.js"
 _MAC_EXECUTABLE_MARKER = "Contents/MacOS/"
@@ -48,6 +54,12 @@ _LOG_EXTENSION_RELOAD_REQUIRED = (
 )
 _LOG_EXTENSION_LIST_FAILED = "Could not list the editor's installed extensions"
 _LOG_EXTENSION_LIST_EXIT = "Listing the editor's installed extensions exited %s"
+_LOG_INSTALLED_THE_PROGRESS_EXTENSION_INTO = "Installed the progress extension into %s"
+_LOG_PROGRESS_EXTENSION_INSTALL_EXITED = "Progress extension install exited %s: %s"
+_LOG_COULD_NOT_IDENTIFY_THE_EDITOR_PROCESS = "Could not identify the editor process"
+_LOG_COULD_NOT_INSTALL_THE_PROGRESS_EXTENSION = (
+    "Could not install the progress extension"
+)
 _reload_required_version: str | None = None
 _WINDOWS_LAUNCHERS = {
     "code.exe": "code.cmd",
@@ -78,8 +90,9 @@ _MAC_EDITOR_BASENAMES = (
     "electron",
     "code",
 )
+_PACKAGE_JSON = "package.json"
 _EXTENSION_FILES = (
-    "package.json",
+    _PACKAGE_JSON,
     "extension.js",
     "progress-model.js",
     "README.md",
@@ -127,7 +140,7 @@ class _ProcessEntry(ctypes.Structure):
         ("th32ParentProcessID", wintypes.DWORD),
         ("pcPriClassBase", ctypes.c_long),
         ("dwFlags", wintypes.DWORD),
-        ("szExeFile", wintypes.WCHAR * 260),
+        ("szExeFile", wintypes.WCHAR * _MAX_PATH),
     )
 
 
@@ -140,12 +153,13 @@ def extension_directory() -> Path:
 
 
 def write_vsix(path: Path) -> None:
-    """Write a VSIX from the current extension source."""
+    """Write a VSIX from the current extension source, versioned as this server."""
     source = extension_directory()
     package = json.loads((source / "package.json").read_text(encoding="utf-8"))
+    package["version"] = __version__
     manifest = _MANIFEST.format(
         identifier=package["name"],
-        version=package["version"],
+        version=__version__,
         publisher=package["publisher"],
         display_name=package["displayName"],
         description=package["description"],
@@ -158,7 +172,10 @@ def write_vsix(path: Path) -> None:
             arcname = (
                 "extension/readme.md" if name == "README.md" else f"extension/{name}"
             )
-            archive.write(source / name, arcname)
+            if name == _PACKAGE_JSON:
+                archive.writestr(arcname, json.dumps(package, indent=2) + "\n")
+            else:
+                archive.write(source / name, arcname)
 
 
 def editor_command(
@@ -199,7 +216,7 @@ def install_progress_extension() -> None:
             tree = _posix_process_tree()
         command = editor_command(os.getppid(), *tree)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        logger.warning("Could not identify the editor process", exc_info=True)
+        logger.warning(_LOG_COULD_NOT_IDENTIFY_THE_EDITOR_PROCESS, exc_info=True)
         return
     if command is None:
         logger.warning(_NO_EDITOR_CLI_MESSAGE)
@@ -207,7 +224,7 @@ def install_progress_extension() -> None:
     try:
         _install_with_command(command)
     except Exception:
-        logger.warning("Could not install the progress extension", exc_info=True)
+        logger.warning(_LOG_COULD_NOT_INSTALL_THE_PROGRESS_EXTENSION, exc_info=True)
 
 
 @contextmanager
@@ -289,10 +306,10 @@ def _install_with_command(command: list[str]) -> None:
     """Install the bundled VSIX unless that exact version is already installed."""
     global _reload_required_version
     package = json.loads(
-        (extension_directory() / "package.json").read_text(encoding="utf-8")
+        (extension_directory() / _PACKAGE_JSON).read_text(encoding="utf-8")
     )
     identity = f"{package['publisher']}.{package['name']}"
-    bundled = package["version"]
+    bundled = __version__
     with _editor_install_lock(command[0]), TemporaryDirectory() as directory:
         child_env = os.environ.copy()
         child_env.pop("VSCODE_DEV", None)
@@ -316,16 +333,16 @@ def _install_with_command(command: list[str]) -> None:
                 env=child_env,
             )
         except (OSError, subprocess.TimeoutExpired):
-            logger.warning("Could not install the progress extension", exc_info=True)
+            logger.warning(_LOG_COULD_NOT_INSTALL_THE_PROGRESS_EXTENSION, exc_info=True)
             return
     if completed.returncode != 0:
         logger.warning(
-            "Progress extension install exited %s: %s",
+            _LOG_PROGRESS_EXTENSION_INSTALL_EXITED,
             completed.returncode,
             (completed.stderr or completed.stdout).strip(),
         )
         return
-    logger.info("Installed the progress extension into %s", command[0])
+    logger.info(_LOG_INSTALLED_THE_PROGRESS_EXTENSION_INTO, command[0])
     if installed is not None:
         # An open window keeps running the older extension until it reloads.
         _reload_required_version = bundled
@@ -382,7 +399,7 @@ def _posix_process_tree() -> tuple[dict[int, tuple[int, str]], dict[int, Path]]:
         timeout=_PS_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
-        raise OSError(completed.stderr.strip() or "ps failed")
+        raise OSError(completed.stderr.strip() or _RAISE_PS_FAILED)
     return _process_tree_from_ps(completed.stdout)
 
 
@@ -522,13 +539,13 @@ def _windows_process_tree() -> tuple[dict[int, tuple[int, str]], dict[int, Path]
     kernel = _kernel32()
     snapshot = kernel.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
     if snapshot == wintypes.HANDLE(-1).value:
-        raise OSError("Process snapshot failed")
+        raise OSError(_RAISE_PROCESS_SNAPSHOT_FAILED)
     parents: dict[int, tuple[int, str]] = {}
     try:
         entry = _ProcessEntry()
         entry.dwSize = ctypes.sizeof(entry)
         if not kernel.Process32FirstW(snapshot, ctypes.byref(entry)):
-            raise OSError("Process snapshot was empty")
+            raise OSError(_RAISE_PROCESS_SNAPSHOT_EMPTY)
         while True:
             parents[int(entry.th32ProcessID)] = (
                 int(entry.th32ParentProcessID),
@@ -577,7 +594,7 @@ def _process_image(pid: int) -> Path | None:
     if not handle:
         return None
     try:
-        size = wintypes.DWORD(32_768)
+        size = wintypes.DWORD(_MAX_IMAGE_PATH_CHARS)
         buffer = ctypes.create_unicode_buffer(size.value)
         if not kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
             return None

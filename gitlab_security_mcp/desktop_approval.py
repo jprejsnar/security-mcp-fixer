@@ -50,6 +50,25 @@ _RAISE_APPROVAL_WINDOW_PID_RETURNED_AN_INVALID_CHOICE = (
 )
 
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_STARTING_APPROVAL_WINDOW = "Starting approval window pid=%s title=%r choices=%s"
+_LOG_SOFTWARE_AUDIT_CHOICE_WINDOW_CLOSED_WITH = (
+    "Software-audit choice window closed with choice=%s"
+)
+_LOG_AUDIT_ITEM_WINDOW_CLOSED_WITH = "Audit-item window closed with action=%s"
+_LOG_APPROVAL_WINDOW_CLOSED_WITH_ACTION = "Approval window pid=%s closed with action=%s"
+_LOG_APPROVAL_WINDOW_IS_VISIBLE = "Approval window pid=%s is visible"
+_LOG_CHOICE_WINDOW_IS_VISIBLE = "Choice window pid=%s is visible"
+_LOG_SOFTWARE_AUDIT_CHOICE_WINDOW_REPORTED_DIAGNOSTICS = (
+    "Software-audit choice window reported diagnostics: %s"
+)
+_LOG_AUDIT_ITEM_WINDOW_REPORTED_DIAGNOSTICS = (
+    "Audit-item window reported diagnostics: %s"
+)
+_LOG_APPROVAL_WINDOW_REPORTED_DIAGNOSTICS = (
+    "Approval window pid=%s reported diagnostics: %s"
+)
+_LOG_APPROVAL_WINDOW_CLOSED_WITH_CHOICE = "Approval window pid=%s closed with choice=%s"
+_LOG_CLOSING_OPEN_APPROVAL_WINDOW = "Closing open approval window pid=%s"
 _MAX_DIAGNOSTIC_CHARS = 2000
 
 _WINDOW_SCRIPT = r"""
@@ -314,7 +333,7 @@ class DesktopApproval:
             )
         if diagnostics:
             logger.warning(
-                "Approval window pid=%s reported diagnostics: %s",
+                _LOG_APPROVAL_WINDOW_REPORTED_DIAGNOSTICS,
                 process.pid,
                 diagnostics,
             )
@@ -335,7 +354,7 @@ class DesktopApproval:
                     )
                 )
             logger.info(
-                "Approval window pid=%s closed with choice=%s",
+                _LOG_APPROVAL_WINDOW_CLOSED_WITH_CHOICE,
                 process.pid,
                 response["choice"],
             )
@@ -350,7 +369,7 @@ class DesktopApproval:
                 )
             )
         logger.info(
-            "Approval window pid=%s closed with action=%s",
+            _LOG_APPROVAL_WINDOW_CLOSED_WITH_ACTION,
             process.pid,
             response["action"],
         )
@@ -361,7 +380,7 @@ class DesktopApproval:
         process = self.process
         try:
             if process.returncode is None:
-                logger.info("Closing open approval window pid=%s", process.pid)
+                logger.info(_LOG_CLOSING_OPEN_APPROVAL_WINDOW, process.pid)
                 try:
                     process.terminate()
                 except ProcessLookupError:
@@ -412,7 +431,7 @@ async def open_dialog(
     )
     dialog = DesktopApproval(process)
     logger.info(
-        "Starting approval window pid=%s title=%r choices=%s",
+        _LOG_STARTING_APPROVAL_WINDOW,
         process.pid,
         title,
         len(properties),
@@ -447,7 +466,7 @@ async def open_dialog(
                     process.pid, process.returncode, _diagnostic_text(stderr)
                 )
             )
-        logger.info("Approval window pid=%s is visible", process.pid)
+        logger.info(_LOG_APPROVAL_WINDOW_IS_VISIBLE, process.pid)
         return dialog
     except BaseException:
         await dialog.close()
@@ -538,7 +557,7 @@ async def open_choice(
                     process.pid, _diagnostic_text(stderr)
                 )
             )
-        logger.info("Choice window pid=%s is visible", process.pid)
+        logger.info(_LOG_CHOICE_WINDOW_IS_VISIBLE, process.pid)
         return dialog
     except BaseException:
         await dialog.close()
@@ -579,7 +598,7 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
         )
     if completed.stderr.strip():
         logger.warning(
-            "Software-audit choice window reported diagnostics: %s",
+            _LOG_SOFTWARE_AUDIT_CHOICE_WINDOW_REPORTED_DIAGNOSTICS,
             completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:],
         )
     try:
@@ -591,7 +610,7 @@ def ask_choice(title: str, message: str, choices: list[dict[str, str]]) -> str:
     choice = response.get("choice") if isinstance(response, dict) else None
     if not isinstance(choice, str) or not choice:
         raise ValueError(_RAISE_THE_SOFTWARE_AUDIT_CHOICE_WINDOW_RETURNED_AN_INVALID)
-    logger.info("Software-audit choice window closed with choice=%s", choice)
+    logger.info(_LOG_SOFTWARE_AUDIT_CHOICE_WINDOW_CLOSED_WITH, choice)
     return choice
 
 
@@ -644,7 +663,7 @@ def ask_checkboxes(
         )
     if completed.stderr.strip():
         logger.warning(
-            "Audit-item window reported diagnostics: %s",
+            _LOG_AUDIT_ITEM_WINDOW_REPORTED_DIAGNOSTICS,
             completed.stderr.strip()[-_MAX_DIAGNOSTIC_CHARS:],
         )
     try:
@@ -658,5 +677,5 @@ def ask_checkboxes(
         "cancel",
     }:
         raise ValueError(_RAISE_THE_AUDIT_ITEM_WINDOW_RETURNED_AN_INVALID_RESPONSE)
-    logger.info("Audit-item window closed with action=%s", response["action"])
+    logger.info(_LOG_AUDIT_ITEM_WINDOW_CLOSED_WITH, response["action"])
     return response

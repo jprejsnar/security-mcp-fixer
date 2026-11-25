@@ -211,6 +211,13 @@ _snapshot_digests: dict[str, dict[str, tuple[int, int, str]]] = {}
 _snapshot_digests_lock = threading.Lock()
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_POLICY_BYTES = 1024 * 1024
+_MAX_EVIDENCE_TEXT = 32768
+_MAX_EVIDENCE_SOURCES = 50
+_MAX_REFERENCE_LINES = 100
+_MAX_REVIEWED_FILES = 100
+_HASH_BLOCK_BYTES = 65536
+_MAX_REPORTED_CHANGES = 10
+_RAISE_UNDECLARED_CHECKOUT_CHANGES = "Undeclared checkout changes require re-review: "
 _ALIGNMENT_VERSION = re.compile(r"(\d+(?:\.\d+)+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)")
 
 
@@ -417,14 +424,18 @@ def _read_bounded(path: Path, limit: int) -> bytes:
 
 def _text(value: object, label: str) -> str:
     """Require bounded, nonempty evidence rather than truthy placeholders."""
-    if not isinstance(value, str) or not value.strip() or len(value) > 32768:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > _MAX_EVIDENCE_TEXT
+    ):
         raise ValueError(_RAISE_MUST_BE_A_NONEMPTY_EVIDENCE_STRING.format(label))
     return value
 
 
 def _sources(value: object, label: str) -> list[str]:
     """Require reviewed HTTPS references without embedded credentials."""
-    if not isinstance(value, list) or not value or len(value) > 50:
+    if not isinstance(value, list) or not value or len(value) > _MAX_EVIDENCE_SOURCES:
         raise ValueError(_RAISE_REQUIRES_REVIEWED_OFFICIAL_HTTPS_SOURCES.format(label))
     for source in value:
         parsed = urlparse(_text(source, label))
@@ -540,7 +551,10 @@ def scan_package_callers(root: Path, plan: dict) -> dict:
             if reference.search(line)
         ]
         if lines:
-            if len(references) >= 100 or len(lines) > 100:
+            if (
+                len(references) >= _MAX_REFERENCE_LINES
+                or len(lines) > _MAX_REFERENCE_LINES
+            ):
                 raise ValueError(
                     _RAISE_CALLER_REFERENCE_SCAN_EXCEEDS_ITS_EVIDENCE_LIMIT
                 )
@@ -605,7 +619,11 @@ def review_major_upgrade(root: Path, plan: dict, review: dict) -> dict | None:
     for key in ("api_comparison", "caller_assessment", "dependency_assessment"):
         _text(evidence.get(key), key)
     reviewed = evidence.get("reviewed_files")
-    if not isinstance(reviewed, list) or not reviewed or len(reviewed) > 100:
+    if (
+        not isinstance(reviewed, list)
+        or not reviewed
+        or len(reviewed) > _MAX_REVIEWED_FILES
+    ):
         raise ValueError(
             _RAISE_REVIEW_ACTUAL_CALLER_SOURCE_FILES_INCLUDING_DEPENDENCY_CALLERS
         )
@@ -1026,7 +1044,7 @@ def tree_snapshot(root: Path) -> dict[str, str]:
         else:
             digest = hashlib.sha256()
             with path.open("rb") as stream:
-                while block := stream.read(65536):
+                while block := stream.read(_HASH_BLOCK_BYTES):
                     total += len(block)
                     if total > MAX_TREE_BYTES:
                         raise ValueError(
@@ -1224,8 +1242,8 @@ def validate_edits(
             allowed.add(relative)
     if changed - allowed:
         raise ValueError(
-            "Undeclared checkout changes require re-review: "
-            + ", ".join(sorted(changed - allowed)[:10])
+            _RAISE_UNDECLARED_CHECKOUT_CHANGES
+            + ", ".join(sorted(changed - allowed)[:_MAX_REPORTED_CHANGES])
         )
     receipt["version_alignment"] = alignment
     receipt["version_alignment_files"] = sorted(alignment)

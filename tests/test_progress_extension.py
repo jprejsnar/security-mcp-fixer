@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from gitlab_security_mcp import __version__
 from gitlab_security_mcp.progress_extension import (
     _editor_cli,
     _linux_process_tree,
@@ -62,12 +63,9 @@ def test_packaged_extension_matches_the_editor_progress_tree():
 
 
 def test_vsix_contains_the_current_extension(tmp_path):
-    """The generated package carries the extension version and its JavaScript."""
+    """The generated package carries the server version and its JavaScript."""
     # Arrange
     destination = tmp_path / "progress.vsix"
-    package = json.loads(
-        (extension_directory() / "package.json").read_text(encoding="utf-8")
-    )
 
     # Act
     write_vsix(destination)
@@ -77,9 +75,11 @@ def test_vsix_contains_the_current_extension(tmp_path):
         names = set(archive.namelist())
         manifest = archive.read("extension.vsixmanifest").decode()
         script = archive.read("extension/extension.js")
+        package = json.loads(archive.read("extension/package.json"))
     assert "extension/extension.js" in names
     assert "extension/progress-model.js" in names
-    assert package["version"] in manifest
+    assert f'Version="{__version__}"' in manifest
+    assert package["version"] == __version__
     assert script == (extension_directory() / "extension.js").read_bytes()
 
 
@@ -535,9 +535,8 @@ def _editor_with_installed(monkeypatch, tmp_path, listing):
 
 
 def _bundled_version():
-    """Read the version of the extension this server ships."""
-    package = extension_directory() / "package.json"
-    return json.loads(package.read_text(encoding="utf-8"))["version"]
+    """Return the version the server stamps on the extension it ships."""
+    return __version__
 
 
 def test_an_already_installed_version_is_not_reinstalled(monkeypatch, tmp_path):

@@ -17,6 +17,9 @@ _RAISE_PROGRESS_NEEDS_VALID_PAIRED_COMPLETION_COUNTS = (
 )
 _WINDOWS_UNC_DEVICE_PREFIX = "\\\\?\\UNC\\"
 _WINDOWS_DEVICE_PREFIX = "\\\\?\\"
+_MIRROR_KEY_LENGTH = 32
+_MAX_MESSAGE_LENGTH = 1000
+_MAX_FINISHED_TASKS = 10
 
 _lock = threading.Lock()
 _tasks: dict[Path, dict[str, dict]] = {}
@@ -55,7 +58,9 @@ def drop_checkout(root: Path) -> None:
 
 def mirror_path(root: Path) -> Path:
     """Name each checkout's mirror by a stable hash of its normalized path."""
-    key = hashlib.sha256(os.path.normcase(str(root)).encode()).hexdigest()[:32]
+    key = hashlib.sha256(os.path.normcase(str(root)).encode()).hexdigest()[
+        :_MIRROR_KEY_LENGTH
+    ]
     return mirror_directory() / f"{key}.json"
 
 
@@ -86,7 +91,7 @@ def publish(
             "label": label,
             "status": status,
             "message": redact(" ".join(str(message).split()), environment_secrets())[
-                :1000
+                :_MAX_MESSAGE_LENGTH
             ],
             "completed": completed,
             "total": total,
@@ -102,7 +107,7 @@ def publish(
             (key for key, value in tasks.items() if value["status"] not in ACTIVE),
             key=lambda key: (tasks[key]["updated_at"], key == task_id),
         )
-        for key in finished[:-10]:
+        for key in finished[:-_MAX_FINISHED_TASKS]:
             del tasks[key]
         text = json.dumps(
             {

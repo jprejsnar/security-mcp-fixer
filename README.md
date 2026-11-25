@@ -15,7 +15,11 @@ reads the current required publisher pages. It does not commit, push, open merge
 requests, or publish code changes. GitLab findings remain read-only except for
 the optional human-approved false-positive dismissal flow described below.
 
-**Current release: 1.0.60** (progress extension 1.0.52). In either VS Code/Copilot or Cursor Agent chat, use:
+The release version is written in one place, `__version__` in
+[gitlab_security_mcp/__init__.py](gitlab_security_mcp/__init__.py). The wheel, the
+`server_version` field, and the bundled progress extension all take it from
+there; `<version>` below means that value. See
+[Increasing the version number](#increasing-the-version-number). In either VS Code/Copilot or Cursor Agent chat, use:
 
 ```text
 run gitlab-security on this repo
@@ -38,7 +42,7 @@ This is one chat request, not a terminal command. The workflow runs these
    fix needs a reproduced root cause and a test that fails before the change and
    passes after it. A selected item that is not a defect is left unchanged.
 7. **Final unresolved report:** write and display
-   `.security-mcp/reports/unresolved-remediation.md`, with package current/target
+   `.security-mcp/reports/<project>-unresolved-remediation.md`, with package current/target
    versions and blockers, plus unsuccessful code attempts and their reasons.
    Confirmed software-audit findings that were not selected for an AI fix are
    listed under **Software audit findings not fixed** with severity, location
@@ -80,6 +84,21 @@ Current changes after 1.0.60 (unreleased):
   up to two turns without new receipts are continued before stopping.
 - Progress extension: an already-installed version is not reinstalled, and an
   upgrade shows a one-time reload notice with the new version.
+- Progress extension: its snapshot size limit, workflow job count, meter width,
+  and poll interval are named constants; behavior is unchanged.
+- One version file: `__version__` in `gitlab_security_mcp/__init__.py` is the only
+  place to change the release number. `pyproject.toml` reads it, and the VSIX
+  build stamps it on the progress extension, so both `package.json` copies keep
+  the placeholder `0.0.0` and never need editing. No versioned VSIX is kept in
+  the checkout; the Windows installer writes
+  `gitlab-security-progress-<version>.vsix` into the install directory from the
+  installed package for manual fallback.
+- Report names start with the GitLab project name and `-`, for example
+  `patient-web-unresolved-remediation.md` and
+  `patient-web-security-remediation-report-<branch>.md`/`.json`. The progress
+  extension opens the newest `*unresolved-remediation.md` in `reports`.
+- Code quality: limits, timeouts, HTTP statuses, Windows API codes, and log and
+  error messages are named module constants; text and behavior are unchanged.
 
 Release 1.0.60 removes manual nudges and shows versions:
 - When the false-positive window opens, the AI makes one waiting
@@ -846,7 +865,7 @@ What each job still does:
   waits for each outcome.
   A Yes path finishes the job as `FINISHED` because the report path exists.
   See [Software audit states (job 6)](#software-audit-states-job-6).
-- **Job 7.** Writes and opens `.security-mcp/reports/unresolved-remediation.md`
+- **Job 7.** Writes and opens `.security-mcp/reports/<project>-unresolved-remediation.md`
   plus the Markdown and JSON reports. It then zips every `.log` and `.jsonl`
   beneath `.security-mcp/`, including nested tool logs, along with generated
   reports, run state, progress, lint evidence, the Gradle no-tests helper,
@@ -2594,10 +2613,46 @@ ls dist/*.whl
 
 Stop if a check fails; building the wheel does not itself run these checks.
 The current version produces
-`dist/gitlab_security_mcp-1.0.60-py3-none-any.whl`; use the newly built filename if
-the project version changes. `--no-deps` builds only this project's artifact,
+`dist/gitlab_security_mcp-<version>-py3-none-any.whl`, where `<version>` is `__version__` in
+`gitlab_security_mcp/__init__.py`. `--no-deps` builds only this project's artifact,
 not a bundle of its dependencies. Build isolation may download build tools.
 Building does not install the wheel or start an MCP process.
+
+### Increasing the version number
+
+The release version is set in one line, `__version__` in
+[gitlab_security_mcp/__init__.py](gitlab_security_mcp/__init__.py):
+
+```python
+__version__ = "<version>"
+```
+
+To release a new version:
+
+1. Change only that string, for example raise the last number by one for a
+   patch release.
+2. Run the checks and the wheel build above. The wheel file name and its
+   metadata take the new value from that line.
+
+Do not edit any other file to change the version:
+
+| Uses the version | How it gets the value |
+| --- | --- |
+| Wheel name and metadata | `pyproject.toml` declares `dynamic = ["version"]` and reads `gitlab_security_mcp.__version__` |
+| `server_version` in run state, progress, and reports | Imports `__version__` at runtime |
+| Progress extension VSIX | `write_vsix` stamps `__version__` into the extension manifest and `package.json` |
+| Installer fallback `gitlab-security-progress-<version>.vsix` | The installer writes it from the installed package |
+
+Both `editor-progress/package.json` and
+`gitlab_security_mcp/editor_progress/package.json` keep the placeholder
+`"version": "0.0.0"`. Leave it there. Do not write the current version in
+`README.md`, `pyproject.toml`, or a committed VSIX file either; examples use
+`<version>`.
+
+A change to the progress extension reaches editors only with a new
+`__version__`. On startup the server skips the extension install when the
+editor already has that version. After an upgrade, the progress view asks for
+**Developer: Reload Window** once.
 
 ## Installing the local MCP server
 
@@ -2610,7 +2665,7 @@ plugin installer. The same installed server works with either host. Choose
 | Shared wheel and installer helper | Testers and other users; no source checkout required | Installed `gitlab-security-mcp` entry point | Install the new wheel into the configured environment, then restart the host connection. |
 | Source checkout | Development and source-only hotfixes | That checkout's virtualenv Python plus the absolute root `server.py` | Update source and any changed requirements, then restart the host connection. |
 
-For distribution, share `gitlab_security_mcp-1.0.60-py3-none-any.whl` and
+For distribution, share `gitlab_security_mcp-<version>-py3-none-any.whl` and
 [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1), optionally together
 in a ZIP. Extract them before installing. Do not share virtual environments,
 tokens, application source, or `.security-mcp` reports/logs as part of the installer.
@@ -2670,7 +2725,7 @@ Share [Install-GitLabSecurityMcp.ps1](Install-GitLabSecurityMcp.ps1) alongside t
 wheel and run it instead of the raw pip command:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.60-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-<version>-py3-none-any.whl"
 ```
 
 The helper defaults to `$HOME\Tools\gitlab-security-mcp`. It checks PowerShell
@@ -2686,7 +2741,7 @@ server connection, use the equivalent dedicated environment:
 
 ```bash
 python3 -m venv "$HOME/Tools/gitlab-security-mcp"
-"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-1.0.60-py3-none-any.whl"
+"$HOME/Tools/gitlab-security-mcp/bin/python" -m pip install --upgrade --force-reinstall "$HOME/Downloads/gitlab_security_mcp-<version>-py3-none-any.whl"
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip show gitlab-security-mcp
 "$HOME/Tools/gitlab-security-mcp/bin/python" -m pip check
 ```
@@ -2707,7 +2762,7 @@ install runtime dependencies using the source-installation commands above.
 Then install the wheel into that same environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-1.0.60-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps .\dist\gitlab_security_mcp-<version>-py3-none-any.whl
 .\.venv\Scripts\python.exe -m pip show gitlab-security-mcp
 .\.venv\Scripts\python.exe -m pip check
 Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
@@ -2716,7 +2771,7 @@ Get-Item .\.venv\Scripts\gitlab-security-mcp.exe
 On macOS/Linux:
 
 ```bash
-.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-1.0.60-py3-none-any.whl
+.venv/bin/python -m pip install --force-reinstall --no-deps dist/gitlab_security_mcp-<version>-py3-none-any.whl
 .venv/bin/python -m pip show gitlab-security-mcp
 .venv/bin/python -m pip check
 ls .venv/bin/gitlab-security-mcp
@@ -3100,7 +3155,7 @@ VS Code/Cursor windows, including Agents/background windows, and use
 **standalone PowerShell**:
 
 ```powershell
-& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-1.0.60-py3-none-any.whl"
+& "$HOME\Downloads\Install-GitLabSecurityMcp.ps1" -WheelPath "$HOME\Downloads\gitlab_security_mcp-<version>-py3-none-any.whl"
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip show gitlab-security-mcp
 & "$HOME\Tools\gitlab-security-mcp\Scripts\python.exe" -m pip check
 ```
@@ -3174,8 +3229,8 @@ installation.
 2. For a Windows wheel upgrade, close all VS Code and Cursor windows before
    running the shared update commands above. The helper detects locks but
    **does not stop servers or kill applications for you**.
-3. Apply the deployment-specific update and verify installed version **1.0.60**
-   (or the newer wheel you intentionally selected) and a successful `pip check`.
+3. Apply the deployment-specific update and verify the installed version matches the
+   wheel you selected and a successful `pip check`.
 4. Reopen VS Code, select the same harness/workspace, and enable/start the server.
    For a native Copilot connection, stop/start is the restart operation; for an
    editor-managed connection, use **Restart Server** when available.
@@ -3183,8 +3238,8 @@ installation.
    `review_false_positives` among the seventeen tools. Run the read-only status
    check in the [VS Code run guide](#running-within-vs-code-and-github-copilot).
    A fresh process normally reports `NOT_STARTED`; review any existing local
-   edits before requesting a new run. Its `server_version` must be `1.0.60`
-   for this release. Missing version/approval fields identify older output;
+   edits before requesting a new run. Its `server_version` must match
+   that wheel's version. Missing version/approval fields identify older output;
    checking pip alone does not prove a running MCP process was restarted.
 
 ### Cursor upgrade steps
@@ -3344,8 +3399,9 @@ when the bundled version is already there. After an upgrade, an open window keep
 running the previous extension, so the progress view shows a one-time
 **Progress extension updated** row naming the new version and asking for
 **Developer: Reload Window**. A manual
-`gitlab-security-progress-1.0.52.vsix` install is only needed when the server
-is not launched by the editor. The progress panel header and the status-bar
+`gitlab-security-progress-<version>.vsix` install is only needed when the server
+is not launched by the editor; the Windows installer writes that file into the
+install directory and prints its path. The progress panel header and the status-bar
 tooltip show the MCP server version that wrote the progress file and the
 progress extension's own version (`unknown` for a server that does not report
 one). The extension reads the checkout progress file
@@ -3545,14 +3601,14 @@ the MCP project unless both roots intentionally match.
 To list reports from a terminal in the application checkout:
 
 ```powershell
-Get-ChildItem .\.security-mcp\reports\security-remediation-report-*
+Get-ChildItem .\.security-mcp\reports\*security-remediation-report-*
 ```
 
 To read a known report path returned by the tool:
 
 ```powershell
-Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-2026-11-03.md'
-Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\security-remediation-report-security-fixes-2026-11-03.json' -Raw | ConvertFrom-Json
+Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\application-repo-security-remediation-report-security-fixes-2026-11-03.md'
+Get-Content -LiteralPath 'C:\path\to\application-repo\.security-mcp\reports\application-repo-security-remediation-report-security-fixes-2026-11-03.json' -Raw | ConvertFrom-Json
 ```
 
 On macOS/Linux, use `ls .security-mcp/reports/` and `cat` with the actual
@@ -3658,19 +3714,22 @@ commit, push, or invented approval.
 
 All paths below are relative to the target `REPO_ROOT`, not this MCP project.
 
+`<project>` in report names is the last segment of the GitLab project path, or the
+checkout folder name when no project is known.
+
 | Artifact | Purpose |
 | --- | --- |
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
 | `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
 | `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full output for every allowed non-Git command, including Gradle `assemble` and runtime-version checks. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files and deletes checkout log copies. |
-| `.security-mcp/reports/unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status, and every confirmed software-audit finding not selected for an AI fix (severity, location, problem, audit-report link). A blocked package shows `None eligible (blocked; advisory floor <version>)` as its target, never the rejected version. Archived and retained in the checkout. |
+| `.security-mcp/reports/<project>-unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status, and every confirmed software-audit finding not selected for an AI fix (severity, location, problem, audit-report link). A blocked package shows `None eligible (blocked; advisory floor <version>)` as its target, never the rejected version. Archived and retained in the checkout. |
 | `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | One ZIP per finished run containing every checkout `.log`/`.jsonl`, generated reports/state/progress/lint/helper files, any optional software-audit report, and redacted `server.log`. User policies and unknown files are excluded. Retries merge into the same ZIP, preserving earlier members. Stable checkout log copies are deleted only after archival succeeds; non-log copies remain. A log that changes while the ZIP is written aborts archival and keeps every checkout log; a `progress.json` or `run-state.json` rewrite by finishing background work does not, because those copies stay in the checkout. The temp spool stays until process exit. Tests use disposable destinations. The checkout token separates repositories with the same project name. |
 | Server stderr | Process log at INFO and above. Plain text on the MCP server's stderr, and the same redacted text in a process temp spool. Job 7 copies the spool into the run zip as `server.log`. The spool is not a home file and is removed when the process exits. |
 | `.security-mcp/lint-issues.json` | Best-effort initial lint diagnostics and raw output, with completeness recorded. Informational only; never gates security fixes. |
 | `.security-mcp/lint-rules.json` | Observed violation rule names, counts and severities for managing project lint configuration. Not a configuration file or an acceptance gate. |
-| `.security-mcp/reports/security-remediation-report-*.md` | Human-readable findings, changes, validation and review evidence. |
-| `.security-mcp/reports/security-remediation-report-*.json` | Machine-readable companion evidence. |
+| `.security-mcp/reports/<project>-security-remediation-report-*.md` | Human-readable findings, changes, validation and review evidence. |
+| `.security-mcp/reports/<project>-security-remediation-report-*.json` | Machine-readable companion evidence. |
 
 The report includes these review categories:
 

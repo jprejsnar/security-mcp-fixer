@@ -10,6 +10,8 @@ from pathlib import Path
 from gitlab_security_mcp.manifests import _read_json, iter_files
 from gitlab_security_mcp.util import atomic_write_text, log_unexpected
 
+_MAX_SLUG_LENGTH = 60
+
 DEPENDENCY_STRATEGIES = {
     "lockfile_only",
     "manifest_bump",
@@ -306,7 +308,7 @@ def _package_type(root: Path) -> str:
 def _slug(value: str) -> str:
     """Make a bounded filename slug from an externally supplied finding id."""
     cleaned = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
-    return cleaned[:60] or "finding"
+    return cleaned[:_MAX_SLUG_LENGTH] or "finding"
 
 
 def _class_name(slug: str) -> str:

@@ -12,6 +12,7 @@ import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gitlab_security_mcp.report import REMEDIATION_REPORT_STEM, UNRESOLVED_REPORT_NAME
 from gitlab_security_mcp.util import checkout_file_id, server_log_snapshot
 
 _RAISE_SECURITY_ARTIFACTS_CONTAIN_A_LINK_REPARSE_POINT = (
@@ -41,6 +42,11 @@ logger = logging.getLogger("gitlab_security_mcp")
 _LOG_ARTIFACT_CLEANUP = "Security log review/cleanup could not complete: %s"
 _SERVER_LOG_MEMBER = "server.log"
 _SERVER_LOG_COPY_BYTES = 64 * 1024
+_HTTP_NOT_FOUND = 404
+_HTTP_ERROR_STATUS = 400
+_MAX_RECORDED_ERRORS = 100
+_MAX_RUN_STATE_BYTES = 20_000_000
+_MAX_LOG_LINE_BYTES = 1024 * 1024
 _RAISE_SERVER_LOG_TRUNCATED = "Server diagnostic spool was truncated during archival; checkout logs were preserved"
 LOG_ARCHIVE_DIRECTORY = "softwareSecurityAuditReports"
 _LOG_SUFFIXES = {".log", ".jsonl"}
@@ -52,9 +58,10 @@ _ARCHIVE_GENERATED_NAMES = {
     "progress.json",
     "no-tests-v1.init.gradle",
 }
-_UNRESOLVED_REPORT = "reports/unresolved-remediation.md"
+_REPORTS_DIRECTORY = "reports"
 _AUDIT_REPORT_DIRECTORY = "software-audit"
 _RAISE_UNSAFE_AUDIT_REPORT = "The software audit report is not an ordinary file"
+_LOG_STARTING_A_CLEAN_REUSED_BRANCH_AFTER_PRIOR = "Starting a clean reused branch after %s prior log errors; removing only generated untracked artifacts."
 _ARCHIVE_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z$")
 _REPARSE_POINT = 0x400
 
@@ -113,11 +120,11 @@ def _record_failure(record: dict) -> str | None:
         if isinstance(record.get(key), int) and record[key] != 0:
             return f"Command exited with code {record[key]}"
     status = record.get("status_code")
-    advisory_miss = record.get("source") == "advisory" and status == 404
+    advisory_miss = record.get("source") == "advisory" and status == _HTTP_NOT_FOUND
     if not advisory_miss:
         if record.get("error"):
             return "Recorded execution/HTTP error"
-        if isinstance(status, int) and status >= 400:
+        if isinstance(status, int) and status >= _HTTP_ERROR_STATUS:
             return f"HTTP request failed with status {status}"
     if str(record.get("level", "")).upper() in {"ERROR", "FATAL", "CRITICAL"}:
         return "Error-level log entry"
@@ -139,8 +146,8 @@ def _generated(relative: str) -> bool:
         return path.name.endswith((".stdout.log", ".stderr.log"))
     return (
         len(path.parts) == 2
-        and path.parts[0] == "reports"
-        and path.name.startswith("security-remediation-report-")
+        and path.parts[0] == _REPORTS_DIRECTORY
+        and REMEDIATION_REPORT_STEM in path.name
         and path.suffix in {".json", ".md"}
     )
 
@@ -169,7 +176,7 @@ def review_security_artifacts(
         """Bound returned diagnostics without stopping the complete log scan."""
         nonlocal error_count
         error_count += 1
-        if len(errors) < 100:
+        if len(errors) < _MAX_RECORDED_ERRORS:
             errors.append(
                 {
                     "file": str(path.relative_to(repo_root)),
@@ -182,7 +189,7 @@ def review_security_artifacts(
         snapshot = _snapshot(root)
         for path in sorted(snapshot):
             if path == root / "run-state.json":
-                if snapshot[path][0] > 20_000_000:
+                if snapshot[path][0] > _MAX_RUN_STATE_BYTES:
                     record(path, 0, "Prior run state is too large to verify safely")
                     continue
                 try:
@@ -218,9 +225,9 @@ def review_security_artifacts(
             logs_scanned += 1
             with path.open("rb") as stream:
                 number = 0
-                while raw := stream.readline(1_048_577):
+                while raw := stream.readline(_MAX_LOG_LINE_BYTES + 1):
                     number += 1
-                    if len(raw) > 1_048_576:
+                    if len(raw) > _MAX_LOG_LINE_BYTES:
                         record(path, number, "Log entry is too large to verify safely")
                         break
                     try:
@@ -249,7 +256,7 @@ def review_security_artifacts(
             prior_errors, prior_error_count = errors, error_count
             errors, error_count = [], 0
             logger.warning(
-                "Starting a clean reused branch after %s prior log errors; removing only generated untracked artifacts.",
+                _LOG_STARTING_A_CLEAN_REUSED_BRANCH_AFTER_PRIOR,
                 prior_error_count,
             )
         if not error_count and tracked is not None:
@@ -272,7 +279,7 @@ def review_security_artifacts(
                     )
                 path.unlink()
                 deleted.append(str(path.relative_to(repo_root)))
-            directories = {root, root / "command-logs", root / "reports"}
+            directories = {root, root / "command-logs", root / _REPORTS_DIRECTORY}
             for path in snapshot:
                 directories.update(
                     parent for parent in path.parents if parent.is_relative_to(root)
@@ -340,6 +347,15 @@ def run_log_files(repo_root: Path) -> list[Path]:
     return list(_run_log_snapshot(repo_root))
 
 
+def _is_unresolved_report(relative: Path) -> bool:
+    """Match the final report with or without its GitLab project-name prefix."""
+    return (
+        len(relative.parts) == 2
+        and relative.parts[0] == _REPORTS_DIRECTORY
+        and relative.name.endswith(UNRESOLVED_REPORT_NAME)
+    )
+
+
 def _archive_snapshot(repo_root: Path) -> dict[Path, tuple[int, int, int]]:
     """Include generated evidence and all logs, but not user policies or unknown files."""
     root = repo_root / ".security-mcp"
@@ -348,7 +364,7 @@ def _archive_snapshot(repo_root: Path) -> dict[Path, tuple[int, int, int]]:
         for path, info in sorted(_snapshot(root).items())
         if _generated(path.relative_to(root).as_posix())
         or path.suffix.lower() in _LOG_SUFFIXES
-        or path.relative_to(root).as_posix() == _UNRESOLVED_REPORT
+        or _is_unresolved_report(path.relative_to(root))
         or path.relative_to(root).as_posix() in _ARCHIVE_GENERATED_NAMES
     }
 

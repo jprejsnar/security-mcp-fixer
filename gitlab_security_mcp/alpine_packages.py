@@ -83,6 +83,11 @@ _RAISE_THE_STAGE_IMAGE_COULD_NOT_BE_INSPECTED = (
 _RAISE_EXCEEDS_THE_BYTE_READ_LIMIT = "{} exceeds the {} byte read limit"
 
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_IMAGE_INSPECTION_FOR_FAILED = "Image inspection for %s failed: %s"
+_LOG_ALPINE_END_OF_LIFE_STATUS_UNAVAILABLE = "Alpine end-of-life status unavailable: %s"
+_LOG_TRANSIENT_READING_RETRYING_ATTEMPT_OF = (
+    "Transient %s reading %s (%s); retrying attempt %s of %s"
+)
 RELEASES_URL = "https://alpinelinux.org/releases.json"
 INDEX_URL = (
     "https://dl-cdn.alpinelinux.org/alpine/{branch}/{repo}/{arch}/APKINDEX.tar.gz"
@@ -98,6 +103,10 @@ _MAX_CACHED_INDEXES = 16
 _ATTEMPTS = 4
 _BACKOFF_SECONDS = 1.0
 _TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+_HTTP_TIMEOUT_SECONDS = 30.0
+_MAX_REPOSITORIES_FILE = 64 * 1024
+_HTTP_UNAUTHORIZED = 401
+_MAX_ERROR_DETAIL = 200
 _BRANCH = re.compile(r"v(\d+)\.(\d+)")
 _TAG_BRANCH = re.compile(r"alpine-?v?(\d+)\.(\d+)(?:\.\d+)*(?![\d])", re.IGNORECASE)
 _PLAIN_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.\d+)*")
@@ -217,7 +226,7 @@ class AlpinePackages:
         self.http = (
             http
             if http is not None
-            else httpx.Client(timeout=30.0, follow_redirects=True)
+            else httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS, follow_redirects=True)
         )
         self.http_log_path = http_log_path
         self._today = today
@@ -271,7 +280,7 @@ class AlpinePackages:
             except AlpineLookupError as exc:
                 inspection_error = str(exc)
                 logger.warning(
-                    "Image inspection for %s failed: %s", image, exc, exc_info=True
+                    _LOG_IMAGE_INSPECTION_FOR_FAILED, image, exc, exc_info=True
                 )
             if inspected is not None:
                 branch, method = inspected
@@ -321,7 +330,7 @@ class AlpinePackages:
                 sources.insert(0, RELEASES_URL)
             except AlpineLookupError as exc:
                 logger.warning(
-                    "Alpine end-of-life status unavailable: %s", exc, exc_info=True
+                    _LOG_ALPINE_END_OF_LIFE_STATUS_UNAVAILABLE, exc, exc_info=True
                 )
         return ApkPins(branch, method, versions, repositories, tuple(sources))
 
@@ -392,7 +401,9 @@ class AlpinePackages:
             with tarfile.open(fileobj=io.BytesIO(layer), mode="r:*") as archive:
                 member = archive.extractfile("etc/apk/repositories")
                 text = (
-                    member.read(64 * 1024).decode("utf-8", "replace") if member else ""
+                    member.read(_MAX_REPOSITORIES_FILE).decode("utf-8", "replace")
+                    if member
+                    else ""
                 )
         except KeyError:
             text = ""
@@ -472,9 +483,9 @@ class AlpinePackages:
             limit,
             source="registry",
             headers=request_headers,
-            allow=frozenset({401}),
+            allow=frozenset({_HTTP_UNAUTHORIZED}),
         )
-        if status != 401:
+        if status != _HTTP_UNAUTHORIZED:
             return body
         token = self._anonymous_token(
             response_headers.get("WWW-Authenticate", ""), repository
@@ -691,7 +702,7 @@ class AlpinePackages:
                     isinstance(exc, httpx.HTTPStatusError)
                     and exc.response.status_code in _TRANSIENT_STATUS
                 )
-                detail = str(exc)[:200] or type(exc).__name__
+                detail = str(exc)[:_MAX_ERROR_DETAIL] or type(exc).__name__
                 if not transient or attempt == _ATTEMPTS - 1:
                     raise AlpineLookupError(
                         f"Data could not be read from {url}: {type(exc).__name__} ({detail})"
@@ -699,7 +710,7 @@ class AlpinePackages:
                         + "."
                     ) from exc
                 logger.warning(
-                    "Transient %s reading %s (%s); retrying attempt %s of %s",
+                    _LOG_TRANSIENT_READING_RETRYING_ATTEMPT_OF,
                     type(exc).__name__,
                     url,
                     detail,

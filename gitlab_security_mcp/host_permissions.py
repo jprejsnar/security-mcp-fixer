@@ -26,6 +26,7 @@ _RAISE_NOT_A_GIT_REPOSITORY_ROOT = (
     "{} is not a Git repository root; Copilot keys saved approvals by the Git root."
 )
 _RAISE_INVALID_PERMISSIONS_FIELD = "Invalid {} in {}"
+_LOCATION_FIELD = "location {}"
 
 
 def copilot_home() -> Path:
@@ -56,7 +57,9 @@ def approve_server_tools(
         )
         if not isinstance(approvals, list):
             raise ValueError(
-                _RAISE_INVALID_PERMISSIONS_FIELD.format(f"location {root}", path)
+                _RAISE_INVALID_PERMISSIONS_FIELD.format(
+                    _LOCATION_FIELD.format(root), path
+                )
             )
         if approval not in approvals:
             approvals.append(dict(approval))

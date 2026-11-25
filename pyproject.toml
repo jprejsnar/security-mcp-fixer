@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gitlab-security-mcp"
-version = "1.0.60"
+dynamic = ["version"]
 description = "Local-only MCP server that verifies GitLab security findings and applies minimal fixes."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,10 @@ gitlab-security-mcp = "gitlab_security_mcp.server:main"
 
 [tool.setuptools]
 packages = ["gitlab_security_mcp"]
+
+# The release version is written only in gitlab_security_mcp/__init__.py.
+[tool.setuptools.dynamic]
+version = { attr = "gitlab_security_mcp.__version__" }
 
 [tool.setuptools.package-data]
 gitlab_security_mcp = [

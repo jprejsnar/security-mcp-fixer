@@ -40,6 +40,11 @@ _RAISE_ORIGIN_IS_NOT_A_SUPPORTED_NETWORK_GIT_REMOTE = (
 _RAISE_REMOTE_IS_OUTSIDE_THE_CONFIGURED_GITLAB_URL_PREFIX = (
     "Remote is outside the configured GitLab URL prefix"
 )
+_FIRST_PRINTABLE_ASCII = 32
+_ASCII_DELETE = 127
+_HTTPS_PORT = 443
+_HTTP_PORT = 80
+_DEFAULT_GIT_TIMEOUT_SECONDS = 120
 
 IN_PROGRESS = (
     "MERGE_HEAD",
@@ -91,7 +96,10 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
     SSH transport ports may differ from the API port; web URL origins must match.
     """
     try:
-        if any(ord(char) < 32 or ord(char) == 127 for char in remote):
+        if any(
+            ord(char) < _FIRST_PRINTABLE_ASCII or ord(char) == _ASCII_DELETE
+            for char in remote
+        ):
             raise ValueError(_RAISE_REMOTE_CONTAINS_CONTROL_CHARACTERS)
         api = urlsplit(api_url)
         if (
@@ -103,7 +111,7 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
             raise ValueError(_RAISE_INVALID_TRUSTED_GITLAB_API_URL)
         if api.query or api.fragment or not api.path.rstrip("/").endswith("/api/v4"):
             raise ValueError(_RAISE_INVALID_TRUSTED_GITLAB_API_URL)
-        api_port = api.port or (443 if api.scheme == "https" else 80)
+        api_port = api.port or (_HTTPS_PORT if api.scheme == "https" else _HTTP_PORT)
         if "://" in remote:
             parsed = urlsplit(remote)
             if (
@@ -119,7 +127,10 @@ def gitlab_project_from_remote(remote: str, api_url: str) -> str:
                 raise ValueError(_RAISE_REMOTE_URL_CONTAINS_QUERY_FRAGMENT_DATA)
             if web and (
                 parsed.scheme != api.scheme
-                or (remote_port or (443 if parsed.scheme == "https" else 80))
+                or (
+                    remote_port
+                    or (_HTTPS_PORT if parsed.scheme == "https" else _HTTP_PORT)
+                )
                 != api_port
             ):
                 raise ValueError(_RAISE_REMOTE_AND_API_ORIGINS_DO_NOT_MATCH)
@@ -164,13 +175,21 @@ class GitOps:
         self.runner = runner
 
     def run(
-        self, args: list[str], *, check: bool = True, timeout: int = 120
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        timeout: int = _DEFAULT_GIT_TIMEOUT_SECONDS,
     ) -> CommandResult:
         """Run one allowlisted git command in this repository."""
         return self._git(args, check=check, timeout=timeout)
 
     def _git(
-        self, args: list[str], *, check: bool = True, timeout: int = 120
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        timeout: int = _DEFAULT_GIT_TIMEOUT_SECONDS,
     ) -> CommandResult:
         """Route Git through the runner's allowlist and repository boundary."""
         return self.runner.run(["git", *args], timeout=timeout, check=check)

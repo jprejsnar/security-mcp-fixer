@@ -13,6 +13,7 @@ from mcp.types import ClientCapabilities
 from gitlab_security_mcp import server, workflow
 from gitlab_security_mcp.engine import Engine
 from gitlab_security_mcp.report import render
+from gitlab_security_mcp.software_audit import project_file_name
 from gitlab_security_mcp.state import RunState
 
 
@@ -480,7 +481,11 @@ def test_failed_source_outcome_and_declined_audit_still_display_final_report(
     assert engine.state.workflow["jobs"][5]["status"] == "SKIPPED"
     assert engine.state.workflow["jobs"][6]["status"] == "FINISHED"
     consent.assert_awaited_once()
-    report = tmp_path / ".security-mcp" / "reports" / "unresolved-remediation.md"
+    project = project_file_name(engine.state.gitlab_project_path, tmp_path.name)
+    report = (
+        tmp_path / ".security-mcp" / "reports" / f"{project}-unresolved-remediation.md"
+    )
+    assert result["report_path"] == str(report)
     assert report.read_text(encoding="utf-8") == result["final_summary_markdown"]
     workflow.activity(engine, "Late worker cleanup")
     receipt = json.loads(
@@ -571,7 +576,8 @@ def test_final_archive_retry_and_late_logs_reuse_one_zip(
             archived_state["workflow"]["final_result"]
             == engine.state.workflow["final_result"]
         )
-        assert "reports/unresolved-remediation.md" in zipped.namelist()
+        project = project_file_name(engine.state.gitlab_project_path, tmp_path.name)
+        assert f"reports/{project}-unresolved-remediation.md" in zipped.namelist()
     assert not first_log.exists()
     assert not late_log.exists()
     assert engine.state.workflow["final_result"]["log_archive"] == third["log_archive"]

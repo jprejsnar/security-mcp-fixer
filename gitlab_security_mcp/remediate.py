@@ -40,6 +40,8 @@ _RAISE_REFUSING_A_LOCKFILE_REFRESH_OUTSIDE_THE_REPOSITORY = (
 
 MAX_AUTO_SCORE = 3
 PACKAGE_TIMEOUT = 300
+_OVERRIDE_OR_IMAGE_SCORE = 3
+_MAX_FAILURE_DETAIL = 500
 # Versions come from public advisories and are written into manifests and
 # regex replacements, so only plain version characters are accepted.
 _SAFE_VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$")
@@ -174,7 +176,7 @@ def plan_remediation(
                     "Gradle reported an unsupported configuration name; no override scope was guessed.",
                 )
             package_plan.strategy = "override"
-            package_plan.score = 3
+            package_plan.score = _OVERRIDE_OR_IMAGE_SCORE
             package_plan.gradle_configurations = scopes
             manifest = (finding.get("dependencyResolution") or {}).get(
                 "manifest"
@@ -280,7 +282,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
         if hit.manager in {"npm", "pnpm", "yarn"}:
             return Plan(
                 strategy="override",
-                score=3,
+                score=_OVERRIDE_OR_IMAGE_SCORE,
                 ecosystem=hit.ecosystem,
                 package=hit.name,
                 installed=hit.version,
@@ -298,7 +300,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
     if hit.manager in {"maven", "gradle"} and hit.manifest and not hit.direct:
         return Plan(
             strategy="override",
-            score=3,
+            score=_OVERRIDE_OR_IMAGE_SCORE,
             ecosystem=hit.ecosystem,
             package=hit.name,
             installed=hit.version,
@@ -349,7 +351,7 @@ def _package_plan(hit: PackageHit, fixed: str) -> Plan | None:
             )
         return Plan(
             strategy="override",
-            score=3,
+            score=_OVERRIDE_OR_IMAGE_SCORE,
             ecosystem=hit.ecosystem,
             package=hit.name,
             installed=hit.version,
@@ -385,7 +387,7 @@ def _image_plan(
     oracle = f"{name}:{fixed}"
     return Plan(
         strategy="image_tag",
-        score=3,
+        score=_OVERRIDE_OR_IMAGE_SCORE,
         ecosystem="container",
         package=name,
         installed=(image or "").split(":", 1)[-1] if image and ":" in image else None,
@@ -638,7 +640,7 @@ def _refresh_node_lock(
     result = runner.run(argv, timeout=PACKAGE_TIMEOUT, check=False, **options)
     commands.append(result.display())
     if result.exit_code != 0:
-        detail = (result.stderr or result.stdout).strip()[:500]
+        detail = (result.stderr or result.stdout).strip()[:_MAX_FAILURE_DETAIL]
         return _failed(
             fallback_status,
             plan,
@@ -696,7 +698,7 @@ def _apply_nuget(root, plan, runner, which, edited, commands) -> dict:
             return _failed(
                 "FIX_FAILED_LOCKFILE",
                 plan,
-                (result.stderr or result.stdout)[:500],
+                (result.stderr or result.stdout)[:_MAX_FAILURE_DETAIL],
                 edited,
                 commands,
             )

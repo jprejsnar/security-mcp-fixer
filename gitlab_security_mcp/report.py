@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from gitlab_security_mcp.gitlab_client import dismissal_is_confirmed
+from gitlab_security_mcp.software_audit import project_file_name
 from gitlab_security_mcp.source_findings import pending_source_reviews
 from gitlab_security_mcp.state import RunState, summarize_trees
 from gitlab_security_mcp.util import atomic_write_text
@@ -31,6 +32,17 @@ _AUDIT_REPORT_LINK = (
     "Evidence, affected lines and the recommended change for each finding are in "
     "the [software audit report]({})."
 )
+UNRESOLVED_REPORT_NAME = "unresolved-remediation.md"
+REMEDIATION_REPORT_STEM = "security-remediation-report-"
+_REPORT_PREFIX_SEPARATOR = "-"
+
+
+def report_prefix(root: Path, state: RunState) -> str:
+    """Name reports after the GitLab project, falling back to the checkout folder."""
+    return (
+        project_file_name(state.gitlab_project_path, root.name)
+        + _REPORT_PREFIX_SEPARATOR
+    )
 
 
 def _audit_location_cell(root: Path, report_dir: Path, location: str) -> str:
@@ -433,7 +445,12 @@ def write_unresolved_report(root: Path, state: RunState) -> dict:
         lines.extend(["", f"Run blocker: {_table_cell(state.workflow['blocked'])}"])
     if state.report_path:
         lines.extend(["", f"[Full security report]({Path(state.report_path).name})"])
-    path = root / ".security-mcp" / "reports" / "unresolved-remediation.md"
+    path = (
+        root
+        / ".security-mcp"
+        / "reports"
+        / f"{report_prefix(root, state)}{UNRESOLVED_REPORT_NAME}"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     markdown = "\n".join(lines) + "\n"
     atomic_write_text(path, markdown)
@@ -1085,7 +1102,10 @@ def write_report(
     )
     directory = root / ".security-mcp" / "reports"
     directory.mkdir(parents=True, exist_ok=True)
-    stem = f"security-remediation-report-{state.branch_name or 'unbranched'}"
+    stem = (
+        f"{report_prefix(root, state)}{REMEDIATION_REPORT_STEM}"
+        f"{state.branch_name or 'unbranched'}"
+    )
     json_path = directory / f"{stem}.json"
     human_path = directory / f"{stem}.md"
     atomic_write_text(json_path, json.dumps(payload, indent=2, ensure_ascii=False))

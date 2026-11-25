@@ -11,7 +11,7 @@ Sites: https://www.python.org/ and https://docs.python.org/
 - Use the standard library and current language docs for the module you touch. Check the versionchanged notes. Do not adopt syntax or APIs that need a newer interpreter than 3.11.
 - Name exceptions you handle. Close files you open. Pass `encoding` for text. Keep public behavior stable when a cleanup is possible without a rewrite.
 - Do not call a deprecated or scheduled-for-removal Python API. Use the current replacement on https://docs.python.org.
-- Write dates and times as ISO 8601. `date.isoformat()` and timezone-aware `datetime.isoformat()` are the normal forms. A file or branch name may use the basic form `YYYY-MM-DDTHHMMSSZ` when a colon is not legal.
+- Write dates and times as ISO 8601. `date.isoformat()` and timezone-aware `datetime.isoformat()` are the normal forms. A file or branch name may use `YYYY-MM-DD` or the basic form `YYYY-MM-DDTHHMMSSZ` when a colon is not legal.
 
 ## MCP servers
 
@@ -33,7 +33,7 @@ Site: https://docs.gitlab.com/
 
 Sites: https://cursor.com/docs/plugins and https://cursor.com/docs/reference/plugins
 
-- Persistent guidance belongs in `.cursor/rules/ai-guardrails.mdc` (`alwaysApply: true`) and in `.github/copilot-instructions.md`. Both are generated from `ai/guardrails.md`. Do not also put that text in a root `AGENTS.md`; Cursor and VS Code would load the extra copy on top of the file each editor already applies.
+- Persistent guidance belongs in `.cursor/rules/ai-guardrails.mdc` (`alwaysApply: true`) and in `.github/copilot-instructions.md`. Both are generated from `ai/guardrails.md`; the skill and agent copies are generated from `ai/skill.md` and `ai/agent.md`. Do not also put that text in a root `AGENTS.md`; Cursor and VS Code would load the extra copy on top of the file each editor already applies.
 - Skills and custom agents explain how to edit the guardrail. They are not a second startup copy.
 - A plugin may bundle rules, skills, agents, commands, and MCP servers. Do not publish secrets in a plugin manifest. Declare names only, and let the user supply values.
 - Do not install another plugin that repeats this repository's guardrails.

@@ -42,6 +42,7 @@ _LOG_CONVERTED_FAILURE = (
 _LOG_RESOLVE_INSIDE = "Could not resolve %s inside %s: %s"
 _SERVER_LOG_DIRECTORY = "gitlab-security-mcp"
 _ATOMIC_REPLACE_ATTEMPTS = 10
+_MAX_SAFE_TOKEN_LENGTH = 300
 _ATOMIC_REPLACE_RETRY_SECONDS = 0.02
 _ATOMIC_REPLACE_MAX_RETRY_SECONDS = 0.25
 _WINDOWS_TRANSIENT_FILE_ERRORS = {5, 32, 33}
@@ -54,6 +55,11 @@ _memory_log_lock = threading.Lock()
 _atomic_replace_lock = threading.Lock()
 _memory_unavailable_logged = False
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_TASK_PERFORMANCE = "Task performance %s"
+_LOG_CONCURRENCY = "Concurrency %s"
+_LOG_HTTP_TIMING = "HTTP timing %s"
+_LOG_COULD_NOT_WRITE_TASK_PERFORMANCE_LOG = "Could not write task performance log"
+_LOG_COULD_NOT_WRITE_CONCURRENCY_LOG = "Could not write concurrency log"
 GIT_OPERATION_FAILURES = (OSError, RuntimeError, ValueError, SubprocessError)
 CONVERTED_DEFECTS = (AttributeError, LookupError, TypeError)
 ADVISORY_READ_FAILURES = (
@@ -297,9 +303,9 @@ def _log_performance(name: str, before: dict) -> None:
             "error": None if error is None else error.__name__,
             "worker": threading.current_thread().name,
         }
-        logger.info("Task performance %s", json.dumps(record, ensure_ascii=True))
+        logger.info(_LOG_TASK_PERFORMANCE, json.dumps(record, ensure_ascii=True))
     except Exception:
-        logger.warning("Could not write task performance log", exc_info=True)
+        logger.warning(_LOG_COULD_NOT_WRITE_TASK_PERFORMANCE_LOG, exc_info=True)
 
 
 def log_unexpected(exc: BaseException, context: str) -> None:
@@ -329,9 +335,9 @@ def log_concurrency(kind: str, name: str, **fields: object) -> None:
     }
     record.update(fields)
     try:
-        logger.info("Concurrency %s", json.dumps(record, ensure_ascii=True))
+        logger.info(_LOG_CONCURRENCY, json.dumps(record, ensure_ascii=True))
     except Exception:
-        logger.warning("Could not write concurrency log", exc_info=True)
+        logger.warning(_LOG_COULD_NOT_WRITE_CONCURRENCY_LOG, exc_info=True)
 
 
 @contextmanager
@@ -426,7 +432,7 @@ def timed_http_stream(
         if operation is not None:
             record["operation"] = operation
         text = json.dumps(record, ensure_ascii=True)
-        logger.info("HTTP timing %s", text)
+        logger.info(_LOG_HTTP_TIMING, text)
         if log_path is not None:
             try:
                 with _HTTP_LOG_LOCK:
@@ -611,7 +617,9 @@ def safe_token(value: str, *, label: str) -> str:
     """Reject values that must never be interpolated into a command line."""
     if not value or not isinstance(value, str):
         raise ValueError(_RAISE_MISSING.format(label))
-    if len(value) > 300 or any(char in value for char in "\r\n\t|&;<>`$\\\"'"):
+    if len(value) > _MAX_SAFE_TOKEN_LENGTH or any(
+        char in value for char in "\r\n\t|&;<>`$\\\"'"
+    ):
         raise ValueError(_RAISE_UNSAFE.format(label))
     if value.startswith("-") or ".." in value:
         raise ValueError(_RAISE_UNSAFE.format(label))

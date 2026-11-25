@@ -182,10 +182,13 @@ if ($leftovers.Count -gt 0) {
         "They were not deleted automatically: " + (($leftovers | ForEach-Object { $_.FullName }) -join ', '))
 }
 Write-Host 'Installation and dependency checks completed. Reopen VS Code/Cursor and start the MCP server.'
-$extensionManifest = Join-Path $sitePackages 'gitlab_security_mcp\editor_progress\package.json'
-$extensionVersion = (Get-Content -LiteralPath $extensionManifest -Raw -Encoding utf8 | ConvertFrom-Json).version
+$extensionVersion = (& $python -c "import gitlab_security_mcp; print(gitlab_security_mcp.__version__)" | Select-Object -Last 1).Trim()
 Write-Host "The MCP server installs the bundled progress extension $extensionVersion into the VS Code or Cursor window that starts it. Reload the MCP server (or the window) after this install."
-$progressVsix = Join-Path $wheelItem.DirectoryName "gitlab-security-progress-$extensionVersion.vsix"
-if (Test-Path -LiteralPath $progressVsix -PathType Leaf) {
+$progressVsix = Join-Path $installRoot "gitlab-security-progress-$extensionVersion.vsix"
+& $python -c "import sys; from pathlib import Path; from gitlab_security_mcp.progress_extension import write_vsix; write_vsix(Path(sys.argv[1]))" $progressVsix
+if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $progressVsix -PathType Leaf)) {
     Write-Host "Manual fallback if automatic installation is blocked: Extensions: Install from VSIX with $progressVsix"
+}
+else {
+    Write-Warning 'Writing the manual-fallback progress extension VSIX failed. Review the error above; automatic installation is unaffected.'
 }

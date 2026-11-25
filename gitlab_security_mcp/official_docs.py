@@ -135,11 +135,20 @@ ALLOWED_HOSTS = frozenset(
 logger = logging.getLogger("gitlab_security_mcp")
 _LOG_DOC_URL_REJECTED = "Official documentation URL was rejected for %s: %s"
 _LOG_DOC_READ_FAILED = "Official documentation page could not be read for %s: %s"
+_LOG_COULD_NOT_READ_OFFICIAL_DOCUMENTATION_PAGE = (
+    "Could not read official documentation page %s"
+)
+_LOG_COULD_NOT_PUBLISH_DOCUMENTATION_PROGRESS = (
+    "Could not publish documentation progress"
+)
 _CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _CWE = re.compile(r"CWE-(\d{1,5})", re.IGNORECASE)
 _MAX_BODY = 1_000_000
 _MAX_IDENTIFIERS = 4
 _MAX_SOURCE_CACHE = 128
+_HTTP_TIMEOUT_SECONDS = 20.0
+_HTTP_OK = 200
+_PROGRESS_BAR_WIDTH = 20
 INFORMATIONAL_SECURITY_DOCS = frozenset({"cve", "cwe", "nsa", "nist"})
 
 
@@ -231,7 +240,7 @@ class OfficialDocs:
         self.http = (
             http
             if http is not None
-            else httpx.Client(timeout=20.0, follow_redirects=True)
+            else httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS, follow_redirects=True)
         )
         self._lock = threading.RLock()
         self._closed = False
@@ -288,7 +297,7 @@ class OfficialDocs:
                 _pages_for(finding, []), review.sources, strict=True
             ):
                 if not (
-                    (source.ok and source.status_code == 200 and source.sha256)
+                    (source.ok and source.status_code == _HTTP_OK and source.sha256)
                     or (page.get("catalog") and not page["required"])
                 ):
                     continue
@@ -314,7 +323,7 @@ class OfficialDocs:
             (source.get("name"), source.get("url")): source
             for source in prior_sources
             if source.get("ok")
-            and source.get("status_code") == 200
+            and source.get("status_code") == _HTTP_OK
             and source.get("sha256")
         }
         reusable = {
@@ -368,9 +377,13 @@ class OfficialDocs:
             def notify() -> None:
                 """Report completed requests, not whether optional sources had records."""
                 total = len(pages)
-                filled = completed * 20 // total if total else 20
+                filled = (
+                    completed * _PROGRESS_BAR_WIDTH // total
+                    if total
+                    else _PROGRESS_BAR_WIDTH
+                )
                 message = (
-                    f"Documentation [{'#' * filled}{'.' * (20 - filled)}] "
+                    f"Documentation [{'#' * filled}{'.' * (_PROGRESS_BAR_WIDTH - filled)}] "
                     f"{completed}/{total} "
                     + (
                         f"pages checked ({reuse_label})"
@@ -384,7 +397,7 @@ class OfficialDocs:
                         sink(message)
                     except PROGRESS_PUBLISH_FAILURES:
                         logger.warning(
-                            "Could not publish documentation progress", exc_info=True
+                            _LOG_COULD_NOT_PUBLISH_DOCUMENTATION_PROGRESS, exc_info=True
                         )
 
             def read(item: tuple[int, dict]) -> tuple[int, DocSource]:
@@ -409,7 +422,7 @@ class OfficialDocs:
             return replace(self._read_page(page), required=page.get("required", True))
         except Exception as exc:
             logger.exception(
-                "Could not read official documentation page %s", page.get("url")
+                _LOG_COULD_NOT_READ_OFFICIAL_DOCUMENTATION_PAGE, page.get("url")
             )
             return DocSource(
                 str(page.get("name") or "documentation"),
@@ -459,7 +472,7 @@ class OfficialDocs:
         except httpx.HTTPError as exc:
             logger.warning(_LOG_DOC_READ_FAILED, name, exc, exc_info=True)
             return DocSource(name, url, False, None, None, type(exc).__name__)
-        if status_code != 200:
+        if status_code != _HTTP_OK:
             return DocSource(
                 name,
                 url,

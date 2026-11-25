@@ -73,14 +73,29 @@ _nvd_last_request: float | None = None
 _nvd_retry_until = 0.0
 _NVD_ATTEMPTS = 3
 _MAX_NVD_RETRY_WAIT = 60.0
+_NVD_INTERVAL_WITH_KEY_SECONDS = 0.61
+_NVD_INTERVAL_WITHOUT_KEY_SECONDS = 6.1
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_HTTP_TIMEOUT_SECONDS = 30.0
+_HTTP_NOT_FOUND = 404
+_MAX_REFERENCE_URLS = 5
+_CPE_PRODUCT_FIELD = 4
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_COULD_NOT_PUBLISH_NVD_PACING_PROGRESS = "Could not publish NVD pacing progress"
+_LOG_NVD_TRANSIENT_REQUEST_FAILURE_RETRYING_ATTEMPT_OF = (
+    "NVD transient request failure (%s); retrying attempt %s of %s."
+)
 
 
 def _nvd_wait(has_key: bool) -> None:
     """Space NVD requests across checkout clients, including retries, in this process."""
     global _nvd_last_request
     with _NVD_LOCK:
-        interval = 0.61 if has_key else 6.1
+        interval = (
+            _NVD_INTERVAL_WITH_KEY_SECONDS
+            if has_key
+            else _NVD_INTERVAL_WITHOUT_KEY_SECONDS
+        )
         earliest = max(
             _nvd_retry_until,
             (_nvd_last_request + interval) if _nvd_last_request is not None else 0,
@@ -99,7 +114,7 @@ def _nvd_wait(has_key: bool) -> None:
                     sink(message)
                 except PROGRESS_PUBLISH_FAILURES:
                     logger.warning(
-                        "Could not publish NVD pacing progress", exc_info=True
+                        _LOG_COULD_NOT_PUBLISH_NVD_PACING_PROGRESS, exc_info=True
                     )
             sleep(delay)
         _nvd_last_request = monotonic()
@@ -108,7 +123,7 @@ def _nvd_wait(has_key: bool) -> None:
 def _nvd_retry_delay(error: httpx.HTTPError, attempt: int) -> float | None:
     """Retry transient reads only; honor bounded Retry-After seconds or HTTP dates."""
     if isinstance(error, httpx.HTTPStatusError):
-        if error.response.status_code not in {429, 500, 502, 503, 504}:
+        if error.response.status_code not in _RETRYABLE_STATUS:
             return None
         header = error.response.headers.get("Retry-After")
         if header:
@@ -187,7 +202,9 @@ class AdvisoryClient:
     ):
         """Configure advisory credentials and retain any caller-owned HTTP client."""
         self._owns_http = http is None
-        self.http = http if http is not None else httpx.Client(timeout=30.0)
+        self.http = (
+            http if http is not None else httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS)
+        )
         self.github_token = github_token
         self.nvd_api_key = nvd_api_key
         self.http_log_path = http_log_path
@@ -534,7 +551,7 @@ class AdvisoryClient:
                     if delay is None or attempt == _NVD_ATTEMPTS - 1:
                         raise
                     logger.warning(
-                        "NVD transient request failure (%s); retrying attempt %s of %s.",
+                        _LOG_NVD_TRANSIENT_REQUEST_FAILURE_RETRYING_ATTEMPT_OF,
                         type(exc).__name__,
                         attempt + 2,
                         _NVD_ATTEMPTS,
@@ -590,7 +607,7 @@ class AdvisoryClient:
                 params=params,
                 headers=headers,
             ) as response:
-                if response.status_code == 404:
+                if response.status_code == _HTTP_NOT_FOUND:
                     return None
                 response.raise_for_status()
                 return _decode_advisory(response)
@@ -638,7 +655,7 @@ class AdvisoryClient:
                 log_path=self.http_log_path,
                 json=body,
             ) as response:
-                if response.status_code == 404:
+                if response.status_code == _HTTP_NOT_FOUND:
                     return None
                 response.raise_for_status()
                 payload = _decode_advisory(response)
@@ -744,7 +761,7 @@ def _references(records: list[dict]) -> list[str]:
             url = ref.get("url") if isinstance(ref, dict) else None
             if url and url not in urls:
                 urls.append(url)
-            if len(urls) == 5:
+            if len(urls) == _MAX_REFERENCE_URLS:
                 return urls
     return urls
 
@@ -922,7 +939,9 @@ def _github_range_contains(version: str, text: str) -> bool | None:
 def _cpe_product(criteria: str) -> str | None:
     """Return the product field of a CPE 2.3 string such as cpe:2.3:a:vendor:product:..."""
     parts = criteria.split(":")
-    return parts[4].lower() if len(parts) > 4 else None
+    return (
+        parts[_CPE_PRODUCT_FIELD].lower() if len(parts) > _CPE_PRODUCT_FIELD else None
+    )
 
 
 def _product_key(package: str) -> str:

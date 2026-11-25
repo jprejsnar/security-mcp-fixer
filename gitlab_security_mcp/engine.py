@@ -40,7 +40,12 @@ from gitlab_security_mcp.commands import (
 from gitlab_security_mcp.config_findings import assess_config, config_kind
 from gitlab_security_mcp.fanout import MAX_WORKERS, map_ordered
 from gitlab_security_mcp.git_ops import GitOps, branch_name_for
-from gitlab_security_mcp.gitlab_client import GitLabClient, dismissal_is_confirmed
+from gitlab_security_mcp.gitlab_client import (
+    DEFAULT_GITLAB_API_URL,
+    MAX_DISMISSAL_REASON_LENGTH,
+    GitLabClient,
+    dismissal_is_confirmed,
+)
 from gitlab_security_mcp.manifests import (
     GradleReport,
     PackageHit,
@@ -271,6 +276,54 @@ _CHECK_DIAGNOSTIC_FIELDS = (
 )
 
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_SECURITY_LOG_REVIEW_BLOCKED_BRANCH_REUSE_ERROR = (
+    "Security log review blocked branch reuse: %s error(s)"
+)
+_LOG_SKIPPING_POST_PULL_CLEAN_INSTALL_DISCOVERY_MUST = "Skipping post-pull clean/install; discovery must not run repository lifecycle hooks."
+_LOG_PROGRESS = "Progress repo=%s finding=%s package=%s: %s"
+_LOG_FIX_SELECTION_RETRY_REJECTED_REQUEST_OR_EVIDENCE = (
+    "Fix selection retry rejected: request or evidence changed"
+)
+_LOG_FIX_SELECTION_REJECTED_FINDING_EVIDENCE_CHANGED = (
+    "Fix selection rejected: finding evidence changed"
+)
+_LOG_REMEDIATION_BLOCKED_WITHOUT_CURRENT_HUMAN_PERMISSION = (
+    "Remediation blocked without current human permission: %s"
+)
+_LOG_IGNORING_A_STALE_DESKTOP_APPROVAL_RESPONSE = (
+    "Ignoring a stale desktop approval response"
+)
+_LOG_PRECHECK_FAILED = "precheck failed"
+_LOG_MESSAGE = "%s"
+_LOG_APPROVED_PACKAGE_EXECUTION_BLOCKED = "Approved package execution blocked"
+_LOG_SKIPPING_INFORMATIONAL_PRE_EDIT_LINT_REMEDIATION_RUNS = "Skipping informational pre-edit lint; remediation runs only required production builds and dependency checks."
+_LOG_IGNORING_A_STALE_DESKTOP_APPROVAL_STATUS_UPDATE = (
+    "Ignoring a stale desktop approval status update"
+)
+_LOG_GIT_ORIGIN_DID_NOT_NAME_A_PROJECT = (
+    "Git origin did not name a project; using GITLAB_PROJECT_ID"
+)
+_LOG_GITLAB_FALSE_POSITIVE_DISMISSAL_FAILED_FOR = (
+    "GitLab false-positive dismissal failed for %s: %s"
+)
+_LOG_COULD_NOT_PUBLISH_STEP_PROGRESS = "Could not publish step progress"
+_LOG_COULD_NOT_CLOSE_GITLAB_CLIENT_AFTER_INITIALIZATION = (
+    "Could not close GitLab client after initialization failure"
+)
+_LOG_COULD_NOT_CLOSE_ADVISORY_CLIENT_AFTER_INITIALIZATION = (
+    "Could not close advisory client after initialization failure"
+)
+_DEFAULT_VALIDATION_TIMEOUT_SECONDS = 600
+_CORPORATE_HOST = "nexus.ert.com"
+_HTTPS_PORT = 443
+_PROGRESS_CHECKING_CORPORATE_DNS = f"Checking corporate DNS for {_CORPORATE_HOST}"
+_CORPORATE_DNS_ACTION = "Connect to corporate VPN first, then rerun run_prechecks."
+_CORPORATE_DNS_REASON = f"Cannot resolve {_CORPORATE_HOST}. {_CORPORATE_DNS_ACTION}"
+_DEPENDENCY_TREE_TIMEOUT_SECONDS = 120
+_MAX_DEPENDENCY_LOG_BYTES = 8 * 1024 * 1024
+_MAX_PROGRESS_LABEL_LENGTH = 200
+_MAX_PROGRESS_STEP_LENGTH = 500
+_PROGRESS_BAR_WIDTH = 20
 
 AFTER_BRANCH = {
     "BRANCH_CREATED",
@@ -439,9 +492,9 @@ class Engine:
         which: Callable[[str], str | None] | None = None,
         today: date | None = None,
         project_id: str | None = None,
-        validation_timeout: int = 600,
+        validation_timeout: int = _DEFAULT_VALIDATION_TIMEOUT_SECONDS,
         gitlab_token: str | None = None,
-        gitlab_api_url: str = "https://gitlab.com/api/v4",
+        gitlab_api_url: str = DEFAULT_GITLAB_API_URL,
         github_token: str | None = None,
         nvd_api_key: str | None = None,
     ):
@@ -495,14 +548,14 @@ class Engine:
                     self.gitlab.close()
                 except Exception:
                     logger.exception(
-                        "Could not close GitLab client after initialization failure"
+                        _LOG_COULD_NOT_CLOSE_GITLAB_CLIENT_AFTER_INITIALIZATION
                     )
             if self._owns_advisory and hasattr(self, "advisory"):
                 try:
                     self.advisory.close()
                 except Exception:
                     logger.exception(
-                        "Could not close advisory client after initialization failure"
+                        _LOG_COULD_NOT_CLOSE_ADVISORY_CLIENT_AFTER_INITIALIZATION
                     )
             raise
         self.which = which if which is not None else shutil.which
@@ -636,14 +689,16 @@ class Engine:
             raise ValueError(
                 _RAISE_REPOSITORY_DIRECTORY_DOES_NOT_EXIST_SET_REPO_ROOT.format(root)
             )
-        timeout = int(os.environ.get("VALIDATION_TIMEOUT_SEC", "600"))
+        timeout = int(
+            os.environ.get(
+                "VALIDATION_TIMEOUT_SEC", str(_DEFAULT_VALIDATION_TIMEOUT_SECONDS)
+            )
+        )
         return cls(
             root,
             gitlab_token=os.environ.get("GITLAB_TOKEN")
             or os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN"),
-            gitlab_api_url=os.environ.get(
-                "GITLAB_API_URL", "https://gitlab.com/api/v4"
-            ),
+            gitlab_api_url=os.environ.get("GITLAB_API_URL", DEFAULT_GITLAB_API_URL),
             github_token=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
             nvd_api_key=os.environ.get("NVD_API_KEY"),
             validation_timeout=timeout,
@@ -666,16 +721,13 @@ class Engine:
 
     def _check_corporate_dns(self, failure_status: str) -> dict | None:
         """Stop in memory if corporate DNS is unavailable, without changing files."""
-        self._progress(None, "Checking corporate DNS for nexus.ert.com")
+        self._progress(None, _PROGRESS_CHECKING_CORPORATE_DNS)
         try:
-            if not getaddrinfo("nexus.ert.com", 443, type=SOCK_STREAM):
+            if not getaddrinfo(_CORPORATE_HOST, _HTTPS_PORT, type=SOCK_STREAM):
                 raise gaierror(_RAISE_NO_DNS_ADDRESSES_RETURNED)
         except OSError as exc:
             logger.warning(_LOG_CORPORATE_DNS_FAILED, exc, exc_info=True)
-            reason = (
-                "Cannot resolve nexus.ert.com. Connect to corporate VPN first, "
-                "then rerun run_prechecks."
-            )
+            reason = _CORPORATE_DNS_REASON
             self._progress(None, reason)
             self.state.status = failure_status
             self.state.stop_stage = "corporate_dns"
@@ -683,8 +735,8 @@ class Engine:
                 "status": failure_status,
                 "reason": reason,
                 "error": str(exc),
-                "action": "Connect to corporate VPN first, then rerun run_prechecks.",
-                "hostname": "nexus.ert.com",
+                "action": _CORPORATE_DNS_ACTION,
+                "hostname": _CORPORATE_HOST,
             }
         return None
 
@@ -769,7 +821,7 @@ class Engine:
                     },
                 )
         except GIT_OPERATION_FAILURES as exc:
-            logger.exception("precheck failed")
+            logger.exception(_LOG_PRECHECK_FAILED)
             return self._stop(
                 "PRECHECK_FAILED",
                 "precheck",
@@ -938,7 +990,7 @@ class Engine:
         self.state.status = status
         self.state.stop_stage = "security_log_review"
         logger.error(
-            "Security log review blocked branch reuse: %s error(s)",
+            _LOG_SECURITY_LOG_REVIEW_BLOCKED_BRANCH_REUSE_ERROR,
             review["error_count"],
         )
         return {
@@ -950,9 +1002,7 @@ class Engine:
 
     def _prepare_pnpm(self) -> list[dict]:
         """Defer installation until an approved update needs a production build."""
-        logger.info(
-            "Skipping post-pull clean/install; discovery must not run repository lifecycle hooks."
-        )
+        logger.info(_LOG_SKIPPING_POST_PULL_CLEAN_INSTALL_DISCOVERY_MUST)
         return []
 
     @_serialized
@@ -1079,9 +1129,7 @@ class Engine:
                         "reason": str(exc),
                         "action": "Check the selected repo_root and Git origin. For automatic per-repository selection, leave GITLAB_PROJECT_ID unset and configure only the trusted GitLab API host and your own token.",
                     }
-                logger.info(
-                    "Git origin did not name a project; using GITLAB_PROJECT_ID"
-                )
+                logger.info(_LOG_GIT_ORIGIN_DID_NOT_NAME_A_PROJECT)
                 pid = pinned
                 project_source = "GITLAB_PROJECT_ID"
         fetched = self.gitlab.fetch(pid)
@@ -1379,7 +1427,7 @@ class Engine:
             or current.get("status") != "OK"
             or current["candidates"] != snapshot
         ):
-            logger.warning("Fix selection retry rejected: request or evidence changed")
+            logger.warning(_LOG_FIX_SELECTION_RETRY_REJECTED_REQUEST_OR_EVIDENCE)
             return {
                 "status": "SELECTION_CHANGED",
                 "reason": "The original live selection request or its evidence changed. No edit permission was recorded.",
@@ -1433,7 +1481,7 @@ class Engine:
             )
             or not set(selected_ids).issubset(item["id"] for item in candidates)
         ):
-            logger.warning("Fix selection rejected: finding evidence changed")
+            logger.warning(_LOG_FIX_SELECTION_REJECTED_FINDING_EVIDENCE_CHANGED)
             if request_id is not None and not stale_request:
                 self.state.fix_selection = {
                     **self.state.fix_selection,
@@ -1576,7 +1624,7 @@ class Engine:
                 break
         if not authorized:
             logger.warning(
-                "Remediation blocked without current human permission: %s", operation
+                _LOG_REMEDIATION_BLOCKED_WITHOUT_CURRENT_HUMAN_PERMISSION, operation
             )
             return {
                 "status": "FIX_APPROVAL_REQUIRED",
@@ -1843,10 +1891,10 @@ class Engine:
                 )
         except InterruptedError as exc:
             status, reason = "INTERRUPTED", str(exc)
-            logger.warning("%s", reason, exc_info=True)
+            logger.warning(_LOG_MESSAGE, reason, exc_info=True)
         except (OSError, ValueError, TypeError, RuntimeError, SubprocessError) as exc:
             status, reason = "BLOCKED", str(exc)
-            logger.exception("Approved package execution blocked")
+            logger.exception(_LOG_APPROVED_PACKAGE_EXECUTION_BLOCKED)
         with self._lock:
             if self.state.fix_selection.get("request_id") != request_id:
                 return {"status": "STALE_SELECTION"}
@@ -2113,9 +2161,7 @@ class Engine:
             lint_recorded = self.state.lint_baseline is not None
             if not lint_recorded:
                 baseline = {"results": []}
-                logger.info(
-                    "Skipping informational pre-edit lint; remediation runs only required production builds and dependency checks."
-                )
+                logger.info(_LOG_SKIPPING_INFORMATIONAL_PRE_EDIT_LINT_REMEDIATION_RUNS)
                 self._capture_lint_baseline(finding_id, [])
             self._progress(
                 finding_id,
@@ -3247,7 +3293,9 @@ class Engine:
                     "solely to request dismissal; no false-positive approval is appropriate."
                 )
             elif (
-                not isinstance(reason, str) or not reason.strip() or len(reason) > 50000
+                not isinstance(reason, str)
+                or not reason.strip()
+                or len(reason) > MAX_DISMISSAL_REASON_LENGTH
             ):
                 exclusion = "INVALID_REASON"
                 action = "Reassess with a nonempty reason of at most 50,000 characters."
@@ -3386,7 +3434,7 @@ class Engine:
                     "action": "Check GitLab before retrying; a failed response does not prove no remote change occurred.",
                 }
                 logger.warning(
-                    "GitLab false-positive dismissal failed for %s: %s",
+                    _LOG_GITLAB_FALSE_POSITIVE_DISMISSAL_FAILED_FOR,
                     item["id"],
                     outcome["error"],
                     exc_info=True,
@@ -3455,7 +3503,7 @@ class Engine:
             if previous.get("request_id") != details.get("request_id") or previous.get(
                 "status"
             ) not in {"REQUESTED", "AWAITING_HUMAN"}:
-                logger.warning("Ignoring a stale desktop approval status update")
+                logger.warning(_LOG_IGNORING_A_STALE_DESKTOP_APPROVAL_STATUS_UPDATE)
                 return {
                     "status": "ERROR",
                     "reason": "The approval window belongs to a different or completed run.",
@@ -3495,7 +3543,7 @@ class Engine:
             "REQUESTED",
             "AWAITING_HUMAN",
         }:
-            logger.warning("Ignoring a stale desktop approval response")
+            logger.warning(_LOG_IGNORING_A_STALE_DESKTOP_APPROVAL_RESPONSE)
             return {
                 "status": "ERROR",
                 "reason": "The approval window belongs to a different or completed run.",
@@ -3782,7 +3830,9 @@ class Engine:
                 else:
                     result = self.runner.run(
                         [tool, "--batch-mode", "dependency:tree"],
-                        timeout=min(self.validation_timeout, 120),
+                        timeout=min(
+                            self.validation_timeout, _DEPENDENCY_TREE_TIMEOUT_SECONDS
+                        ),
                         check=False,
                         cwd=manifest.parent,
                     )
@@ -3811,7 +3861,7 @@ class Engine:
                             raise ValueError(
                                 _RAISE_TRUNCATED_MAVEN_DEPENDENCY_OUTPUT_HAS_NO_COMPLETE_LOCAL
                             )
-                        raw = read_bounded(log, 8 * 1024 * 1024)
+                        raw = read_bounded(log, _MAX_DEPENDENCY_LOG_BYTES)
                         if raw is None:
                             raise ValueError(
                                 _RAISE_MAVEN_DEPENDENCY_LOG_EXCEEDS_THE_8_MIB_INSPECTION
@@ -3903,7 +3953,7 @@ class Engine:
                 argv.extend(["--configuration", configuration])
             result = self.runner.run(
                 argv,
-                timeout=min(self.validation_timeout, 120),
+                timeout=min(self.validation_timeout, _DEPENDENCY_TREE_TIMEOUT_SECONDS),
                 check=False,
                 **(
                     {"cwd": manifest.parent}
@@ -3937,7 +3987,7 @@ class Engine:
                         detail="Gradle dependency output is truncated and has no complete local log.",
                     )
                 else:
-                    raw = read_bounded(log, 8 * 1024 * 1024)
+                    raw = read_bounded(log, _MAX_DEPENDENCY_LOG_BYTES)
                     if raw is None:
                         row.update(
                             status="FAILED",
@@ -4811,10 +4861,12 @@ class Engine:
     def _progress_locked(self, finding_id: str | None, step: str) -> None:
         """Assign progress ordinals while holding the engine's state lock."""
         finding = self._finding(finding_id) if finding_id else None
-        label = " ".join(str(finding_id or "run").split())[:200]
-        package = " ".join(str((finding or {}).get("component") or "N/A").split())[:200]
-        repository = " ".join(str(self.repo_root).split())[:500]
-        step = " ".join(step.split())[:500]
+        label = " ".join(str(finding_id or "run").split())[:_MAX_PROGRESS_LABEL_LENGTH]
+        package = " ".join(str((finding or {}).get("component") or "N/A").split())[
+            :_MAX_PROGRESS_LABEL_LENGTH
+        ]
+        repository = " ".join(str(self.repo_root).split())[:_MAX_PROGRESS_STEP_LENGTH]
+        step = " ".join(step.split())[:_MAX_PROGRESS_STEP_LENGTH]
         if (
             finding_id is not None
             and finding is not None
@@ -4832,7 +4884,7 @@ class Engine:
             )
             step = f"Processing {ordinal} of {total} {PROGRESS_SEVERITIES[severity]} | {step}"
         logger.info(
-            "Progress repo=%s finding=%s package=%s: %s",
+            _LOG_PROGRESS,
             repository,
             label,
             package,
@@ -4840,11 +4892,15 @@ class Engine:
         )
         sink = progress_sink.get()
         if sink is not None:
-            bar = "#" * 20 if " finished:" in step else "?" * 20
+            bar = (
+                "#" * _PROGRESS_BAR_WIDTH
+                if " finished:" in step
+                else "?" * _PROGRESS_BAR_WIDTH
+            )
             try:
                 sink(f"[{bar}] {package} / {label}: {step}")
             except PROGRESS_PUBLISH_FAILURES:
-                logger.warning("Could not publish step progress", exc_info=True)
+                logger.warning(_LOG_COULD_NOT_PUBLISH_STEP_PROGRESS, exc_info=True)
 
     def _finding(self, finding_id: str) -> dict | None:
         """Return the active finding matching an id, or None if absent."""

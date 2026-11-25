@@ -222,6 +222,15 @@ query ConfirmFalsePositiveDismissal($id: VulnerabilityID!) {
 """.strip()
 
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_GITLAB_FALSE_POSITIVE_DISMISSAL_INDEPENDENTLY_CONFIRMED = (
+    "GitLab false-positive dismissal independently confirmed: %s"
+)
+_LOG_TRANSIENT_GITLAB_TRANSPORT_FAILURE_RETRYING_READ_OF = (
+    "Transient GitLab transport failure; retrying read %s of %s: %s"
+)
+_LOG_TRANSIENT_GITLAB_STATUS_RETRYING_READ_OF = (
+    "Transient GitLab status %s; retrying read %s of %s"
+)
 
 
 def dismissal_is_confirmed(record: dict) -> bool:
@@ -246,6 +255,13 @@ _GITLAB_READ_ATTEMPTS = 4
 _GITLAB_BACKOFF_SECONDS = 1.0
 _MAX_GITLAB_RETRY_WAIT = 4.0
 _GITLAB_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+DEFAULT_GITLAB_API_URL = "https://gitlab.com/api/v4"
+_DEFAULT_MAX_FINDINGS = 1000
+_HTTP_TIMEOUT_SECONDS = 30.0
+MAX_DISMISSAL_REASON_LENGTH = 50000
+_HTTP_ERROR_STATUS = 400
+_ERROR_EXCERPT_LIMIT = 500
+_ERROR_EXCERPT_CHUNK_BYTES = 256
 
 
 @dataclass
@@ -273,17 +289,19 @@ class GitLabClient:
     def __init__(
         self,
         token: str | None,
-        api_url: str = "https://gitlab.com/api/v4",
+        api_url: str = DEFAULT_GITLAB_API_URL,
         *,
         http: httpx.Client | None = None,
-        max_findings: int = 1000,
+        max_findings: int = _DEFAULT_MAX_FINDINGS,
         http_log_path: Path | None = None,
     ):
         """Configure report retrieval and retain any caller-owned HTTP client."""
         self.token = token
         self.api_url = api_url.rstrip("/")
         self._owns_http = http is None
-        self.http = http if http is not None else httpx.Client(timeout=30.0)
+        self.http = (
+            http if http is not None else httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS)
+        )
         self.max_findings = max_findings
         self.http_log_path = http_log_path
         self._closed = False
@@ -440,7 +458,7 @@ class GitLabClient:
                 not finding_id
                 or not project_path
                 or not reason.strip()
-                or len(reason) > 50000
+                or len(reason) > MAX_DISMISSAL_REASON_LENGTH
             ):
                 raise ValueError(_RAISE_FINDING_PROJECT_AND_A_REASON_OF_1_50)
             payload = self._graphql(DISMISSAL_TARGET_QUERY, {"id": vulnerability_id})
@@ -549,7 +567,7 @@ class GitLabClient:
             },
         }
         logger.info(
-            "GitLab false-positive dismissal independently confirmed: %s",
+            _LOG_GITLAB_FALSE_POSITIVE_DISMISSAL_INDEPENDENTLY_CONFIRMED,
             vulnerability_id,
         )
         return result
@@ -749,7 +767,7 @@ class GitLabClient:
                     raise
                 delay = _GITLAB_BACKOFF_SECONDS * 2**attempt
                 logger.warning(
-                    "Transient GitLab transport failure; retrying read %s of %s: %s",
+                    _LOG_TRANSIENT_GITLAB_TRANSPORT_FAILURE_RETRYING_READ_OF,
                     attempt + 2,
                     attempts,
                     exc,
@@ -804,7 +822,7 @@ class GitLabClient:
             },
             json=json_body,
         ) as response:
-            if response.status_code >= 400:
+            if response.status_code >= _HTTP_ERROR_STATUS:
                 detail = self._clean(
                     f"GitLab {method} {url} returned {response.status_code}: "
                     f"{_response_excerpt(response)}"
@@ -817,7 +835,7 @@ class GitLabClient:
                     delay = _retry_wait(response, attempt)
                     if delay is not None:
                         logger.warning(
-                            "Transient GitLab status %s; retrying read %s of %s",
+                            _LOG_TRANSIENT_GITLAB_STATUS_RETRYING_READ_OF,
                             response.status_code,
                             attempt + 2,
                             attempts,
@@ -859,7 +877,9 @@ def _bounded_body(response: httpx.Response) -> bytes:
     return b"".join(chunks)
 
 
-def _response_excerpt(response: httpx.Response, limit: int = 500) -> str:
+def _response_excerpt(
+    response: httpx.Response, limit: int = _ERROR_EXCERPT_LIMIT
+) -> str:
     """Decode only the first part of an error body.
 
     The remainder stays on the wire and is discarded when the response
@@ -868,7 +888,7 @@ def _response_excerpt(response: httpx.Response, limit: int = 500) -> str:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     kept: list[str] = []
     count = 0
-    for chunk in response.iter_bytes(chunk_size=256):
+    for chunk in response.iter_bytes(chunk_size=_ERROR_EXCERPT_CHUNK_BYTES):
         text = decoder.decode(chunk)
         room = limit - count
         if room <= 0:

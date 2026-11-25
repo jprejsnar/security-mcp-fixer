@@ -28,6 +28,7 @@ _RAISE_UNSUPPORTED_HOOK_CONFIGURATION_VERSION = (
 )
 _RAISE_INVALID_HOOKS_OBJECT = "Invalid hooks object: {}"
 _RAISE_INVALID_HOOK_EVENT_LIST = "Invalid hook event list {}: {}"
+_RAISE_HOST_AND_EVENT_REQUIRED = "--host and --event are required for hook execution"
 
 _ACTIVE = {
     "GENERATE_AUDIT_REPORT",
@@ -43,6 +44,9 @@ _MAX_CONTINUATIONS = 24
 _MAX_STALLED_CONTINUATIONS = 2
 _AUDIT_TOOLS = ("choose_software_audit_action", "complete_security_run")
 _STOP_COMPLETED = "completed"
+_HOOK_TIMEOUT_SECONDS = 15
+# Workflow job 6 is the software audit.
+_AUDIT_WORKFLOW_JOB = 6
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,7 @@ class HostProfile:
 
 def _cursor_entry(command: str, event: str) -> dict:
     """Cursor's stop loop limit must be lifted; the turn cap is enforced here instead."""
-    entry = {"command": command, "timeout": 15}
+    entry = {"command": command, "timeout": _HOOK_TIMEOUT_SECONDS}
     if event == "stop":
         entry["loop_limit"] = None
     return entry
@@ -68,7 +72,7 @@ def _cursor_entry(command: str, event: str) -> dict:
 def _copilot_entry(command: str, _event: str) -> dict:
     """Copilot selects its shell by key name."""
     shell = "powershell" if os.name == "nt" else "bash"
-    return {"type": "command", shell: command, "timeoutSec": 15}
+    return {"type": "command", shell: command, "timeoutSec": _HOOK_TIMEOUT_SECONDS}
 
 
 HOSTS: dict[str, HostProfile] = {
@@ -219,7 +223,10 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
     pending = (
         audit.get("status") in _ACTIVE
         and not audit.get("report_complete")
-        and (not state.get("workflow") or state["workflow"].get("current") == 6)
+        and (
+            not state.get("workflow")
+            or state["workflow"].get("current") == _AUDIT_WORKFLOW_JOB
+        )
     )
     if event == "post":
         if not pending or not audit.get("output_path"):
@@ -357,7 +364,7 @@ def main() -> None:
                 print(path)
             return
         if args.host is None or args.event is None:
-            parser.error("--host and --event are required for hook execution")
+            parser.error(_RAISE_HOST_AND_EVENT_REQUIRED)
         response = handle_event(args.host, args.event, json_object(sys.stdin.read()))
         _emit_hook(response)
     except (OSError, ValueError, RuntimeError) as exc:

@@ -11,6 +11,7 @@ from subprocess import SubprocessError
 from xml.etree.ElementTree import ParseError
 
 from gitlab_security_mcp.commands import (
+    TIMEOUT_EXIT_CODE,
     CommandResult,
     CommandRunner,
     resolve_tool,
@@ -38,6 +39,13 @@ _RAISE_GRADLE_TEST_VALIDATION_REQUIRES_A_WORKING_DIRECTORY = (
 _RAISE_JUNIT_REPORT_EXCEEDS_10_MIB = "JUnit report exceeds 10 MiB: {}"
 _RAISE_INVALID_JUNIT_REPORT = "Invalid JUnit report {}: {}"
 _RAISE_JUNIT_REPORT_CONTAINS_FAILING_TESTS = "JUnit report contains failing tests: {}"
+_PROBE_TIMEOUT_SECONDS = 60
+_MIN_JAVA_MAJOR = 17
+_MIN_DOTNET_SDK_MAJOR = 10
+_MAX_JUNIT_REPORT_BYTES = 10 * 1024 * 1024
+_TRUNCATED_DETAIL_LENGTH = 400
+_MAX_DETAIL_LENGTH = 500
+_FAILURE_TAIL_LENGTH = 2000
 # Corporate proxies such as Nexus often reject the npm bulk-advisory endpoint.
 _AUDIT_ENDPOINT_UNSUPPORTED_MARKERS = (
     "ERR_PNPM_AUDIT_BAD_RESPONSE",
@@ -267,21 +275,21 @@ def _versions(runner, which, stack: StackInfo, timeout: int) -> list[dict]:
         if not tool:
             found.append(_row(None, "SKIPPED", True, f"{name} is not on PATH."))
             continue
-        result = runner.run([tool, *args], timeout=min(timeout, 60), check=False)
+        result = runner.run(
+            [tool, *args], timeout=min(timeout, _PROBE_TIMEOUT_SECONDS), check=False
+        )
         text = (result.stdout or result.stderr).strip()
         detail = text.splitlines()[0] if text else f"exit {result.exit_code}"
         requires_net10 = name == "dotnet" and any(
             re.match(r"net10\.0(?:-|$)", item) for item in stack.target_frameworks or []
         )
         compatible = True
-        if name == "java" and not _java_major(text, 17):
+        if name == "java" and not _java_major(text, _MIN_JAVA_MAJOR):
             compatible = False
-            detail = (
-                f"{detail}. Java 17 or newer is required for this validation matrix."
-            )
+            detail = f"{detail}. Java {_MIN_JAVA_MAJOR} or newer is required for this validation matrix."
         if requires_net10:
             sdk = re.match(r"(\d+)\.\d+\.\d+", text)
-            if sdk is None or int(sdk.group(1)) < 10:
+            if sdk is None or int(sdk.group(1)) < _MIN_DOTNET_SDK_MAJOR:
                 compatible = False
                 detail = (
                     f"{detail}. A .NET SDK 10 or newer is required for net10.0 targets."
@@ -694,7 +702,7 @@ def _nginx(root: Path, stack: StackInfo, runner, which, timeout: int) -> list[di
             _run(
                 runner,
                 [tool, "-t", "-c", str((root / rel).resolve())],
-                min(timeout, 60),
+                min(timeout, _PROBE_TIMEOUT_SECONDS),
                 required=True,
             )
         )
@@ -832,7 +840,9 @@ def _execute_product_check(
                 status="PASSED",
                 detail=f"Gradle JUnit reports confirm {count} executed tests.",
             )
-    if kind == "lint" and (result.exit_code == 124 or result.exit_code < 0):
+    if kind == "lint" and (
+        result.exit_code == TIMEOUT_EXIT_CODE or result.exit_code < 0
+    ):
         row["output_complete"] = False
     return row
 
@@ -857,10 +867,10 @@ def _executed_gradle_tests(
     for path, stamp in _gradle_test_reports(root).items():
         if before.get(path) == stamp:
             continue
-        if stamp[1] > 10 * 1024 * 1024:
+        if stamp[1] > _MAX_JUNIT_REPORT_BYTES:
             raise ValueError(_RAISE_JUNIT_REPORT_EXCEEDS_10_MIB.format(path))
         try:
-            contents = read_bounded(path, 10 * 1024 * 1024)
+            contents = read_bounded(path, _MAX_JUNIT_REPORT_BYTES)
             if contents is None:
                 raise ValueError(_RAISE_JUNIT_REPORT_EXCEEDS_10_MIB.format(path))
             report = parse_xml(contents)
@@ -890,9 +900,13 @@ def _run_result(
     detail = (result.stderr or result.stdout).strip()
     if result.truncated:
         detail = (
-            (detail[:400] + " (output truncated)") if detail else "output truncated"
+            (detail[:_TRUNCATED_DETAIL_LENGTH] + " (output truncated)")
+            if detail
+            else "output truncated"
         )
-    return _row(result, status, required and not informational, detail[:500])
+    return _row(
+        result, status, required and not informational, detail[:_MAX_DETAIL_LENGTH]
+    )
 
 
 def _lint_result(result: CommandResult) -> dict:
@@ -1053,7 +1067,7 @@ def _product_result(result: CommandResult, kind: str) -> dict:
         elif result.exit_code == 0:
             result.unit_tests_verified = True
     if result.exit_code != 0:
-        tail = (result.stderr or result.stdout).strip()[-2000:]
+        tail = (result.stderr or result.stdout).strip()[-_FAILURE_TAIL_LENGTH:]
         logs = ", ".join(
             path for path in (result.stdout_log_path, result.stderr_log_path) if path
         )

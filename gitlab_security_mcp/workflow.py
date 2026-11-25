@@ -12,6 +12,10 @@ if TYPE_CHECKING:
     from gitlab_security_mcp.engine import Engine
 
 logger = logging.getLogger("gitlab_security_mcp")
+_LOG_OUT_OF_ORDER_WORKFLOW_CALL_CURRENT_JOB = (
+    "Out-of-order workflow call: current job %s, expected %s"
+)
+_LOG_COULD_NOT_PUBLISH_WORKFLOW_PROGRESS = "Could not publish workflow progress"
 
 JOB_LABELS = (
     "Pre-checks",
@@ -88,7 +92,7 @@ def activity(engine: Engine, message: str, *, status: str = "RUNNING") -> None:
             final_report=workflow.get("final_report", False),
         )
     except (OSError, ValueError):
-        logger.warning("Could not publish workflow progress", exc_info=True)
+        logger.warning(_LOG_COULD_NOT_PUBLISH_WORKFLOW_PROGRESS, exc_info=True)
 
 
 def advance(engine: Engine, *, status: str = "FINISHED", message: str = "") -> None:
@@ -110,9 +114,7 @@ def require(engine: Engine, *numbers: int) -> dict | None:
     if not workflow or workflow["current"] in numbers:
         return None
     current = workflow["current"]
-    logger.warning(
-        "Out-of-order workflow call: current job %s, expected %s", current, numbers
-    )
+    logger.warning(_LOG_OUT_OF_ORDER_WORKFLOW_CALL_CURRENT_JOB, current, numbers)
     next_tool = (
         _PRECHECK_NEXT_TOOL.get(engine.state.status, _DEFAULT_NEXT_TOOL)
         if current == JOB_PRECHECKS
