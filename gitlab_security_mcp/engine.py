@@ -142,6 +142,19 @@ _RAISE_SERVER_SHUTDOWN_INTERRUPTED_THE_APPROVED_PACKAGE_BATCH = (
 _RAISE_THE_LATEST_ELIGIBLE_TARGET_IS_R_BUT_THE = "The latest eligible target is {!r}, but the release review does not identify that exact target. Review the current catalog and resubmit; a newly published release cannot inherit an older target's support or fee review."
 _RAISE_LATEST_ELIGIBLE_TARGET_IS_AFFECTED = "Latest eligible target {} is affected by public advisory evidence; manual investigation required"
 _RAISE_TARGET_ADVISORY_PACKAGE_MISMATCH = "Target advisory evidence does not match the requested package; manual investigation required"
+# qualify_package_update is refused until the human selects, so reviews must travel
+# with select_security_fixes; a stored review from an earlier call is still reused.
+_PACKAGE_REVIEW_REQUIRED_MESSAGE = (
+    "Before the unchecked selection form opens, write one review per listed finding "
+    "in the qualification review schema from the server instructions (official docs, "
+    "framework/API compatibility, license terms), then call select_security_fixes with "
+    "package_reviews keyed by finding ID. Each listed reason names every missing piece. "
+    "Do not call qualify_package_update now: it is refused until the human selects, and "
+    "the Windows form qualifies, applies, and validates the selected updates itself. "
+    "For a package that cannot safely qualify, send its exact ecosystem/package/target "
+    "and an honest blocked_reason; it is labeled blocked and never edited. A major "
+    "upgrade also needs its major_upgrade evidence. Do not invent evidence."
+)
 _UNVERIFIED_TARGET_WARNING = (
     "Public advisory bounds could not verify target {target} as unaffected. "
     "Human-approved compatibility validation may retain this update, but passing "
@@ -1664,7 +1677,7 @@ class Engine:
                 "status": "PACKAGE_REVIEW_REQUIRED",
                 "required_reviews": required,
                 "next_tool": "select_security_fixes",
-                "message": "Call qualify_package_update once for each listed finding. Do not re-read the pages that tool returns and do not paste its review into package_reviews. Call select_security_fixes again with repo_root only; the server reuses the stored qualification. A major upgrade still needs that one qualification call. Do not invent evidence.",
+                "message": _PACKAGE_REVIEW_REQUIRED_MESSAGE,
             }
         return {
             "status": "READY",

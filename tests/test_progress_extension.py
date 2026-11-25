@@ -18,6 +18,7 @@ from gitlab_security_mcp.progress_extension import (
     editor_command,
     extension_directory,
     install_progress_extension,
+    reload_required_version,
     write_vsix,
 )
 
@@ -505,6 +506,95 @@ def test_editor_command_ignores_an_editor_without_its_cli(tmp_path):
     assert command is None
 
 
+def _editor_with_installed(monkeypatch, tmp_path, listing):
+    """Fake an editor CLI whose extension list prints ``listing``; return its calls."""
+    calls = []
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension._reload_required_version", None
+    )
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension.editor_command",
+        lambda *_args: [str(tmp_path / "Cursor.exe"), str(tmp_path / "cli.js")],
+    )
+    monkeypatch.setattr(
+        "gitlab_security_mcp.progress_extension._windows_process_tree",
+        lambda: ({}, {}),
+    )
+
+    def run(argv, **_kwargs):
+        """Answer the list request and record every editor invocation."""
+        calls.append(argv)
+        stdout = listing if "--list-extensions" in argv else ""
+        return type(
+            "Completed", (), {"returncode": 0, "stdout": stdout, "stderr": ""}
+        )()
+
+    monkeypatch.setattr("gitlab_security_mcp.progress_extension.subprocess.run", run)
+    return calls
+
+
+def _bundled_version():
+    """Read the version of the extension this server ships."""
+    package = extension_directory() / "package.json"
+    return json.loads(package.read_text(encoding="utf-8"))["version"]
+
+
+def test_an_already_installed_version_is_not_reinstalled(monkeypatch, tmp_path):
+    """Startup skips the slow editor install when the same version is present."""
+    # Arrange
+    listing = f"other.ext@1.0.0\nlocal-security-tools.gitlab-security-progress@{_bundled_version()}\n"
+    calls = _editor_with_installed(monkeypatch, tmp_path, listing)
+
+    # Act
+    install_progress_extension()
+
+    # Assert
+    assert not any("--install-extension" in argv for argv in calls)
+    assert reload_required_version() is None
+
+
+def test_an_upgraded_extension_asks_open_windows_to_reload(monkeypatch, tmp_path):
+    """An open window keeps the old extension, so the new version is announced."""
+    # Arrange
+    listing = "local-security-tools.gitlab-security-progress@0.0.1\n"
+    calls = _editor_with_installed(monkeypatch, tmp_path, listing)
+
+    # Act
+    install_progress_extension()
+
+    # Assert
+    assert any("--install-extension" in argv for argv in calls)
+    assert reload_required_version() == _bundled_version()
+
+
+def test_each_checkout_is_told_once_to_reload_for_a_new_extension(
+    monkeypatch, tmp_path
+):
+    """The progress panel names the new version once per checkout."""
+    # Arrange
+    from gitlab_security_mcp import server
+
+    published = []
+    monkeypatch.setattr(server, "reload_required_version", lambda: "9.9.9")
+    monkeypatch.setattr(server, "_extension_reload_notified", set())
+    monkeypatch.setattr(
+        server,
+        "publish_editor_progress",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    # Act
+    server._editor_progress(tmp_path, "audit", "Audit", "running")
+    server._editor_progress(tmp_path, "audit", "Audit", "running")
+
+    # Assert
+    notices = [args for args in published if args[1] == "progress-extension"]
+    assert len(notices) == 1
+    assert "9.9.9" in notices[0][3]
+    assert "Reload Window" in notices[0][3]
+
+
 def test_server_startup_installs_when_an_editor_launched_it(monkeypatch, tmp_path):
     """Reloading the server installs the extension and keeps MCP stdout empty."""
     # Arrange
@@ -530,7 +620,7 @@ def test_server_startup_installs_when_an_editor_launched_it(monkeypatch, tmp_pat
     install_progress_extension()
 
     # Assert
-    argv, kwargs = calls[0]
+    argv, kwargs = calls[-1]
     assert "--install-extension" in argv
     assert argv[-1] == "--force"
     assert Path(argv[-2]).name == "gitlab-security-progress.vsix"

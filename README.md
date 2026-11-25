@@ -72,6 +72,15 @@ folders, or a directory inside one of them. A window with no open folder still
 shows the newest mirror for each checkout. Another VS Code or Cursor window can
 run a different repository at the same time.
 
+Current changes after 1.0.60 (unreleased):
+- Package reviews: the `PACKAGE_REVIEW_REQUIRED` reason and server instructions
+  no longer tell the AI to call `qualify_package_update` before human selection.
+  That call was refused by the approval gate and caused a retry loop.
+- Audit continuation: an unrelated tool failure no longer pauses the audit, and
+  up to two turns without new receipts are continued before stopping.
+- Progress extension: an already-installed version is not reinstalled, and an
+  upgrade shows a one-time reload notice with the new version.
+
 Release 1.0.60 removes manual nudges and shows versions:
 - When the false-positive window opens, the AI makes one waiting
   `choose_software_audit_action` call that returns the next job's work, including
@@ -1323,8 +1332,15 @@ preserved. Cursor's `afterMCPExecution`/`stop` hooks and the VS Code **Copilot
 harness** `PostToolUse`/`Stop` hooks bind continuation to the session that actually
 used the live audit tool. Saved run state alone cannot start continuation or
 approve a scan/fix. A new user prompt, cancellation, error, human selection, or
-completed report is not overridden. No-progress attempts stop with an explicit
-diagnostic instead of looping. Cursor's script-level cap is replaced by a
+completed report is not overridden. Only a failure of the audit tools
+(`choose_software_audit_action`, `complete_security_run`) ends continuation;
+Cursor's `postToolUseFailure` also fires for unrelated tools such as a failed
+shell read, and those failures no longer pause the audit. A turn that ends
+without a new review receipt, phase, or report content is continued up to two
+more times, because a turn can end in the middle of a file. A third such turn
+stops with an explicit diagnostic instead of looping. Each stop records
+`last_stop` (ISO 8601 time, host status, stop reason) in the binding under
+`~/.cache/gitlab-security-mcp/audit-hosts/` for diagnosis. Cursor's script-level cap is replaced by a
 progress-bounded guard; Copilot's native eight-block safeguard remains in force.
 Enterprise-disabled hooks, unsupported editor harnesses, tool permission
 requests, host context/credit limits, and native safety caps cannot be bypassed.
@@ -1424,7 +1440,10 @@ not consent. If evidence cannot establish safety, supply the exact package/targe
 and an honest `blocked_reason`; that choice is labeled blocked and never edited.
 A `PACKAGE_REVIEW_REQUIRED` reason lists every missing piece at once: the review
 itself, the complete package documentation fields, and each required manager
-documentation source, so one corrected call can satisfy it.
+documentation source, so one corrected call can satisfy it. The reason also says
+to resend `select_security_fixes` with `package_reviews` keyed by finding ID and
+not to call `qualify_package_update` before the human selects, because the
+approval gate refuses qualification until then.
 Only selected source-code work still needs the agent to continue. Read
 `get_run_status` when requested; never reopen approved selections. While
 `REQUESTED`/`AWAITING_HUMAN` or `package_execution.status=QUEUED/RUNNING`,
@@ -3319,7 +3338,12 @@ than relying only on a short natural-language success message.
 ### Live progress and HTTP timings
 
 For progress **inside** Cursor or VS Code on Windows, macOS, or Linux, reloading
-this MCP server installs the progress extension into that editor. A manual
+this MCP server installs the progress extension into that editor. Startup first
+asks the editor CLI for its installed extension versions and skips the install
+when the bundled version is already there. After an upgrade, an open window keeps
+running the previous extension, so the progress view shows a one-time
+**Progress extension updated** row naming the new version and asking for
+**Developer: Reload Window**. A manual
 `gitlab-security-progress-1.0.52.vsix` install is only needed when the server
 is not launched by the editor. The progress panel header and the status-bar
 tooltip show the MCP server version that wrote the progress file and the

@@ -42,6 +42,13 @@ _NO_EDITOR_CLI_MESSAGE = (
     "The graphical progress bar requires GitLab Security Progress: use Extensions: Install from VSIX if this server was launched outside the editor."
 )
 _OVERSIZED_LAUNCHER_MESSAGE = "Editor CLI launcher exceeds %s bytes: %s"
+_LOG_EXTENSION_CURRENT = "Progress extension %s is already installed in %s"
+_LOG_EXTENSION_RELOAD_REQUIRED = (
+    "Progress extension updated from %s to %s; open windows load it after a reload"
+)
+_LOG_EXTENSION_LIST_FAILED = "Could not list the editor's installed extensions"
+_LOG_EXTENSION_LIST_EXIT = "Listing the editor's installed extensions exited %s"
+_reload_required_version: str | None = None
 _WINDOWS_LAUNCHERS = {
     "code.exe": "code.cmd",
     "code - insiders.exe": "code-insiders.cmd",
@@ -279,13 +286,23 @@ def _editor_cli(image: Path) -> Path | None:
 
 
 def _install_with_command(command: list[str]) -> None:
-    """Build a temporary VSIX and ask that editor to install it."""
+    """Install the bundled VSIX unless that exact version is already installed."""
+    global _reload_required_version
+    package = json.loads(
+        (extension_directory() / "package.json").read_text(encoding="utf-8")
+    )
+    identity = f"{package['publisher']}.{package['name']}"
+    bundled = package["version"]
     with _editor_install_lock(command[0]), TemporaryDirectory() as directory:
-        vsix = Path(directory) / "gitlab-security-progress.vsix"
-        write_vsix(vsix)
         child_env = os.environ.copy()
         child_env.pop("VSCODE_DEV", None)
         child_env["ELECTRON_RUN_AS_NODE"] = "1"
+        installed = _installed_version(command, child_env, identity)
+        if installed == bundled:
+            logger.info(_LOG_EXTENSION_CURRENT, bundled, command[0])
+            return
+        vsix = Path(directory) / "gitlab-security-progress.vsix"
+        write_vsix(vsix)
         try:
             completed = subprocess.run(
                 [*command, "--install-extension", str(vsix), "--force"],
@@ -309,6 +326,44 @@ def _install_with_command(command: list[str]) -> None:
         )
         return
     logger.info("Installed the progress extension into %s", command[0])
+    if installed is not None:
+        # An open window keeps running the older extension until it reloads.
+        _reload_required_version = bundled
+        logger.info(_LOG_EXTENSION_RELOAD_REQUIRED, installed, bundled)
+
+
+def reload_required_version() -> str | None:
+    """Return the progress extension version that needs a window reload, if any."""
+    return _reload_required_version
+
+
+def _installed_version(
+    command: list[str], env: dict[str, str], identity: str
+) -> str | None:
+    """Ask the editor which version of this extension is installed, if any."""
+    try:
+        completed = subprocess.run(
+            [*command, "--list-extensions", "--show-versions"],
+            check=False,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_INSTALL_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning(_LOG_EXTENSION_LIST_FAILED, exc_info=True)
+        return None
+    if completed.returncode != 0:
+        logger.warning(_LOG_EXTENSION_LIST_EXIT, completed.returncode)
+        return None
+    for line in completed.stdout.splitlines():
+        name, separator, version = line.strip().partition("@")
+        if separator and name.lower() == identity.lower():
+            return version
+    return None
 
 
 def _posix_process_tree() -> tuple[dict[int, tuple[int, str]], dict[int, Path]]:

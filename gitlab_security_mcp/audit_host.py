@@ -11,6 +11,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gitlab_security_mcp.software_audit import (
@@ -37,6 +38,11 @@ _ACTIVE = {
 _PREFIX = "[gitlab-security-mcp audit continuation]"
 # Each continuation is a paid host turn; never scale the cap with repository size.
 _MAX_CONTINUATIONS = 24
+# A turn can end mid-file before a new receipt is written; allow a few retries
+# without progress before treating the host as blocked.
+_MAX_STALLED_CONTINUATIONS = 2
+_AUDIT_TOOLS = ("choose_software_audit_action", "complete_security_run")
+_STOP_COMPLETED = "completed"
 
 
 @dataclass(frozen=True)
@@ -187,7 +193,7 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
         return {}
     if event == "post":
         name = payload.get("tool_name", payload.get("toolName", ""))
-        if not name.endswith(("choose_software_audit_action", "complete_security_run")):
+        if not name.endswith(_AUDIT_TOOLS):
             return {}
     root = _checkout(payload)
     if root is None:
@@ -196,7 +202,10 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
     binding = json_object(path.read_text(encoding="utf-8")) if path.is_file() else {}
     owned = binding.get("session") == owner and binding.get("host") == host
     if event == "failure":
-        if owned:
+        # Cursor sends this event for every failed tool; a failed shell or file
+        # read inside the audit must not cancel the continuation.
+        name = payload.get("tool_name", payload.get("toolName", ""))
+        if owned and name.endswith(_AUDIT_TOOLS):
             _save_binding(path, {**binding, "active": False})
         return {}
     if event == "prompt":
@@ -239,10 +248,19 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
         return {}
     if event != "stop" or not owned or not binding.get("active") or not pending:
         return {}
-    completed = payload.get("status") == "completed"
-    if (profile.requires_completed_status and not completed) or payload.get(
-        "stop_reason", payload.get("stopReason", "end_turn")
-    ) != "end_turn":
+    status = payload.get("status")
+    stop_reason = payload.get("stop_reason", payload.get("stopReason", "end_turn"))
+    binding = {
+        **binding,
+        "last_stop": {
+            "at": datetime.now(UTC).isoformat(),
+            "status": status,
+            "stop_reason": stop_reason,
+        },
+    }
+    if (
+        profile.requires_completed_status and status != _STOP_COMPLETED
+    ) or stop_reason != "end_turn":
         _save_binding(path, {**binding, "active": False})
         return {}
     if binding.get("output_path") != audit.get("output_path"):
@@ -252,14 +270,24 @@ def handle_event(host: str, event: str, payload: dict) -> dict:
     persist_audit_draft(report, root, coverage, audit.get("progress"))
     fingerprint = _fingerprint(coverage, report.read_text(encoding="utf-8"))
     attempts = binding.get("attempts", 0)
-    if fingerprint == binding.get("fingerprint"):
+    stalls = (
+        binding.get("stalls", 0) + 1 if fingerprint == binding.get("fingerprint") else 0
+    )
+    if stalls > _MAX_STALLED_CONTINUATIONS:
+        _save_binding(path, {**binding, "active": False, "stalls": stalls})
         raise RuntimeError(
             _RAISE_AUDIT_CONTINUATION_STOPPED_NO_NEW_REVIEW_RECEIPTS_PHASES
         )
     if attempts >= profile.max_turns:
         raise RuntimeError(_RAISE_AUDIT_CONTINUATION_REACHED_THE_EDITOR_S_SAFE_TURN)
     _save_binding(
-        path, {**binding, "fingerprint": fingerprint, "attempts": attempts + 1}
+        path,
+        {
+            **binding,
+            "fingerprint": fingerprint,
+            "attempts": attempts + 1,
+            "stalls": stalls,
+        },
     )
     return profile.reply(_continuation(root, report))
 

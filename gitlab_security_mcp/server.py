@@ -50,7 +50,10 @@ from gitlab_security_mcp.ai_source_review import SourceEvidence, cited_lines
 from gitlab_security_mcp.commands import progress_sink
 from gitlab_security_mcp.engine import NOT_FALSE_POSITIVE, Engine
 from gitlab_security_mcp.progress import publish as publish_editor_progress
-from gitlab_security_mcp.progress_extension import install_progress_extension
+from gitlab_security_mcp.progress_extension import (
+    install_progress_extension,
+    reload_required_version,
+)
 from gitlab_security_mcp.report import write_unresolved_report
 from gitlab_security_mcp.security_artifacts import archive_run_logs, run_log_files
 from gitlab_security_mcp.software_audit import (
@@ -179,11 +182,14 @@ For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    merely to minimize the version bump. Flag all paid releases for user
    investigation; never automatically upgrade to paid terms. Unverified licensing
    is allowed only with an explicit warning; configured corporate policy may be stricter.
-   Then select_security_fixes before any remediation edit. Call
-   qualify_package_update once for each selected finding. Do not paste that
-   review into package_reviews and do not re-read the pages it returns. Call
-   select_security_fixes again with repo_root only; the server reuses the stored
-   qualification. Do not invent evidence or approval.
+   Then call select_security_fixes with package_reviews keyed by finding ID: one
+   qualification review (schema below) for every proposed package update. It
+   opens the unchecked selection form only when every review is present. Do not
+   call qualify_package_update before the human selects; it is refused until then.
+   After the human selects, the Windows form qualifies, applies, and validates
+   the selected updates itself. Otherwise call qualify_package_update once for
+   each human-selected finding, then select_security_fixes again with repo_root
+   only; the server reuses the stored qualification. Do not invent evidence or approval.
    Release review schema: target:<exact reviewed eligible version or null if none>,
    supported:true,runtime_compatible:true (honest values when target is null),
    sources:[official
@@ -202,7 +208,8 @@ For every npm, NuGet (.NET 10), or Maven/Gradle Java package fix, call
    api_comparison,caller_assessment,dependency_assessment,
    reviewed_files:[{path,assessment}]}. Do not send sha256; the server hashes
    each path.
-Call qualify_package_update for each selected package update, apply_minimal_fix
+After the human selects, call qualify_package_update for each selected package
+update (not needed after the Windows form, which runs them itself), apply_minimal_fix
 for each selected eligible fix with no build between package edits, and
 run_validation_matrix once for that package batch. generate_aaa_test applies
 only to a selected supported base-image change in the source/config job.
@@ -623,8 +630,33 @@ def _editor_progress(
     """Make editor-delivery failures explicit without cancelling approved remediation."""
     try:
         publish_editor_progress(root, task_id, label, message, **details)
+        _publish_extension_reload_notice(root)
     except (OSError, ValueError):
         logger.warning("Could not publish editor progress for %s", root, exc_info=True)
+
+
+_EXTENSION_RELOAD_TASK_ID = "progress-extension"
+_EXTENSION_RELOAD_LABEL = "Progress extension updated"
+_EXTENSION_RELOAD_MESSAGE = (
+    "GitLab Security Progress {version} is installed. Run 'Developer: Reload Window' "
+    "to load it; this window still runs the previous extension."
+)
+_extension_reload_notified: set[Path] = set()
+
+
+def _publish_extension_reload_notice(root: Path) -> None:
+    """Tell each checkout once that a newly installed progress extension needs a reload."""
+    version = reload_required_version()
+    if version is None or root in _extension_reload_notified:
+        return
+    _extension_reload_notified.add(root)
+    publish_editor_progress(
+        root,
+        _EXTENSION_RELOAD_TASK_ID,
+        _EXTENSION_RELOAD_LABEL,
+        _EXTENSION_RELOAD_MESSAGE.format(version=version),
+        status="FINISHED",
+    )
 
 
 _audit_activity_tasks: dict[Path, tuple[object, asyncio.Task]] = {}

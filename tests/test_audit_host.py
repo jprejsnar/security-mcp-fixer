@@ -74,8 +74,41 @@ def test_owned_audit_continues_and_preserves_receipts_and_native_output(audit, h
     state_path.write_text(json.dumps(state), encoding="utf-8")
     assert handle_event(host, "stop", {**payload, "stop_hook_active": True})
 
+
+def test_a_turn_without_new_receipts_is_retried_a_bounded_number_of_times(audit):
+    """A turn that ends mid-file is continued twice more, then reported as blocked."""
+    # Arrange
+    _, _, _, payload = audit
+    handle_event("cursor", "post", payload)
+    handle_event("cursor", "stop", payload)
+
+    # Act
+    retries = [handle_event("cursor", "stop", payload) for _ in range(2)]
+
+    # Assert
+    assert all("followup_message" in retry for retry in retries)
     with pytest.raises(RuntimeError, match="no new review"):
-        handle_event(host, "stop", {**payload, "stop_hook_active": True})
+        handle_event("cursor", "stop", payload)
+    binding = json.loads(
+        next(Path.home().rglob("audit-hosts/*.json")).read_text(encoding="utf-8")
+    )
+    assert binding["active"] is False
+    assert binding["last_stop"]["status"] == "completed"
+    assert "T" in binding["last_stop"]["at"]
+
+
+def test_an_unrelated_tool_failure_does_not_stop_the_continuation(audit):
+    """Cursor reports every failed tool; a failed shell read must not pause the audit."""
+    # Arrange
+    _, _, _, payload = audit
+    handle_event("cursor", "post", payload)
+    handle_event("cursor", "failure", {**payload, "tool_name": "Shell"})
+
+    # Act
+    result = handle_event("cursor", "stop", payload)
+
+    # Assert
+    assert "followup_message" in result
 
 
 def test_saved_audit_state_alone_never_starts_continuation(audit):
