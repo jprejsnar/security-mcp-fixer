@@ -642,6 +642,12 @@ def test_http_timings_include_body_failures_without_secrets(
     )
     assert record["started_at"] <= record["finished_at"]
     assert record["worker"]
+    assert record["thread"] == record["worker"]
+    assert record["cpu_seconds"] >= 0
+    assert isinstance(record["memory_bytes"], int)
+    assert len(record["gc_collections"]) == 3
+    assert record["response_bytes"] == (None if outcome == "timeout" else 11)
+    assert record["request_bytes"] in {None, 0}
     assert "secret" not in text
 
 
@@ -690,6 +696,12 @@ def test_http_clients_write_timing_records(tmp_path, operation):
     assert records[0]["source"] == ("gitlab" if operation == "gitlab" else "advisory")
     assert records[0]["status_code"] == 200
     assert records[0]["duration_ms"] >= 0
+    assert records[0]["response_bytes"] > 0
+    assert records[0]["thread"]
+    assert len(records[0]["gc_collected"]) == 3
+    if operation == "gitlab":
+        assert records[0]["operation"] == "Timing"
+        assert records[0]["request_bytes"] > 0
     assert "secret" not in path.read_text(encoding="utf-8")
 
 
@@ -1217,6 +1229,10 @@ def test_fanout_logs_worker_count_duration_and_failure(caplog):
     assert records[0]["workers"] == 3
     assert records[0]["items"] == 3
     assert records[0]["duration_ms"] >= 0
+    assert records[0]["cpu_seconds"] >= 0
+    assert isinstance(records[0]["memory_bytes"], int)
+    assert len(records[0]["gc_collections"]) == 3
+    assert records[0]["thread"]
     assert records[0]["error"] is None
     assert records[1]["error"] == "RuntimeError"
     assert all("glpat-hidden" not in record.message for record in caplog.records)

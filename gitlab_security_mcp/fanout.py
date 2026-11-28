@@ -13,7 +13,11 @@ from itertools import islice
 from time import perf_counter
 from typing import TypeVar
 
-from gitlab_security_mcp.util import log_concurrency
+from gitlab_security_mcp.util import (
+    _resource_counters,
+    _resource_interval,
+    log_concurrency,
+)
 
 MAX_WORKERS = 8
 
@@ -46,6 +50,7 @@ def map_ordered(
             single_results.append(result)
         return single_results
     workers = min(MAX_WORKERS, len(sequence))
+    before = _resource_counters()
     started = perf_counter()
     error = None
     submitted = len(sequence)
@@ -74,11 +79,13 @@ def map_ordered(
         finally:
             for future in pending:
                 future.cancel()
+            elapsed = perf_counter() - started
             log_concurrency(
                 "fanout",
                 "security-io",
                 workers=workers,
                 items=submitted,
-                duration_ms=round((perf_counter() - started) * 1000, 3),
+                duration_ms=round(elapsed * 1000, 3),
                 error=error,
+                **_resource_interval(before, _resource_counters(), elapsed),
             )

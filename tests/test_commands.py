@@ -1063,6 +1063,8 @@ def test_task_performance_logs_cpu_memory_time_and_gc(caplog):
     assert sum(record["gc_collections"]) >= 1
     assert len(record["gc_collected"]) == 3
     assert len(record["gc_uncollectable"]) == 3
+    assert record["thread"]
+    assert record["worker"] == record["thread"]
     assert record["error"] is None
 
 

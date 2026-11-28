@@ -200,27 +200,52 @@ def test_missing_repository_has_actionable_error(tmp_path, monkeypatch):
     assert "Repository directory does not exist" in str(raised.value)
 
 
-def test_server_recovers_configuration_error(cloned_repo, monkeypatch, tmp_path):
+def test_server_recovers_configuration_error(
+    cloned_repo, monkeypatch, tmp_path, caplog
+):
     """Server recovers configuration error."""
     # Arrange
+    import re
+
     from gitlab_security_mcp import server
 
+    receipt = re.compile(
+        r"^Run receipt status=(ERROR|PRECHECK_FAILED) "
+        r"finished=\d+ failed=\d+ skipped=\d+ archive=- "
+        r"at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00$"
+    )
     server._close_engine()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("REPO_ROOT", "${workspaceFolder}")
 
     # Act
-    failed = server.run_prechecks()
-    recovered = server.run_prechecks(repo_root=str(cloned_repo))
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        failed = server.run_prechecks()
+        recovered = server.run_prechecks(repo_root=str(cloned_repo))
     try:
         # Assert
+        logged = [record.message for record in caplog.records]
+        assert any(receipt.fullmatch(message) for message in logged)
+        assert any(
+            message.startswith("Run receipt status=ERROR ") for message in logged
+        )
         assert failed["status"] == "ERROR"
         assert failed["stage"] == "configuration"
         assert "unresolved host placeholder" in failed["error"]
         assert "repo_root" in failed["action"]
         assert recovered["status"] == "PRECHECK_PASSED"
         assert recovered["repo_root"] == str(cloned_repo.resolve())
-        other = server.run_prechecks(repo_root=str(cloned_repo.parent))
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+            other = server.run_prechecks(repo_root=str(cloned_repo.parent))
+        failed_receipts = [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("Run receipt status=PRECHECK_FAILED ")
+        ]
+        assert len(failed_receipts) == 1
+        assert receipt.fullmatch(failed_receipts[0])
+        assert "glpat-" not in failed_receipts[0]
         assert other["status"] == "PRECHECK_FAILED"
         assert (
             server.get_run_status(repo_root=str(cloned_repo))["status"]

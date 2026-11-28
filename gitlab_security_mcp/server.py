@@ -376,6 +376,9 @@ _LOG_FALSE_POSITIVE_INVALID = "Invalid false-positive approval response: %s"
 _LOG_FALSE_POSITIVE_UNAVAILABLE = "False-positive approval form unavailable: %s"
 _LOG_CODE_OUTCOME_REJECTED = "Code outcome rejected: %s"
 _LOG_ARCHIVE_FAILED = "Could not archive run logs"
+_LOG_RUN_RECEIPT = (
+    "Run receipt status=%s finished=%s failed=%s skipped=%s archive=%s at=%s"
+)
 _LOG_AUDIT_APPROVAL_FAILED = "Software-audit approval failed"
 _LOG_AUDIT_CONSENT_UNAVAILABLE = "Audit consent unavailable: %s"
 _LOG_STALE_AUDIT_RESPONSE = "Ignoring a software-audit response from a previous run"
@@ -387,6 +390,22 @@ _LOG_AUDIT_ITEMS_NOT_COLLECTED = "Audit-item checkboxes were not collected: %s"
 _LOG_SERVING_STDIO = "gitlab-security-mcp %s serving stdio"
 _LOG_SHUTDOWN_CLOSE_FAILED = "Could not close the engine during server shutdown"
 _LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+def _log_run_receipt(
+    status: str, workflow: dict | None, *, archive: str | None = None
+) -> None:
+    """Record one run outcome. The line has no secrets or report text."""
+    jobs = (workflow or {}).get("jobs") or []
+    logger.info(
+        _LOG_RUN_RECEIPT,
+        status,
+        sum(job.get("status") == "FINISHED" for job in jobs),
+        sum(job.get("status") == "FAILED" for job in jobs),
+        sum(job.get("status") == "SKIPPED" for job in jobs),
+        archive or "-",
+        datetime.now(UTC).isoformat(),
+    )
 
 
 def _prepare_stderr() -> Exception | None:
@@ -1413,6 +1432,7 @@ def _run(
                 workflow.activity(
                     selected, selected.state.workflow["blocked"], status="FAILED"
                 )
+                _log_run_receipt(result["status"], selected.state.workflow)
         elif selected.state.workflow:
             if (
                 tool_name == "create_security_branch"
@@ -1431,9 +1451,13 @@ def _run(
                     result.get("reason") or result.get("error") or result["status"]
                 )
                 selected._remember()
+                _log_run_receipt(result["status"], selected.state.workflow)
         return result
     except Exception as exc:
         logger.exception(_LOG_TOOL_FAILED, tool_name)
+        _log_run_receipt(
+            "ERROR", selected.state.workflow if selected is not None else None
+        )
         return {
             "status": "ERROR",
             "stage": "configuration" if selected is None else tool_name,
@@ -3055,6 +3079,11 @@ async def _continue_workflow(
             )
             state.workflow["final_result"] = result
             selected._remember()
+            _log_run_receipt(
+                result.get("status", "WORKFLOW_COMPLETE"),
+                state.workflow,
+                archive=result["log_archive"]["status"],
+            )
             if result["log_archive"]["status"] == "ARCHIVED":
                 # Include the persisted completion receipt without losing earlier logs.
                 await asyncio.to_thread(
@@ -3063,6 +3092,11 @@ async def _continue_workflow(
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             logger.exception(_LOG_ARCHIVE_FAILED)
             result["log_archive"] = {"status": "ERROR", "path": None, "error": str(exc)}
+            _log_run_receipt(
+                result.get("status", "WORKFLOW_COMPLETE"),
+                state.workflow,
+                archive="ERROR",
+            )
             state.workflow["final_result"] = result
             selected._remember()
         state.workflow["final_result"] = result

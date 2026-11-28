@@ -328,6 +328,15 @@ async function activate(context, vscode = require("vscode")) {
         Date.now() - stat.mtime > MIRROR_MAX_AGE_MS;
       if (staleMirror) {
         snapshots.delete(uri.toString());
+        known.delete(uri.toString());
+        mirrors.delete(uri.toString());
+        if (typeof vscode.workspace.fs.delete === "function") {
+          try {
+            await vscode.workspace.fs.delete(uri);
+          } catch {
+            // The file is already gone, or this poll cannot remove it.
+          }
+        }
       } else {
         if (stat.size > MAX_SNAPSHOT_BYTES) throw new Error(SNAPSHOT_TOO_LARGE);
         const bytes = await vscode.workspace.fs.readFile(uri);

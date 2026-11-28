@@ -10,7 +10,7 @@ mirror under `~/.cache/gitlab-security-mcp/progress/` (override with
 `GITLAB_SECURITY_PROGRESS_DIR`). A window with open folders shows a run only
 when that checkout is one of those folders, or a directory inside one of them.
 A window with no open folder shows the newest mirror for each checkout.
-Mirrors older than 12 hours are ignored.
+Mirrors older than 12 hours are deleted and are not polled again.
 
 Version 1.0.48 displays a persistent **GitLab Security Progress** editor tab
 with a graphical progress bar, exact counts/percentage, current activity and
@@ -52,4 +52,5 @@ unchecked finding choices. Progress and delegated-review summaries are not
 completion handoffs.
 
 For development, run `npm test`. Package with
-`npx --yes --package @vscode/vsce@3.6.2 vsce package --no-dependencies --skip-license`.
+`npx --yes --package @vscode/vsce@4.1.1 vsce package --no-dependencies --skip-license`.
+That package requires Node.js 22 or newer.

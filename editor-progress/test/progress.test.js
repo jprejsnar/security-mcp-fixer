@@ -648,15 +648,18 @@ test("stale mirror files are not reread on every poll", async () => {
     fs: {
       readDirectory: async () => [["old.json", 1]],
       stat: async () => ({ size: 1000, mtime: Date.now() - 13 * 60 * 60 * 1000 }),
-      readFile: async () => { reads++; return Buffer.from(JSON.stringify(snapshot())); }
+      readFile: async () => { reads++; return Buffer.from(JSON.stringify(snapshot())); },
+      delete: async file => { deleted.push(file.toString()); }
     }
   };
   const context = { subscriptions: [] };
+  const deleted = [];
 
   // Act
   await activate(context, ui.vscode);
 
   // Assert
   assert.equal(reads, 0);
+  assert.deepEqual(deleted, ["file:///mirror/old.json"]);
   for (const subscription of context.subscriptions) subscription.dispose();
 });

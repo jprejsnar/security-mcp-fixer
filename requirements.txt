@@ -1,5 +1,5 @@
 mcp[cli]>=2.3.0,<3
-httpx>=0.28.1
+httpx>=0.29.0
 packaging>=26.4
 pydantic>=2.14.4,<3
 ruamel.yaml>=0.19.1,<0.20

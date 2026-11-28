@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,27 @@ def test_progress_is_mirrored_for_editors_that_did_not_open_the_checkout(
     assert json.loads(local)["repo_root"] == str(first)
     assert progress.mirror_path(second) != mirrored
     assert len(list(isolated_progress_mirror.glob("*.json"))) == 2
+
+
+def test_expired_progress_mirrors_are_deleted(tmp_path, isolated_progress_mirror):
+    """Drop mirrors the editor already ignores so later polls do not grow."""
+    # Arrange
+    old = tmp_path / "old"
+    current = tmp_path / "current"
+    progress.publish(old, "audit", "Audit", "Done", completed=1, total=1)
+    expired = progress.mirror_path(old)
+    expired_stamp = time.time() - progress._MIRROR_MAX_AGE_SECONDS - 60
+    os.utime(expired, (expired_stamp, expired_stamp))
+
+    # Act
+    progress.publish(current, "audit", "Audit", "Reading", completed=0, total=1)
+
+    # Assert
+    assert not expired.exists()
+    assert progress.mirror_path(current).is_file()
+    assert list(isolated_progress_mirror.glob("*.json")) == [
+        progress.mirror_path(current)
+    ]
 
 
 _DEVICE_CHECKOUT = "\\\\?\\C:\\Repo"

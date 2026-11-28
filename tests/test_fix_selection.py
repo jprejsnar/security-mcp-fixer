@@ -430,10 +430,13 @@ def test_native_continuation_rejects_a_replaced_run(tmp_path, monkeypatch):
 
 
 def test_failed_source_outcome_and_declined_audit_still_display_final_report(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     """Record failed source attempts and finish reporting even when audit is declined."""
     # Arrange
+    import logging
+    import re
+
     engine = _ordered_engine(tmp_path, monkeypatch, job=5)
     candidates = engine.fix_selection_candidates()["candidates"]
     engine.record_fix_selection(candidates, ["source"], "APPROVED")
@@ -472,8 +475,23 @@ def test_failed_source_outcome_and_declined_audit_still_display_final_report(
         )
 
     # Act
-    result = asyncio.run(exercise()).structured_content
+    with caplog.at_level(logging.INFO, logger="gitlab_security_mcp"):
+        result = asyncio.run(exercise()).structured_content
     # Assert
+    receipt = re.compile(
+        r"^Run receipt status=WORKFLOW_COMPLETE "
+        r"finished=\d+ failed=\d+ skipped=\d+ "
+        r"archive=(?:ARCHIVED|NO_LOGS|ERROR) "
+        r"at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00$"
+    )
+    receipts = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("Run receipt ")
+    ]
+    assert len(receipts) == 1
+    assert receipt.fullmatch(receipts[0])
+    assert "glpat-" not in receipts[0]
     assert result["status"] == "WORKFLOW_COMPLETE"
     assert "Required API contract is unavailable." in result["final_summary_markdown"]
     assert "2.0.0" in result["final_summary_markdown"]

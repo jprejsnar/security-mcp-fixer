@@ -20,6 +20,8 @@ _WINDOWS_DEVICE_PREFIX = "\\\\?\\"
 _MIRROR_KEY_LENGTH = 32
 _MAX_MESSAGE_LENGTH = 1000
 _MAX_FINISHED_TASKS = 10
+# The editor ignores mirrors older than this and must not keep stating them.
+_MIRROR_MAX_AGE_SECONDS = 12 * 60 * 60
 
 _lock = threading.Lock()
 _tasks: dict[Path, dict[str, dict]] = {}
@@ -125,3 +127,20 @@ def publish(
         mirror = mirror_path(root)
         mirror.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(mirror, text)
+    _prune_expired_mirrors()
+
+
+def _prune_expired_mirrors() -> None:
+    """Delete mirrors the editor already ignores so the poll set cannot grow forever."""
+    directory = mirror_directory()
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return
+    cutoff = datetime.now(UTC).timestamp() - _MIRROR_MAX_AGE_SECONDS
+    for path in paths:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue

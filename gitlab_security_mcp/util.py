@@ -248,11 +248,10 @@ def _windows_working_set() -> int | None:
     return int(counters.WorkingSetSize)
 
 
-def _performance_sample() -> dict:
-    """Capture wall time, process CPU, memory and per-generation collection counts."""
+def _resource_counters() -> dict:
+    """Capture process CPU, memory and per-generation collection counts."""
     stats = gc.get_stats()
     return {
-        "wall": perf_counter(),
         "cpu": process_time(),
         "memory_bytes": _memory_bytes(),
         "gc_collections": [int(item["collections"]) for item in stats],
@@ -261,45 +260,50 @@ def _performance_sample() -> dict:
     }
 
 
+def _performance_sample() -> dict:
+    """Capture wall time together with the process resource counters."""
+    return {"wall": perf_counter(), **_resource_counters()}
+
+
+def _counter_delta(before: dict, after: dict, key: str) -> list[int]:
+    """Return one generation series as an interval, not a process lifetime total."""
+    return [end - start for start, end in zip(before[key], after[key], strict=False)]
+
+
+def _resource_interval(before: dict, after: dict, wall_seconds: float) -> dict:
+    """Describe CPU, memory, GC and the thread that recorded the interval.
+
+    Process CPU can exceed one core when several threads run. Overlapping
+    intervals share that process total, so their deltas must not be added.
+    """
+    cpu = after["cpu"] - before["cpu"]
+    memory = after["memory_bytes"]
+    previous = before["memory_bytes"]
+    return {
+        "cpu_seconds": round(cpu, 6),
+        "cpu_percent": round((cpu / wall_seconds) * 100, 2) if wall_seconds else 0.0,
+        "memory_bytes": memory,
+        "memory_delta_bytes": (
+            None if memory is None or previous is None else memory - previous
+        ),
+        "gc_collections": _counter_delta(before, after, "gc_collections"),
+        "gc_collected": _counter_delta(before, after, "gc_collected"),
+        "gc_uncollectable": _counter_delta(before, after, "gc_uncollectable"),
+        "thread": threading.current_thread().name,
+    }
+
+
 def _log_performance(name: str, before: dict) -> None:
     """Write one performance record. A logging failure must not fail the task."""
     try:
         after = _performance_sample()
         wall = after["wall"] - before["wall"]
-        cpu = after["cpu"] - before["cpu"]
         error = sys.exc_info()[0]
         record = {
             "event": "task_performance",
             "task": name,
             "duration_ms": round(wall * 1000, 3),
-            "cpu_seconds": round(cpu, 6),
-            "cpu_percent": round((cpu / wall) * 100, 2) if wall else 0.0,
-            "memory_bytes": after["memory_bytes"],
-            "memory_delta_bytes": (
-                None
-                if after["memory_bytes"] is None or before["memory_bytes"] is None
-                else after["memory_bytes"] - before["memory_bytes"]
-            ),
-            "gc_collections": [
-                end - start
-                for start, end in zip(
-                    before["gc_collections"], after["gc_collections"], strict=False
-                )
-            ],
-            "gc_collected": [
-                end - start
-                for start, end in zip(
-                    before["gc_collected"], after["gc_collected"], strict=False
-                )
-            ],
-            "gc_uncollectable": [
-                end - start
-                for start, end in zip(
-                    before["gc_uncollectable"],
-                    after["gc_uncollectable"],
-                    strict=False,
-                )
-            ],
+            **_resource_interval(before, after, wall),
             "error": None if error is None else error.__name__,
             "worker": threading.current_thread().name,
         }
@@ -349,6 +353,7 @@ def logged_lock(
     The wait is measured before the critical section. The record is written
     after release so logging cannot extend the hold.
     """
+    before = _resource_counters()
     started = perf_counter()
     lock.acquire()
     waited_ms = (perf_counter() - started) * 1000
@@ -357,7 +362,14 @@ def logged_lock(
     finally:
         lock.release()
         if waited_ms >= 1:
-            log_concurrency("lock_wait", name, wait_ms=round(waited_ms, 3))
+            log_concurrency(
+                "lock_wait",
+                name,
+                wait_ms=round(waited_ms, 3),
+                **_resource_interval(
+                    before, _resource_counters(), perf_counter() - started
+                ),
+            )
 
 
 def read_bounded_response(response: httpx.Response, limit: int, *, error: str) -> bytes:
@@ -423,6 +435,33 @@ def log_task(name: str) -> Generator[None, None, None]:
         _log_performance(name, before)
 
 
+def _request_bytes(response: httpx.Response | None) -> int | None:
+    """Return the request body size. The body itself is not logged."""
+    if response is None:
+        return None
+    try:
+        return len(response.request.content)
+    except (httpx.RequestNotRead, httpx.StreamConsumed, httpx.HTTPError):
+        return None
+
+
+def _response_bytes(response: httpx.Response | None) -> int | None:
+    """Return the response body size. The body itself is not logged.
+
+    A streaming read records the downloaded count. A body that was already
+    loaded, then had that count cleared, uses the loaded content length.
+    """
+    if response is None:
+        return None
+    downloaded = response.num_bytes_downloaded
+    if downloaded:
+        return downloaded
+    try:
+        return len(response.content)
+    except (httpx.ResponseNotRead, httpx.StreamConsumed, httpx.HTTPError):
+        return None
+
+
 def _http_log_url(url: str | httpx.URL) -> str:
     """Keep the endpoint without user credentials, query values or fragments."""
     try:
@@ -452,6 +491,7 @@ def timed_http_stream(
     Transport failures retain their exception class, never exception messages,
     request headers, payloads, query strings or response bodies.
     """
+    before = _resource_counters()
     started_at = utc_now_iso()
     started = perf_counter()
     response = None
@@ -474,9 +514,12 @@ def timed_http_stream(
             "finished_at": utc_now_iso(),
             "duration_ms": duration_ms,
             "status_code": response.status_code if response is not None else None,
+            "request_bytes": _request_bytes(response),
+            "response_bytes": _response_bytes(response),
             "error": error,
-            "worker": threading.current_thread().name,
+            **_resource_interval(before, _resource_counters(), duration_ms / 1000),
         }
+        record["worker"] = record["thread"]
         if operation is not None:
             record["operation"] = operation
         text = json.dumps(record, ensure_ascii=True)

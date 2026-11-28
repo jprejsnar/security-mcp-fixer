@@ -2027,7 +2027,7 @@ the same checkout, or make the Markdown/JSON report pair a single transaction.
   already on `PATH`. Use the same
   [winget commands](#install-windows-prerequisites-with-winget). macOS and
   Linux wheel installs do not use this script and do not require PowerShell.
-- Runtime floors: `mcp[cli]>=2.3.0,<3`, `httpx>=0.28.1`, `packaging>=26.4`,
+- Runtime floors: `mcp[cli]>=2.3.0,<3`, `httpx>=0.29.0`, `packaging>=26.4`,
   `pydantic>=2.14.4,<3`, and `ruamel.yaml>=0.19.1,<0.20`. Development floors are
   `anyio>=4.16.0,<5`, `pytest>=9.2.0` and `ruff>=0.17.6,<1`.
   Isolated wheel builds use `setuptools>=84.2.1` through the declared PEP 517
@@ -3413,7 +3413,7 @@ tooltip show the MCP server version that wrote the progress file and the
 progress extension's own version (`unknown` for a server that does not report
 one). The extension reads the checkout progress file
 and the per-user mirror in `~/.cache/gitlab-security-mcp/progress/`
-(mirrors older than 12 hours are ignored, and a file without a finite
+(mirrors older than 12 hours are deleted, and a file without a finite
 ISO 8601 `updated_at` is rejected). A window with open folders shows
 only checkouts inside those folders. A window with no open folder shows the
 newest mirror for each checkout.
@@ -3445,10 +3445,16 @@ review, lint/policy checks, official documentation, application, and post-update
 validation. Tool start/finish messages include the outcome and elapsed time.
 Each tool call and allowlisted command also writes one stderr performance
 record: wall-clock duration, process CPU time and percent, working-set memory
-and its change, and garbage-collection counts, objects collected, and
-uncollectable objects for each generation. Contended engine, command, and
-registry locks log their wait. Fan-out batches log worker count, item count,
-duration, and the exception class when a worker fails or is cancelled.
+and its change, garbage-collection counts, objects collected, and
+uncollectable objects for each generation, and the thread name. Contended
+engine, command, and registry locks log their wait with that same resource
+interval. Fan-out batches log worker count, item count, duration, the thread
+that joined them, the CPU, memory and GC interval for the batch, and the
+exception class when a worker fails or is cancelled. Each network call,
+including every GraphQL page inside a fan-out, writes the same interval plus
+the request and response byte counts. A named GraphQL operation, such as
+`SecurityFindings`, is recorded on that call so overlapping pages can be
+matched to the batch.
 Command-reader and uncaught thread failures log the exception class and thread
 name; commands that fail before producing a result log the tool, checkout, child
 process ID and traceback. Approval-window start, visibility, close and PowerShell
@@ -3728,7 +3734,7 @@ checkout folder name when no project is known.
 | --- | --- |
 | `.security-mcp/run-state.json` | Atomic inspection snapshot of the active run; never reloaded for resume. |
 | `.security-mcp/audit.jsonl` | Command metadata and output hashes, not raw output logs. |
-| `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, failure type, worker and safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. |
+| `.security-mcp/http-timings.jsonl` | Concurrent HTTP request spans with sanitized endpoint URLs, UTC times, milliseconds, status, request and response byte counts, CPU, memory, GC, thread name, failure type, and the safe GraphQL operation name when present. New GitLab/advisory/documentation calls only. The same line is also written to stderr and `server.log`. |
 | `.security-mcp/command-logs/*.stdout.log` / `*.stderr.log` | Full output for every allowed non-Git command, including Gradle `assemble` and runtime-version checks. In-memory previews retain the beginning and final summary; clipping a successful build preview does not fail validation. Job 7 zips these files and deletes checkout log copies. |
 | `.security-mcp/reports/<project>-unresolved-remediation.md` | Final unresolved table, including explicit rollback causes and build/test status, and every confirmed software-audit finding not selected for an AI fix (severity, location, problem, audit-report link). A blocked package shows `None eligible (blocked; advisory floor <version>)` as its target, never the rejected version. Archived and retained in the checkout. |
 | `~/softwareSecurityAuditReports/<project>_YYYY-MM-DDTHHMMSSZ_<checkout>.zip` | One ZIP per finished run containing every checkout `.log`/`.jsonl`, generated reports/state/progress/lint/helper files, any optional software-audit report, and redacted `server.log`. User policies and unknown files are excluded. Retries merge into the same ZIP, preserving earlier members. Stable checkout log copies are deleted only after archival succeeds; non-log copies remain. A log that changes while the ZIP is written aborts archival and keeps every checkout log; a `progress.json` or `run-state.json` rewrite by finishing background work does not, because those copies stay in the checkout. The temp spool stays until process exit. Tests use disposable destinations. The checkout token separates repositories with the same project name. |
