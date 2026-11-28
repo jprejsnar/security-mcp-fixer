@@ -1691,7 +1691,11 @@ records `APPROVAL_INTERRUPTED`; a response from an old run cannot recreate appro
 state or refresh a newer run's report.
 
 On other platforms, hosts supporting **MCP form elicitation** display an in-chat
-form; those requests remain subject to the host's own deadlines. Both presentations
+form; those requests remain subject to the host's own deadlines. MCP 2026-07-28
+and newer return `input_required` and retry the same tool with the human's
+answer for false-positive approval, audit consent, the audit closing choice,
+and audit fix checkboxes. Older hosts keep `elicitation/create`. A retried
+answer must match the live question. Both presentations
 show one initially unchecked checkbox per eligible assessment. The Windows reason
 column is the plain explanation, without the file path or line number. The issue
 title identifies the finding. Select the findings you approve and submit the form.

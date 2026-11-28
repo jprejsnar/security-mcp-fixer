@@ -920,6 +920,52 @@ def test_checkbox_submission_is_the_only_write_gate(
         assert engine.state.gitlab_dismissals == []
 
 
+@pytest.mark.parametrize(
+    ("action", "values", "writes"),
+    [("accept", {"finding_0": True}, 1), ("decline", None, 0)],
+)
+def test_modern_protocol_false_positive_approval_uses_human_input_rounds(
+    tmp_path, monkeypatch, action, values, writes
+):
+    """Exercise the actual SDK modern transport, where elicitation/create is forbidden."""
+    # Arrange
+    from mcp import Client
+    from mcp.types import ElicitResult
+
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(server, "_engine_for", lambda root: engine)
+    forms = []
+
+    async def choose(context, params):
+        """Answer the approval form through the real modern client callback."""
+        forms.append(params)
+        assert all(
+            field["default"] is False
+            for field in params.requested_schema["properties"].values()
+        )
+        return ElicitResult(action=action, content=values)
+
+    async def exercise():
+        """Negotiate modern MCP and let the client perform its input retry."""
+        async with Client(server.mcp, elicitation_callback=choose) as client:
+            assert client.protocol_version >= "2026-07-28"
+            return await client.call_tool(
+                "submit_false_positive_approvals", {"repo_root": str(tmp_path)}
+            )
+
+    # Act
+    result = asyncio.run(exercise())
+
+    # Assert
+    assert len(forms) == 1
+    assert engine.gitlab.dismiss_false_positive.call_count == writes
+    if writes:
+        assert result.structured_content["results"][0]["status"] == "DISMISSED"
+    else:
+        assert result.structured_content["status"] == "CANCELLED"
+        engine.gitlab.dismiss_false_positive.assert_not_called()
+
+
 @pytest.mark.parametrize("supported", [True, False])
 @pytest.mark.parametrize(
     "tool_name", ["complete_security_run", "generate_local_report"]

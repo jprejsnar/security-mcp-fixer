@@ -98,6 +98,18 @@ _RAISE_UNEXPECTED_WORKFLOW_JOB = "Unexpected workflow job"
 _RAISE_THE_HUMAN_FIX_SELECTION_RESPONSE_DOES_NOT_MATCH = (
     "The human fix-selection response does not match the live request."
 )
+_RAISE_THE_HUMAN_FORM_RESPONSE_DOES_NOT_MATCH = (
+    "The human form response does not match the live request."
+)
+_MODERN_ELICITATION_PROTOCOL = "2026-07-28"
+_FORM_FIX_SELECTION = "fix_selection"
+_FORM_FALSE_POSITIVE = "false_positive_approval"
+_FORM_AUDIT_CONSENT = "audit_consent"
+_FORM_AUDIT_CHOICE = "audit_choice"
+_FORM_AUDIT_ITEMS = "audit_items"
+_LOG_MODERN_FORM_HAS_NO_BACKGROUND_CHANNEL = (
+    "A modern human form cannot be delivered from a finished desktop handoff"
+)
 _RAISE_THE_LOCAL_REPORT_DID_NOT_RETURN_STRUCTURED_REPORT = (
     "The local report did not return structured report data"
 )
@@ -1695,17 +1707,41 @@ def _form_supported(ctx: Context) -> bool:
     return elicitation.form is not None or not elicitation.model_dump(exclude_none=True)
 
 
+def _modern_protocol(ctx: Context) -> bool:
+    """Return whether this connection refuses the server-request back-channel."""
+    try:
+        protocol = ctx.protocol_version
+    except AttributeError:
+        return False
+    return isinstance(protocol, str) and protocol >= _MODERN_ELICITATION_PROTOCOL
+
+
+def _bound_form_request(ctx: Context, stored: dict, slot: str) -> str | None:
+    """Return the live modern request id, or None when a new form must open."""
+    if not _modern_protocol(ctx):
+        return None
+    state = ctx.request_state
+    if not isinstance(state, str):
+        return None
+    if stored.get("form_request_id") != state or stored.get("form_slot") != slot:
+        raise ValueError(_RAISE_THE_HUMAN_FORM_RESPONSE_DOES_NOT_MATCH)
+    return state
+
+
 async def _fix_form_response(
-    ctx: Context, message: str, schema: type[BaseModel], request_id: str
+    ctx: Context,
+    message: str,
+    schema: type[BaseModel],
+    request_id: str,
+    slot: str = _FORM_FIX_SELECTION,
 ) -> ElicitationResult[BaseModel] | InputRequiredResult:
     """Use modern input rounds or the legacy back-channel without AI consent inputs."""
-    protocol = ctx.protocol_version
-    if not isinstance(protocol, str) or protocol < "2026-07-28":
+    if not _modern_protocol(ctx):
         return await ctx.elicit(message, schema)
     if ctx.input_responses is None:
         return InputRequiredResult(
             input_requests={
-                "fix_selection": ElicitRequest(
+                slot: ElicitRequest(
                     params=ElicitRequestFormParams(
                         message=message,
                         requested_schema=render_elicitation_schema(schema),
@@ -1716,12 +1752,14 @@ async def _fix_form_response(
         )
     if (
         ctx.request_state != request_id
-        or set(ctx.input_responses) != {"fix_selection"}
-        or not isinstance(
-            response := ctx.input_responses["fix_selection"], ElicitResult
-        )
+        or set(ctx.input_responses) != {slot}
+        or not isinstance(response := ctx.input_responses[slot], ElicitResult)
     ):
-        raise ValueError(_RAISE_THE_HUMAN_FIX_SELECTION_RESPONSE_DOES_NOT_MATCH)
+        raise ValueError(
+            _RAISE_THE_HUMAN_FIX_SELECTION_RESPONSE_DOES_NOT_MATCH
+            if slot == _FORM_FIX_SELECTION
+            else _RAISE_THE_HUMAN_FORM_RESPONSE_DOES_NOT_MATCH
+        )
     if response.action == "accept":
         return AcceptedElicitation(data=schema.model_validate(response.content))
     if response.action == "decline":
@@ -1815,6 +1853,9 @@ async def _resume_desktop_workflow(
     if selected.state is not owner_state:
         raise RuntimeError(_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN)
     completion = await complete_security_run(ctx, str(selected.repo_root))
+    if isinstance(completion, InputRequiredResult):
+        logger.warning(_LOG_MODERN_FORM_HAS_NO_BACKGROUND_CHANNEL)
+        return
     if selected.state is not owner_state:
         raise RuntimeError(_RAISE_THE_AUDIT_HANDOFF_BELONGED_TO_A_REPLACED_RUN)
     if (
@@ -2185,6 +2226,8 @@ async def select_security_fixes(
                 "Every proposed update is blocked by its documented review; no edits are authorized.",
             )
             completion = await complete_security_run(ctx, str(selected.repo_root))
+            if isinstance(completion, InputRequiredResult):
+                return completion
             return {
                 **result,
                 "blocked_updates": [
@@ -2451,7 +2494,7 @@ async def review_false_positives(
 )
 async def submit_false_positive_approvals(
     ctx: Context, repo_root: str | None = None
-) -> dict[str, Any]:
+) -> dict[str, Any] | InputRequiredResult:
     """Open unchecked human-only dismissal approvals; no AI consent arguments.
 
     Completion calls once; reopen only on explicit human request after cancellation.
@@ -2570,23 +2613,42 @@ async def submit_false_positive_approvals(
             )
         )
         return result
-    await asyncio.to_thread(
-        selected.record_false_positive_approval_form,
-        {**receipt, "status": "REQUESTED"},
-    )
     report_note = (
         f"Saved report: {selected.state.report_path}. "
         if selected.state.report_path
         else ""
     )
+    message = (
+        f"Human approval required for {selected.repo_root} ({candidates[0]['project_path']}). "
+        f"{report_note}{queue['finding_count']} findings still require source review and are excluded from this form. "
+        "Select only the false positives you approve. Submit to immediately dismiss selected GitLab vulnerabilities with the displayed reasons. Unchecked findings stay unchanged. "
+        "Cancel to continue reviewing the saved local report and explicitly reopen this form later."
+    )
     try:
-        response = await ctx.elicit(
-            f"Human approval required for {selected.repo_root} ({candidates[0]['project_path']}). "
-            f"{report_note}{queue['finding_count']} findings still require source review and are excluded from this form. "
-            "Select only the false positives you approve. Submit to immediately dismiss selected GitLab vulnerabilities with the displayed reasons. Unchecked findings stay unchanged. "
-            "Cancel to continue reviewing the saved local report and explicitly reopen this form later.",
-            schema,
+        request_id = _bound_form_request(
+            ctx, selected.state.false_positive_approval_form, _FORM_FALSE_POSITIVE
         )
+        if request_id is None:
+            details = {**receipt, "status": "REQUESTED"}
+            request_id = "legacy"
+            if _modern_protocol(ctx):
+                request_id = uuid4().hex
+                details["form_request_id"] = request_id
+                details["form_slot"] = _FORM_FALSE_POSITIVE
+            await asyncio.to_thread(
+                selected.record_false_positive_approval_form, details
+            )
+        elif (
+            selected.state.false_positive_approval_form.get("candidate_ids")
+            != receipt["candidate_ids"]
+            or selected.state.false_positive_approval_form.get("status") != "REQUESTED"
+        ):
+            raise ValueError(_RAISE_THE_HUMAN_FORM_RESPONSE_DOES_NOT_MATCH)
+        response = await _fix_form_response(
+            ctx, message, schema, request_id, _FORM_FALSE_POSITIVE
+        )
+        if isinstance(response, InputRequiredResult):
+            return response
     except asyncio.CancelledError:
         logger.warning(_LOG_FALSE_POSITIVE_INTERRUPTED)
         await asyncio.shield(
@@ -2668,7 +2730,7 @@ def _generate_local_report(repo_root: str | None = None) -> CallToolResult:
 )
 async def generate_local_report(
     ctx: Context, repo_root: str | None = None
-) -> CallToolResult:
+) -> CallToolResult | InputRequiredResult:
     """Alias for complete_security_run; follow the current ordered job."""
     return await complete_security_run(ctx, repo_root)
 
@@ -2687,7 +2749,7 @@ async def complete_security_run(
     repo_root: str | None = None,
     code_results: list[dict[str, Any]] | None = None,
     progress: dict[str, Any] | None = None,
-) -> CallToolResult:
+) -> CallToolResult | InputRequiredResult:
     """Advance jobs; code_results use workflow outcome schema; progress={id,message}."""
     selected = await asyncio.to_thread(_engine_for, repo_root)
     if not selected.state.workflow:
@@ -2695,6 +2757,8 @@ async def complete_security_run(
     lock = _workflow_locks.setdefault(selected.repo_root, asyncio.Lock())
     async with lock:
         result = await _continue_workflow(ctx, selected, code_results, progress)
+    if isinstance(result, InputRequiredResult):
+        return result
     return CallToolResult(
         content=[
             TextContent(
@@ -2863,7 +2927,7 @@ async def _continue_workflow(
     selected: Engine,
     code_results: list[dict] | None,
     progress: dict | None,
-) -> dict:
+) -> dict | InputRequiredResult:
     """Run only the next job, returning host work instead of overlapping jobs."""
     state = selected.state
     job = state.workflow["current"]
@@ -2989,6 +3053,8 @@ async def _continue_workflow(
             }
         if not state.false_positive_approval_form:
             review = await submit_false_positive_approvals(ctx, str(selected.repo_root))
+            if isinstance(review, InputRequiredResult):
+                return review
             if review["status"] == "AWAITING_HUMAN":
                 return review
             state.workflow["false_positive_result"] = deepcopy(review)
@@ -3106,7 +3172,7 @@ async def _continue_workflow(
 
 async def _complete_legacy(
     ctx: Context, repo_root: str | None = None
-) -> CallToolResult:
+) -> CallToolResult | InputRequiredResult:
     """Save GitLab reports, then request the full audit before Select fixes / Exit.
 
     Call after assessments and approved fixes/validation; never poll AWAITING_HUMAN.
@@ -3159,6 +3225,8 @@ async def _complete_legacy(
             )
         else:
             review = await submit_false_positive_approvals(ctx, repo_root=selected_root)
+            if isinstance(review, InputRequiredResult):
+                return review
             report = await asyncio.to_thread(
                 _generate_local_report, repo_root=selected_root
             )
@@ -3175,6 +3243,8 @@ async def _complete_legacy(
         note += "\nThe software-audit choice is offered automatically after this window closes; the waiting choose_software_audit_action call returns its result."
     elif not report.is_error:
         audit = await _offer_software_audit(ctx, selected)
+        if isinstance(audit, InputRequiredResult):
+            return audit
         note += f"\nSoftware audit: {audit['status']}."
         if audit.get("message"):
             note += f"\n{audit['message']}"
@@ -3404,7 +3474,9 @@ async def _open_audit_approval(
         raise
 
 
-async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any]:
+async def _offer_software_audit(
+    ctx: Context, selected: Engine
+) -> dict[str, Any] | InputRequiredResult:
     """Request a fresh post-remediation report before offering audit fixes."""
     if selected.state.workflow:
         blocked = workflow.require(selected, JOB_AUDIT)
@@ -3428,17 +3500,24 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
             if desktop_approval.available():
                 return await _open_audit_approval(ctx, selected, "CONSENT")
             elif _form_supported(ctx):
-                _record_audit_result(
-                    selected,
-                    {
+                message = "Run the deep-dive software audit? No or Cancel skips to the final unresolved report."
+                request_id = _bound_form_request(ctx, previous, _FORM_AUDIT_CONSENT)
+                if request_id is None:
+                    details = {
                         "status": "REQUESTED",
                         "message": "Waiting for human audit consent. No scan has started.",
-                    },
+                    }
+                    request_id = "legacy"
+                    if _modern_protocol(ctx):
+                        request_id = uuid4().hex
+                        details["form_request_id"] = request_id
+                        details["form_slot"] = _FORM_AUDIT_CONSENT
+                    _record_audit_result(selected, details)
+                response = await _fix_form_response(
+                    ctx, message, SoftwareAuditConsent, request_id, _FORM_AUDIT_CONSENT
                 )
-                response = await ctx.elicit(
-                    "Run the deep-dive software audit? No or Cancel skips to the final unresolved report.",
-                    SoftwareAuditConsent,
-                )
+                if isinstance(response, InputRequiredResult):
+                    return response
                 answer = (
                     "generate_report"
                     if response.action == "accept"
@@ -3497,11 +3576,15 @@ async def _offer_software_audit(ctx: Context, selected: Engine) -> dict[str, Any
     return await asyncio.to_thread(_software_audit_result, selected, "generate_report")
 
 
-async def _offer_audit_choices(ctx: Context, selected: Engine) -> dict[str, Any]:
+async def _offer_audit_choices(
+    ctx: Context, selected: Engine
+) -> dict[str, Any] | InputRequiredResult:
     """Offer only select-fixes or exit after the current report passed coverage checks."""
     state = selected.state
     try:
-        choice = await _ask_software_audit_choice(ctx)
+        choice = await _ask_software_audit_choice(ctx, selected)
+        if isinstance(choice, InputRequiredResult):
+            return choice
         if selected.state is not state:
             logger.warning(_LOG_STALE_AUDIT_RESPONSE)
             return {
@@ -4095,7 +4178,9 @@ def _record_audit_result(engine: Engine, result: dict[str, Any]) -> dict[str, An
     return result
 
 
-async def _ask_software_audit_choice(ctx: Context) -> str | None:
+async def _ask_software_audit_choice(
+    ctx: Context, engine: Engine
+) -> str | None | InputRequiredResult:
     """Ask the human for one closing action. Cancel means stop."""
     sink = progress_sink.get()
     if sink is not None:
@@ -4117,19 +4202,34 @@ async def _ask_software_audit_choice(ctx: Context) -> str | None:
         return choice
     if not _form_supported(ctx):
         return None
-    response = await ctx.elicit(
+    message = (
         "The audit report is complete. Select findings to fix, or exit. "
-        "Cancel stops without code changes. Nothing is committed or pushed.",
-        SoftwareAuditChoice,
+        "Cancel stops without code changes. Nothing is committed or pushed."
     )
+    request_id = _bound_form_request(
+        ctx, engine.state.software_audit, _FORM_AUDIT_CHOICE
+    )
+    if request_id is None:
+        request_id = "legacy"
+        if _modern_protocol(ctx):
+            request_id = uuid4().hex
+            stored = dict(engine.state.software_audit)
+            stored["form_request_id"] = request_id
+            stored["form_slot"] = _FORM_AUDIT_CHOICE
+            engine.record_software_audit(stored)
+    response = await _fix_form_response(
+        ctx, message, SoftwareAuditChoice, request_id, _FORM_AUDIT_CHOICE
+    )
+    if isinstance(response, InputRequiredResult):
+        return response
     if response.action != "accept" or response.data is None:
         return "done"
     return normalize_choice(response.data.action)
 
 
 async def _ask_audit_items(
-    ctx: Context, items: list[dict[str, str]]
-) -> list[str] | None:
+    ctx: Context, engine: Engine, items: list[dict[str, str]]
+) -> list[str] | None | InputRequiredResult:
     """Show one unchecked box per audit item. None means the host must show them."""
     sink = progress_sink.get()
     if sink is not None:
@@ -4164,11 +4264,26 @@ async def _ask_audit_items(
         return [item["id"] for item in _checked(items, response.get("content") or {})]
     if not _form_supported(ctx):
         return None
-    response = await ctx.elicit(
+    message = (
         "Check only the audit items to fix. Every box starts unchecked. "
-        "Submit fixes only the checked items. Cancel fixes nothing.",
-        schema,
+        "Submit fixes only the checked items. Cancel fixes nothing."
     )
+    request_id = _bound_form_request(
+        ctx, engine.state.software_audit, _FORM_AUDIT_ITEMS
+    )
+    if request_id is None:
+        request_id = "legacy"
+        if _modern_protocol(ctx):
+            request_id = uuid4().hex
+            stored = dict(engine.state.software_audit)
+            stored["form_request_id"] = request_id
+            stored["form_slot"] = _FORM_AUDIT_ITEMS
+            engine.record_software_audit(stored)
+    response = await _fix_form_response(
+        ctx, message, schema, request_id, _FORM_AUDIT_ITEMS
+    )
+    if isinstance(response, InputRequiredResult):
+        return response
     if response.action != "accept" or response.data is None:
         return []
     return [item["id"] for item in _checked(items, response.data.model_dump())]
@@ -4279,7 +4394,7 @@ async def choose_software_audit_action(
     selected_ids: list[str] | None = None,
     report_ready: bool = False,
     progress: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | InputRequiredResult:
     """Await the next job; obtain audit consent, then coverage-check report_ready before unchecked audit fixes."""
     selected = await asyncio.to_thread(_engine_for, repo_root)
     if (
@@ -4303,6 +4418,8 @@ async def choose_software_audit_action(
             ):
                 return workflow.require(selected, JOB_AUDIT) or {"status": "ERROR"}
             result = await complete_security_run(ctx, str(selected.repo_root))
+            if isinstance(result, InputRequiredResult):
+                return result
             return result.structured_content
     previous = selected.state.software_audit
     if (
@@ -4506,6 +4623,8 @@ async def choose_software_audit_action(
         )
         if selected.state.workflow and result["status"] == "DONE":
             completed = await complete_security_run(ctx, str(selected.repo_root))
+            if isinstance(completed, InputRequiredResult):
+                return completed
             return completed.structured_content
         return result
     prepared = await asyncio.to_thread(_software_audit_fix, selected, None)
@@ -4515,7 +4634,9 @@ async def choose_software_audit_action(
         return await _open_audit_approval(ctx, selected, "FIX_SELECTION", prepared)
     audit_state = selected.state
     try:
-        checked = await _ask_audit_items(ctx, prepared["items"])
+        checked = await _ask_audit_items(ctx, selected, prepared["items"])
+        if isinstance(checked, InputRequiredResult):
+            return checked
     except (OSError, RuntimeError, ValueError, MCPError) as exc:
         logger.warning(_LOG_AUDIT_ITEMS_NOT_COLLECTED, exc, exc_info=True)
         return prepared
@@ -4538,10 +4659,14 @@ async def choose_software_audit_action(
     return await _finish_empty_audit(ctx, selected, result)
 
 
-async def _finish_empty_audit(ctx: Context, selected: Engine, result: dict) -> dict:
+async def _finish_empty_audit(
+    ctx: Context, selected: Engine, result: dict
+) -> dict | InputRequiredResult:
     """Skipping audit fixes still produces the final unresolved report."""
     if selected.state.workflow and result["status"] in {"NONE_SELECTED", "NO_FINDINGS"}:
         completed = await complete_security_run(ctx, str(selected.repo_root))
+        if isinstance(completed, InputRequiredResult):
+            return completed
         return completed.structured_content
     return result
 

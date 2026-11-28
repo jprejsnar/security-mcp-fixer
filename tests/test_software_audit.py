@@ -211,6 +211,45 @@ def test_interrupted_host_audit_consent_records_no_scan_instead_of_running(
     assert "no audit is running" in task["message"]
 
 
+def test_modern_protocol_audit_consent_uses_human_input_rounds(tmp_path, monkeypatch):
+    """Refuse the back-channel and keep a declined audit from starting a scan."""
+    # Arrange
+    from mcp.types import ElicitResult, InputRequiredResult
+
+    engine = _engine(tmp_path / "checkout")
+    (engine.repo_root / "app.java").write_text("class App {}", encoding="utf-8")
+    workflow.start(engine)
+    while engine.state.workflow["current"] < 6:
+        workflow.advance(engine)
+    monkeypatch.setattr(server.desktop_approval, "available", lambda: False)
+    ctx = Mock()
+    ctx.protocol_version = "2026-07-28"
+    ctx.request_state = None
+    ctx.input_responses = None
+    ctx.session.client_capabilities = ClientCapabilities.model_validate(
+        {"elicitation": {"form": {}}}
+    )
+    ctx.elicit = AsyncMock()
+
+    async def exercise():
+        """Open the modern consent round, then decline it on the retry."""
+        pending = await server._offer_software_audit(ctx, engine)
+        assert isinstance(pending, InputRequiredResult)
+        ctx.request_state = pending.request_state
+        ctx.input_responses = {
+            "audit_consent": ElicitResult(action="decline", content=None)
+        }
+        return await server._offer_software_audit(ctx, engine)
+
+    # Act
+    result = asyncio.run(exercise())
+
+    # Assert
+    ctx.elicit.assert_not_called()
+    assert result["status"] != "GENERATE_AUDIT_REPORT"
+    assert not engine.state.software_audit.get("output_path")
+
+
 def test_native_audit_fix_checklist_hands_back_checked_items_without_reopening(
     tmp_path, monkeypatch
 ):

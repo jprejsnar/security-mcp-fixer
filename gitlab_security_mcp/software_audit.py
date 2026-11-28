@@ -230,6 +230,12 @@ def _generated_source(path: Path) -> bool:
     return False
 
 
+def _file_sha256(path: Path) -> str:
+    """Hash a file in chunks. The digest matches a full-file SHA-256."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
 def _generated_output_paths(root: Path, exclusions: list[dict]) -> set[Path]:
     """Validate host-attested generator configuration before pruning its outputs."""
     outputs = set()
@@ -252,7 +258,7 @@ def _generated_output_paths(root: Path, exclusions: list[dict]) -> set[Path]:
                 _RAISE_INVALID_GENERATED_EXCLUSION_EVIDENCE.format(evidence["path"])
             )
         supplied = evidence.get("sha256") or ""
-        digest = hashlib.sha256(config.read_bytes()).hexdigest()
+        digest = _file_sha256(config)
         if not evidence["assessment"].strip() or (supplied and supplied != digest):
             raise ValueError(
                 _RAISE_GENERATED_EXCLUSION_NEEDS_CURRENT_CONFIGURATION_EVIDENCE.format(
@@ -333,7 +339,7 @@ def record_audit_coverage(
             raise ValueError(
                 _RAISE_AUDIT_REVIEW_IS_OUTSIDE_THE_INVENTORY.format(review["path"])
             )
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = _file_sha256(path)
         supplied = review.get("sha256") or ""
         if supplied and supplied != digest:
             raise ValueError(
@@ -363,11 +369,7 @@ def audit_coverage_gaps(root: Path, coverage: dict) -> dict:
     for name in current["files"]:
         review = coverage["reviews"].get(name)
         path = resolve_inside(root, name)
-        if (
-            review is None
-            or path is None
-            or review["sha256"] != hashlib.sha256(path.read_bytes()).hexdigest()
-        ):
+        if review is None or path is None or review["sha256"] != _file_sha256(path):
             missing.append(name)
     return {
         "remaining_files": missing,
